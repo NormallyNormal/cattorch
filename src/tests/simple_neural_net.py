@@ -9,13 +9,14 @@ class SimpleNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.W1 = nn.Parameter(torch.randn(input_dim, hidden_dim))
-        self.b1 = nn.Parameter(torch.zeros(hidden_dim))
+        self.b1 = nn.Parameter(torch.randn(hidden_dim))
         self.W2 = nn.Parameter(torch.randn(hidden_dim, output_dim))
-        self.b2 = nn.Parameter(torch.zeros(output_dim))
+        self.b2 = nn.Parameter(torch.randn(output_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # [batch, input_dim] @ [input_dim, hidden_dim] + [hidden_dim] -> [batch, hidden_dim]
         hidden = x @ self.W1 + self.b1
+        # print(hidden.flatten())
         hidden = F.relu(hidden)
 
         # [batch, hidden_dim] @ [hidden_dim, output_dim] + [output_dim] -> [batch, output_dim]

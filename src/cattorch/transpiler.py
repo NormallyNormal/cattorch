@@ -82,7 +82,8 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
                 instruction = TensorAddInstruction(
                     node.target,
                     target_list,
-                    Argument(input_lists[0], get_shape(node.args[0]))
+                    Argument(input_lists[0], get_shape(node.args[0])),
+                    Argument(input_lists[1], get_shape(node.args[1])),
                 )
             data = instruction.finalize() # get the sprite dict with blocks
 
@@ -90,10 +91,10 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
             data["blocks"] = block_manager.apply_to_blocks(data["blocks"])
 
             tensor_adder = TensorAdder()
-            data = tensor_adder.apply(data, [input_lists[0], input_lists[1], target_list])
+            data = tensor_adder.apply(data, input_lists + [target_list])
 
             # T1 = input A, T2 = input B, T3 = output
-            tensor_replacer = TensorReplacer(data, [input_lists[0], input_lists[1], target_list])
+            tensor_replacer = TensorReplacer(data, input_lists + [target_list])
             data["blocks"] = tensor_replacer.apply(data["blocks"])
 
             if scratch_output is None:
