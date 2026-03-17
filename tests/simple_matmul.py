@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from src.cattorch.transpiler import transpile
+from cattorch.transpiler import transpile
 
 
 class SimpleMatMulModel(nn.Module):

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cattorch"
+version = "0.1.0"
+description = "Export PyTorch modules to Scratch sprites"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "torch>=2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["cattorch*"]
+
+[tool.setuptools.package-data]
+cattorch = ["templates/**/*.json", "templates/**/*.svg"]

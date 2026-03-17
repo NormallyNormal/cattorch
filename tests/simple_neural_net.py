@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.cattorch.transpiler import transpile
+from cattorch.transpiler import transpile
 
 
 class SimpleNN(nn.Module):
@@ -16,7 +16,6 @@ class SimpleNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # [batch, input_dim] @ [input_dim, hidden_dim] + [hidden_dim] -> [batch, hidden_dim]
         hidden = x @ self.W1 + self.b1
-        # print(hidden.flatten())
         hidden = F.relu(hidden)
 
         # [batch, hidden_dim] @ [hidden_dim, output_dim] + [output_dim] -> [batch, output_dim]

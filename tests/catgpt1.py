@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.cattorch.transpiler import transpile
+from cattorch.transpiler import transpile
 
 CHARS    = ' abcdefghijklmnopqrstuvwxyz'
 HUMAN_TOKEN = len(CHARS)      # 27

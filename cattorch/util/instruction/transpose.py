@@ -1,6 +1,6 @@
 import torch
 
-from src.cattorch.util.instruction.instruction import Instruction, ScratchInstruction
+from cattorch.util.instruction.instruction import Instruction, ScratchInstruction
 
 
 class TransposeInstruction(Instruction):

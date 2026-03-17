@@ -1,12 +1,13 @@
 import json
 import math
 
-from src.cattorch.templates.template import TEMPLATE_DIR
-from src.cattorch.util.instruction.instruction import Instruction, ScratchInstruction
-from src.cattorch.util.scratch.constant_replacer import ConstantReplacer
+from cattorch.templates.template import TEMPLATE_DIR
+from cattorch.util.instruction.instruction import Instruction, ScratchInstruction
+from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 
 class ReLUInstruction(Instruction):
+    aten_op = "aten.relu.default"
     def prepare(self):
         assert len(self.args) == 1
         self.scratch_instruction = ScratchInstruction.RELU

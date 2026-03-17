@@ -7,7 +7,7 @@ and zips both into a .sprite3 file.
 
 Usage
 -----
-    from src.cattorch.util.scratch.finalize_sprite import finalize_sprite
+    from cattorch.util.scratch.finalize_sprite import finalize_sprite
     finalize_sprite(data, "my_model.sprite3")
 """
 
@@ -20,7 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from src.cattorch.templates.template import TEMPLATE_DIR
+from cattorch.templates.template import TEMPLATE_DIR
 
 SPRITE_ASSET_DIR = TEMPLATE_DIR / "sprite"
 

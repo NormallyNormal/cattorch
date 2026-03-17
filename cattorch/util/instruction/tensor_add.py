@@ -1,12 +1,13 @@
 import json
 import math
 
-from src.cattorch.templates.template import TEMPLATE_DIR
-from src.cattorch.util.instruction.instruction import Instruction, ScratchInstruction
-from src.cattorch.util.scratch.constant_replacer import ConstantReplacer
+from cattorch.templates.template import TEMPLATE_DIR
+from cattorch.util.instruction.instruction import Instruction, ScratchInstruction
+from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 
 class TensorAddInstruction(Instruction):
+    aten_op = "aten.add.Tensor"
     def prepare(self):
         assert len(self.args) == 2
         assert self.args[0].shape[-1] == self.args[1].shape[-1]
