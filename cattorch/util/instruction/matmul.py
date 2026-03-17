@@ -29,6 +29,7 @@ class MatMulInstruction(Instruction):
                 101: 1,
                 102: self.args[1].shape[-1],
                 103: self.args[0].shape[-1],
+                104: 1
             })
         elif len(self.args[1].shape) == 1:
             # [..., K, N] @ [N] -> [K]
@@ -36,16 +37,18 @@ class MatMulInstruction(Instruction):
                 101: math.prod(self.args[0].shape[:-1]),
                 102: 1,
                 103: self.args[0].shape[-1],
+                104: 1
             })
         else:
-            # [..., K, N] @ [N, M] -> [K, M]
+            # [..., K, N] @ [N, M] -> [..., K, M]
             constant_replacer = ConstantReplacer({
                 101: math.prod(self.args[0].shape[:-1]),
                 102: self.args[1].shape[-1],
                 103: self.args[0].shape[-1],
+                104: 1,
             })
 
-        template_path = TEMPLATE_DIR / "matmul" / "template.json"
+        template_path = TEMPLATE_DIR / "matmul" / "template_simple.json"
         with open(template_path, "r") as jsonfile:
             data = json.load(jsonfile)
 
@@ -54,4 +57,16 @@ class MatMulInstruction(Instruction):
 
 
     def finalize_tensor_matmul(self):
-        pass
+        # [..., K, N] @ [..., N, M] -> [..., K, M]
+        constant_replacer = ConstantReplacer({
+            101: self.args[0].shape[-2],
+            102: self.args[1].shape[-1],
+            103: self.args[0].shape[-1],
+            104: math.prod(self.args[1].shape[:-2])
+        })
+
+        template_path = TEMPLATE_DIR / "matmul" / "template_tensor.json"
+        with open(template_path, "r") as jsonfile:
+            data = json.load(jsonfile)
+        data = constant_replacer.apply(data)
+        return data

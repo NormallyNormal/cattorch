@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 
 import torch
 from torch.export import export
@@ -96,6 +97,28 @@ def _remove_unused(sprite):
             del slots[sid]
 
 
+def _uniquify_ids(sprite):
+    """Add a UUID suffix to all list and variable IDs to prevent conflicts
+    when multiple cattorch sprites are loaded into one Scratch project."""
+    suffix = uuid.uuid4().hex[:12]
+    remap = {}
+
+    for section in ("lists", "variables"):
+        slots = sprite.get(section, {})
+        for sid in list(slots):
+            new_id = f"{sid}_{suffix}"
+            remap[sid] = new_id
+            slots[new_id] = slots.pop(sid)
+
+    if not remap:
+        return
+
+    raw = json.dumps(sprite["blocks"])
+    for old, new in sorted(remap.items(), key=lambda x: -len(x[0])):
+        raw = raw.replace(f'"{old}"', f'"{new}"')
+    sprite["blocks"] = json.loads(raw)
+
+
 def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str):
     exported = export(model, (torch.randn(input_shape),))
     nodes = list(exported.graph.nodes)
@@ -178,6 +201,10 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
 
     # Remove orphaned lists and variables
     _remove_unused(scratch_output)
+
+    # Add unique suffixes to all internal list/variable IDs to avoid
+    # conflicts when multiple cattorch sprites are loaded into one project
+    _uniquify_ids(scratch_output)
 
     log.info("Dynamic lists: %s", list(all_dynamic_lists))
     log.info("Static lists: %s", list(all_static_lists.keys()))
