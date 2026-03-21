@@ -17,6 +17,38 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 log = logging.getLogger(__name__)
 
 
+def _decompose_linear(graph):
+    """Rewrite aten.linear.default nodes into transpose + matmul + optional add."""
+    for node in list(graph.nodes):
+        if node.op != 'call_function' or str(node.target) != 'aten.linear.default':
+            continue
+
+        args = node.args
+        x, weight = args[0], args[1]
+        has_bias = len(args) == 3
+
+        with graph.inserting_before(node):
+            # Transpose weight: [out, in] → [in, out]
+            tp = graph.create_node('call_function', torch.ops.aten.numpy_T.default, (weight,))
+            tp.meta = {'val': torch.empty(torch.Size(reversed(weight.meta['val'].shape)))}
+
+            # Matmul: x @ weight.T
+            mm = graph.create_node('call_function', torch.ops.aten.matmul.default, (x, tp))
+            mm_shape = list(x.meta['val'].shape[:-1]) + [weight.meta['val'].shape[0]]
+            mm.meta = {'val': torch.empty(mm_shape)}
+
+            if has_bias:
+                bias = args[2]
+                add = graph.create_node('call_function', torch.ops.aten.add.Tensor, (mm, bias))
+                add.meta = {'val': torch.empty(mm_shape)}
+                replacement = add
+            else:
+                replacement = mm
+
+        node.replace_all_uses_with(replacement)
+        graph.erase_node(node)
+
+
 def _get_shape(arg) -> torch.Size:
     if hasattr(arg, 'meta') and 'val' in arg.meta:
         return arg.meta['val'].shape
@@ -54,8 +86,11 @@ def _process_instruction(instruction, input_lists, target_list, block_manager):
     block_manager.new_context()
     data["blocks"] = block_manager.apply_to_blocks(data["blocks"])
 
+    # Only tensor args go through list management; constants are compile-time only
+    tensor_lists = [name for name in input_lists if not name.startswith("C_")]
+
     tensor_adder = TensorAdder()
-    all_lists = input_lists + [target_list]
+    all_lists = tensor_lists + [target_list]
     data = tensor_adder.apply(data, all_lists)
 
     tensor_replacer = TensorReplacer(data, all_lists)
@@ -121,8 +156,9 @@ def _uniquify_ids(sprite):
 
 def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str):
     exported = export(model, (torch.randn(input_shape),))
+    _decompose_linear(exported.graph)
     nodes = list(exported.graph.nodes)
-    normalised_state = {k.lower(): v for k, v in exported.state_dict.items()}
+    normalised_state = {k.lower().replace(".", "_"): v for k, v in exported.state_dict.items()}
 
     def resolve_weight(arg_name: str):
         key = arg_name.removeprefix("p_")
@@ -166,10 +202,13 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
 
         log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
 
-        args = [
-            Argument(input_lists[i], _get_shape(node.args[i]))
-            for i in range(len(input_lists))
-        ]
+        args = []
+        for i in range(len(input_lists)):
+            node_arg = node.args[i]
+            if hasattr(node_arg, 'name'):
+                args.append(Argument(input_lists[i], _get_shape(node_arg)))
+            else:
+                args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
         instruction = Instruction.create(aten_op, node.target, target_list, *args)
 
         data = _process_instruction(instruction, input_lists, target_list, block_manager)

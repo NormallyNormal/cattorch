@@ -6,7 +6,7 @@ from cattorch.util.instruction.instruction import Instruction, ScratchInstructio
 from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 class MatMulInstruction(Instruction):
-    aten_op = "aten.matmul.default"
+    aten_op = ["aten.matmul.default", "aten.mm.default", "aten.bmm.default"]
     def prepare(self):
         assert len(self.args) == 2
         a, b = self.args[0], self.args[1]

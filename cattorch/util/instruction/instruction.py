@@ -14,12 +14,14 @@ class ScratchInstruction(Enum):
 
 class Instruction(ABC):
     _registry: dict[str, type["Instruction"]] = {}
-    aten_op: str  # subclasses must set this
+    aten_op: str | list[str]  # subclasses must set this
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if hasattr(cls, "aten_op"):
-            Instruction._registry[cls.aten_op] = cls
+            ops = cls.aten_op if isinstance(cls.aten_op, list) else [cls.aten_op]
+            for op in ops:
+                Instruction._registry[op] = cls
 
     def __init__(self, torch_name: str, output: Argument, *args: Argument):
         self.torch_name = torch_name

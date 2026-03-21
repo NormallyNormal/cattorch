@@ -48,31 +48,49 @@ def _find_top_level_root(blocks: dict) -> str:
     return roots[0]
 
 
+LOCAL_PREFIX = "_"
+
+
 def _merge_slots(primary: dict, secondary: dict) -> dict:
     """
     Merge two variable or list dicts.
     - If a display name appears in both, the primary slot wins (its ID is kept).
-    - Returns a new dict and a remapping {secondary_id: primary_id} for any
-      slots that were collapsed.
+    - Slots whose display name starts with LOCAL_PREFIX ("_") are never merged;
+      each instruction keeps its own copy. If the ID collides, the secondary
+      slot is given a unique ID and a remap entry is added.
+    - Returns a new dict and a remapping {secondary_id: new_id} for any
+      slots that were collapsed or renamed.
     """
+    import uuid
+
     # Build display_name -> (id, entry) for the primary
     by_name: dict[str, tuple[str, list]] = {
         entry[0]: (sid, entry) for sid, entry in primary.items()
     }
 
     merged = dict(primary)
-    remap: dict[str, str] = {}  # secondary_id -> winning_id
+    remap: dict[str, str] = {}  # secondary_id -> winning/new_id
 
     for sid, entry in secondary.items():
         display_name = entry[0]
-        if display_name in by_name:
-            # Collapse: secondary slot maps to primary slot's ID
+        is_local = display_name.startswith(LOCAL_PREFIX)
+
+        if not is_local and display_name in by_name:
+            # Shared slot: collapse secondary into primary
             winning_id = by_name[display_name][0]
             remap[sid] = winning_id
+        elif sid in merged:
+            # ID collision — assign a new unique ID
+            new_id = f"{sid}_{uuid.uuid4().hex[:8]}"
+            merged[new_id] = entry
+            remap[sid] = new_id
+            if not is_local:
+                by_name[display_name] = (new_id, entry)
         else:
-            # New slot — add it
+            # New slot, no collision
             merged[sid] = entry
-            by_name[display_name] = (sid, entry)
+            if not is_local:
+                by_name[display_name] = (sid, entry)
 
     return merged, remap
 
