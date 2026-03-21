@@ -16,6 +16,15 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 
 log = logging.getLogger(__name__)
 
+# Ops that change logical shape but don't move data in the flat array
+_NOOP_OPS = {
+    "aten.view.default",
+    "aten.reshape.default",
+    "aten._unsafe_view.default",
+    "aten.contiguous.default",
+    "aten.clone.default",
+}
+
 
 def _decompose_linear(graph):
     """Rewrite aten.linear.default nodes into transpose + matmul + optional add."""
@@ -55,7 +64,7 @@ def _get_shape(arg) -> torch.Size:
     return torch.Size([])
 
 
-def _resolve_args(node, scope, input_names, resolve_weight):
+def _resolve_args(node, scope, input_names, resolve_weight, aliases=None):
     input_lists = []
     dynamic_lists = set()
     static_lists = {}
@@ -63,16 +72,19 @@ def _resolve_args(node, scope, input_names, resolve_weight):
 
     for arg in node.args:
         if hasattr(arg, 'name'):
-            if arg.name in scope.assignments:
-                name = f"T{scope.assignments[arg.name]}"
+            arg_name = arg.name
+            if aliases and arg_name in aliases:
+                arg_name = aliases[arg_name]
+            if arg_name in scope.assignments:
+                name = f"T{scope.assignments[arg_name]}"
                 input_lists.append(name)
                 dynamic_lists.add(name)
-            elif arg.name in input_names:
-                input_lists.append(input_names[arg.name])
+            elif arg_name in input_names:
+                input_lists.append(input_names[arg_name])
             else:
-                name = f"W_{arg.name}"
+                name = f"W_{arg_name}"
                 input_lists.append(name)
-                static_lists[arg.name] = resolve_weight(arg.name)
+                static_lists[arg_name] = resolve_weight(arg_name)
         else:
             input_lists.append(f"C_{arg}")
             constants.append(arg)
@@ -173,8 +185,23 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
             input_names[node.name] = name
             input_count += 1
 
+    # Build alias map for no-op shape ops (view, reshape, contiguous, etc.)
+    # These don't move data, so their output is the same list as their input.
+    aliases = {}  # no-op node name -> source node name
+    for node in nodes:
+        if node.op != 'call_function':
+            continue
+        aten_op = str(node.target)
+        if aten_op in _NOOP_OPS and hasattr(node.args[0], 'name'):
+            source = node.args[0].name
+            # Follow alias chains: if source is itself aliased, point to the root
+            while source in aliases:
+                source = aliases[source]
+            aliases[node.name] = source
+            log.info("Alias: %s -> %s (no-op %s)", node.name, source, aten_op)
+
     scope = ScopeManager()
-    scope.analyze_lifetimes(nodes)
+    scope.analyze_lifetimes(nodes, skip=set(aliases.keys()))
 
     all_dynamic_lists = set()
     all_static_lists = {}
@@ -188,12 +215,16 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
         if node.op != 'call_function':
             continue
 
+        # Skip no-op nodes — they are aliases, not real computations
+        if node.name in aliases:
+            continue
+
         target_list = scope.get_list_for_node(node)
         last_target_list = target_list
         aten_op = str(node.target)
 
         input_lists, dynamic_lists, static_lists, constants = _resolve_args(
-            node, scope, input_names, resolve_weight
+            node, scope, input_names, resolve_weight, aliases
         )
 
         all_dynamic_lists.update(dynamic_lists)
@@ -233,6 +264,19 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
         scratch_output,
         list(input_names.values()),
     )
+
+    # If the last graph node is a no-op alias, resolve to the source list
+    last_call = None
+    for node in reversed(nodes):
+        if node.op == 'call_function':
+            last_call = node
+            break
+    if last_call and last_call.name in aliases:
+        source = aliases[last_call.name]
+        if source in scope.assignments:
+            last_target_list = f"T{scope.assignments[source]}"
+        elif source in input_names:
+            last_target_list = input_names[source]
 
     # Rename the final output list
     if last_target_list is not None:

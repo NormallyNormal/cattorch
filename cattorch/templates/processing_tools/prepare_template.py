@@ -3,8 +3,10 @@ prepare_template.py
 -------------------
 Single-pass preparation of a Scratch sprite template JSON:
   1. Renames all opaque IDs to human-readable cattorch_ prefixed names
-  2. Empties all list contents
+  2. Empties all list contents and zeroes all variables
   3. Converts numeric string literals in block inputs to int or float
+  4. Resets the topLevel root block position to (0, 0)
+  5. Strips sprite metadata after blocks (comments, costumes, sounds, etc.)
 
 Works with both full sprite JSON and blocks-only JSON.
 
@@ -75,6 +77,29 @@ def empty_lists(data: dict) -> dict:
     return data
 
 
+def zero_variables(data: dict) -> dict:
+    for entry in data.get("variables", {}).values():
+        entry[1] = 0
+    return data
+
+
+def reset_toplevel_position(data: dict) -> dict:
+    for block in data.get("blocks", {}).values():
+        if block.get("topLevel"):
+            block["x"] = 0
+            block["y"] = 0
+    return data
+
+
+def strip_sprite_metadata(data: dict) -> dict:
+    """Remove everything after blocks that isn't needed for templates."""
+    keep = {"isStage", "name", "variables", "lists", "broadcasts", "blocks"}
+    for key in list(data.keys()):
+        if key not in keep:
+            del data[key]
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Step 3: Convert numeric string literals
 # ---------------------------------------------------------------------------
@@ -138,12 +163,15 @@ def prepare(data: dict) -> dict:
     data = copy.deepcopy(data)
     data = rename_ids(data)
     data = empty_lists(data)
+    data = zero_variables(data)
     data = convert_numerics(data)
+    data = reset_toplevel_position(data)
+    data = strip_sprite_metadata(data)
     return data
 
 
 if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else "../softmax/template.json"
+    src = sys.argv[1] if len(sys.argv) > 1 else "../scalar_multiply/template.json"
     dst = sys.argv[2] if len(sys.argv) > 2 else src.replace(".json", "_prepared.json")
 
     with open(src) as f:

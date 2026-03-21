@@ -150,6 +150,112 @@ class Softmax3D(nn.Module):
         return F.softmax(x, dim=1)
 
 
+class ScalarMul(nn.Module):
+    def forward(self, x):
+        return x * 0.5
+
+
+class ScalarMulChained(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        return (x @ self.W) * 0.125
+
+
+class LayerNorm1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln = nn.LayerNorm(4)
+
+    def forward(self, x):
+        return self.ln(x)
+
+
+class LayerNorm2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln = nn.LayerNorm([3, 4])
+
+    def forward(self, x):
+        return self.ln(x)
+
+
+class ViewReshape(nn.Module):
+    """View/reshape as a no-op (same flat data, different logical shape)."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 6))
+
+    def forward(self, x):
+        y = x @ self.W            # [2, 6]
+        y = y.view(3, 4)          # reshape, same flat data
+        return y * 0.5
+
+
+class FlattenModel(nn.Module):
+    """Flatten uses reshape internally."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        y = x @ self.W            # [2, 3]
+        return y.reshape(-1)      # flatten to [6]
+
+
+class ScalarDiv(nn.Module):
+    def forward(self, x):
+        return x / 4.0
+
+
+class SingleHeadAttention(nn.Module):
+    """Minimal single-head self-attention block."""
+    def __init__(self, d_model=8):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5
+
+    def forward(self, x):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        attn = F.softmax((q @ k.T) / self.scale, dim=-1)
+        return self.out_proj(attn @ v)
+
+
+class TransformerBlock(nn.Module):
+    """Single transformer block: self-attention + FFN with residuals and layernorm."""
+    def __init__(self, d_model=8, d_ff=16):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff1 = nn.Linear(d_model, d_ff)
+        self.ff2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        # Self-attention with residual
+        h = self.ln1(x)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
+        attn = F.softmax((q @ k.T) / self.scale, dim=-1)
+        x = x + self.out_proj(attn @ v)
+        # FFN with residual
+        h = self.ln2(x)
+        x = x + self.ff2(F.relu(self.ff1(h)))
+        return x
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -232,4 +338,67 @@ def test_softmax_3d():
     model = Softmax3D()
     x = torch.randn(3, 4, 5)
     expected, actual = _run_sprite(model, torch.Size([3, 4, 5]), x)
+    _assert_close(expected, actual)
+
+
+def test_scalar_multiply():
+    model = ScalarMul()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_scalar_multiply_chained():
+    model = ScalarMulChained()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    _assert_close(expected, actual)
+
+
+def test_layernorm():
+    model = LayerNorm1D()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    _assert_close(expected, actual)
+
+
+def test_layernorm_2d():
+    model = LayerNorm2D()
+    x = torch.randn(2, 3, 4)
+    expected, actual = _run_sprite(model, torch.Size([2, 3, 4]), x)
+    _assert_close(expected, actual)
+
+
+def test_view_reshape():
+    model = ViewReshape()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    _assert_close(expected, actual)
+
+
+def test_flatten():
+    model = FlattenModel()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    _assert_close(expected, actual)
+
+
+def test_scalar_divide():
+    model = ScalarDiv()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_single_head_attention():
+    model = SingleHeadAttention(d_model=8)
+    x = torch.randn(3, 8)
+    expected, actual = _run_sprite(model, torch.Size([3, 8]), x)
+    _assert_close(expected, actual)
+
+
+def test_transformer_block():
+    model = TransformerBlock(d_model=8, d_ff=16)
+    x = torch.randn(3, 8)
+    expected, actual = _run_sprite(model, torch.Size([3, 8]), x)
     _assert_close(expected, actual)

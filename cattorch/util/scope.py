@@ -12,11 +12,16 @@ class ScopeManager:
         # Tracks how many times a node's output will be used
         self.ref_counts = defaultdict(int)
 
-    def analyze_lifetimes(self, nodes):
+    def analyze_lifetimes(self, nodes, skip=None):
         # Step 1: Count how many times each node is used as an input
+        # Skipped (aliased) nodes don't get counted — their consumers
+        # count against the source node instead.
+        skip = skip or set()
         for node in nodes:
+            if node.name in skip:
+                continue
             for arg in node.args:
-                if hasattr(arg, 'name'):  # If the argument is a previous node
+                if hasattr(arg, 'name'):
                     self.ref_counts[arg.name] += 1
 
     def get_list_for_node(self, node):

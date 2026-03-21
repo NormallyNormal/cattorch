@@ -99,17 +99,31 @@ def _apply_remap(blocks: dict, var_remap: dict, list_remap: dict) -> dict:
     """
     Walk every block and replace collapsed variable/list IDs with the
     winning IDs from the merge step.
+
+    All replacements are applied in a single pass to prevent cascading
+    (where the output of one replacement is consumed by a later one).
     """
     import json
+    import re
 
     if not var_remap and not list_remap:
         return blocks
 
-    raw = json.dumps(blocks)
-    # Sort by descending length to avoid partial-match collisions
     all_remap = {**var_remap, **list_remap}
-    for old, new in sorted(all_remap.items(), key=lambda x: -len(x[0])):
-        raw = raw.replace(f'"{old}"', f'"{new}"')
+
+    # Drop identity remaps — they can't change anything and only add noise
+    all_remap = {k: v for k, v in all_remap.items() if k != v}
+    if not all_remap:
+        return blocks
+
+    raw = json.dumps(blocks)
+
+    # Build a regex matching any quoted key, longest first
+    pattern = "|".join(
+        re.escape(f'"{k}"')
+        for k in sorted(all_remap, key=len, reverse=True)
+    )
+    raw = re.sub(pattern, lambda m: f'"{all_remap[m.group(0)[1:-1]]}"', raw)
 
     return json.loads(raw)
 
