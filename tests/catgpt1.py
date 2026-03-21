@@ -148,4 +148,4 @@ class NanoGPT(nn.Module):
 
 model = NanoGPT()
 # CATGPT cannot be transpiled (yet)
-transpile(model, torch.Size([1, 32]))
+transpile(model, torch.randint(0, 64, (1, 32)), "catgpt1")

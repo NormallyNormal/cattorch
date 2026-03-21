@@ -20,13 +20,13 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 TOLERANCE = 1e-4
 
 
-def _run_sprite(model: nn.Module, input_shape: torch.Size, x: torch.Tensor) -> tuple[list[float], list[float]]:
+def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
     """Transpile a model, run through emulator, return (expected, actual)."""
     with torch.no_grad():
         expected = model(x).flatten().tolist()
 
     path = os.path.join(os.path.dirname(__file__), "_test_output")
-    transpile(model, input_shape, path)
+    transpile(model, x, path)
 
     sprite_path = path + ".sprite3"
     try:
@@ -313,180 +313,180 @@ def seed():
 def test_single_matmul():
     model = SingleMatMul()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_chained_matmul():
     model = ChainedMatMul()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_matmul_with_bias():
     model = MatMulWithBias()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_matmul_relu():
     model = MatMulReLU()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_simple_neural_net():
     model = SimpleNN()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, torch.Size([3, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_linear():
     model = LinearModel()
     x = torch.randn(1, 2)
-    expected, actual = _run_sprite(model, torch.Size([1, 2]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_linear_no_bias():
     model = LinearNoBias()
     x = torch.randn(1, 2)
-    expected, actual = _run_sprite(model, torch.Size([1, 2]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_stacked_linear():
     model = StackedLinear()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_softmax_1d():
     model = Softmax1D()
     x = torch.randn(4)
-    expected, actual = _run_sprite(model, torch.Size([4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_softmax_2d():
     model = Softmax2D()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_softmax_3d():
     model = Softmax3D()
     x = torch.randn(3, 4, 5)
-    expected, actual = _run_sprite(model, torch.Size([3, 4, 5]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_scalar_multiply():
     model = ScalarMul()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_scalar_multiply_chained():
     model = ScalarMulChained()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_layernorm():
     model = LayerNorm1D()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_layernorm_2d():
     model = LayerNorm2D()
     x = torch.randn(2, 3, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 3, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_view_reshape():
     model = ViewReshape()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_flatten():
     model = FlattenModel()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, torch.Size([2, 4]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_scalar_divide():
     model = ScalarDiv()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_single_head_attention():
     model = SingleHeadAttention(d_model=8)
     x = torch.randn(3, 8)
-    expected, actual = _run_sprite(model, torch.Size([3, 8]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_transformer_block():
     model = TransformerBlock(d_model=8, d_ff=16)
     x = torch.randn(3, 8)
-    expected, actual = _run_sprite(model, torch.Size([3, 8]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_sigmoid():
     model = SigmoidModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_tanh():
     model = TanhModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_gelu():
     model = GELUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_silu():
     model = SiLUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_leaky_relu():
     model = LeakyReLUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
 
 def test_elu():
     model = ELUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)

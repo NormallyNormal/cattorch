@@ -4,7 +4,10 @@ Export PyTorch neural networks to [Scratch](https://scratch.mit.edu) sprites.
 
 cattorch transpiles a `torch.nn.Module` into a `.sprite3` file that can be
 imported directly into any Scratch project. The generated sprite uses only
-standard Scratch blocks — no extensions or modifications required.
+standard Scratch blocks, so no extensions or modifications are required.
+
+cattorch does not export training scripts, you will need to train your model
+with torch before exporting to a Scratch sprite.
 
 ## Install
 
@@ -31,12 +34,18 @@ class TwoLayerNet(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 model = TwoLayerNet()
-transpile(model, torch.Size([1, 4]), "two_layer_net")
+# train your model first! then:
+# transpile(model, example input, sprite name)
+transpile(model, torch.randn(1, 4), "two_layer_net")
 # => two_layer_net.sprite3
 ```
 
 In Scratch, the sprite reads its input from a list called `input` and writes
-results to a list called `output`. Click the green flag to run inference.
+results to a list called `output`. It is up to you to add logic to fill the
+input tensor and run the generated code blocks.
+
+If the model takes multiple input tensors, the additional inputs are named
+`input_1`, `input_2`, etc.
 
 ## Supported operations
 
@@ -53,6 +62,8 @@ results to a list called `output`. Click the green flag to run inference.
 
 These are sufficient for architectures like MLPs and single-head transformers
 (including full pre-norm transformer blocks with residual connections).
+
+More operations are planned for the future, such as those required to support full LLMs, CNNs, and more.
 
 ## Scratch limits
 

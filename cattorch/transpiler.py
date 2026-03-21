@@ -211,8 +211,10 @@ def _uniquify_ids(sprite):
     sprite["blocks"] = json.loads(raw)
 
 
-def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str):
-    exported = export(model, (torch.randn(input_shape),))
+def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str):
+    if isinstance(example_inputs, torch.Tensor):
+        example_inputs = (example_inputs,)
+    exported = export(model, example_inputs)
     _decompose_linear(exported.graph)
     nodes = list(exported.graph.nodes)
     normalised_state = {k.lower().replace(".", "_"): v for k, v in exported.state_dict.items()}
