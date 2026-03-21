@@ -42,12 +42,12 @@ def _run_sprite(model: nn.Module, input_shape: torch.Size, x: torch.Tensor) -> t
     return expected, actual
 
 
-def _assert_close(expected: list[float], actual: list[float]):
+def _assert_close(expected: list[float], actual: list[float], tolerance=TOLERANCE):
     assert len(expected) == len(actual), (
         f"Length mismatch: expected {len(expected)}, got {len(actual)}"
     )
     for i, (e, a) in enumerate(zip(expected, actual)):
-        assert abs(e - a) < TOLERANCE, (
+        assert abs(e - a) < tolerance, (
             f"Index {i}: expected {e:.6f}, got {a:.6f}"
         )
 
@@ -208,6 +208,52 @@ class FlattenModel(nn.Module):
 class ScalarDiv(nn.Module):
     def forward(self, x):
         return x / 4.0
+
+
+class SigmoidModel(nn.Module):
+    def forward(self, x):
+        return torch.sigmoid(x)
+
+
+class TanhModel(nn.Module):
+    def forward(self, x):
+        return torch.tanh(x)
+
+
+class GELUModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gelu = nn.GELU(approximate='tanh')
+
+    def forward(self, x):
+        return self.gelu(x)
+
+
+class SiLUModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        return self.silu(x)
+
+
+class LeakyReLUModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
+
+    def forward(self, x):
+        return self.leaky_relu(x)
+
+
+class ELUModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.elu = nn.ELU(alpha=1.0)
+
+    def forward(self, x):
+        return self.elu(x)
 
 
 class SingleHeadAttention(nn.Module):
@@ -401,4 +447,46 @@ def test_transformer_block():
     model = TransformerBlock(d_model=8, d_ff=16)
     x = torch.randn(3, 8)
     expected, actual = _run_sprite(model, torch.Size([3, 8]), x)
+    _assert_close(expected, actual)
+
+
+def test_sigmoid():
+    model = SigmoidModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_tanh():
+    model = TanhModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_gelu():
+    model = GELUModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_silu():
+    model = SiLUModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_leaky_relu():
+    model = LeakyReLUModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
+    _assert_close(expected, actual)
+
+
+def test_elu():
+    model = ELUModel()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, torch.Size([2, 3]), x)
     _assert_close(expected, actual)

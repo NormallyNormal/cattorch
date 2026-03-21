@@ -21,6 +21,7 @@ _NOOP_OPS = {
     "aten.view.default",
     "aten.reshape.default",
     "aten._unsafe_view.default",
+    "aten.flatten.using_ints",
     "aten.contiguous.default",
     "aten.clone.default",
 }
@@ -129,6 +130,50 @@ def _rename_list(sprite, old_name, new_name):
         json.dumps([old_name, target_id]),
         json.dumps([new_name, target_id]),
     )
+    sprite["blocks"] = json.loads(raw)
+
+
+def _merge_duplicate_lists(sprite):
+    """Merge local lists (names starting with '_') that have identical contents.
+
+    When multiple instructions produce identical data lists (e.g. two transposes
+    with the same index map), we can share a single list and remap all block
+    references to it.
+    """
+    lists = sprite.get("lists", {})
+
+    # Group local lists by their contents
+    by_content: dict[tuple, list[tuple[str, str]]] = {}  # (content_tuple) -> [(sid, display_name), ...]
+    for sid, entry in lists.items():
+        display_name = entry[0]
+        if not display_name.startswith("_"):
+            continue
+        content_key = tuple(entry[1])
+        by_content.setdefault(content_key, []).append((sid, display_name))
+
+    # Build remap for groups with more than one list
+    remap = {}
+    for group in by_content.values():
+        if len(group) < 2:
+            continue
+        winner_sid = group[0][0]
+        for sid, display_name in group[1:]:
+            log.info("Merging duplicate list %s (%s) -> %s (%s)",
+                     display_name, sid, group[0][1], winner_sid)
+            remap[sid] = winner_sid
+            del lists[sid]
+
+    if not remap:
+        return
+
+    # Remap block references in a single pass
+    import re
+    raw = json.dumps(sprite["blocks"])
+    pattern = "|".join(
+        re.escape(f'"{k}"')
+        for k in sorted(remap, key=len, reverse=True)
+    )
+    raw = re.sub(pattern, lambda m: f'"{remap[m.group(0)[1:-1]]}"', raw)
     sprite["blocks"] = json.loads(raw)
 
 
@@ -281,6 +326,9 @@ def transpile(model: torch.nn.Module, input_shape: torch.Size, sprite_name: str)
     # Rename the final output list
     if last_target_list is not None:
         _rename_list(scratch_output, last_target_list, "output")
+
+    # Merge local lists with identical contents to save space
+    _merge_duplicate_lists(scratch_output)
 
     # Remove orphaned lists and variables
     _remove_unused(scratch_output)

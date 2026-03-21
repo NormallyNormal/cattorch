@@ -14,13 +14,21 @@ Usage
 import copy
 import hashlib
 import json
+import logging
 import shutil
 import tempfile
 import uuid
+import warnings
 import zipfile
 from pathlib import Path
 
 from cattorch.templates.template import TEMPLATE_DIR
+
+log = logging.getLogger(__name__)
+
+SCRATCH_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+SCRATCH_FILE_WARN_SIZE = 4 * 1024 * 1024  # 4 MB
+SCRATCH_MAX_LIST_LENGTH = 200_000
 
 SPRITE_ASSET_DIR = TEMPLATE_DIR / "sprite"
 
@@ -93,6 +101,15 @@ def finalize_sprite(data: dict, output_path: str, sprite_name: str = "cattorch")
         "rotationStyle": "all around",
     })
 
+    # Check list sizes before writing
+    for sid, entry in sprite.get("lists", {}).items():
+        name, contents = entry[0], entry[1]
+        if len(contents) > SCRATCH_MAX_LIST_LENGTH:
+            raise ValueError(
+                f"List \"{name}\" has {len(contents):,} items, "
+                f"which exceeds Scratch's limit of {SCRATCH_MAX_LIST_LENGTH:,}."
+            )
+
     # Write into a temp dir then zip
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -110,6 +127,22 @@ def finalize_sprite(data: dict, output_path: str, sprite_name: str = "cattorch")
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(sprite_json_path, "sprite.json")
             zf.write(svg_dest, md5ext)
+
+    # Check file size
+    file_size = output_path.stat().st_size
+    if file_size > SCRATCH_MAX_FILE_SIZE:
+        warnings.warn(
+            f"Sprite file is {file_size / 1024 / 1024:.1f} MB, "
+            f"which exceeds Scratch's 5 MB project limit. "
+            f"The sprite may not load in Scratch.",
+            stacklevel=2,
+        )
+    elif file_size > SCRATCH_FILE_WARN_SIZE:
+        warnings.warn(
+            f"Sprite file is {file_size / 1024 / 1024:.1f} MB, "
+            f"approaching Scratch's 5 MB project limit.",
+            stacklevel=2,
+        )
 
     print(f"Written: {output_path} (asset_id: {asset_id})")
     return output_path

@@ -296,6 +296,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+#AI
+/.claude/
 
 # cattorch custom
 *.sprite3

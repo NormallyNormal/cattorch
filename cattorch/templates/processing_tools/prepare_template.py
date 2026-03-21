@@ -11,11 +11,11 @@ Single-pass preparation of a Scratch sprite template JSON:
 Works with both full sprite JSON and blocks-only JSON.
 
 Usage:
-  python3 prepare_template.py input.json [output.json]
+  python -m cattorch.templates.processing_tools.prepare_template input.json [output.json]
 """
 
+import argparse
 import json
-import sys
 import copy
 
 
@@ -170,11 +170,22 @@ def prepare(data: dict) -> dict:
     return data
 
 
-if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else "../scalar_multiply/template.json"
-    dst = sys.argv[2] if len(sys.argv) > 2 else src.replace(".json", "_prepared.json")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Prepare a Scratch sprite template JSON for use with cattorch."
+    )
+    parser.add_argument("input", help="Path to the input JSON file")
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default=None,
+        help="Path to the output JSON file (default: overwrite input)",
+    )
+    args = parser.parse_args()
 
-    with open(src) as f:
+    dst = args.output or args.input
+
+    with open(args.input) as f:
         data = json.load(f)
 
     result = prepare(data)
@@ -182,4 +193,8 @@ if __name__ == "__main__":
     with open(dst, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"Prepared {src} -> {dst}")
+    print(f"Prepared {args.input} -> {dst}")
+
+
+if __name__ == "__main__":
+    main()
