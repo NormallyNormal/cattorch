@@ -49,16 +49,16 @@ If the model takes multiple input tensors, the additional inputs are named
 
 ## Supported operations
 
-| Category | Operations |
-|---|---|
-| Linear layers | `nn.Linear` (with and without bias) |
-| Matrix multiply | `@` / `torch.matmul` |
-| Activations | ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU |
-| Normalization | `nn.LayerNorm` |
-| Softmax | `F.softmax` (any dim) |
-| Arithmetic | tensor add, scalar multiply, scalar divide |
-| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
-| Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
+| Category | Operations                                                          |
+|---|---------------------------------------------------------------------|
+| Linear layers | `nn.Linear` (with and without bias)                                 |
+| Matrix multiply | `@` / `torch.matmul`                                                |
+| Activations | ReLU, Sigmoid, Tanh, GELU (tanh approx. only), SiLU, LeakyReLU, ELU |
+| Normalization | `nn.LayerNorm`                                                      |
+| Softmax | `F.softmax` (any dim)                                               |
+| Arithmetic | tensor add, scalar multiply, scalar divide                          |
+| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data)     |
+| Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions)                 |
 
 These are sufficient for architectures like MLPs and single-head transformers
 (including full pre-norm transformer blocks with residual connections).
