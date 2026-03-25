@@ -490,3 +490,215 @@ def test_elu():
     x = torch.randn(2, 3)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
+
+
+# ── Edge case / chained op tests ─────────────────────────────────────────────
+
+
+class ChainedNoOps(nn.Module):
+    """View → reshape → contiguous → scalar op. Tests alias chain resolution."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 6))
+
+    def forward(self, x):
+        y = x @ self.W            # [2, 6]
+        y = y.view(3, 4)
+        y = y.reshape(12)
+        y = y.contiguous()
+        return y * 0.5
+
+
+class FanOut(nn.Module):
+    """One intermediate used by two downstream ops. Tests ref counting."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        h = x @ self.W
+        return h + h              # same tensor added to itself
+
+
+class FanOutDivergent(nn.Module):
+    """One intermediate feeds two different op types. Tests list not freed early."""
+    def __init__(self):
+        super().__init__()
+        self.W1 = nn.Parameter(torch.randn(4, 4))
+        self.W2 = nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        h = F.relu(x)
+        a = h @ self.W1
+        b = h @ self.W2
+        return a + b
+
+
+class NoOpOutput(nn.Module):
+    """Final node is a no-op (view). Tests output alias resolution."""
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 6)
+
+    def forward(self, x):
+        return self.linear(x).view(2, 3)
+
+
+class SoftmaxThenTranspose(nn.Module):
+    """Softmax and transpose both have local lists. Tests no ID collision."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        h = x @ self.W           # [2, 3]
+        h = F.softmax(h, dim=-1)
+        return h.T               # [3, 2]
+
+
+class ResidualWithActivations(nn.Module):
+    """Residual + two different activations. Tests scope reuse under pressure."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4)
+        self.fc2 = nn.Linear(4, 4)
+
+    def forward(self, x):
+        h = torch.sigmoid(self.fc1(x))
+        return x + torch.tanh(self.fc2(h))
+
+
+class DeepChain(nn.Module):
+    """6 operations chained. Tests sustained list reuse without corruption."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 8)
+        self.fc3 = nn.Linear(8, 4)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.sigmoid(self.fc2(x))
+        return self.fc3(x)
+
+
+class LayerNormSoftmaxChain(nn.Module):
+    """LayerNorm → linear → softmax. Both LN and softmax have group logic."""
+    def __init__(self):
+        super().__init__()
+        self.ln = nn.LayerNorm(4)
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        h = self.ln(x)
+        return F.softmax(h @ self.W, dim=-1)
+
+
+class ScalarChain(nn.Module):
+    """Chained scalar ops. Tests multiple scalar templates don't collide."""
+    def forward(self, x):
+        return (x * 2.0) / 3.0 * 0.5
+
+
+class ActivationSandwich(nn.Module):
+    """Different activation on each layer. Tests template reuse with variety."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 8)
+        self.fc3 = nn.Linear(8, 3)
+
+    def forward(self, x):
+        x = torch.sigmoid(self.fc1(x))
+        x = F.silu(self.fc2(x))
+        return torch.tanh(self.fc3(x))
+
+
+class DoubleResidual(nn.Module):
+    """Two residual connections. Tests scope with multiple fan-out/fan-in."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4)
+        self.fc2 = nn.Linear(4, 4)
+
+    def forward(self, x):
+        x = x + F.relu(self.fc1(x))
+        x = x + F.relu(self.fc2(x))
+        return x
+
+
+def test_chained_no_ops():
+    model = ChainedNoOps()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_fan_out():
+    model = FanOut()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_fan_out_divergent():
+    model = FanOutDivergent()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_no_op_output():
+    model = NoOpOutput()
+    x = torch.randn(1, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_softmax_then_transpose():
+    model = SoftmaxThenTranspose()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_residual_with_activations():
+    model = ResidualWithActivations()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_deep_chain():
+    model = DeepChain()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_layernorm_softmax_chain():
+    model = LayerNormSoftmaxChain()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_scalar_chain():
+    model = ScalarChain()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_activation_sandwich():
+    model = ActivationSandwich()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_double_residual():
+    model = DoubleResidual()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
