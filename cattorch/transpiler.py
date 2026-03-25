@@ -176,6 +176,22 @@ def _merge_duplicate_lists(sprite):
     raw = re.sub(pattern, lambda m: f'"{remap[m.group(0)[1:-1]]}"', raw)
     sprite["blocks"] = json.loads(raw)
 
+    # Renumber local list display names sequentially
+    base_counts: dict[str, int] = {}
+    for entry in lists.values():
+        name = entry[0]
+        if not name.startswith("_"):
+            continue
+        # Strip existing suffix: "_index_map_4" -> "_index_map"
+        base = name
+        for i in range(len(name) - 1, 0, -1):
+            if name[i] == '_' and name[i+1:].isdigit():
+                base = name[:i]
+                break
+        count = base_counts.get(base, 0) + 1
+        base_counts[base] = count
+        entry[0] = base if count == 1 else f"{base}_{count}"
+
 
 def _remove_unused(sprite):
     """Remove lists and variables that are not referenced by any block."""
