@@ -114,36 +114,9 @@ def _merge_slots(primary: dict, secondary: dict) -> dict:
 
 
 def _apply_remap(blocks: dict, var_remap: dict, list_remap: dict) -> dict:
-    """
-    Walk every block and replace collapsed variable/list IDs with the
-    winning IDs from the merge step.
-
-    All replacements are applied in a single pass to prevent cascading
-    (where the output of one replacement is consumed by a later one).
-    """
-    import json
-    import re
-
-    if not var_remap and not list_remap:
-        return blocks
-
-    all_remap = {**var_remap, **list_remap}
-
-    # Drop identity remaps — they can't change anything and only add noise
-    all_remap = {k: v for k, v in all_remap.items() if k != v}
-    if not all_remap:
-        return blocks
-
-    raw = json.dumps(blocks)
-
-    # Build a regex matching any quoted key, longest first
-    pattern = "|".join(
-        re.escape(f'"{k}"')
-        for k in sorted(all_remap, key=len, reverse=True)
-    )
-    raw = re.sub(pattern, lambda m: f'"{all_remap[m.group(0)[1:-1]]}"', raw)
-
-    return json.loads(raw)
+    """Replace collapsed variable/list IDs in blocks with their winning IDs."""
+    from cattorch.util.scratch.remap import remap_ids
+    return remap_ids(blocks, {**var_remap, **list_remap})
 
 
 def combine(sprite_a: dict, sprite_b: dict) -> dict:

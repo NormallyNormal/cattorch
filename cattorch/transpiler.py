@@ -11,6 +11,7 @@ from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.tensor_adder import TensorAdder
 from cattorch.util.scratch.tensor_replacer import TensorReplacer
 
@@ -166,15 +167,7 @@ def _merge_duplicate_lists(sprite):
     if not remap:
         return
 
-    # Remap block references in a single pass
-    import re
-    raw = json.dumps(sprite["blocks"])
-    pattern = "|".join(
-        re.escape(f'"{k}"')
-        for k in sorted(remap, key=len, reverse=True)
-    )
-    raw = re.sub(pattern, lambda m: f'"{remap[m.group(0)[1:-1]]}"', raw)
-    sprite["blocks"] = json.loads(raw)
+    sprite["blocks"] = remap_ids(sprite["blocks"], remap)
 
     # Renumber local list display names sequentially
     base_counts: dict[str, int] = {}
@@ -209,22 +202,17 @@ def _uniquify_ids(sprite):
     """Add a UUID suffix to all list and variable IDs to prevent conflicts
     when multiple cattorch sprites are loaded into one Scratch project."""
     suffix = uuid.uuid4().hex[:12]
-    remap = {}
+    mapping = {}
 
     for section in ("lists", "variables"):
         slots = sprite.get(section, {})
         for sid in list(slots):
             new_id = f"{sid}_{suffix}"
-            remap[sid] = new_id
+            mapping[sid] = new_id
             slots[new_id] = slots.pop(sid)
 
-    if not remap:
-        return
-
-    raw = json.dumps(sprite["blocks"])
-    for old, new in sorted(remap.items(), key=lambda x: -len(x[0])):
-        raw = raw.replace(f'"{old}"', f'"{new}"')
-    sprite["blocks"] = json.loads(raw)
+    if mapping:
+        sprite["blocks"] = remap_ids(sprite["blocks"], mapping)
 
 
 def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str):
