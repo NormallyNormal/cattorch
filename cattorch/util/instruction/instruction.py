@@ -1,15 +1,10 @@
+import json
+import math
 from abc import abstractmethod, ABC
-from enum import Enum
 
+from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.argument import Argument
-
-
-class ScratchInstruction(Enum):
-    NONE = 0
-    MATMUL = 1
-    TRANSPOSE = 2
-    RELU = 3
-    TENSOR_ADD = 4
+from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 
 class Instruction(ABC):
@@ -27,8 +22,6 @@ class Instruction(ABC):
         self.torch_name = torch_name
         self.output = output
         self.args = args
-        self.constants = []
-        self.scratch_instruction = ScratchInstruction.NONE
         self.prepare()
 
     @classmethod
@@ -44,3 +37,24 @@ class Instruction(ABC):
     @abstractmethod
     def finalize(self):
         pass
+
+
+class TemplateInstruction(Instruction):
+    """Base class for instructions that load a template and apply constants.
+
+    Subclasses set `template_name` and optionally override `get_constants()`.
+    This covers all simple elementwise ops, scalar ops, and most others.
+    """
+    template_name: str
+
+    def prepare(self):
+        pass
+
+    def get_constants(self) -> dict:
+        return {101: math.prod(self.args[0].shape)}
+
+    def finalize(self):
+        template_path = TEMPLATE_DIR / self.template_name / "template.json"
+        with open(template_path) as f:
+            data = json.load(f)
+        return ConstantReplacer(self.get_constants()).apply(data)
