@@ -28,26 +28,28 @@ def _make_id(name: str) -> str:
     return f"cattorch_tensor_{name}"
 
 
-def _flatten(tensor) -> list:
+def _flatten(tensor, sig_figs: int | None = None) -> list:
     """Flatten a tensor or nested list to a plain Python list of scalars."""
     try:
         # torch.Tensor
-        return tensor.detach().flatten().tolist()
+        values = tensor.detach().flatten().tolist()
     except AttributeError:
-        pass
-    try:
-        # numpy array
-        return tensor.flatten().tolist()
-    except AttributeError:
-        pass
-    # Plain Python list/nested list
-    def _recurse(x):
-        if isinstance(x, (list, tuple)):
-            for item in x:
-                yield from _recurse(item)
-        else:
-            yield x
-    return list(_recurse(tensor))
+        try:
+            # numpy array
+            values = tensor.flatten().tolist()
+        except AttributeError:
+            # Plain Python list/nested list
+            def _recurse(x):
+                if isinstance(x, (list, tuple)):
+                    for item in x:
+                        yield from _recurse(item)
+                else:
+                    yield x
+            values = list(_recurse(tensor))
+
+    if sig_figs is not None:
+        values = [float(f"%.{sig_figs}g" % v) for v in values]
+    return values
 
 
 class TensorAdder:
@@ -56,6 +58,7 @@ class TensorAdder:
         sprite: dict,
         tensor_names: list[str],
         weights: dict | None = None,
+        sig_figs: int | None = None,
     ) -> dict:
         """
         Return a new sprite dict with the given tensor names added to the
@@ -84,13 +87,13 @@ class TensorAdder:
 
         for name in tensor_names:
             if name not in existing:
-                data = _flatten(weights[name]) if name in weights else []
+                data = _flatten(weights[name], sig_figs) if name in weights else []
                 lists[_make_id(name)] = [name, data]
                 existing.add(name)
             elif name in weights:
                 # Slot already exists — update its data
                 sid = next(sid for sid, entry in lists.items() if entry[0] == name)
-                lists[sid][1] = _flatten(weights[name])
+                lists[sid][1] = _flatten(weights[name], sig_figs)
 
         return sprite
 

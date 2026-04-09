@@ -297,6 +297,24 @@ class MaskedFillModel(nn.Module):
         return x.masked_fill(self.mask, float('-inf'))
 
 
+class RMSNorm1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rms = nn.RMSNorm(4)
+
+    def forward(self, x):
+        return self.rms(x)
+
+
+class RMSNorm2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rms = nn.RMSNorm([3, 4])
+
+    def forward(self, x):
+        return self.rms(x)
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -501,6 +519,20 @@ def test_tensor_multiply():
 def test_masked_fill():
     model = MaskedFillModel()
     x = torch.randn(3, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rms_norm():
+    model = RMSNorm1D()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rms_norm_2d():
+    model = RMSNorm2D()
+    x = torch.randn(2, 3, 4)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 

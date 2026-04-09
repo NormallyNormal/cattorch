@@ -9,6 +9,7 @@ from cattorch.util.instruction.elementwise import (
     ReLUInstruction,
     ScalarDivideInstruction,
     MultiplyInstruction,
+    RMSNormInstruction,
     SigmoidInstruction,
     SiLUInstruction,
     TanhInstruction,

@@ -114,3 +114,16 @@ class LayerNormInstruction(TemplateInstruction):
 
     def get_constants(self):
         return {101: self.norm_size, 102: self.num_groups}
+
+
+class RMSNormInstruction(TemplateInstruction):
+    aten_op = "aten.rms_norm.default"
+    template_name = "rms_norm"
+
+    def prepare(self):
+        normalized_shape = self.args[1].value
+        self.norm_size = math.prod(normalized_shape)
+        self.num_groups = math.prod(self.args[0].shape) // self.norm_size
+
+    def get_constants(self):
+        return {101: self.norm_size, 102: self.num_groups}

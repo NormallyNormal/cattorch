@@ -215,7 +215,7 @@ def _uniquify_ids(sprite):
         sprite["blocks"] = remap_ids(sprite["blocks"], mapping)
 
 
-def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str):
+def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str, sig_figs: int | None = None):
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
     exported = export(model, example_inputs)
@@ -307,7 +307,8 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     scratch_output = tensor_adder.apply(
         scratch_output,
         [f"W_{k}" for k in all_static_lists.keys()],
-        weights={f"W_{k}": v for k, v in all_static_lists.items() if v is not None}
+        weights={f"W_{k}": v for k, v in all_static_lists.items() if v is not None},
+        sig_figs=sig_figs,
     )
 
     # Add input lists (empty — populated at runtime)
