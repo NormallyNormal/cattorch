@@ -327,6 +327,92 @@ class ChunkAdd(nn.Module):
         return a + b
 
 
+class CatDim0(nn.Module):
+    """Concatenate two linear outputs along dim 0."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 3, bias=False)
+        self.fc2 = nn.Linear(4, 3, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 3]
+        b = self.fc2(x)  # [2, 3]
+        return torch.cat([a, b], dim=0)  # [4, 3]
+
+
+class CatDim1(nn.Module):
+    """Concatenate two linear outputs along dim 1."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 3, bias=False)
+        self.fc2 = nn.Linear(4, 5, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 3]
+        b = self.fc2(x)  # [2, 5]
+        return torch.cat([a, b], dim=1)  # [2, 8]
+
+
+class CatThreeWay(nn.Module):
+    """Concatenate three linear outputs along dim 1 (chained cat)."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 2, bias=False)
+        self.fc2 = nn.Linear(4, 3, bias=False)
+        self.fc3 = nn.Linear(4, 5, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 2]
+        b = self.fc2(x)  # [2, 3]
+        c = self.fc3(x)  # [2, 5]
+        return torch.cat([a, b, c], dim=1)  # [2, 10]
+
+
+class SplitCat(nn.Module):
+    """Split then cat back together (round-trip)."""
+    def forward(self, x):
+        a, b = x.chunk(2, dim=-1)
+        a = a * 2.0
+        return torch.cat([a, b], dim=-1)
+
+
+class NegateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return -self.fc(x)
+
+
+class TensorSubtract(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4, bias=False)
+        self.fc2 = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.fc1(x) - self.fc2(x)
+
+
+class RoPEModel(nn.Module):
+    """Rotary position embeddings with precomputed cos/sin buffers."""
+    def __init__(self, dim=8, max_len=16):
+        super().__init__()
+        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_len).float()
+        angles = torch.outer(t, freqs)
+        self.register_buffer('cos_cached', angles.cos())
+        self.register_buffer('sin_cached', angles.sin())
+
+    def forward(self, x):
+        seq_len = x.shape[0]
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -559,6 +645,55 @@ def test_split():
 def test_chunk():
     model = ChunkAdd()
     x = torch.randn(2, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_negate():
+    model = NegateModel()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_tensor_subtract():
+    model = TensorSubtract()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_dim0():
+    model = CatDim0()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_dim1():
+    model = CatDim1()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_three_way():
+    model = CatThreeWay()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_split_cat():
+    model = SplitCat()
+    x = torch.randn(2, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rope():
+    model = RoPEModel(dim=8, max_len=16)
+    x = torch.randn(4, 8)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 

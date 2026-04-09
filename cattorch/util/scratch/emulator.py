@@ -216,6 +216,11 @@ class ScratchEmulator:
             b = float(self._eval_input(inputs["NUM2"]))
             return a + b
 
+        elif opcode == "operator_subtract":
+            a = float(self._eval_input(inputs["NUM1"]))
+            b = float(self._eval_input(inputs["NUM2"]))
+            return a - b
+
         elif opcode == "operator_multiply":
             a = float(self._eval_input(inputs["NUM1"]))
             b = float(self._eval_input(inputs["NUM2"]))

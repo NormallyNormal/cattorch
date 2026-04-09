@@ -61,15 +61,17 @@ If the model takes multiple input tensors, the additional inputs are named
 | Softmax | `F.softmax` (any dim) |
 | Embedding | `nn.Embedding` |
 | Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
-| Arithmetic | tensor add, tensor multiply, scalar multiply, scalar divide |
+| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate |
 | Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
 | Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
+| Split / Chunk | `split`, `split_with_sizes`, `chunk` |
+| Concatenation | `torch.cat` (any dim, any number of inputs) |
+| Slice | `tensor[:n]` style slicing along any dimension |
 
-These are sufficient for architectures like MLPs and single-head transformer
-LLMs (including embedding, causal masking, pre-norm blocks with residual
-connections, and SwiGLU-style gating).
-
-More operations are planned for the future, such as concatenation, split, and those required for CNNs.
+These are sufficient for architectures like MLPs and transformer LLMs,
+including multi-head attention, combined QKV projections, rotary position
+embeddings (RoPE), causal masking, pre-norm blocks with residual connections,
+and SwiGLU-style gating. CNN and RNN support is planned for the future.
 
 ## Scratch limits
 

@@ -9,6 +9,7 @@ from torch.export import export
 
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
+from cattorch.util.instruction.cat import CatInstruction
 from cattorch.util.instruction.getitem import GetItemInstruction
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
@@ -304,8 +305,152 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
         last_target_list = target_list
         aten_op = str(node.target)
 
+        # Handle cat (first arg is a list of tensors, not a single tensor)
+        if aten_op == "aten.cat.default":
+            tensor_list = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else 0
+
+            def _resolve_tensor(t):
+                t_name = t.name
+                if aliases and t_name in aliases:
+                    t_name = aliases[t_name]
+                if t_name in scope.assignments:
+                    name = f"T{scope.assignments[t_name]}"
+                    all_dynamic_lists.add(name)
+                elif t_name in input_names:
+                    name = input_names[t_name]
+                else:
+                    name = f"W_{t_name}"
+                    all_static_lists[t_name] = resolve_weight(t_name)
+                return name
+
+            def _cat_shapes(s1, s2, d):
+                """Compute the output shape of cat(s1, s2, dim=d)."""
+                out = list(s1)
+                out[d] = s1[d] + s2[d]
+                return torch.Size(out)
+
+            resolved = [(_resolve_tensor(t), _get_shape(t)) for t in tensor_list]
+
+            if dim < 0:
+                dim = len(resolved[0][1]) + dim
+
+            # Chain pairwise: cat(a,b)→tmp, cat(tmp,c)→tmp2, ... cat(tmpN,last)→target
+            cur_list, cur_shape = resolved[0]
+            for pair_idx in range(1, len(resolved)):
+                next_list, next_shape = resolved[pair_idx]
+                is_last = pair_idx == len(resolved) - 1
+
+                if is_last:
+                    cat_target = target_list
+                else:
+                    # Allocate a temporary list from the scope
+                    if scope.free_pool:
+                        scope.free_pool.sort()
+                        temp_id = scope.free_pool.pop(0)
+                    else:
+                        scope.peak_lists += 1
+                        temp_id = scope.peak_lists
+                    cat_target = f"T{temp_id}"
+                    all_dynamic_lists.add(cat_target)
+
+                num_outer = math.prod(cur_shape[:dim]) if dim > 0 else 1
+                chunk_1 = math.prod(cur_shape[dim:])
+                chunk_2 = math.prod(next_shape[dim:])
+                cat_inputs = [cur_list, next_list]
+
+                log.info("cat(dim=%d) [%d/%d] -> %s (%s) (Inputs: %s)",
+                         dim, pair_idx, len(resolved) - 1, cat_target, node.name, cat_inputs)
+
+                cat_args = [
+                    Argument(cur_list, cur_shape),
+                    Argument(next_list, next_shape),
+                    Argument("C_num_outer", torch.Size([]), value=num_outer),
+                    Argument("C_chunk_1", torch.Size([]), value=chunk_1),
+                    Argument("C_chunk_2", torch.Size([]), value=chunk_2),
+                ]
+                cat_instr = CatInstruction(node.target, cat_target, *cat_args)
+                data = _process_instruction(cat_instr, cat_inputs, cat_target, block_manager)
+
+                if scratch_output is None:
+                    scratch_output = data
+                else:
+                    scratch_output = combine(scratch_output, data)
+
+                # The intermediate becomes the left input for the next pair
+                out_shape = _cat_shapes(cur_shape, next_shape, dim)
+                if not is_last:
+                    prev_temp_id = temp_id
+                cur_list, cur_shape = cat_target, out_shape
+
+                # Free the intermediate after it's consumed (except the final target)
+                if pair_idx > 1:
+                    scope.free_pool.append(prev_temp_id)
+
+            # Skip the shared _process_instruction below — already handled inline
+            scope.release_dependencies(node)
+            continue
+
+        # Handle slice as a getitem-style copy (or no-op if full range)
+        elif aten_op == "aten.slice.Tensor":
+            source = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else 0
+            start = node.args[2] if len(node.args) > 2 else 0
+            end = node.args[3] if len(node.args) > 3 else None
+            input_shape = _get_shape(source)
+
+            if dim < 0:
+                dim = len(input_shape) + dim
+
+            # Clamp end to actual size
+            dim_size = input_shape[dim]
+            if end is None or end > dim_size:
+                end = dim_size
+
+            # Full-range slice is a no-op
+            if start == 0 and end == dim_size:
+                src_name = source.name
+                while src_name in aliases:
+                    src_name = aliases[src_name]
+                aliases[node.name] = src_name
+                log.info("Alias: %s -> %s (full slice)", node.name, src_name)
+                continue
+
+            # Partial slice: resolve source and use getitem template
+            src_name = source.name
+            if aliases and src_name in aliases:
+                src_name = aliases[src_name]
+            if src_name in scope.assignments:
+                src_list = f"T{scope.assignments[src_name]}"
+                all_dynamic_lists.add(src_list)
+            elif src_name in input_names:
+                src_list = input_names[src_name]
+            else:
+                src_list = f"W_{src_name}"
+                all_static_lists[src_name] = resolve_weight(src_name)
+
+            trailing = math.prod(input_shape[dim + 1:]) if dim + 1 < len(input_shape) else 1
+            chunk_size = (end - start) * trailing
+            num_rows = math.prod(input_shape[:dim]) if dim > 0 else 1
+            row_stride = math.prod(input_shape[dim:])
+            skip = row_stride - chunk_size
+            offset = start * trailing
+
+            input_lists = [src_list]
+            log.info("slice(dim=%d, %d:%d) -> %s (%s) (Inputs: %s)",
+                     dim, start, end, target_list, node.name, input_lists)
+
+            args = [
+                Argument(src_list, input_shape),
+                Argument("C_chunk_size", torch.Size([]), value=chunk_size),
+                Argument("C_num_rows", torch.Size([]), value=num_rows),
+                Argument("C_skip", torch.Size([]), value=skip),
+                Argument("C_offset", torch.Size([]), value=offset),
+            ]
+            instruction = GetItemInstruction(node.target, target_list, *args)
+
         # Handle getitem on split/chunk results
-        if node.target is operator.getitem and hasattr(node.args[0], 'name') and node.args[0].name in split_meta:
+        elif node.target is operator.getitem and hasattr(node.args[0], 'name') and node.args[0].name in split_meta:
             split_node = node.args[0]
             chunk_index = node.args[1]
             input_shape, split_size, dim = split_meta[split_node.name]

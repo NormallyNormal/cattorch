@@ -78,6 +78,11 @@ class MultiplyInstruction(TemplateInstruction):
         }
 
 
+class NegateInstruction(TemplateInstruction):
+    aten_op = "aten.neg.default"
+    template_name = "tensor_negate"
+
+
 class ScalarDivideInstruction(TemplateInstruction):
     aten_op = "aten.div.Tensor"
     template_name = "scalar_divide"
@@ -92,6 +97,17 @@ class ScalarDivideInstruction(TemplateInstruction):
 class TensorAddInstruction(TemplateInstruction):
     aten_op = "aten.add.Tensor"
     template_name = "tensor_add"
+
+    def get_constants(self):
+        return {
+            101: math.prod(self.args[0].shape),
+            102: math.prod(self.args[1].shape),
+        }
+
+
+class TensorSubtractInstruction(TemplateInstruction):
+    aten_op = "aten.sub.Tensor"
+    template_name = "tensor_subtract"
 
     def get_constants(self):
         return {
