@@ -29,6 +29,11 @@ _NOOP_OPS = {
     "aten.flatten.using_ints",
     "aten.contiguous.default",
     "aten.clone.default",
+    "aten.unsqueeze.default",
+    "aten.alias.default",
+    "aten.dropout.default",
+    "aten._assert_tensor_metadata.default",
+    "aten.to.dtype",
 }
 
 # Ops that split a tensor into multiple outputs. The split itself is a no-op;
@@ -235,7 +240,19 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     nodes = list(exported.graph.nodes)
     normalised_state = {k.lower().replace(".", "_"): v for k, v in exported.state_dict.items()}
 
+    # Materialise compile-time generated tensors (e.g. arange) as static weights
+    generated_weights = {}  # node name -> tensor
+    for node in nodes:
+        if node.op != 'call_function':
+            continue
+        if str(node.target) == "aten.arange.default":
+            n = node.args[0]
+            generated_weights[node.name] = torch.arange(n, dtype=torch.float32)
+            log.info("Generated arange(%d) as static weight %s", n, node.name)
+
     def resolve_weight(arg_name: str):
+        if arg_name in generated_weights:
+            return generated_weights[arg_name]
         key = arg_name.removeprefix("p_").removeprefix("b_")
         return normalised_state.get(key)
 
@@ -283,7 +300,7 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
             log.info("Split: %s -> %s (split_size=%s, dim=%s)", node.name, source, split_size, dim)
 
     scope = ScopeManager()
-    scope.analyze_lifetimes(nodes, skip=set(aliases.keys()))
+    scope.analyze_lifetimes(nodes, skip=set(aliases.keys()) | set(generated_weights.keys()))
 
     all_dynamic_lists = set()
     all_static_lists = {}
@@ -299,6 +316,10 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
 
         # Skip no-op nodes — they are aliases, not real computations
         if node.name in aliases:
+            continue
+
+        # Skip generated tensors — already materialised as static weights
+        if node.name in generated_weights:
             continue
 
         target_list = scope.get_list_for_node(node)

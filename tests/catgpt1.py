@@ -100,6 +100,7 @@ class NanoGPT(nn.Module):
         self.norm     = nn.LayerNorm(EMBED_DIM)
         self.out_head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
         self.out_head.weight = self.tok_emb.weight  # weight tying
+        self.register_buffer('positions', torch.arange(CONTEXT_LEN))
 
         self.apply(self._init_weights)
 
@@ -124,6 +125,15 @@ class NanoGPT(nn.Module):
         loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
         return logits, loss
 
+    def forward_inference(self, idx):
+        """Export-friendly forward: no conditional return."""
+        B, T = idx.shape
+        positions = torch.arange(T, device=idx.device)
+        x = self.tok_emb(idx) + self.pos_emb(positions)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.out_head(x)
+
     def count_params(self):
         params = sum(p.numel() for p in self.parameters())
         params -= self.out_head.weight.numel()
@@ -147,5 +157,6 @@ class NanoGPT(nn.Module):
         return idx
 
 model = NanoGPT()
-# CATGPT cannot be transpiled (yet)
-transpile(model, torch.randint(0, 64, (1, 32)), "catgpt1")
+model.eval()
+model.forward = model.forward_inference
+transpile(model, torch.randint(0, VOCAB_SIZE, (1, CONTEXT_LEN)), "catgpt1", sig_figs=6)

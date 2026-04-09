@@ -43,6 +43,27 @@ transpile(model, torch.randn(1, 4), "two_layer_net")
 transpile(model, torch.randn(1, 4), "two_layer_net", sig_figs=6)
 ```
 
+cattorch uses `torch.export` under the hood, which requires a single code path
+with no data-dependent control flow. If your model has conditional returns
+(e.g. returning loss during training), add an inference-only forward method:
+
+```python
+# won't work: conditional return
+def forward(self, x, targets=None):
+    logits = self.head(x)
+    if targets is None:
+        return logits
+    return logits, F.cross_entropy(logits, targets)
+
+# will work: single return path
+def forward_inference(self, x):
+    return self.head(x)
+
+model.eval()
+model.forward = model.forward_inference
+transpile(model, example_input, "my_model")
+```
+
 In Scratch, the sprite reads its input from a list called `input` and writes
 results to a list called `output`. It is up to you to add logic to fill the
 input tensor and run the generated code blocks.
@@ -67,6 +88,7 @@ If the model takes multiple input tensors, the additional inputs are named
 | Split / Chunk | `split`, `split_with_sizes`, `chunk` |
 | Concatenation | `torch.cat` (any dim, any number of inputs) |
 | Slice | `tensor[:n]` style slicing along any dimension |
+| Tensor generation | `torch.arange` (materialised at transpile time) |
 
 These are sufficient for architectures like MLPs and transformer LLMs,
 including multi-head attention, combined QKV projections, rotary position
