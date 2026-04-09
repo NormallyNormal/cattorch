@@ -4,7 +4,7 @@ import math
 import torch
 
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.util.instruction.instruction import Instruction, ScratchInstruction
+from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 
@@ -36,7 +36,6 @@ class TransposeInstruction(Instruction):
     ]
 
     def prepare(self):
-        self.scratch_instruction = ScratchInstruction.TRANSPOSE
         input_shape = self.args[0].shape
         ndim = len(input_shape)
         aten_op = str(self.torch_name)
@@ -59,15 +58,11 @@ class TransposeInstruction(Instruction):
     def finalize(self):
         total = math.prod(self.args[0].shape)
 
-        constant_replacer = ConstantReplacer({
-            101: total,
-        })
-
         template_path = TEMPLATE_DIR / "transpose" / "template.json"
-        with open(template_path, "r") as jsonfile:
-            data = json.load(jsonfile)
+        with open(template_path) as f:
+            data = json.load(f)
 
-        data = constant_replacer.apply(data)
+        data = ConstantReplacer({101: total}).apply(data)
 
         # Inject the precomputed index map into the _index_map list
         for entry in data["lists"].values():

@@ -47,6 +47,8 @@ def _assert_close(expected: list[float], actual: list[float], tolerance=TOLERANC
         f"Length mismatch: expected {len(expected)}, got {len(actual)}"
     )
     for i, (e, a) in enumerate(zip(expected, actual)):
+        if e == a:
+            continue
         assert abs(e - a) < tolerance, (
             f"Index {i}: expected {e:.6f}, got {a:.6f}"
         )
@@ -256,6 +258,161 @@ class ELUModel(nn.Module):
         return self.elu(x)
 
 
+class EmbeddingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(8, 4)
+
+    def forward(self, x):
+        return self.emb(x)
+
+
+class EmbeddingLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(8, 4)
+        self.fc = nn.Linear(4, 3)
+
+    def forward(self, x):
+        return self.fc(self.emb(x))
+
+
+class TensorMultiply(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4, bias=False)
+        self.fc2 = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.fc1(x) * self.fc2(x)
+
+
+class MaskedFillModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        mask = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
+        self.register_buffer('mask', mask)
+
+    def forward(self, x):
+        return x.masked_fill(self.mask, float('-inf'))
+
+
+class RMSNorm1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rms = nn.RMSNorm(4)
+
+    def forward(self, x):
+        return self.rms(x)
+
+
+class RMSNorm2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rms = nn.RMSNorm([3, 4])
+
+    def forward(self, x):
+        return self.rms(x)
+
+
+class SplitAdd(nn.Module):
+    def forward(self, x):
+        a, b, c = x.split(4, dim=-1)
+        return a + b + c
+
+
+class ChunkAdd(nn.Module):
+    def forward(self, x):
+        a, b = x.chunk(2, dim=-1)
+        return a + b
+
+
+class CatDim0(nn.Module):
+    """Concatenate two linear outputs along dim 0."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 3, bias=False)
+        self.fc2 = nn.Linear(4, 3, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 3]
+        b = self.fc2(x)  # [2, 3]
+        return torch.cat([a, b], dim=0)  # [4, 3]
+
+
+class CatDim1(nn.Module):
+    """Concatenate two linear outputs along dim 1."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 3, bias=False)
+        self.fc2 = nn.Linear(4, 5, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 3]
+        b = self.fc2(x)  # [2, 5]
+        return torch.cat([a, b], dim=1)  # [2, 8]
+
+
+class CatThreeWay(nn.Module):
+    """Concatenate three linear outputs along dim 1 (chained cat)."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 2, bias=False)
+        self.fc2 = nn.Linear(4, 3, bias=False)
+        self.fc3 = nn.Linear(4, 5, bias=False)
+
+    def forward(self, x):
+        a = self.fc1(x)  # [2, 2]
+        b = self.fc2(x)  # [2, 3]
+        c = self.fc3(x)  # [2, 5]
+        return torch.cat([a, b, c], dim=1)  # [2, 10]
+
+
+class SplitCat(nn.Module):
+    """Split then cat back together (round-trip)."""
+    def forward(self, x):
+        a, b = x.chunk(2, dim=-1)
+        a = a * 2.0
+        return torch.cat([a, b], dim=-1)
+
+
+class NegateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return -self.fc(x)
+
+
+class TensorSubtract(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4, bias=False)
+        self.fc2 = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.fc1(x) - self.fc2(x)
+
+
+class RoPEModel(nn.Module):
+    """Rotary position embeddings with precomputed cos/sin buffers."""
+    def __init__(self, dim=8, max_len=16):
+        super().__init__()
+        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_len).float()
+        angles = torch.outer(t, freqs)
+        self.register_buffer('cos_cached', angles.cos())
+        self.register_buffer('sin_cached', angles.sin())
+
+    def forward(self, x):
+        seq_len = x.shape[0]
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -436,6 +593,111 @@ def test_scalar_divide():
     _assert_close(expected, actual)
 
 
+def test_embedding():
+    model = EmbeddingModel()
+    x = torch.tensor([0, 3, 7, 1])
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_embedding_linear():
+    model = EmbeddingLinear()
+    x = torch.tensor([2, 5, 0])
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_tensor_multiply():
+    model = TensorMultiply()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_masked_fill():
+    model = MaskedFillModel()
+    x = torch.randn(3, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rms_norm():
+    model = RMSNorm1D()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rms_norm_2d():
+    model = RMSNorm2D()
+    x = torch.randn(2, 3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_split():
+    model = SplitAdd()
+    x = torch.randn(2, 12)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_chunk():
+    model = ChunkAdd()
+    x = torch.randn(2, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_negate():
+    model = NegateModel()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_tensor_subtract():
+    model = TensorSubtract()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_dim0():
+    model = CatDim0()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_dim1():
+    model = CatDim1()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_cat_three_way():
+    model = CatThreeWay()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_split_cat():
+    model = SplitCat()
+    x = torch.randn(2, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rope():
+    model = RoPEModel(dim=8, max_len=16)
+    x = torch.randn(4, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
 def test_single_head_attention():
     model = SingleHeadAttention(d_model=8)
     x = torch.randn(3, 8)
@@ -488,5 +750,217 @@ def test_leaky_relu():
 def test_elu():
     model = ELUModel()
     x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+# ── Edge case / chained op tests ─────────────────────────────────────────────
+
+
+class ChainedNoOps(nn.Module):
+    """View → reshape → contiguous → scalar op. Tests alias chain resolution."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 6))
+
+    def forward(self, x):
+        y = x @ self.W            # [2, 6]
+        y = y.view(3, 4)
+        y = y.reshape(12)
+        y = y.contiguous()
+        return y * 0.5
+
+
+class FanOut(nn.Module):
+    """One intermediate used by two downstream ops. Tests ref counting."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        h = x @ self.W
+        return h + h              # same tensor added to itself
+
+
+class FanOutDivergent(nn.Module):
+    """One intermediate feeds two different op types. Tests list not freed early."""
+    def __init__(self):
+        super().__init__()
+        self.W1 = nn.Parameter(torch.randn(4, 4))
+        self.W2 = nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        h = F.relu(x)
+        a = h @ self.W1
+        b = h @ self.W2
+        return a + b
+
+
+class NoOpOutput(nn.Module):
+    """Final node is a no-op (view). Tests output alias resolution."""
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 6)
+
+    def forward(self, x):
+        return self.linear(x).view(2, 3)
+
+
+class SoftmaxThenTranspose(nn.Module):
+    """Softmax and transpose both have local lists. Tests no ID collision."""
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        h = x @ self.W           # [2, 3]
+        h = F.softmax(h, dim=-1)
+        return h.T               # [3, 2]
+
+
+class ResidualWithActivations(nn.Module):
+    """Residual + two different activations. Tests scope reuse under pressure."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4)
+        self.fc2 = nn.Linear(4, 4)
+
+    def forward(self, x):
+        h = torch.sigmoid(self.fc1(x))
+        return x + torch.tanh(self.fc2(h))
+
+
+class DeepChain(nn.Module):
+    """6 operations chained. Tests sustained list reuse without corruption."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 8)
+        self.fc3 = nn.Linear(8, 4)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.sigmoid(self.fc2(x))
+        return self.fc3(x)
+
+
+class LayerNormSoftmaxChain(nn.Module):
+    """LayerNorm → linear → softmax. Both LN and softmax have group logic."""
+    def __init__(self):
+        super().__init__()
+        self.ln = nn.LayerNorm(4)
+        self.W = nn.Parameter(torch.randn(4, 3))
+
+    def forward(self, x):
+        h = self.ln(x)
+        return F.softmax(h @ self.W, dim=-1)
+
+
+class ScalarChain(nn.Module):
+    """Chained scalar ops. Tests multiple scalar templates don't collide."""
+    def forward(self, x):
+        return (x * 2.0) / 3.0 * 0.5
+
+
+class ActivationSandwich(nn.Module):
+    """Different activation on each layer. Tests template reuse with variety."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 8)
+        self.fc3 = nn.Linear(8, 3)
+
+    def forward(self, x):
+        x = torch.sigmoid(self.fc1(x))
+        x = F.silu(self.fc2(x))
+        return torch.tanh(self.fc3(x))
+
+
+class DoubleResidual(nn.Module):
+    """Two residual connections. Tests scope with multiple fan-out/fan-in."""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4)
+        self.fc2 = nn.Linear(4, 4)
+
+    def forward(self, x):
+        x = x + F.relu(self.fc1(x))
+        x = x + F.relu(self.fc2(x))
+        return x
+
+
+def test_chained_no_ops():
+    model = ChainedNoOps()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_fan_out():
+    model = FanOut()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_fan_out_divergent():
+    model = FanOutDivergent()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_no_op_output():
+    model = NoOpOutput()
+    x = torch.randn(1, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_softmax_then_transpose():
+    model = SoftmaxThenTranspose()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_residual_with_activations():
+    model = ResidualWithActivations()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_deep_chain():
+    model = DeepChain()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_layernorm_softmax_chain():
+    model = LayerNormSoftmaxChain()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_scalar_chain():
+    model = ScalarChain()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_activation_sandwich():
+    model = ActivationSandwich()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_double_residual():
+    model = DoubleResidual()
+    x = torch.randn(2, 4)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)

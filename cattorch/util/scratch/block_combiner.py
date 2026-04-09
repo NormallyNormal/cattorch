@@ -71,6 +71,19 @@ def _merge_slots(primary: dict, secondary: dict) -> dict:
     merged = dict(primary)
     remap: dict[str, str] = {}  # secondary_id -> winning/new_id
 
+    # Count existing local display names so we can number new ones
+    local_counts: dict[str, int] = {}
+    for entry in primary.values():
+        name = entry[0]
+        if name.startswith(LOCAL_PREFIX):
+            # Parse base name: "_index_map_2" -> "_index_map"
+            base = name
+            for i in range(len(name) - 1, 0, -1):
+                if name[i] == '_' and name[i+1:].isdigit():
+                    base = name[:i]
+                    break
+            local_counts[base] = local_counts.get(base, 0) + 1
+
     for sid, entry in secondary.items():
         display_name = entry[0]
         is_local = display_name.startswith(LOCAL_PREFIX)
@@ -82,6 +95,11 @@ def _merge_slots(primary: dict, secondary: dict) -> dict:
         elif sid in merged:
             # ID collision — assign a new unique ID
             new_id = f"{sid}_{uuid.uuid4().hex[:8]}"
+            if is_local:
+                # Give a unique display name so Scratch shows it as a separate list
+                count = local_counts.get(display_name, 1) + 1
+                local_counts[display_name] = count
+                entry = [f"{display_name}_{count}", entry[1]]
             merged[new_id] = entry
             remap[sid] = new_id
             if not is_local:
@@ -96,36 +114,9 @@ def _merge_slots(primary: dict, secondary: dict) -> dict:
 
 
 def _apply_remap(blocks: dict, var_remap: dict, list_remap: dict) -> dict:
-    """
-    Walk every block and replace collapsed variable/list IDs with the
-    winning IDs from the merge step.
-
-    All replacements are applied in a single pass to prevent cascading
-    (where the output of one replacement is consumed by a later one).
-    """
-    import json
-    import re
-
-    if not var_remap and not list_remap:
-        return blocks
-
-    all_remap = {**var_remap, **list_remap}
-
-    # Drop identity remaps — they can't change anything and only add noise
-    all_remap = {k: v for k, v in all_remap.items() if k != v}
-    if not all_remap:
-        return blocks
-
-    raw = json.dumps(blocks)
-
-    # Build a regex matching any quoted key, longest first
-    pattern = "|".join(
-        re.escape(f'"{k}"')
-        for k in sorted(all_remap, key=len, reverse=True)
-    )
-    raw = re.sub(pattern, lambda m: f'"{all_remap[m.group(0)[1:-1]]}"', raw)
-
-    return json.loads(raw)
+    """Replace collapsed variable/list IDs in blocks with their winning IDs."""
+    from cattorch.util.scratch.remap import remap_ids
+    return remap_ids(blocks, {**var_remap, **list_remap})
 
 
 def combine(sprite_a: dict, sprite_b: dict) -> dict:

@@ -1,5 +1,7 @@
 import json
 import logging
+import math
+import operator
 import uuid
 
 import torch
@@ -7,10 +9,13 @@ from torch.export import export
 
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
+from cattorch.util.instruction.cat import CatInstruction
+from cattorch.util.instruction.getitem import GetItemInstruction
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.tensor_adder import TensorAdder
 from cattorch.util.scratch.tensor_replacer import TensorReplacer
 
@@ -24,6 +29,14 @@ _NOOP_OPS = {
     "aten.flatten.using_ints",
     "aten.contiguous.default",
     "aten.clone.default",
+}
+
+# Ops that split a tensor into multiple outputs. The split itself is a no-op;
+# each getitem on the result becomes the real copy operation.
+_SPLIT_OPS = {
+    "aten.split.Tensor",
+    "aten.split_with_sizes.default",
+    "aten.chunk.default",
 }
 
 
@@ -166,15 +179,23 @@ def _merge_duplicate_lists(sprite):
     if not remap:
         return
 
-    # Remap block references in a single pass
-    import re
-    raw = json.dumps(sprite["blocks"])
-    pattern = "|".join(
-        re.escape(f'"{k}"')
-        for k in sorted(remap, key=len, reverse=True)
-    )
-    raw = re.sub(pattern, lambda m: f'"{remap[m.group(0)[1:-1]]}"', raw)
-    sprite["blocks"] = json.loads(raw)
+    sprite["blocks"] = remap_ids(sprite["blocks"], remap)
+
+    # Renumber local list display names sequentially
+    base_counts: dict[str, int] = {}
+    for entry in lists.values():
+        name = entry[0]
+        if not name.startswith("_"):
+            continue
+        # Strip existing suffix: "_index_map_4" -> "_index_map"
+        base = name
+        for i in range(len(name) - 1, 0, -1):
+            if name[i] == '_' and name[i+1:].isdigit():
+                base = name[:i]
+                break
+        count = base_counts.get(base, 0) + 1
+        base_counts[base] = count
+        entry[0] = base if count == 1 else f"{base}_{count}"
 
 
 def _remove_unused(sprite):
@@ -193,25 +214,20 @@ def _uniquify_ids(sprite):
     """Add a UUID suffix to all list and variable IDs to prevent conflicts
     when multiple cattorch sprites are loaded into one Scratch project."""
     suffix = uuid.uuid4().hex[:12]
-    remap = {}
+    mapping = {}
 
     for section in ("lists", "variables"):
         slots = sprite.get(section, {})
         for sid in list(slots):
             new_id = f"{sid}_{suffix}"
-            remap[sid] = new_id
+            mapping[sid] = new_id
             slots[new_id] = slots.pop(sid)
 
-    if not remap:
-        return
-
-    raw = json.dumps(sprite["blocks"])
-    for old, new in sorted(remap.items(), key=lambda x: -len(x[0])):
-        raw = raw.replace(f'"{old}"', f'"{new}"')
-    sprite["blocks"] = json.loads(raw)
+    if mapping:
+        sprite["blocks"] = remap_ids(sprite["blocks"], mapping)
 
 
-def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str):
+def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], sprite_name: str, sig_figs: int | None = None):
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
     exported = export(model, example_inputs)
@@ -220,7 +236,7 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     normalised_state = {k.lower().replace(".", "_"): v for k, v in exported.state_dict.items()}
 
     def resolve_weight(arg_name: str):
-        key = arg_name.removeprefix("p_")
+        key = arg_name.removeprefix("p_").removeprefix("b_")
         return normalised_state.get(key)
 
     # Identify placeholder nodes: those not in state_dict are model inputs
@@ -235,17 +251,36 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     # Build alias map for no-op shape ops (view, reshape, contiguous, etc.)
     # These don't move data, so their output is the same list as their input.
     aliases = {}  # no-op node name -> source node name
+    split_meta = {}  # split node name -> (input_shape, split_size, dim)
     for node in nodes:
         if node.op != 'call_function':
             continue
         aten_op = str(node.target)
         if aten_op in _NOOP_OPS and hasattr(node.args[0], 'name'):
             source = node.args[0].name
-            # Follow alias chains: if source is itself aliased, point to the root
             while source in aliases:
                 source = aliases[source]
             aliases[node.name] = source
             log.info("Alias: %s -> %s (no-op %s)", node.name, source, aten_op)
+        elif aten_op in _SPLIT_OPS:
+            source = node.args[0].name
+            while source in aliases:
+                source = aliases[source]
+            aliases[node.name] = source
+            input_shape = _get_shape(node.args[0])
+            if aten_op == "aten.chunk.default":
+                num_chunks = node.args[1]
+                dim = node.args[2] if len(node.args) > 2 else 0
+                if dim < 0:
+                    dim = len(input_shape) + dim
+                split_size = math.ceil(input_shape[dim] / num_chunks)
+            else:
+                split_size = node.args[1]
+                dim = node.args[2] if len(node.args) > 2 else 0
+                if dim < 0:
+                    dim = len(input_shape) + dim
+            split_meta[node.name] = (input_shape, split_size, dim)
+            log.info("Split: %s -> %s (split_size=%s, dim=%s)", node.name, source, split_size, dim)
 
     scope = ScopeManager()
     scope.analyze_lifetimes(nodes, skip=set(aliases.keys()))
@@ -270,24 +305,202 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
         last_target_list = target_list
         aten_op = str(node.target)
 
-        input_lists, dynamic_lists, static_lists, constants = _resolve_args(
-            node, scope, input_names, resolve_weight, aliases
-        )
+        # Handle cat (first arg is a list of tensors, not a single tensor)
+        if aten_op == "aten.cat.default":
+            tensor_list = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else 0
 
-        all_dynamic_lists.update(dynamic_lists)
-        all_static_lists.update(static_lists)
-        all_constants.extend(constants)
+            def _resolve_tensor(t):
+                t_name = t.name
+                if aliases and t_name in aliases:
+                    t_name = aliases[t_name]
+                if t_name in scope.assignments:
+                    name = f"T{scope.assignments[t_name]}"
+                    all_dynamic_lists.add(name)
+                elif t_name in input_names:
+                    name = input_names[t_name]
+                else:
+                    name = f"W_{t_name}"
+                    all_static_lists[t_name] = resolve_weight(t_name)
+                return name
 
-        log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
+            def _cat_shapes(s1, s2, d):
+                """Compute the output shape of cat(s1, s2, dim=d)."""
+                out = list(s1)
+                out[d] = s1[d] + s2[d]
+                return torch.Size(out)
 
-        args = []
-        for i in range(len(input_lists)):
-            node_arg = node.args[i]
-            if hasattr(node_arg, 'name'):
-                args.append(Argument(input_lists[i], _get_shape(node_arg)))
+            resolved = [(_resolve_tensor(t), _get_shape(t)) for t in tensor_list]
+
+            if dim < 0:
+                dim = len(resolved[0][1]) + dim
+
+            # Chain pairwise: cat(a,b)→tmp, cat(tmp,c)→tmp2, ... cat(tmpN,last)→target
+            cur_list, cur_shape = resolved[0]
+            for pair_idx in range(1, len(resolved)):
+                next_list, next_shape = resolved[pair_idx]
+                is_last = pair_idx == len(resolved) - 1
+
+                if is_last:
+                    cat_target = target_list
+                else:
+                    # Allocate a temporary list from the scope
+                    if scope.free_pool:
+                        scope.free_pool.sort()
+                        temp_id = scope.free_pool.pop(0)
+                    else:
+                        scope.peak_lists += 1
+                        temp_id = scope.peak_lists
+                    cat_target = f"T{temp_id}"
+                    all_dynamic_lists.add(cat_target)
+
+                num_outer = math.prod(cur_shape[:dim]) if dim > 0 else 1
+                chunk_1 = math.prod(cur_shape[dim:])
+                chunk_2 = math.prod(next_shape[dim:])
+                cat_inputs = [cur_list, next_list]
+
+                log.info("cat(dim=%d) [%d/%d] -> %s (%s) (Inputs: %s)",
+                         dim, pair_idx, len(resolved) - 1, cat_target, node.name, cat_inputs)
+
+                cat_args = [
+                    Argument(cur_list, cur_shape),
+                    Argument(next_list, next_shape),
+                    Argument("C_num_outer", torch.Size([]), value=num_outer),
+                    Argument("C_chunk_1", torch.Size([]), value=chunk_1),
+                    Argument("C_chunk_2", torch.Size([]), value=chunk_2),
+                ]
+                cat_instr = CatInstruction(node.target, cat_target, *cat_args)
+                data = _process_instruction(cat_instr, cat_inputs, cat_target, block_manager)
+
+                if scratch_output is None:
+                    scratch_output = data
+                else:
+                    scratch_output = combine(scratch_output, data)
+
+                # The intermediate becomes the left input for the next pair
+                out_shape = _cat_shapes(cur_shape, next_shape, dim)
+                if not is_last:
+                    prev_temp_id = temp_id
+                cur_list, cur_shape = cat_target, out_shape
+
+                # Free the intermediate after it's consumed (except the final target)
+                if pair_idx > 1:
+                    scope.free_pool.append(prev_temp_id)
+
+            # Skip the shared _process_instruction below — already handled inline
+            scope.release_dependencies(node)
+            continue
+
+        # Handle slice as a getitem-style copy (or no-op if full range)
+        elif aten_op == "aten.slice.Tensor":
+            source = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else 0
+            start = node.args[2] if len(node.args) > 2 else 0
+            end = node.args[3] if len(node.args) > 3 else None
+            input_shape = _get_shape(source)
+
+            if dim < 0:
+                dim = len(input_shape) + dim
+
+            # Clamp end to actual size
+            dim_size = input_shape[dim]
+            if end is None or end > dim_size:
+                end = dim_size
+
+            # Full-range slice is a no-op
+            if start == 0 and end == dim_size:
+                src_name = source.name
+                while src_name in aliases:
+                    src_name = aliases[src_name]
+                aliases[node.name] = src_name
+                log.info("Alias: %s -> %s (full slice)", node.name, src_name)
+                continue
+
+            # Partial slice: resolve source and use getitem template
+            src_name = source.name
+            if aliases and src_name in aliases:
+                src_name = aliases[src_name]
+            if src_name in scope.assignments:
+                src_list = f"T{scope.assignments[src_name]}"
+                all_dynamic_lists.add(src_list)
+            elif src_name in input_names:
+                src_list = input_names[src_name]
             else:
-                args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
-        instruction = Instruction.create(aten_op, node.target, target_list, *args)
+                src_list = f"W_{src_name}"
+                all_static_lists[src_name] = resolve_weight(src_name)
+
+            trailing = math.prod(input_shape[dim + 1:]) if dim + 1 < len(input_shape) else 1
+            chunk_size = (end - start) * trailing
+            num_rows = math.prod(input_shape[:dim]) if dim > 0 else 1
+            row_stride = math.prod(input_shape[dim:])
+            skip = row_stride - chunk_size
+            offset = start * trailing
+
+            input_lists = [src_list]
+            log.info("slice(dim=%d, %d:%d) -> %s (%s) (Inputs: %s)",
+                     dim, start, end, target_list, node.name, input_lists)
+
+            args = [
+                Argument(src_list, input_shape),
+                Argument("C_chunk_size", torch.Size([]), value=chunk_size),
+                Argument("C_num_rows", torch.Size([]), value=num_rows),
+                Argument("C_skip", torch.Size([]), value=skip),
+                Argument("C_offset", torch.Size([]), value=offset),
+            ]
+            instruction = GetItemInstruction(node.target, target_list, *args)
+
+        # Handle getitem on split/chunk results
+        elif node.target is operator.getitem and hasattr(node.args[0], 'name') and node.args[0].name in split_meta:
+            split_node = node.args[0]
+            chunk_index = node.args[1]
+            input_shape, split_size, dim = split_meta[split_node.name]
+
+            # Resolve the split's input tensor through aliases
+            source_name = aliases[split_node.name]
+            if source_name in scope.assignments:
+                src_list = f"T{scope.assignments[source_name]}"
+                all_dynamic_lists.add(src_list)
+            elif source_name in input_names:
+                src_list = input_names[source_name]
+            else:
+                src_list = f"W_{source_name}"
+
+            row_stride = input_shape[dim]
+            chunk_size = min(split_size, row_stride - chunk_index * split_size)
+            num_rows = math.prod(input_shape[:dim]) if dim > 0 else 1
+            skip = row_stride - chunk_size
+            offset = chunk_index * split_size
+
+            input_lists = [src_list]
+            log.info("getitem[%d] -> %s (%s) (Inputs: %s)", chunk_index, target_list, node.name, input_lists)
+
+            args = [
+                Argument(src_list, input_shape),
+                Argument("C_chunk_size", torch.Size([]), value=chunk_size),
+                Argument("C_num_rows", torch.Size([]), value=num_rows),
+                Argument("C_skip", torch.Size([]), value=skip),
+                Argument("C_offset", torch.Size([]), value=offset),
+            ]
+            instruction = GetItemInstruction(node.target, target_list, *args)
+        else:
+            input_lists, dynamic_lists, static_lists, constants = _resolve_args(
+                node, scope, input_names, resolve_weight, aliases
+            )
+
+            all_dynamic_lists.update(dynamic_lists)
+            all_static_lists.update(static_lists)
+            all_constants.extend(constants)
+
+            log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
+
+            args = []
+            for i in range(len(input_lists)):
+                node_arg = node.args[i]
+                if hasattr(node_arg, 'name'):
+                    args.append(Argument(input_lists[i], _get_shape(node_arg)))
+                else:
+                    args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
+            instruction = Instruction.create(aten_op, node.target, target_list, *args)
 
         data = _process_instruction(instruction, input_lists, target_list, block_manager)
 
@@ -303,7 +516,8 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     scratch_output = tensor_adder.apply(
         scratch_output,
         [f"W_{k}" for k in all_static_lists.keys()],
-        weights={f"W_{k}": v for k, v in all_static_lists.items() if v is not None}
+        weights={f"W_{k}": v for k, v in all_static_lists.items() if v is not None},
+        sig_figs=sig_figs,
     )
 
     # Add input lists (empty — populated at runtime)

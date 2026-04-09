@@ -38,6 +38,9 @@ model = TwoLayerNet()
 # transpile(model, example input, sprite name)
 transpile(model, torch.randn(1, 4), "two_layer_net")
 # => two_layer_net.sprite3
+
+# optionally reduce file size by rounding weights
+transpile(model, torch.randn(1, 4), "two_layer_net", sig_figs=6)
 ```
 
 In Scratch, the sprite reads its input from a list called `input` and writes
@@ -49,21 +52,26 @@ If the model takes multiple input tensors, the additional inputs are named
 
 ## Supported operations
 
-| Category | Operations                                                          |
-|---|---------------------------------------------------------------------|
-| Linear layers | `nn.Linear` (with and without bias)                                 |
-| Matrix multiply | `@` / `torch.matmul`                                                |
+| Category | Operations |
+|---|---|
+| Linear layers | `nn.Linear` (with and without bias) |
+| Matrix multiply | `@` / `torch.matmul` |
 | Activations | ReLU, Sigmoid, Tanh, GELU (tanh approx. only), SiLU, LeakyReLU, ELU |
-| Normalization | `nn.LayerNorm`                                                      |
-| Softmax | `F.softmax` (any dim)                                               |
-| Arithmetic | tensor add, scalar multiply, scalar divide                          |
-| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data)     |
-| Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions)                 |
+| Normalization | `nn.LayerNorm`, `nn.RMSNorm` |
+| Softmax | `F.softmax` (any dim) |
+| Embedding | `nn.Embedding` |
+| Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
+| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate |
+| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
+| Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
+| Split / Chunk | `split`, `split_with_sizes`, `chunk` |
+| Concatenation | `torch.cat` (any dim, any number of inputs) |
+| Slice | `tensor[:n]` style slicing along any dimension |
 
-These are sufficient for architectures like MLPs and single-head transformers
-(including full pre-norm transformer blocks with residual connections).
-
-More operations are planned for the future, such as those required to support full LLMs, CNNs, and more.
+These are sufficient for architectures like MLPs and transformer LLMs,
+including multi-head attention, combined QKV projections, rotary position
+embeddings (RoPE), causal masking, pre-norm blocks with residual connections,
+and SwiGLU-style gating. CNN and RNN support is planned for the future.
 
 ## Scratch limits
 
