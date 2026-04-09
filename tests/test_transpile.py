@@ -47,6 +47,8 @@ def _assert_close(expected: list[float], actual: list[float], tolerance=TOLERANC
         f"Length mismatch: expected {len(expected)}, got {len(actual)}"
     )
     for i, (e, a) in enumerate(zip(expected, actual)):
+        if e == a:
+            continue
         assert abs(e - a) < tolerance, (
             f"Index {i}: expected {e:.6f}, got {a:.6f}"
         )
@@ -256,6 +258,45 @@ class ELUModel(nn.Module):
         return self.elu(x)
 
 
+class EmbeddingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(8, 4)
+
+    def forward(self, x):
+        return self.emb(x)
+
+
+class EmbeddingLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(8, 4)
+        self.fc = nn.Linear(4, 3)
+
+    def forward(self, x):
+        return self.fc(self.emb(x))
+
+
+class TensorMultiply(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 4, bias=False)
+        self.fc2 = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.fc1(x) * self.fc2(x)
+
+
+class MaskedFillModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        mask = torch.triu(torch.ones(3, 3, dtype=torch.bool), diagonal=1)
+        self.register_buffer('mask', mask)
+
+    def forward(self, x):
+        return x.masked_fill(self.mask, float('-inf'))
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -432,6 +473,34 @@ def test_flatten():
 def test_scalar_divide():
     model = ScalarDiv()
     x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_embedding():
+    model = EmbeddingModel()
+    x = torch.tensor([0, 3, 7, 1])
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_embedding_linear():
+    model = EmbeddingLinear()
+    x = torch.tensor([2, 5, 0])
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_tensor_multiply():
+    model = TensorMultiply()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_masked_fill():
+    model = MaskedFillModel()
+    x = torch.randn(3, 3)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 

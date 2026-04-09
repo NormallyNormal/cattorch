@@ -226,6 +226,11 @@ class ScratchEmulator:
             b = float(self._eval_input(inputs["NUM2"]))
             return a % b if b != 0 else 0
 
+        elif opcode == "operator_equals":
+            a = self._eval_input(inputs["OPERAND1"])
+            b = self._eval_input(inputs["OPERAND2"])
+            return float(a) == float(b)
+
         elif opcode == "operator_gt":
             a = float(self._eval_input(inputs["OPERAND1"]))
             b = float(self._eval_input(inputs["OPERAND2"]))

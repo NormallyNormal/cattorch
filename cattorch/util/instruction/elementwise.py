@@ -60,12 +60,22 @@ class ELUInstruction(TemplateInstruction):
 # ── Scalar ops ───────────────────────────────────────────────────────────────
 
 
-class ScalarMultiplyInstruction(TemplateInstruction):
+class MultiplyInstruction(TemplateInstruction):
     aten_op = "aten.mul.Tensor"
-    template_name = "scalar_multiply"
+
+    @property
+    def template_name(self):
+        if self.args[1].value is not None:
+            return "scalar_multiply"
+        return "tensor_multiply"
 
     def get_constants(self):
-        return {101: math.prod(self.args[0].shape), 102: self.args[1].value}
+        if self.args[1].value is not None:
+            return {101: math.prod(self.args[0].shape), 102: self.args[1].value}
+        return {
+            101: math.prod(self.args[0].shape),
+            102: math.prod(self.args[1].shape),
+        }
 
 
 class ScalarDivideInstruction(TemplateInstruction):
@@ -76,7 +86,7 @@ class ScalarDivideInstruction(TemplateInstruction):
         return {101: math.prod(self.args[0].shape), 102: self.args[1].value}
 
 
-# ── Tensor add ───────────────────────────────────────────────────────────────
+# ── Tensor elementwise ───────────────────────────────────────────────────────
 
 
 class TensorAddInstruction(TemplateInstruction):

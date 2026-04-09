@@ -224,7 +224,7 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     normalised_state = {k.lower().replace(".", "_"): v for k, v in exported.state_dict.items()}
 
     def resolve_weight(arg_name: str):
-        key = arg_name.removeprefix("p_")
+        key = arg_name.removeprefix("p_").removeprefix("b_")
         return normalised_state.get(key)
 
     # Identify placeholder nodes: those not in state_dict are model inputs

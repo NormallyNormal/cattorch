@@ -302,3 +302,4 @@ __marimo__/
 # cattorch custom
 *.sprite3
 .idea/
+examples/
