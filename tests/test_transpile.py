@@ -413,6 +413,13 @@ class RoPEModel(nn.Module):
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
+class ArangeAdd(nn.Module):
+    """Uses torch.arange inside forward (common for positional embeddings)."""
+    def forward(self, x):
+        pos = torch.arange(x.shape[-1]).float()
+        return x + pos
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -687,6 +694,13 @@ def test_cat_three_way():
 def test_split_cat():
     model = SplitCat()
     x = torch.randn(2, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_arange():
+    model = ArangeAdd()
+    x = torch.randn(4, 3)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
