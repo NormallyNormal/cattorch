@@ -1,5 +1,7 @@
 import json
 import logging
+import math
+import operator
 import uuid
 
 import torch
@@ -7,6 +9,7 @@ from torch.export import export
 
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
+from cattorch.util.instruction.getitem import GetItemInstruction
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
@@ -25,6 +28,14 @@ _NOOP_OPS = {
     "aten.flatten.using_ints",
     "aten.contiguous.default",
     "aten.clone.default",
+}
+
+# Ops that split a tensor into multiple outputs. The split itself is a no-op;
+# each getitem on the result becomes the real copy operation.
+_SPLIT_OPS = {
+    "aten.split.Tensor",
+    "aten.split_with_sizes.default",
+    "aten.chunk.default",
 }
 
 
@@ -239,17 +250,36 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     # Build alias map for no-op shape ops (view, reshape, contiguous, etc.)
     # These don't move data, so their output is the same list as their input.
     aliases = {}  # no-op node name -> source node name
+    split_meta = {}  # split node name -> (input_shape, split_size, dim)
     for node in nodes:
         if node.op != 'call_function':
             continue
         aten_op = str(node.target)
         if aten_op in _NOOP_OPS and hasattr(node.args[0], 'name'):
             source = node.args[0].name
-            # Follow alias chains: if source is itself aliased, point to the root
             while source in aliases:
                 source = aliases[source]
             aliases[node.name] = source
             log.info("Alias: %s -> %s (no-op %s)", node.name, source, aten_op)
+        elif aten_op in _SPLIT_OPS:
+            source = node.args[0].name
+            while source in aliases:
+                source = aliases[source]
+            aliases[node.name] = source
+            input_shape = _get_shape(node.args[0])
+            if aten_op == "aten.chunk.default":
+                num_chunks = node.args[1]
+                dim = node.args[2] if len(node.args) > 2 else 0
+                if dim < 0:
+                    dim = len(input_shape) + dim
+                split_size = math.ceil(input_shape[dim] / num_chunks)
+            else:
+                split_size = node.args[1]
+                dim = node.args[2] if len(node.args) > 2 else 0
+                if dim < 0:
+                    dim = len(input_shape) + dim
+            split_meta[node.name] = (input_shape, split_size, dim)
+            log.info("Split: %s -> %s (split_size=%s, dim=%s)", node.name, source, split_size, dim)
 
     scope = ScopeManager()
     scope.analyze_lifetimes(nodes, skip=set(aliases.keys()))
@@ -274,24 +304,58 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
         last_target_list = target_list
         aten_op = str(node.target)
 
-        input_lists, dynamic_lists, static_lists, constants = _resolve_args(
-            node, scope, input_names, resolve_weight, aliases
-        )
+        # Handle getitem on split/chunk results
+        if node.target is operator.getitem and hasattr(node.args[0], 'name') and node.args[0].name in split_meta:
+            split_node = node.args[0]
+            chunk_index = node.args[1]
+            input_shape, split_size, dim = split_meta[split_node.name]
 
-        all_dynamic_lists.update(dynamic_lists)
-        all_static_lists.update(static_lists)
-        all_constants.extend(constants)
-
-        log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
-
-        args = []
-        for i in range(len(input_lists)):
-            node_arg = node.args[i]
-            if hasattr(node_arg, 'name'):
-                args.append(Argument(input_lists[i], _get_shape(node_arg)))
+            # Resolve the split's input tensor through aliases
+            source_name = aliases[split_node.name]
+            if source_name in scope.assignments:
+                src_list = f"T{scope.assignments[source_name]}"
+                all_dynamic_lists.add(src_list)
+            elif source_name in input_names:
+                src_list = input_names[source_name]
             else:
-                args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
-        instruction = Instruction.create(aten_op, node.target, target_list, *args)
+                src_list = f"W_{source_name}"
+
+            row_stride = input_shape[dim]
+            chunk_size = min(split_size, row_stride - chunk_index * split_size)
+            num_rows = math.prod(input_shape[:dim]) if dim > 0 else 1
+            skip = row_stride - chunk_size
+            offset = chunk_index * split_size
+
+            input_lists = [src_list]
+            log.info("getitem[%d] -> %s (%s) (Inputs: %s)", chunk_index, target_list, node.name, input_lists)
+
+            args = [
+                Argument(src_list, input_shape),
+                Argument("C_chunk_size", torch.Size([]), value=chunk_size),
+                Argument("C_num_rows", torch.Size([]), value=num_rows),
+                Argument("C_skip", torch.Size([]), value=skip),
+                Argument("C_offset", torch.Size([]), value=offset),
+            ]
+            instruction = GetItemInstruction(node.target, target_list, *args)
+        else:
+            input_lists, dynamic_lists, static_lists, constants = _resolve_args(
+                node, scope, input_names, resolve_weight, aliases
+            )
+
+            all_dynamic_lists.update(dynamic_lists)
+            all_static_lists.update(static_lists)
+            all_constants.extend(constants)
+
+            log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
+
+            args = []
+            for i in range(len(input_lists)):
+                node_arg = node.args[i]
+                if hasattr(node_arg, 'name'):
+                    args.append(Argument(input_lists[i], _get_shape(node_arg)))
+                else:
+                    args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
+            instruction = Instruction.create(aten_op, node.target, target_list, *args)
 
         data = _process_instruction(instruction, input_lists, target_list, block_manager)
 

@@ -315,6 +315,18 @@ class RMSNorm2D(nn.Module):
         return self.rms(x)
 
 
+class SplitAdd(nn.Module):
+    def forward(self, x):
+        a, b, c = x.split(4, dim=-1)
+        return a + b + c
+
+
+class ChunkAdd(nn.Module):
+    def forward(self, x):
+        a, b = x.chunk(2, dim=-1)
+        return a + b
+
+
 class SingleHeadAttention(nn.Module):
     """Minimal single-head self-attention block."""
     def __init__(self, d_model=8):
@@ -533,6 +545,20 @@ def test_rms_norm():
 def test_rms_norm_2d():
     model = RMSNorm2D()
     x = torch.randn(2, 3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_split():
+    model = SplitAdd()
+    x = torch.randn(2, 12)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_chunk():
+    model = ChunkAdd()
+    x = torch.randn(2, 8)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 
