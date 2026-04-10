@@ -64,6 +64,18 @@ model.forward = model.forward_inference
 transpile(model, example_input, "my_model")
 ```
 
+Some modules (e.g. HuggingFace transformer blocks) return tuples instead of
+plain tensors. `torch.export` will fail if a downstream layer receives a tuple
+where it expects a tensor. Unpack the output in your wrapper's forward method:
+
+```python
+# won't work: block returns (hidden_states, attention_weights, ...)
+x = block(x)
+
+# will work: extract the tensor you need
+x = block(x)[0]
+```
+
 In Scratch, the sprite reads its input from a list called `input` and writes
 results to a list called `output`. It is up to you to add logic to fill the
 input tensor and run the generated code blocks.
@@ -77,18 +89,19 @@ If the model takes multiple input tensors, the additional inputs are named
 |---|---|
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
-| Activations | ReLU, Sigmoid, Tanh, GELU (tanh approx. only), SiLU, LeakyReLU, ELU |
-| Normalization | `nn.LayerNorm`, `nn.RMSNorm` |
+| Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
+| Normalization | `nn.LayerNorm`, `nn.RMSNorm`, `torch.rsqrt` |
 | Softmax | `F.softmax` (any dim) |
 | Embedding | `nn.Embedding` |
 | Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
-| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate |
-| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
+| Arithmetic | `+`, `-`, `*` (tensor and scalar), `/` (scalar), unary `-`, `torch.pow` |
+| Reduction | `torch.mean` (along a dim) |
+| Tensor creation | `torch.arange`, `torch.ones`, `torch.zeros`, `torch.full`, `torch.ones_like`, `torch.zeros_like` |
+| Shape | `view`, `reshape`, `flatten`, `contiguous`, `clone` (no-ops on flat data) |
 | Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
 | Split / Chunk | `split`, `split_with_sizes`, `chunk` |
 | Concatenation | `torch.cat` (any dim, any number of inputs) |
 | Slice | `tensor[:n]` style slicing along any dimension |
-| Tensor generation | `torch.arange` (materialised at transpile time) |
 
 These are sufficient for architectures like MLPs and transformer LLMs,
 including multi-head attention, combined QKV projections, rotary position
