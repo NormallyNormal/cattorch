@@ -96,9 +96,16 @@ class ScalarDivideInstruction(TemplateInstruction):
 
 class TensorAddInstruction(TemplateInstruction):
     aten_op = "aten.add.Tensor"
-    template_name = "tensor_add"
+
+    @property
+    def template_name(self):
+        if self.args[1].value is not None:
+            return "scalar_add"
+        return "tensor_add"
 
     def get_constants(self):
+        if self.args[1].value is not None:
+            return {101: math.prod(self.args[0].shape), 102: self.args[1].value}
         return {
             101: math.prod(self.args[0].shape),
             102: math.prod(self.args[1].shape),
@@ -107,9 +114,16 @@ class TensorAddInstruction(TemplateInstruction):
 
 class TensorSubtractInstruction(TemplateInstruction):
     aten_op = "aten.sub.Tensor"
-    template_name = "tensor_subtract"
+
+    @property
+    def template_name(self):
+        if self.args[1].value is not None:
+            return "scalar_add"
+        return "tensor_subtract"
 
     def get_constants(self):
+        if self.args[1].value is not None:
+            return {101: math.prod(self.args[0].shape), 102: -self.args[1].value}
         return {
             101: math.prod(self.args[0].shape),
             102: math.prod(self.args[1].shape),

@@ -966,7 +966,7 @@ class PowMeanRsqrt(nn.Module):
     """pow → mean → rsqrt chain (core of manual RMSNorm, without broadcasting)."""
     def forward(self, x):
         ms = torch.pow(x, 2).mean(dim=-1)
-        return torch.rsqrt(ms)
+        return torch.rsqrt(ms + 1e-6)
 
 
 def test_chained_no_ops():
