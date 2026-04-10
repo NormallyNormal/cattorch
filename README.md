@@ -89,15 +89,15 @@ If the model takes multiple input tensors, the additional inputs are named
 |---|---|
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
-| Activations | ReLU, Sigmoid, Tanh, GELU (tanh approx. only), SiLU, LeakyReLU, ELU |
-| Normalization | `nn.LayerNorm`, `nn.RMSNorm`, `aten.rsqrt.default` |
+| Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
+| Normalization | `nn.LayerNorm`, `nn.RMSNorm`, `torch.rsqrt` |
 | Softmax | `F.softmax` (any dim) |
 | Embedding | `nn.Embedding` |
 | Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
-| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate, `aten.pow.Tensor_Scalar` |
-| Reduction | `aten.mean.dim` |
-| Tensor creation | `aten.arange.default`, `aten.arange.start`, `aten.ones.default`, `aten.zeros.default`, `aten.full.default`, `aten.ones_like.default`, `aten.zeros_like.default` |
-| Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
+| Arithmetic | `+`, `-`, `*` (tensor and scalar), `/` (scalar), unary `-`, `torch.pow` |
+| Reduction | `torch.mean` (along a dim) |
+| Tensor creation | `torch.arange`, `torch.ones`, `torch.zeros`, `torch.full`, `torch.ones_like`, `torch.zeros_like` |
+| Shape | `view`, `reshape`, `flatten`, `contiguous`, `clone` (no-ops on flat data) |
 | Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
 | Split / Chunk | `split`, `split_with_sizes`, `chunk` |
 | Concatenation | `torch.cat` (any dim, any number of inputs) |
