@@ -64,6 +64,18 @@ model.forward = model.forward_inference
 transpile(model, example_input, "my_model")
 ```
 
+Some modules (e.g. HuggingFace transformer blocks) return tuples instead of
+plain tensors. `torch.export` will fail if a downstream layer receives a tuple
+where it expects a tensor. Unpack the output in your wrapper's forward method:
+
+```python
+# won't work: block returns (hidden_states, attention_weights, ...)
+x = block(x)
+
+# will work: extract the tensor you need
+x = block(x)[0]
+```
+
 In Scratch, the sprite reads its input from a list called `input` and writes
 results to a list called `output`. It is up to you to add logic to fill the
 input tensor and run the generated code blocks.
@@ -78,17 +90,18 @@ If the model takes multiple input tensors, the additional inputs are named
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
 | Activations | ReLU, Sigmoid, Tanh, GELU (tanh approx. only), SiLU, LeakyReLU, ELU |
-| Normalization | `nn.LayerNorm`, `nn.RMSNorm` |
+| Normalization | `nn.LayerNorm`, `nn.RMSNorm`, `aten.rsqrt.default` |
 | Softmax | `F.softmax` (any dim) |
 | Embedding | `nn.Embedding` |
 | Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
-| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate |
+| Arithmetic | tensor add, tensor subtract, tensor multiply, scalar multiply, scalar divide, negate, `aten.pow.Tensor_Scalar` |
+| Reduction | `aten.mean.dim` |
+| Tensor creation | `aten.arange.default`, `aten.arange.start`, `aten.ones.default`, `aten.zeros.default`, `aten.full.default`, `aten.ones_like.default`, `aten.zeros_like.default` |
 | Shape | view, reshape, flatten, contiguous, clone (no-ops on flat data) |
 | Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
 | Split / Chunk | `split`, `split_with_sizes`, `chunk` |
 | Concatenation | `torch.cat` (any dim, any number of inputs) |
 | Slice | `tensor[:n]` style slicing along any dimension |
-| Tensor generation | `torch.arange` (materialised at transpile time) |
 
 These are sufficient for architectures like MLPs and transformer LLMs,
 including multi-head attention, combined QKV projections, rotary position

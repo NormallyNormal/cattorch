@@ -245,10 +245,50 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
     for node in nodes:
         if node.op != 'call_function':
             continue
-        if str(node.target) == "aten.arange.default":
+
+        target = str(node.target)
+
+        if target == "aten.arange.default":
             n = node.args[0]
             generated_weights[node.name] = torch.arange(n, dtype=torch.float32)
             log.info("Generated arange(%d) as static weight %s", n, node.name)
+
+        elif target == "aten.arange.start":
+            start, end = node.args[0], node.args[1]
+            generated_weights[node.name] = torch.arange(start, end, dtype=torch.float32)
+            log.info("Generated arange(%d, %d) as static weight %s", start, end, node.name)
+
+        elif target == "aten.ones.default":
+            size = node.args[0]
+            generated_weights[node.name] = torch.ones(size, dtype=torch.float32)
+            log.info("Generated ones%s as static weight %s", tuple(size), node.name)
+
+        elif target == "aten.zeros.default":
+            size = node.args[0]
+            generated_weights[node.name] = torch.zeros(size, dtype=torch.float32)
+            log.info("Generated zeros%s as static weight %s", tuple(size), node.name)
+
+        elif target == "aten.full.default":
+            size, fill_value = node.args[0], node.args[1]
+            generated_weights[node.name] = torch.full(size, fill_value, dtype=torch.float32)
+            log.info(
+                "Generated full%s (value=%s) as static weight %s",
+                tuple(size), fill_value, node.name
+            )
+        elif target == "aten.ones_like.default":
+            ref = node.args[0]
+            if ref.name in generated_weights:
+                shape = generated_weights[ref.name].shape
+            else:
+                shape = tuple(ref.meta['tensor_meta'].shape)
+            generated_weights[node.name] = torch.ones(shape, dtype=torch.float32)
+        elif target == "aten.zeros_like.default":
+            ref = node.args[0]
+            if ref.name in generated_weights:
+                shape = generated_weights[ref.name].shape
+            else:
+                shape = tuple(ref.meta['tensor_meta'].shape)
+            generated_weights[node.name] = torch.zeros(shape, dtype=torch.float32)
 
     def resolve_weight(arg_name: str):
         if arg_name in generated_weights:

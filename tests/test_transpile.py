@@ -465,6 +465,35 @@ class TransformerBlock(nn.Module):
         x = x + self.ff2(F.relu(self.ff1(h)))
         return x
 
+class OnesAdd(nn.Module):
+    def forward(self, x):
+        t = torch.ones(x.shape).float()
+        return x + t
+
+
+class ZerosAdd(nn.Module):
+    def forward(self, x):
+        t = torch.zeros(x.shape).float()
+        return x + t
+
+
+class FullAdd(nn.Module):
+    def forward(self, x):
+        t = torch.full(x.shape, 2.5).float()
+        return x + t
+
+
+class OnesLikeAdd(nn.Module):
+    def forward(self, x):
+        t = torch.ones_like(x).float()
+        return x + t
+
+
+class ZerosLikeAdd(nn.Module):
+    def forward(self, x):
+        t = torch.zeros_like(x).float()
+        return x + t
+
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -903,6 +932,43 @@ class DoubleResidual(nn.Module):
         return x
 
 
+class PowSquared(nn.Module):
+    """x^2 via torch.pow — tests the optimised x*x path."""
+    def forward(self, x):
+        return torch.pow(x, 2)
+
+
+class PowGeneral(nn.Module):
+    """x^1.5 via torch.pow — tests the general e^(n*ln(x)) path."""
+    def forward(self, x):
+        return torch.pow(x, 1.5)
+
+
+class RSqrtModel(nn.Module):
+    """1/sqrt(x) — tests rsqrt instruction."""
+    def forward(self, x):
+        return torch.rsqrt(x)
+
+
+class MeanLastDim(nn.Module):
+    """Mean over last dimension."""
+    def forward(self, x):
+        return x.mean(dim=-1)
+
+
+class MeanFirstDim(nn.Module):
+    """Mean over first dimension of a 2D tensor."""
+    def forward(self, x):
+        return x.mean(dim=0)
+
+
+class PowMeanRsqrt(nn.Module):
+    """pow → mean → rsqrt chain (core of manual RMSNorm, without broadcasting)."""
+    def forward(self, x):
+        ms = torch.pow(x, 2).mean(dim=-1)
+        return torch.rsqrt(ms)
+
+
 def test_chained_no_ops():
     model = ChainedNoOps()
     x = torch.randn(2, 4)
@@ -976,5 +1042,82 @@ def test_activation_sandwich():
 def test_double_residual():
     model = DoubleResidual()
     x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_pow_squared():
+    model = PowSquared()
+    x = torch.randn(2, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_pow_general():
+    model = PowGeneral()
+    x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs for ln
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_rsqrt():
+    model = RSqrtModel()
+    x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_mean_last_dim():
+    model = MeanLastDim()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_mean_first_dim():
+    model = MeanFirstDim()
+    x = torch.randn(3, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_pow_mean_rsqrt():
+    model = PowMeanRsqrt()
+    x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_ones():
+    model = OnesAdd()
+    x = torch.randn(4, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_zeros():
+    model = ZerosAdd()
+    x = torch.randn(4, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_full():
+    model = FullAdd()
+    x = torch.randn(4, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_ones_like():
+    model = OnesLikeAdd()
+    x = torch.randn(4, 3)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_zeros_like():
+    model = ZerosLikeAdd()
+    x = torch.randn(4, 3)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
