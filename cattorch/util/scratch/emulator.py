@@ -241,6 +241,25 @@ class ScratchEmulator:
             b = float(self._eval_input(inputs["OPERAND2"]))
             return a > b
 
+        elif opcode == "operator_lt":
+            a = float(self._eval_input(inputs["OPERAND1"]))
+            b = float(self._eval_input(inputs["OPERAND2"]))
+            return a < b
+
+        elif opcode == "operator_and":
+            a = self._eval_input(inputs["OPERAND1"])
+            b = self._eval_input(inputs["OPERAND2"])
+            return bool(a) and bool(b)
+
+        elif opcode == "operator_or":
+            a = self._eval_input(inputs["OPERAND1"])
+            b = self._eval_input(inputs["OPERAND2"])
+            return bool(a) or bool(b)
+
+        elif opcode == "operator_not":
+            a = self._eval_input(inputs["OPERAND"])
+            return not bool(a)
+
         elif opcode == "operator_subtract":
             a = float(self._eval_input(inputs["NUM1"]))
             b = float(self._eval_input(inputs["NUM2"]))

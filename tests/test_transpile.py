@@ -932,6 +932,71 @@ class DoubleResidual(nn.Module):
         return x
 
 
+class Conv1dSimple(nn.Module):
+    """Basic 1D convolution."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv1d(2, 3, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv2dSimple(nn.Module):
+    """Basic 2D convolution."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 2, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv2dNoBias(nn.Module):
+    """Conv2d without bias."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 2, kernel_size=3, padding=1, bias=False)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv2dStride(nn.Module):
+    """Conv2d with stride > 1."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 2, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv2dReLU(nn.Module):
+    """Conv2d followed by ReLU activation."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 4, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return F.relu(self.conv(x))
+
+
+class TinyConvNet(nn.Module):
+    """Two conv layers with ReLU and a linear head."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(2, 2, kernel_size=3, padding=1)
+        self.fc = nn.Linear(2 * 4 * 4, 3)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.flatten(1)
+        return self.fc(x)
+
+
 class PowSquared(nn.Module):
     """x^2 via torch.pow — tests the optimised x*x path."""
     def forward(self, x):
@@ -1042,6 +1107,48 @@ def test_activation_sandwich():
 def test_double_residual():
     model = DoubleResidual()
     x = torch.randn(2, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv1d():
+    model = Conv1dSimple()
+    x = torch.randn(1, 2, 8)  # (batch, channels, length)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv2d():
+    model = Conv2dSimple()
+    x = torch.randn(1, 1, 5, 5)  # (batch, channels, H, W)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv2d_no_bias():
+    model = Conv2dNoBias()
+    x = torch.randn(1, 1, 5, 5)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv2d_stride():
+    model = Conv2dStride()
+    x = torch.randn(1, 1, 6, 6)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv2d_relu():
+    model = Conv2dReLU()
+    x = torch.randn(1, 1, 5, 5)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_tiny_conv_net():
+    model = TinyConvNet()
+    x = torch.randn(1, 1, 4, 4)  # small spatial dims to keep it fast
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)
 

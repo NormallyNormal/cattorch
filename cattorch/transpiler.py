@@ -552,6 +552,14 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
             all_static_lists.update(static_lists)
             all_constants.extend(constants)
 
+            # Conv with no bias: torch passes None for bias arg, but the
+            # template still needs a T3 list slot.  Replace the C_None
+            # constant with a dummy tensor list so the replacer maps all
+            # four template lists correctly.
+            if aten_op in ("aten.conv1d.default", "aten.conv2d.default"):
+                if node.args[2] is None:
+                    input_lists[2] = "_conv_no_bias"
+
             log.info("%s -> %s (%s) (Inputs: %s)", aten_op, target_list, node.name, input_lists)
 
             args = []

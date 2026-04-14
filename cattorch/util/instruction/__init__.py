@@ -1,5 +1,6 @@
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.cat import CatInstruction
+from cattorch.util.instruction.conv import ConvolutionInstruction
 from cattorch.util.instruction.embedding import EmbeddingInstruction
 from cattorch.util.instruction.getitem import GetItemInstruction
 from cattorch.util.instruction.masked_fill import MaskedFillInstruction

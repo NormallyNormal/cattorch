@@ -87,6 +87,7 @@ If the model takes multiple input tensors, the additional inputs are named
 
 | Category | Operations |
 |---|---|
+| Convolution | `nn.Conv1d`, `nn.Conv2d` (with and without bias, stride, padding) |
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
 | Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
@@ -103,10 +104,10 @@ If the model takes multiple input tensors, the additional inputs are named
 | Concatenation | `torch.cat` (any dim, any number of inputs) |
 | Slice | `tensor[:n]` style slicing along any dimension |
 
-These are sufficient for architectures like MLPs and transformer LLMs,
+These are sufficient for architectures like MLPs, CNNs, and transformer LLMs,
 including multi-head attention, combined QKV projections, rotary position
 embeddings (RoPE), causal masking, pre-norm blocks with residual connections,
-and SwiGLU-style gating. CNN and RNN support is planned for the future.
+and SwiGLU-style gating. RNN support is planned for the future.
 
 ## Scratch limits
 
