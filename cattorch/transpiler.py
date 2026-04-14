@@ -570,6 +570,7 @@ def transpile(model: torch.nn.Module, example_inputs: torch.Tensor | tuple[torch
                 else:
                     args.append(Argument(input_lists[i], torch.Size([]), value=node_arg))
             instruction = Instruction.create(aten_op, node.target, target_list, *args)
+            instruction.transform_weights(all_static_lists)
 
         data = _process_instruction(instruction, input_lists, target_list, block_manager)
 

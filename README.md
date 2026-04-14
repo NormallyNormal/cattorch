@@ -92,7 +92,7 @@ If the model takes multiple input tensors, the additional inputs are named
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
 | Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
-| Normalization | `nn.LayerNorm`, `nn.RMSNorm`, `torch.rsqrt` |
+| Normalization | `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.LayerNorm`, `nn.RMSNorm`, `torch.rsqrt` |
 | Softmax | `F.softmax` (any dim) |
 | Embedding | `nn.Embedding` |
 | Masking | `masked_fill` (for causal attention masks via `register_buffer`) |

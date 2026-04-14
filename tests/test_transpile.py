@@ -1073,6 +1073,37 @@ class ConvPoolLinear(nn.Module):
         return self.fc(x)
 
 
+class BatchNorm2dSimple(nn.Module):
+    """Basic BatchNorm2d in eval mode."""
+    def __init__(self):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(3)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class BatchNorm1dSimple(nn.Module):
+    """BatchNorm1d in eval mode."""
+    def __init__(self):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(4)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class ConvBatchNormReLU(nn.Module):
+    """Conv2d → BatchNorm2d → ReLU — typical CNN block."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 4, kernel_size=3, padding=1)
+        self.bn = nn.BatchNorm2d(4)
+
+    def forward(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+
 class PowSquared(nn.Module):
     """x^2 via torch.pow — tests the optimised x*x path."""
     def forward(self, x):
@@ -1273,6 +1304,30 @@ def test_adaptive_avg_pool():
 
 def test_conv_pool_linear():
     model = ConvPoolLinear()
+    x = torch.randn(1, 1, 6, 6)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_batchnorm2d():
+    model = BatchNorm2dSimple()
+    model.eval()
+    x = torch.randn(1, 3, 4, 4)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_batchnorm1d():
+    model = BatchNorm1dSimple()
+    model.eval()
+    x = torch.randn(1, 4, 8)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
+
+
+def test_conv_batchnorm_relu():
+    model = ConvBatchNormReLU()
+    model.eval()
     x = torch.randn(1, 1, 6, 6)
     expected, actual = _run_sprite(model, x)
     _assert_close(expected, actual)

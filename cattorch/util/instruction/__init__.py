@@ -1,4 +1,5 @@
 from cattorch.util.instruction.instruction import Instruction
+from cattorch.util.instruction.batchnorm import BatchNormInstruction
 from cattorch.util.instruction.cat import CatInstruction
 from cattorch.util.instruction.conv import ConvolutionInstruction
 from cattorch.util.instruction.embedding import EmbeddingInstruction
