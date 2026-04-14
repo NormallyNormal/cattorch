@@ -21,5 +21,10 @@ from cattorch.util.instruction.elementwise import (
     TensorSubtractInstruction,
 )
 from cattorch.util.instruction.matmul import MatMulInstruction
+from cattorch.util.instruction.pooling import (
+    AvgPool2dInstruction,
+    AdaptiveAvgPool2dInstruction,
+    MaxPool2dInstruction,
+)
 from cattorch.util.instruction.softmax import SoftmaxInstruction
 from cattorch.util.instruction.transpose import TransposeInstruction

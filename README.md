@@ -88,6 +88,7 @@ If the model takes multiple input tensors, the additional inputs are named
 | Category | Operations |
 |---|---|
 | Convolution | `nn.Conv1d`, `nn.Conv2d` (with and without bias, stride, padding) |
+| Pooling | `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool2d` |
 | Linear layers | `nn.Linear` (with and without bias) |
 | Matrix multiply | `@` / `torch.matmul` |
 | Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
