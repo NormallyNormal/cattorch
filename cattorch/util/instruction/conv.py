@@ -5,12 +5,7 @@ Handles both Conv1d and Conv2d.
 Conv1d is treated as Conv2d with H_in=1, kH=1.
 """
 
-import json
-import math
-
-from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.instruction.instruction import TemplateInstruction
-from cattorch.util.scratch.constant_replacer import ConstantReplacer
 
 
 class ConvolutionInstruction(TemplateInstruction):
@@ -80,16 +75,7 @@ class ConvolutionInstruction(TemplateInstruction):
             116: 1 if self.has_bias else 0,
         }
 
-    def finalize(self):
-        template_path = TEMPLATE_DIR / self.template_name / "template.json"
-        with open(template_path) as f:
-            data = json.load(f)
-        data = ConstantReplacer(self.get_constants()).apply(data)
+    def get_lists(self):
         if not self.has_bias:
-            # Inject a dummy single-element T3 list so the template's T3
-            # reference resolves even when the conv has no bias.
-            for list_id, entry in data["lists"].items():
-                if entry[0] == "T3":
-                    entry[1] = [0]
-                    break
-        return data
+            return {"T3": [0]}
+        return {}

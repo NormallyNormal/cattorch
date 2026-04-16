@@ -1,9 +1,6 @@
-import json
 import math
 
-from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.util.instruction.instruction import Instruction
-from cattorch.util.scratch.constant_replacer import ConstantReplacer
+from cattorch.util.instruction.instruction import TemplateInstruction
 
 
 def _compute_softmax_indices(shape, dim):
@@ -25,8 +22,9 @@ def _compute_softmax_indices(shape, dim):
     return indices
 
 
-class SoftmaxInstruction(Instruction):
+class SoftmaxInstruction(TemplateInstruction):
     aten_op = "aten.softmax.int"
+    template_name = "softmax"
 
     def prepare(self):
         input_shape = self.args[0].shape
@@ -40,22 +38,12 @@ class SoftmaxInstruction(Instruction):
         self.num_groups = math.prod(input_shape) // self.dim_size
         self.softmax_indices = _compute_softmax_indices(input_shape, dim)
 
-    def finalize(self):
-        constants = {
+    def get_constants(self):
+        return {
             101: self.dim_size,
             102: self.num_groups,
             103: self.stride,
         }
 
-        template_path = TEMPLATE_DIR / "softmax" / "template.json"
-        with open(template_path) as f:
-            data = json.load(f)
-
-        data = ConstantReplacer(constants).apply(data)
-
-        for entry in data["lists"].values():
-            if entry[0] == "_softmax_indices":
-                entry[1] = self.softmax_indices
-                break
-
-        return data
+    def get_lists(self):
+        return {"_softmax_indices": self.softmax_indices}

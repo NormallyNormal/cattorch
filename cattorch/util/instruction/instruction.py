@@ -50,7 +50,10 @@ class Instruction(ABC):
 class TemplateInstruction(Instruction):
     """Base class for instructions that load a template and apply constants.
 
-    Subclasses set `template_name` and optionally override `get_constants()`.
+    Subclasses set ``template_name`` and optionally override:
+      - ``get_constants()`` — template constant replacements
+      - ``get_lists()`` — data to inject into named template lists
+
     This covers all simple elementwise ops, scalar ops, and most others.
     """
     template_name: str
@@ -61,8 +64,24 @@ class TemplateInstruction(Instruction):
     def get_constants(self) -> dict:
         return {101: math.prod(self.args[0].shape)}
 
+    def get_lists(self) -> dict[str, list]:
+        """Return {list_display_name: data} to pre-fill in the template.
+
+        Called by finalize() after constants are applied.  Override this
+        to inject precomputed index maps or other auxiliary list data.
+        """
+        return {}
+
     def finalize(self):
         template_path = TEMPLATE_DIR / self.template_name / "template.json"
         with open(template_path) as f:
             data = json.load(f)
-        return ConstantReplacer(self.get_constants()).apply(data)
+        data = ConstantReplacer(self.get_constants()).apply(data)
+
+        for list_name, list_data in self.get_lists().items():
+            for entry in data["lists"].values():
+                if entry[0] == list_name:
+                    entry[1] = list_data
+                    break
+
+        return data

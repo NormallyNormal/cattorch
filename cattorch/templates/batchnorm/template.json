@@ -14,14 +14,6 @@
       "tensor_idx",
       0
     ],
-    "cattorch_var_4": [
-      "batchnorm_index",
-      0
-    ],
-    "cattorch_var_5": [
-      "sum",
-      0
-    ],
     "cattorch_var_6": [
       "idx",
       0
@@ -34,10 +26,6 @@
     ],
     "cattorch_list_2": [
       "T4",
-      []
-    ],
-    "cattorch_list_3": [
-      "_batchnorm_indices",
       []
     ],
     "cattorch_list_4": [
@@ -61,7 +49,7 @@
   "blocks": {
     "cattorch_block_1": {
       "opcode": "data_setvariableto",
-      "next": "cattorch_block_8",
+      "next": "cattorch_block_2",
       "parent": null,
       "inputs": {
         "VALUE": [
@@ -84,9 +72,31 @@
       "y": 0
     },
     "cattorch_block_2": {
-      "opcode": "data_deletealloflist",
+      "opcode": "data_setvariableto",
       "next": "cattorch_block_3",
-      "parent": "cattorch_block_8",
+      "parent": "cattorch_block_1",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "idx",
+          "cattorch_var_6"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_3": {
+      "opcode": "data_deletealloflist",
+      "next": "cattorch_block_4",
+      "parent": "cattorch_block_2",
       "inputs": {},
       "fields": {
         "LIST": [
@@ -97,14 +107,14 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_3": {
+    "cattorch_block_4": {
       "opcode": "control_repeat",
-      "next": "cattorch_block_6",
-      "parent": "cattorch_block_2",
+      "next": "cattorch_block_7",
+      "parent": "cattorch_block_3",
       "inputs": {
         "TIMES": [
           3,
-          "cattorch_block_4",
+          "cattorch_block_5",
           [
             6,
             102
@@ -112,7 +122,7 @@
         ],
         "SUBSTACK": [
           3,
-          "cattorch_block_5",
+          "cattorch_block_6",
           null
         ]
       },
@@ -120,10 +130,10 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_4": {
+    "cattorch_block_5": {
       "opcode": "operator_multiply",
       "next": null,
-      "parent": "cattorch_block_3",
+      "parent": "cattorch_block_4",
       "inputs": {
         "NUM1": [
           1,
@@ -144,10 +154,10 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_5": {
+    "cattorch_block_6": {
       "opcode": "data_addtolist",
       "next": null,
-      "parent": "cattorch_block_3",
+      "parent": "cattorch_block_4",
       "inputs": {
         "ITEM": [
           1,
@@ -166,10 +176,10 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_6": {
+    "cattorch_block_7": {
       "opcode": "control_repeat",
       "next": null,
-      "parent": "cattorch_block_3",
+      "parent": "cattorch_block_4",
       "inputs": {
         "TIMES": [
           1,
@@ -180,7 +190,7 @@
         ],
         "SUBSTACK": [
           3,
-          "cattorch_block_9",
+          "cattorch_block_8",
           null
         ]
       },
@@ -188,55 +198,10 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_7": {
-      "opcode": "data_setvariableto",
-      "next": "cattorch_block_21",
-      "parent": "cattorch_block_12",
-      "inputs": {
-        "VALUE": [
-          3,
-          "cattorch_block_28",
-          [
-            10,
-            0
-          ]
-        ]
-      },
-      "fields": {
-        "VARIABLE": [
-          "variance",
-          "cattorch_var_2"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
     "cattorch_block_8": {
-      "opcode": "data_setvariableto",
-      "next": "cattorch_block_2",
-      "parent": "cattorch_block_1",
-      "inputs": {
-        "VALUE": [
-          1,
-          [
-            10,
-            0
-          ]
-        ]
-      },
-      "fields": {
-        "VARIABLE": [
-          "batchnorm_index",
-          "cattorch_var_4"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_9": {
       "opcode": "data_changevariableby",
-      "next": "cattorch_block_11",
-      "parent": "cattorch_block_6",
+      "next": "cattorch_block_9",
+      "parent": "cattorch_block_7",
       "inputs": {
         "VALUE": [
           1,
@@ -248,71 +213,21 @@
       },
       "fields": {
         "VARIABLE": [
-          "batchnorm_index",
-          "cattorch_var_4"
+          "idx",
+          "cattorch_var_6"
         ]
       },
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_10": {
-      "opcode": "data_itemoflist",
-      "next": null,
-      "parent": "cattorch_block_11",
-      "inputs": {
-        "INDEX": [
-          3,
-          [
-            12,
-            "batchnorm_index",
-            "cattorch_var_4"
-          ],
-          [
-            7,
-            1
-          ]
-        ]
-      },
-      "fields": {
-        "LIST": [
-          "_batchnorm_indices",
-          "cattorch_list_3"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_11": {
+    "cattorch_block_9": {
       "opcode": "data_setvariableto",
-      "next": "cattorch_block_12",
-      "parent": "cattorch_block_9",
+      "next": "cattorch_block_11",
+      "parent": "cattorch_block_8",
       "inputs": {
         "VALUE": [
           3,
           "cattorch_block_10",
-          [
-            10,
-            0
-          ]
-        ]
-      },
-      "fields": {
-        "VARIABLE": [
-          "tensor_idx",
-          "cattorch_var_3"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_12": {
-      "opcode": "data_setvariableto",
-      "next": "cattorch_block_7",
-      "parent": "cattorch_block_11",
-      "inputs": {
-        "VALUE": [
-          3,
-          "cattorch_block_27",
           [
             10,
             0
@@ -328,10 +243,87 @@
       "shadow": false,
       "topLevel": false
     },
+    "cattorch_block_10": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_9",
+      "inputs": {
+        "INDEX": [
+          3,
+          [
+            12,
+            "idx",
+            "cattorch_var_6"
+          ],
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T4",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_11": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_13",
+      "parent": "cattorch_block_9",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_12",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "variance",
+          "cattorch_var_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_12": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_11",
+      "inputs": {
+        "INDEX": [
+          3,
+          [
+            12,
+            "idx",
+            "cattorch_var_6"
+          ],
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T5",
+          "cattorch_list_6"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
     "cattorch_block_13": {
       "opcode": "control_repeat",
       "next": null,
-      "parent": "cattorch_block_21",
+      "parent": "cattorch_block_11",
       "inputs": {
         "TIMES": [
           1,
@@ -342,7 +334,7 @@
         ],
         "SUBSTACK": [
           3,
-          "cattorch_block_22",
+          "cattorch_block_14",
           null
         ]
       },
@@ -352,12 +344,12 @@
     },
     "cattorch_block_14": {
       "opcode": "data_replaceitemoflist",
-      "next": "cattorch_block_18",
-      "parent": "cattorch_block_22",
+      "next": "cattorch_block_15",
+      "parent": "cattorch_block_13",
       "inputs": {
         "INDEX": [
           3,
-          "cattorch_block_15",
+          "cattorch_block_16",
           [
             7,
             1
@@ -365,7 +357,7 @@
         ],
         "ITEM": [
           3,
-          "cattorch_block_24",
+          "cattorch_block_17",
           [
             10,
             "thing"
@@ -382,87 +374,6 @@
       "topLevel": false
     },
     "cattorch_block_15": {
-      "opcode": "operator_add",
-      "next": null,
-      "parent": "cattorch_block_14",
-      "inputs": {
-        "NUM1": [
-          3,
-          [
-            12,
-            "tensor_idx",
-            "cattorch_var_3"
-          ],
-          [
-            4,
-            ""
-          ]
-        ],
-        "NUM2": [
-          1,
-          [
-            4,
-            1
-          ]
-        ]
-      },
-      "fields": {},
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_16": {
-      "opcode": "data_itemoflist",
-      "next": null,
-      "parent": "cattorch_block_19",
-      "inputs": {
-        "INDEX": [
-          3,
-          "cattorch_block_17",
-          [
-            7,
-            1
-          ]
-        ]
-      },
-      "fields": {
-        "LIST": [
-          "T1",
-          "cattorch_list_1"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_17": {
-      "opcode": "operator_add",
-      "next": null,
-      "parent": "cattorch_block_16",
-      "inputs": {
-        "NUM1": [
-          3,
-          [
-            12,
-            "tensor_idx",
-            "cattorch_var_3"
-          ],
-          [
-            4,
-            ""
-          ]
-        ],
-        "NUM2": [
-          1,
-          [
-            4,
-            1
-          ]
-        ]
-      },
-      "fields": {},
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_18": {
       "opcode": "data_changevariableby",
       "next": null,
       "parent": "cattorch_block_14",
@@ -471,7 +382,7 @@
           1,
           [
             4,
-            103
+            1
           ]
         ]
       },
@@ -484,14 +395,43 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_19": {
-      "opcode": "operator_subtract",
+    "cattorch_block_16": {
+      "opcode": "operator_add",
       "next": null,
-      "parent": "cattorch_block_20",
+      "parent": "cattorch_block_14",
       "inputs": {
         "NUM1": [
           3,
-          "cattorch_block_16",
+          [
+            12,
+            "tensor_idx",
+            "cattorch_var_3"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_17": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_14",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_18",
           [
             4,
             ""
@@ -499,11 +439,7 @@
         ],
         "NUM2": [
           3,
-          [
-            12,
-            "mean",
-            "cattorch_var_1"
-          ],
+          "cattorch_block_19",
           [
             4,
             ""
@@ -514,14 +450,67 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_20": {
-      "opcode": "operator_divide",
+    "cattorch_block_18": {
+      "opcode": "operator_multiply",
       "next": null,
-      "parent": "cattorch_block_23",
+      "parent": "cattorch_block_17",
       "inputs": {
         "NUM1": [
           3,
-          "cattorch_block_19",
+          "cattorch_block_20",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          "cattorch_block_21",
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_19": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_17",
+      "inputs": {
+        "INDEX": [
+          3,
+          [
+            12,
+            "idx",
+            "cattorch_var_6"
+          ],
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T3",
+          "cattorch_list_5"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_20": {
+      "opcode": "operator_divide",
+      "next": null,
+      "parent": "cattorch_block_18",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_22",
           [
             4,
             ""
@@ -545,112 +534,16 @@
       "topLevel": false
     },
     "cattorch_block_21": {
-      "opcode": "data_setvariableto",
-      "next": "cattorch_block_13",
-      "parent": "cattorch_block_7",
-      "inputs": {
-        "VALUE": [
-          1,
-          [
-            10,
-            0
-          ]
-        ]
-      },
-      "fields": {
-        "VARIABLE": [
-          "idx",
-          "cattorch_var_6"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_22": {
-      "opcode": "data_changevariableby",
-      "next": "cattorch_block_14",
-      "parent": "cattorch_block_13",
-      "inputs": {
-        "VALUE": [
-          1,
-          [
-            4,
-            1
-          ]
-        ]
-      },
-      "fields": {
-        "VARIABLE": [
-          "idx",
-          "cattorch_var_6"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_23": {
-      "opcode": "operator_multiply",
-      "next": null,
-      "parent": "cattorch_block_24",
-      "inputs": {
-        "NUM1": [
-          3,
-          "cattorch_block_20",
-          [
-            4,
-            ""
-          ]
-        ],
-        "NUM2": [
-          3,
-          "cattorch_block_25",
-          [
-            4,
-            ""
-          ]
-        ]
-      },
-      "fields": {},
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_24": {
-      "opcode": "operator_add",
-      "next": null,
-      "parent": "cattorch_block_14",
-      "inputs": {
-        "NUM1": [
-          3,
-          "cattorch_block_23",
-          [
-            4,
-            ""
-          ]
-        ],
-        "NUM2": [
-          3,
-          "cattorch_block_26",
-          [
-            4,
-            ""
-          ]
-        ]
-      },
-      "fields": {},
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_25": {
       "opcode": "data_itemoflist",
       "next": null,
-      "parent": "cattorch_block_23",
+      "parent": "cattorch_block_18",
       "inputs": {
         "INDEX": [
           3,
           [
             12,
-            "batchnorm_index",
-            "cattorch_var_4"
+            "idx",
+            "cattorch_var_6"
           ],
           [
             7,
@@ -667,18 +560,44 @@
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_26": {
-      "opcode": "data_itemoflist",
+    "cattorch_block_22": {
+      "opcode": "operator_subtract",
       "next": null,
-      "parent": "cattorch_block_24",
+      "parent": "cattorch_block_20",
       "inputs": {
-        "INDEX": [
+        "NUM1": [
+          3,
+          "cattorch_block_23",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
           3,
           [
             12,
-            "batchnorm_index",
-            "cattorch_var_4"
+            "mean",
+            "cattorch_var_1"
           ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_23": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_22",
+      "inputs": {
+        "INDEX": [
+          3,
+          "cattorch_block_24",
           [
             7,
             1
@@ -687,64 +606,39 @@
       },
       "fields": {
         "LIST": [
-          "T3",
-          "cattorch_list_5"
+          "T1",
+          "cattorch_list_1"
         ]
       },
       "shadow": false,
       "topLevel": false
     },
-    "cattorch_block_27": {
-      "opcode": "data_itemoflist",
+    "cattorch_block_24": {
+      "opcode": "operator_add",
       "next": null,
-      "parent": "cattorch_block_12",
+      "parent": "cattorch_block_23",
       "inputs": {
-        "INDEX": [
+        "NUM1": [
           3,
           [
             12,
-            "batchnorm_index",
-            "cattorch_var_4"
+            "tensor_idx",
+            "cattorch_var_3"
           ],
           [
-            7,
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
             1
           ]
         ]
       },
-      "fields": {
-        "LIST": [
-          "T4",
-          "cattorch_list_2"
-        ]
-      },
-      "shadow": false,
-      "topLevel": false
-    },
-    "cattorch_block_28": {
-      "opcode": "data_itemoflist",
-      "next": null,
-      "parent": "cattorch_block_7",
-      "inputs": {
-        "INDEX": [
-          3,
-          [
-            12,
-            "batchnorm_index",
-            "cattorch_var_4"
-          ],
-          [
-            7,
-            1
-          ]
-        ]
-      },
-      "fields": {
-        "LIST": [
-          "T5",
-          "cattorch_list_6"
-        ]
-      },
+      "fields": {},
       "shadow": false,
       "topLevel": false
     }
