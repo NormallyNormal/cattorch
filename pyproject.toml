@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cattorch"
-version = "0.3.o"
+version = "0.3.0"
 description = "Export PyTorch modules to Scratch sprites"
 readme = "README.md"
 requires-python = ">=3.10"
