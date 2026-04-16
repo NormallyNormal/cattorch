@@ -1,11 +1,8 @@
-import json
 import math
 
 import torch
 
-from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.util.instruction.instruction import Instruction
-from cattorch.util.scratch.constant_replacer import ConstantReplacer
+from cattorch.util.instruction.instruction import TemplateInstruction
 
 
 def _compute_index_map(input_shape: torch.Size, permutation: list[int]) -> list[int]:
@@ -28,12 +25,13 @@ def _compute_index_map(input_shape: torch.Size, permutation: list[int]) -> list[
     return index_map
 
 
-class TransposeInstruction(Instruction):
+class TransposeInstruction(TemplateInstruction):
     aten_op = [
         "aten.numpy_T.default",
         "aten.transpose.int",
         "aten.permute.default",
     ]
+    template_name = "transpose"
 
     def prepare(self):
         input_shape = self.args[0].shape
@@ -55,19 +53,8 @@ class TransposeInstruction(Instruction):
 
         self.index_map = _compute_index_map(input_shape, self.permutation)
 
-    def finalize(self):
-        total = math.prod(self.args[0].shape)
+    def get_constants(self):
+        return {101: math.prod(self.args[0].shape)}
 
-        template_path = TEMPLATE_DIR / "transpose" / "template.json"
-        with open(template_path) as f:
-            data = json.load(f)
-
-        data = ConstantReplacer({101: total}).apply(data)
-
-        # Inject the precomputed index map into the _index_map list
-        for entry in data["lists"].values():
-            if entry[0] == "_index_map":
-                entry[1] = self.index_map
-                break
-
-        return data
+    def get_lists(self):
+        return {"_index_map": self.index_map}

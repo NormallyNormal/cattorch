@@ -1,0 +1,1649 @@
+{
+  "isStage": false,
+  "name": "max_pool2d",
+  "variables": {
+    "cattorch_var_1": [
+      "c_idx",
+      0
+    ],
+    "cattorch_var_2": [
+      "n_idx",
+      0
+    ],
+    "cattorch_var_3": [
+      "oh_idx",
+      0
+    ],
+    "cattorch_var_4": [
+      "ow_idx",
+      0
+    ],
+    "cattorch_var_5": [
+      "kh_idx",
+      0
+    ],
+    "cattorch_var_6": [
+      "kw_idx",
+      0
+    ],
+    "cattorch_var_7": [
+      "ih",
+      0
+    ],
+    "cattorch_var_8": [
+      "iw",
+      0
+    ],
+    "cattorch_var_9": [
+      "input_idx",
+      0
+    ],
+    "cattorch_var_10": [
+      "output_idx",
+      0
+    ],
+    "cattorch_var_11": [
+      "val",
+      0
+    ]
+  },
+  "lists": {
+    "cattorch_list_1": [
+      "T1",
+      []
+    ],
+    "cattorch_list_2": [
+      "T2",
+      []
+    ]
+  },
+  "broadcasts": {},
+  "blocks": {
+    "cattorch_block_1": {
+      "opcode": "data_deletealloflist",
+      "next": "cattorch_block_27",
+      "parent": null,
+      "inputs": {},
+      "fields": {
+        "LIST": [
+          "T2",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": true,
+      "x": 0,
+      "y": 0
+    },
+    "cattorch_block_2": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_11",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            101
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_10",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_3": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_6",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            102
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_7",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_4": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_12",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            103
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_13",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_5": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_14",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            104
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_32",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_6": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_3",
+      "parent": "cattorch_block_10",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "c_idx",
+          "cattorch_var_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_7": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_12",
+      "parent": "cattorch_block_3",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "c_idx",
+          "cattorch_var_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_8": {
+      "opcode": "control_repeat",
+      "next": "cattorch_block_56",
+      "parent": "cattorch_block_15",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            105
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_16",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_9": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_17",
+      "inputs": {
+        "TIMES": [
+          1,
+          [
+            6,
+            106
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_18",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_10": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_6",
+      "parent": "cattorch_block_2",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "n_idx",
+          "cattorch_var_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_11": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_2",
+      "parent": "cattorch_block_27",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "n_idx",
+          "cattorch_var_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_12": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_4",
+      "parent": "cattorch_block_7",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "oh_idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_13": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_14",
+      "parent": "cattorch_block_4",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "oh_idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_14": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_5",
+      "parent": "cattorch_block_13",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "ow_idx",
+          "cattorch_var_4"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_15": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_8",
+      "parent": "cattorch_block_48",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "kh_idx",
+          "cattorch_var_5"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_16": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_17",
+      "parent": "cattorch_block_8",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "kh_idx",
+          "cattorch_var_5"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_17": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_9",
+      "parent": "cattorch_block_16",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "kw_idx",
+          "cattorch_var_6"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_18": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_19",
+      "parent": "cattorch_block_9",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "kw_idx",
+          "cattorch_var_6"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_19": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_20",
+      "parent": "cattorch_block_18",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_23",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "ih",
+          "cattorch_var_7"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_20": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_33",
+      "parent": "cattorch_block_19",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_24",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "iw",
+          "cattorch_var_8"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_21": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_22",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "oh_idx",
+            "cattorch_var_3"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            107
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_22": {
+      "opcode": "operator_subtract",
+      "next": null,
+      "parent": "cattorch_block_23",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_21",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            109
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_23": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_19",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_22",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "kh_idx",
+            "cattorch_var_5"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_24": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_20",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_25",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "kw_idx",
+            "cattorch_var_6"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_25": {
+      "opcode": "operator_subtract",
+      "next": null,
+      "parent": "cattorch_block_24",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_26",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            110
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_26": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_25",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "ow_idx",
+            "cattorch_var_4"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            108
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_27": {
+      "opcode": "control_repeat",
+      "next": "cattorch_block_11",
+      "parent": "cattorch_block_1",
+      "inputs": {
+        "TIMES": [
+          3,
+          "cattorch_block_30",
+          [
+            6,
+            10
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_29",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_28": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_30",
+      "inputs": {
+        "NUM1": [
+          1,
+          [
+            4,
+            103
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            104
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_29": {
+      "opcode": "data_addtolist",
+      "next": null,
+      "parent": "cattorch_block_27",
+      "inputs": {
+        "ITEM": [
+          1,
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T2",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_30": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_27",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_31",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          "cattorch_block_28",
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_31": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_30",
+      "inputs": {
+        "NUM1": [
+          1,
+          [
+            4,
+            101
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            102
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_32": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_48",
+      "parent": "cattorch_block_5",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "ow_idx",
+          "cattorch_var_4"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_33": {
+      "opcode": "control_if",
+      "next": null,
+      "parent": "cattorch_block_20",
+      "inputs": {
+        "CONDITION": [
+          3,
+          "cattorch_block_34",
+          null
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_41",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_34": {
+      "opcode": "operator_and",
+      "next": null,
+      "parent": "cattorch_block_33",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          "cattorch_block_35",
+          null
+        ],
+        "OPERAND2": [
+          3,
+          "cattorch_block_38",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_35": {
+      "opcode": "operator_and",
+      "next": null,
+      "parent": "cattorch_block_34",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          "cattorch_block_36",
+          null
+        ],
+        "OPERAND2": [
+          3,
+          "cattorch_block_37",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_36": {
+      "opcode": "operator_lt",
+      "next": null,
+      "parent": "cattorch_block_35",
+      "inputs": {
+        "OPERAND1": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ],
+        "OPERAND2": [
+          3,
+          [
+            12,
+            "ih",
+            "cattorch_var_7"
+          ],
+          [
+            10,
+            50
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_37": {
+      "opcode": "operator_lt",
+      "next": null,
+      "parent": "cattorch_block_35",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          [
+            12,
+            "ih",
+            "cattorch_var_7"
+          ],
+          [
+            10,
+            ""
+          ]
+        ],
+        "OPERAND2": [
+          1,
+          [
+            10,
+            111
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_38": {
+      "opcode": "operator_and",
+      "next": null,
+      "parent": "cattorch_block_34",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          "cattorch_block_39",
+          null
+        ],
+        "OPERAND2": [
+          3,
+          "cattorch_block_40",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_39": {
+      "opcode": "operator_lt",
+      "next": null,
+      "parent": "cattorch_block_38",
+      "inputs": {
+        "OPERAND1": [
+          1,
+          [
+            10,
+            -1
+          ]
+        ],
+        "OPERAND2": [
+          3,
+          [
+            12,
+            "iw",
+            "cattorch_var_8"
+          ],
+          [
+            10,
+            50
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_40": {
+      "opcode": "operator_lt",
+      "next": null,
+      "parent": "cattorch_block_38",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          [
+            12,
+            "iw",
+            "cattorch_var_8"
+          ],
+          [
+            10,
+            ""
+          ]
+        ],
+        "OPERAND2": [
+          1,
+          [
+            10,
+            112
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_41": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_49",
+      "parent": "cattorch_block_33",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_42",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "input_idx",
+          "cattorch_var_9"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_42": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_41",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_43",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "iw",
+            "cattorch_var_8"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_43": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_42",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_44",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            112
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_44": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_43",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_45",
+          [
+            4,
+            114
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "ih",
+            "cattorch_var_7"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_45": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_44",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_46",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            111
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_46": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_45",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_47",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "c_idx",
+            "cattorch_var_1"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_47": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_46",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "n_idx",
+            "cattorch_var_2"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            102
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_48": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_15",
+      "parent": "cattorch_block_32",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            -99999
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "val",
+          "cattorch_var_11"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_49": {
+      "opcode": "control_if",
+      "next": null,
+      "parent": "cattorch_block_41",
+      "inputs": {
+        "CONDITION": [
+          2,
+          "cattorch_block_52"
+        ],
+        "SUBSTACK": [
+          2,
+          "cattorch_block_53"
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_50": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_52",
+      "inputs": {
+        "INDEX": [
+          3,
+          "cattorch_block_51",
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T1",
+          "cattorch_list_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_51": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_50",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "input_idx",
+            "cattorch_var_9"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_52": {
+      "opcode": "operator_gt",
+      "next": null,
+      "parent": "cattorch_block_49",
+      "inputs": {
+        "OPERAND1": [
+          3,
+          "cattorch_block_50",
+          [
+            10,
+            ""
+          ]
+        ],
+        "OPERAND2": [
+          3,
+          [
+            12,
+            "val",
+            "cattorch_var_11"
+          ],
+          [
+            10,
+            50
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_53": {
+      "opcode": "data_setvariableto",
+      "next": null,
+      "parent": "cattorch_block_49",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_54",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "val",
+          "cattorch_var_11"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_54": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_53",
+      "inputs": {
+        "INDEX": [
+          3,
+          "cattorch_block_55",
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T1",
+          "cattorch_list_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_55": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_54",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "input_idx",
+            "cattorch_var_9"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_56": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_63",
+      "parent": "cattorch_block_8",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_57",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "output_idx",
+          "cattorch_var_10"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_57": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_56",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_58",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "ow_idx",
+            "cattorch_var_4"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_58": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_57",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_59",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            104
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_59": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_58",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_60",
+          [
+            4,
+            114
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "oh_idx",
+            "cattorch_var_3"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_60": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_59",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_61",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            103
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_61": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_60",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_62",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          3,
+          [
+            12,
+            "c_idx",
+            "cattorch_var_1"
+          ],
+          [
+            4,
+            ""
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_62": {
+      "opcode": "operator_multiply",
+      "next": null,
+      "parent": "cattorch_block_61",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "n_idx",
+            "cattorch_var_2"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            102
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_63": {
+      "opcode": "data_replaceitemoflist",
+      "next": null,
+      "parent": "cattorch_block_56",
+      "inputs": {
+        "INDEX": [
+          3,
+          "cattorch_block_64",
+          [
+            7,
+            1
+          ]
+        ],
+        "ITEM": [
+          3,
+          [
+            12,
+            "val",
+            "cattorch_var_11"
+          ],
+          [
+            10,
+            "thing"
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "T2",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_64": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_63",
+      "inputs": {
+        "NUM1": [
+          3,
+          [
+            12,
+            "output_idx",
+            "cattorch_var_10"
+          ],
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    }
+  }
+}

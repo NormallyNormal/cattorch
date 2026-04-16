@@ -1,0 +1,43 @@
+AvgPool2d Algorithm (also covers AvgPool1d with H_in=1, kH=1)
+=============================================================
+
+Input:  T1  (N, C, H_in, W_in)   flattened row-major
+Output: T2  (N, C, H_out, W_out) flattened row-major
+
+All precomputed at export time:
+  H_out = (H_in + 2*pH - kH) / sH + 1
+  W_out = (W_in + 2*pW - kW) / sW + 1
+
+Template constants:
+  101 = N
+  102 = C
+  103 = H_out
+  104 = W_out
+  105 = kH
+  106 = kW
+  107 = sH
+  108 = sW
+  109 = pH
+  110 = pW
+  111 = H_in
+  112 = W_in
+  113 = kH * kW          (divisor for averaging)
+
+Algorithm:
+  for n in range(N):                              # 101
+    for c in range(C):                            # 102
+      for oh in range(H_out):                     # 103
+        for ow in range(W_out):                   # 104
+          acc = 0
+
+          for kh in range(kH):                    # 105
+            for kw in range(kW):                  # 106
+              ih = oh * sH - pH + kh
+              iw = ow * sW - pW + kw
+
+              if 0 <= ih < H_in and 0 <= iw < W_in:
+                input_idx = ((n * C + c) * H_in + ih) * W_in + iw
+                acc += input[input_idx]
+
+          output_idx = ((n * C + c) * H_out + oh) * W_out + ow
+          output[output_idx] = acc / (kH * kW)    # 113

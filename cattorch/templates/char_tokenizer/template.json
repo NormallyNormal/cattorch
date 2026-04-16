@@ -1,0 +1,459 @@
+{
+  "isStage": false,
+  "name": "char_tokenizer",
+  "variables": {
+    "cattorch_var_1": [
+      "input",
+      0
+    ],
+    "cattorch_var_2": [
+      "output",
+      0
+    ],
+    "cattorch_var_3": [
+      "idx",
+      0
+    ]
+  },
+  "lists": {
+    "cattorch_list_1": [
+      "tokens",
+      []
+    ],
+    "cattorch_list_2": [
+      "token_ids",
+      []
+    ]
+  },
+  "broadcasts": {},
+  "blocks": {
+    "cattorch_block_1": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_3",
+      "inputs": {
+        "TIMES": [
+          3,
+          "cattorch_block_2",
+          [
+            6,
+            101
+          ]
+        ],
+        "SUBSTACK": [
+          3,
+          "cattorch_block_4",
+          null
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_2": {
+      "opcode": "operator_length",
+      "next": null,
+      "parent": "cattorch_block_1",
+      "inputs": {
+        "STRING": [
+          3,
+          [
+            12,
+            "input",
+            "cattorch_var_1"
+          ],
+          [
+            10,
+            "apple"
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_3": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_1",
+      "parent": null,
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": true,
+      "x": 0,
+      "y": 0
+    },
+    "cattorch_block_4": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_7",
+      "parent": "cattorch_block_1",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_5": {
+      "opcode": "data_itemnumoflist",
+      "next": null,
+      "parent": "cattorch_block_18",
+      "inputs": {
+        "ITEM": [
+          3,
+          "cattorch_block_6",
+          [
+            10,
+            "thing"
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "tokens",
+          "cattorch_list_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_6": {
+      "opcode": "operator_letter_of",
+      "next": null,
+      "parent": "cattorch_block_5",
+      "inputs": {
+        "LETTER": [
+          3,
+          [
+            12,
+            "idx",
+            "cattorch_var_3"
+          ],
+          [
+            6,
+            1
+          ]
+        ],
+        "STRING": [
+          3,
+          [
+            12,
+            "input",
+            "cattorch_var_1"
+          ],
+          [
+            10,
+            "apple"
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_7": {
+      "opcode": "data_addtolist",
+      "next": null,
+      "parent": "cattorch_block_4",
+      "inputs": {
+        "ITEM": [
+          3,
+          "cattorch_block_18",
+          [
+            10,
+            "thing"
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "token_ids",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_8": {
+      "opcode": "control_repeat",
+      "next": null,
+      "parent": "cattorch_block_15",
+      "inputs": {
+        "TIMES": [
+          3,
+          "cattorch_block_9",
+          [
+            6,
+            10
+          ]
+        ],
+        "SUBSTACK": [
+          2,
+          "cattorch_block_11"
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_9": {
+      "opcode": "data_lengthoflist",
+      "next": null,
+      "parent": "cattorch_block_8",
+      "inputs": {},
+      "fields": {
+        "LIST": [
+          "token_ids",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_10": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_15",
+      "parent": null,
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": true,
+      "x": 0,
+      "y": 0
+    },
+    "cattorch_block_11": {
+      "opcode": "data_changevariableby",
+      "next": "cattorch_block_14",
+      "parent": "cattorch_block_8",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "idx",
+          "cattorch_var_3"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_12": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_16",
+      "inputs": {
+        "INDEX": [
+          3,
+          "cattorch_block_17",
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "tokens",
+          "cattorch_list_1"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_13": {
+      "opcode": "data_itemoflist",
+      "next": null,
+      "parent": "cattorch_block_17",
+      "inputs": {
+        "INDEX": [
+          3,
+          [
+            12,
+            "idx",
+            "cattorch_var_3"
+          ],
+          [
+            7,
+            1
+          ]
+        ]
+      },
+      "fields": {
+        "LIST": [
+          "token_ids",
+          "cattorch_list_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_14": {
+      "opcode": "data_setvariableto",
+      "next": null,
+      "parent": "cattorch_block_11",
+      "inputs": {
+        "VALUE": [
+          3,
+          "cattorch_block_16",
+          [
+            10,
+            0
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "output",
+          "cattorch_var_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_15": {
+      "opcode": "data_setvariableto",
+      "next": "cattorch_block_8",
+      "parent": "cattorch_block_10",
+      "inputs": {
+        "VALUE": [
+          1,
+          [
+            10,
+            ""
+          ]
+        ]
+      },
+      "fields": {
+        "VARIABLE": [
+          "output",
+          "cattorch_var_2"
+        ]
+      },
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_16": {
+      "opcode": "operator_join",
+      "next": null,
+      "parent": "cattorch_block_14",
+      "inputs": {
+        "STRING1": [
+          3,
+          [
+            12,
+            "output",
+            "cattorch_var_2"
+          ],
+          [
+            10,
+            "apple "
+          ]
+        ],
+        "STRING2": [
+          3,
+          "cattorch_block_12",
+          [
+            10,
+            "banana"
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_17": {
+      "opcode": "operator_add",
+      "next": null,
+      "parent": "cattorch_block_12",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_13",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    },
+    "cattorch_block_18": {
+      "opcode": "operator_subtract",
+      "next": null,
+      "parent": "cattorch_block_7",
+      "inputs": {
+        "NUM1": [
+          3,
+          "cattorch_block_5",
+          [
+            4,
+            ""
+          ]
+        ],
+        "NUM2": [
+          1,
+          [
+            4,
+            1
+          ]
+        ]
+      },
+      "fields": {},
+      "shadow": false,
+      "topLevel": false
+    }
+  }
+}

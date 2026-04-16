@@ -1,0 +1,50 @@
+Conv2d Algorithm (also covers Conv1d with H_in=1, kH=1)
+=======================================================
+
+Input:  T1  (N, C_in, H_in, W_in)   flattened row-major
+Weight: T2  (C_out, C_in, kH, kW)    flattened row-major
+Bias:   T3  (C_out,)                  optional
+Output: T4  (N, C_out, H_out, W_out) flattened row-major
+
+All precomputed at export time:
+  H_out = (H_in + 2*pH - dH*(kH-1) - 1) / sH + 1
+  W_out = (W_in + 2*pW - dW*(kW-1) - 1) / sW + 1
+
+Template constants:
+  101 = N
+  102 = C_out
+  103 = H_out
+  104 = W_out
+  105 = C_in
+  106 = kH
+  107 = kW
+  108 = sH        (stride height)
+  109 = sW        (stride width)
+  110 = pH        (padding height)
+  111 = pW        (padding width)
+  112 = dH        (dilation height)
+  113 = dW        (dilation width)
+  114 = H_in
+  115 = W_in
+  116 = has_bias  (1 or 0)
+
+Algorithm:
+  for n in range(N):                              # 101
+    for c_out in range(C_out):                    # 102
+      for oh in range(H_out):                     # 103
+        for ow in range(W_out):                   # 104
+          acc = bias[c_out] if has_bias else 0.0
+
+          for c_in in range(C_in):                # 105
+            for kh in range(kH):                  # 106
+              for kw in range(kW):                # 107
+                ih = oh * sH - pH + kh * dH
+                iw = ow * sW - pW + kw * dW
+
+                if 0 <= ih < H_in and 0 <= iw < W_in:
+                  input_idx  = ((n * C_in + c_in) * H_in + ih) * W_in + iw
+                  weight_idx = ((c_out * C_in + c_in) * kH + kh) * kW + kw
+                  acc += input[input_idx] * weight[weight_idx]
+
+          output_idx = ((n * C_out + c_out) * H_out + oh) * W_out + ow
+          output[output_idx] = acc
