@@ -78,18 +78,27 @@ class ScratchEmulator:
         self.variables = _NameView(self._vars, self._var_name_to_ids)
         self.lists = _NameView(self._lists, self._list_name_to_ids)
 
-    def run(self):
-        root = self._find_root()
-        self._exec_chain(root)
+    def run(self, root_index: int = 0):
+        """Run a top-level block stack.
 
-    def _find_root(self) -> str:
+        Parameters
+        ----------
+        root_index : int
+            Which top-level stack to run (0-based). Default runs the first.
+        """
+        roots = self._find_roots()
+        if root_index >= len(roots):
+            raise ValueError(f"root_index {root_index} out of range, found {len(roots)} roots")
+        self._exec_chain(roots[root_index])
+
+    def _find_roots(self) -> list[str]:
         roots = [
             bid for bid, block in self.blocks.items()
             if block.get("topLevel") and block.get("parent") is None
         ]
-        if len(roots) != 1:
-            raise ValueError(f"Expected 1 topLevel root, found {len(roots)}: {roots}")
-        return roots[0]
+        if not roots:
+            raise ValueError("No topLevel roots found")
+        return roots
 
     def _exec_chain(self, block_id: str | None):
         while block_id is not None:
@@ -127,10 +136,22 @@ class ScratchEmulator:
             if 1 <= index <= len(lst):
                 lst[index - 1] = value
 
+        elif opcode == "data_deleteoflist":
+            list_id = fields["LIST"][1]
+            index = self._to_index(self._eval_input(inputs["INDEX"]))
+            lst = self._lists[list_id]
+            if 1 <= index <= len(lst):
+                lst.pop(index - 1)
+
         elif opcode == "control_repeat":
             times = int(float(self._eval_input(inputs["TIMES"])))
             substack_id = self._get_substack(inputs.get("SUBSTACK"))
             for _ in range(times):
+                self._exec_chain(substack_id)
+
+        elif opcode == "control_repeat_until":
+            substack_id = self._get_substack(inputs.get("SUBSTACK"))
+            while not self._eval_input(inputs["CONDITION"]):
                 self._exec_chain(substack_id)
 
         elif opcode == "control_if":
@@ -234,7 +255,11 @@ class ScratchEmulator:
         elif opcode == "operator_equals":
             a = self._eval_input(inputs["OPERAND1"])
             b = self._eval_input(inputs["OPERAND2"])
-            return float(a) == float(b)
+            na = self._scratch_number(a)
+            nb = self._scratch_number(b)
+            if na is not None and nb is not None:
+                return na == nb
+            return str(a).lower() == str(b).lower()
 
         elif opcode == "operator_gt":
             a = float(self._eval_input(inputs["OPERAND1"]))
@@ -310,6 +335,33 @@ class ScratchEmulator:
             list_id = fields["LIST"][1]
             return len(self._lists.get(list_id, []))
 
+        elif opcode == "data_itemnumoflist":
+            list_id = fields["LIST"][1]
+            item = self._eval_input(inputs["ITEM"])
+            lst = self._lists.get(list_id, [])
+            # Scratch returns 1-based index, or 0 if not found
+            item_str = str(item)
+            for i, val in enumerate(lst):
+                if str(val) == item_str:
+                    return i + 1
+            return 0
+
+        elif opcode == "operator_length":
+            string = str(self._eval_input(inputs["STRING"]))
+            return len(string)
+
+        elif opcode == "operator_letter_of":
+            index = int(float(self._eval_input(inputs["LETTER"])))
+            string = str(self._eval_input(inputs["STRING"]))
+            if 1 <= index <= len(string):
+                return string[index - 1]
+            return ""
+
+        elif opcode == "operator_join":
+            a = str(self._eval_input(inputs["STRING1"]))
+            b = str(self._eval_input(inputs["STRING2"]))
+            return a + b
+
         else:
             raise NotImplementedError(f"Unknown reporter opcode: {opcode}")
 
@@ -340,3 +392,20 @@ class ScratchEmulator:
             return int(f) if f == int(f) else f
         except (ValueError, TypeError):
             return value
+
+    @staticmethod
+    def _scratch_number(value):
+        """Convert to a number using Scratch's casting rules.
+
+        Returns None if the value cannot be cast.  Scratch treats empty
+        strings and whitespace-only strings as 0.
+        """
+        if isinstance(value, (int, float)):
+            return value
+        s = str(value).strip()
+        if s == "":
+            return 0
+        try:
+            return float(s)
+        except ValueError:
+            return None

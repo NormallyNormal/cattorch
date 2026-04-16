@@ -110,6 +110,66 @@ including multi-head attention, combined QKV projections, rotary position
 embeddings (RoPE), causal masking, pre-norm blocks with residual connections,
 and SwiGLU-style gating. RNN support is planned for the future.
 
+## Tokenizers
+
+cattorch can also transpile HuggingFace tokenizers into Scratch sprites, so the
+full text → token IDs → model → token IDs → text pipeline can run inside a
+Scratch project. Two tokenizer types are supported:
+
+- `CharTokenizer` — character-level lookup. Each character maps to one ID.
+- `BPETokenizer` — byte-pair encoding. Merges are applied iteratively over the
+  full input string, including spaces.
+
+Off-the-shelf tokenizers from large models will not work here. Production
+tokenizers like GPT-2's or Llama's use byte-level pre-tokenization, regex
+splits, and other preprocessing steps that the Scratch templates don't
+implement, and their 30k–100k+ token vocabularies would cause embeddings to blow past Scratch's
+200,000 list item limit. In practice you'll
+want to train a small custom BPE tokenizer on your own corpus (with no
+pre-tokenizer), so BPE operates on the raw input string, sized to match the
+small model you're transpiling.
+
+```python
+from transformers import AutoTokenizer
+from cattorch import CharTokenizer, BPETokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("my-model")
+BPETokenizer(tokenizer).save("my_tokenizer")
+# => my_tokenizer.sprite3
+```
+
+cattorch does not train tokenizers itself, the classes only transpile an
+existing HuggingFace tokenizer. To train a small BPE tokenizer from scratch,
+use the `tokenizers` library directly and wrap the result:
+
+```python
+from tokenizers import Tokenizer, models, trainers
+from transformers import PreTrainedTokenizerFast
+from cattorch import BPETokenizer
+
+corpus = ["the cat sat on the mat", "the dog sat on the log"]
+
+tok = Tokenizer(models.BPE())
+trainer = trainers.BpeTrainer(vocab_size=100, min_frequency=1, special_tokens=[])
+tok.train_from_iterator(corpus, trainer=trainer)
+
+# no pre-tokenizer: BPE operates on the raw input string, including spaces
+BPETokenizer(PreTrainedTokenizerFast(tokenizer_object=tok)).save("my_tokenizer")
+```
+
+The generated sprite has two top-level block stacks:
+
+- **Encode**: reads the `input` variable (a string) and writes token IDs to
+  the `token_ids` list.
+- **Decode**: reads the `token_ids` list and writes the decoded string to the
+  `output` variable.
+
+Token IDs are 0-based, matching PyTorch embedding conventions, so the output
+of the encode stack can be fed directly into a transpiled model. If you don't
+care about the tokenizer type, use `transpile_tokenizer(tokenizer, name)` and
+cattorch will pick `BPETokenizer` or `CharTokenizer` based on the tokenizer's
+backend.
+
 ## Scratch limits
 
 - **Project size**: Scratch limits projects to 5 MB. cattorch warns at 4 MB

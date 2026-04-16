@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "transformers", "tokenizers"]
 
 [project.urls]
 Repository = "https://github.com/NormallyNormal/cattorch"
