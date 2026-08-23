@@ -96,20 +96,3 @@ class TensorAdder:
                 lists[sid][1] = _flatten(weights[name], sig_figs)
 
         return sprite
-
-    def remove(self, sprite: dict, tensor_names: list[str]) -> dict:
-        """
-        Return a new sprite dict with the given tensor names removed from
-        the lists section. Silently skips names that don't exist.
-        """
-        sprite = copy.deepcopy(sprite)
-        lists = sprite.get("lists", {})
-
-        to_delete = [
-            sid for sid, entry in lists.items()
-            if entry[0] in tensor_names
-        ]
-        for sid in to_delete:
-            del lists[sid]
-
-        return sprite

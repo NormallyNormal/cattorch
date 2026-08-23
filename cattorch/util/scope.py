@@ -1,4 +1,5 @@
 from collections import defaultdict
+import heapq
 
 
 class ScopeManager:
@@ -26,16 +27,21 @@ class ScopeManager:
 
     def get_list_for_node(self, node):
         # Step 2: Assign a list from the pool or create a new one
-        if self.free_pool:
-            # Sort to always reuse the lowest-numbered list (cleaner Scratch project)
-            self.free_pool.sort()
-            assigned_id = self.free_pool.pop(0)
-        else:
-            self.peak_lists += 1
-            assigned_id = self.peak_lists
+        assigned_id = self.acquire_list()
 
         self.assignments[node.name] = assigned_id
         return f"T{assigned_id}"
+
+    def acquire_list(self) -> int:
+        """Return the lowest reusable list ID without repeatedly sorting the pool."""
+        if self.free_pool:
+            return heapq.heappop(self.free_pool)
+        self.peak_lists += 1
+        return self.peak_lists
+
+    def release_list(self, list_id: int) -> None:
+        """Make a temporary list ID available for deterministic lowest-ID reuse."""
+        heapq.heappush(self.free_pool, list_id)
 
     def release_dependencies(self, node):
         # Step 3: Check if inputs are finished. If so, recycle their lists.
@@ -46,5 +52,5 @@ class ScopeManager:
                     if self.ref_counts[arg.name] == 0:
                         # Input is no longer needed by any future node!
                         list_id = self.assignments[arg.name]
-                        self.free_pool.append(list_id)
+                        self.release_list(list_id)
                         # Optional: print(f"Recycling List T{list_id} (last used by {node.name})")

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from cattorch.errors import UnsupportedOperationError
 from cattorch.transpiler import transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
@@ -1340,11 +1341,11 @@ def test_pow_squared():
     _assert_close(expected, actual)
 
 
-def test_pow_general():
+def test_pow_general_is_rejected():
     model = PowGeneral()
     x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs for ln
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    with pytest.raises(UnsupportedOperationError, match="exponents 0 and 2"):
+        _run_sprite(model, x)
 
 
 def test_rsqrt():

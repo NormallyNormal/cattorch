@@ -3,7 +3,7 @@ emulator.py
 -----------
 Minimal Scratch block emulator for testing transpiled sprites.
 
-Supports the subset of Scratch used by cattorch templates:
+Supports the subset of Scratch emitted by cattorch:
   - Variables: set, change by
   - Lists: delete all, add, replace item, item of
   - Control: repeat, if/else
@@ -18,6 +18,10 @@ Usage
     emu.run()
     result = emu.lists["output"]
 """
+
+from collections import Counter
+
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 
 class _NameView:
@@ -57,6 +61,13 @@ class _NameView:
 class ScratchEmulator:
     def __init__(self, sprite: dict):
         self.blocks = sprite["blocks"]
+        self._procedures = self._find_procedures()
+        self.opcode_counts = Counter()
+        self._costume_names = [
+            costume.get("name", "") for costume in sprite.get("costumes", [])
+        ]
+        self._current_costume = int(sprite.get("currentCostume", 0))
+        self.broadcasts = []
 
         # Variables stored by ID
         self._vars = {}
@@ -91,14 +102,38 @@ class ScratchEmulator:
             raise ValueError(f"root_index {root_index} out of range, found {len(roots)} roots")
         self._exec_chain(roots[root_index])
 
+    def run_procedure(self, name: str) -> None:
+        """Run a named custom block without relying on top-level stack order."""
+        if name not in self._procedures:
+            available = ", ".join(sorted(self._procedures)) or "none"
+            raise ValueError(f"Procedure {name!r} not found; available: {available}")
+        self._exec_chain(self._procedures[name])
+
     def _find_roots(self) -> list[str]:
         roots = [
             bid for bid, block in self.blocks.items()
             if block.get("topLevel") and block.get("parent") is None
+            and block.get("opcode") != "procedures_definition"
         ]
         if not roots:
             raise ValueError("No topLevel roots found")
         return roots
+
+    def _find_procedures(self) -> dict[str, str | None]:
+        procedures = {}
+        for block in self.blocks.values():
+            if block.get("opcode") != "procedures_definition":
+                continue
+            custom_input = block.get("inputs", {}).get("custom_block")
+            if not custom_input or len(custom_input) < 2:
+                continue
+            prototype = self.blocks.get(custom_input[1])
+            if prototype is None:
+                continue
+            proccode = prototype.get("mutation", {}).get("proccode")
+            if proccode:
+                procedures[proccode] = block.get("next")
+        return procedures
 
     def _exec_chain(self, block_id: str | None):
         while block_id is not None:
@@ -108,6 +143,7 @@ class ScratchEmulator:
 
     def _exec_block(self, block_id: str, block: dict):
         opcode = block["opcode"]
+        self.opcode_counts[opcode] += 1
         inputs = block.get("inputs", {})
         fields = block.get("fields", {})
 
@@ -126,7 +162,8 @@ class ScratchEmulator:
         elif opcode == "data_addtolist":
             list_id = fields["LIST"][1]
             value = self._eval_input(inputs["ITEM"])
-            self._lists[list_id].append(value)
+            if len(self._lists[list_id]) < SCRATCH_LIST_LIMIT:
+                self._lists[list_id].append(value)
 
         elif opcode == "data_replaceitemoflist":
             list_id = fields["LIST"][1]
@@ -149,6 +186,14 @@ class ScratchEmulator:
             for _ in range(times):
                 self._exec_chain(substack_id)
 
+        elif opcode == "control_for_each":
+            times = int(float(self._eval_input(inputs["VALUE"])))
+            variable_id = fields["VARIABLE"][1]
+            substack_id = self._get_substack(inputs.get("SUBSTACK"))
+            for index in range(1, times + 1):
+                self._vars[variable_id] = index
+                self._exec_chain(substack_id)
+
         elif opcode == "control_repeat_until":
             substack_id = self._get_substack(inputs.get("SUBSTACK"))
             while not self._eval_input(inputs["CONDITION"]):
@@ -165,6 +210,31 @@ class ScratchEmulator:
                 self._exec_chain(self._get_substack(inputs.get("SUBSTACK")))
             else:
                 self._exec_chain(self._get_substack(inputs.get("SUBSTACK2")))
+
+        elif opcode == "procedures_call":
+            proccode = block.get("mutation", {}).get("proccode")
+            if proccode not in self._procedures:
+                raise ValueError(f"Procedure not found: {proccode}")
+            self._exec_chain(self._procedures[proccode])
+
+        elif opcode == "looks_switchcostumeto":
+            requested = self._eval_input(inputs["COSTUME"])
+            try:
+                self._current_costume = self._costume_names.index(str(requested))
+            except ValueError:
+                # Sufficient fallback for cattorch tests; codec symbols always
+                # resolve through the exact, case-sensitive name path.
+                index = self._to_index(requested)
+                if 1 <= index <= len(self._costume_names):
+                    self._current_costume = index - 1
+
+        elif opcode in {"event_broadcast", "event_broadcastandwait"}:
+            self.broadcasts.append(self._eval_input(inputs["BROADCAST_INPUT"]))
+
+        elif opcode in {"procedures_definition", "procedures_prototype"}:
+            # Definitions are metadata/entry points rather than executable
+            # commands when encountered outside a procedure call.
+            return
 
         else:
             raise NotImplementedError(f"Unknown opcode: {opcode}")
@@ -211,7 +281,11 @@ class ScratchEmulator:
 
         elif lit_type in (10,):
             # String literal
-            return self._to_number(spec[1])
+            return spec[1]
+
+        elif lit_type == 11:
+            # Broadcast menu literal: [11, display_name, broadcast_id]
+            return spec[1]
 
         elif lit_type == 12:
             # Variable reference: [12, display_name, var_id]
@@ -233,23 +307,23 @@ class ScratchEmulator:
         fields = block.get("fields", {})
 
         if opcode == "operator_add":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
             return a + b
 
         elif opcode == "operator_subtract":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
             return a - b
 
         elif opcode == "operator_multiply":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
             return a * b
 
         elif opcode == "operator_mod":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
             return a % b if b != 0 else 0
 
         elif opcode == "operator_equals":
@@ -262,13 +336,13 @@ class ScratchEmulator:
             return str(a).lower() == str(b).lower()
 
         elif opcode == "operator_gt":
-            a = float(self._eval_input(inputs["OPERAND1"]))
-            b = float(self._eval_input(inputs["OPERAND2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["OPERAND1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["OPERAND2"]))
             return a > b
 
         elif opcode == "operator_lt":
-            a = float(self._eval_input(inputs["OPERAND1"]))
-            b = float(self._eval_input(inputs["OPERAND2"]))
+            a = self._scratch_numeric(self._eval_input(inputs["OPERAND1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["OPERAND2"]))
             return a < b
 
         elif opcode == "operator_and":
@@ -291,12 +365,17 @@ class ScratchEmulator:
             return a - b
 
         elif opcode == "operator_divide":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
-            return a / b if b != 0 else 0
+            a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
+            b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
+            if b != 0:
+                return a / b
+            import math
+            if a == 0:
+                return math.nan
+            return math.copysign(math.inf, a * math.copysign(1, b))
 
         elif opcode == "operator_mathop":
-            value = float(self._eval_input(inputs["NUM"]))
+            value = self._scratch_numeric(self._eval_input(inputs["NUM"]))
             op = fields["OPERATOR"][0]
             if op == "e ^":
                 import math
@@ -323,13 +402,29 @@ class ScratchEmulator:
             else:
                 raise NotImplementedError(f"Unknown mathop: {op}")
 
+        elif opcode == "operator_round":
+            import math
+            value = self._scratch_numeric(self._eval_input(inputs["NUM"]))
+            # Scratch uses JavaScript Math.round, including its handling of
+            # negative half values.
+            return math.floor(value + 0.5)
+
+        elif opcode == "operator_random":
+            import random
+            low = self._scratch_numeric(self._eval_input(inputs["FROM"]))
+            high = self._scratch_numeric(self._eval_input(inputs["TO"]))
+            low, high = min(low, high), max(low, high)
+            if float(low).is_integer() and float(high).is_integer():
+                return random.randint(int(low), int(high))
+            return random.uniform(low, high)
+
         elif opcode == "data_itemoflist":
             list_id = fields["LIST"][1]
             index = self._to_index(self._eval_input(inputs["INDEX"]))
             lst = self._lists.get(list_id, [])
             if 1 <= index <= len(lst):
                 return lst[index - 1]
-            return 0
+            return ""
 
         elif opcode == "data_lengthoflist":
             list_id = fields["LIST"][1]
@@ -340,9 +435,11 @@ class ScratchEmulator:
             item = self._eval_input(inputs["ITEM"])
             lst = self._lists.get(list_id, [])
             # Scratch returns 1-based index, or 0 if not found
-            item_str = str(item)
+            item_str = str(item).lower()
             for i, val in enumerate(lst):
-                if str(val) == item_str:
+                # The official VM uses Cast.compare here, including Scratch's
+                # case-insensitive string comparison.
+                if str(val).lower() == item_str:
                     return i + 1
             return 0
 
@@ -361,6 +458,9 @@ class ScratchEmulator:
             a = str(self._eval_input(inputs["STRING1"]))
             b = str(self._eval_input(inputs["STRING2"]))
             return a + b
+
+        elif opcode == "looks_costumenumbername":
+            return self._current_costume + 1
 
         else:
             raise NotImplementedError(f"Unknown reporter opcode: {opcode}")
@@ -389,6 +489,9 @@ class ScratchEmulator:
             return value
         try:
             f = float(value)
+            import math
+            if not math.isfinite(f):
+                return f
             return int(f) if f == int(f) else f
         except (ValueError, TypeError):
             return value
@@ -409,3 +512,8 @@ class ScratchEmulator:
             return float(s)
         except ValueError:
             return None
+
+    @classmethod
+    def _scratch_numeric(cls, value):
+        converted = cls._scratch_number(value)
+        return 0 if converted is None else converted

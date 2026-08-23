@@ -43,7 +43,7 @@ def _find_top_level_root(blocks: dict) -> str:
     if len(roots) > 1:
         raise ValueError(
             f"Multiple topLevel root blocks found: {roots}. "
-            "Ensure the template has a single entry point."
+            "Ensure the fragment has a single entry point."
         )
     return roots[0]
 
@@ -51,7 +51,7 @@ def _find_top_level_root(blocks: dict) -> str:
 LOCAL_PREFIX = "_"
 
 
-def _merge_slots(primary: dict, secondary: dict) -> dict:
+def _merge_slots(primary: dict, secondary: dict) -> tuple[dict, dict[str, str]]:
     """
     Merge two variable or list dicts.
     - If a display name appears in both, the primary slot wins (its ID is kept).

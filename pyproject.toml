@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cattorch"
-version = "0.3.0"
+version = "0.4.0"
 description = "Export PyTorch modules to Scratch sprites"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,21 +14,38 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Education",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Education",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0",
+    "torch>=2.6",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "transformers", "tokenizers"]
+tokenizers = ["tokenizers", "transformers", "sentencepiece"]
+dev = ["pytest", "ruff", "mypy", "transformers", "tokenizers", "sentencepiece", "twine"]
 
 [project.urls]
 Repository = "https://github.com/NormallyNormal/cattorch"
+Documentation = "https://github.com/NormallyNormal/cattorch/tree/main/docs"
+Changelog = "https://github.com/NormallyNormal/cattorch/blob/main/CHANGELOG.md"
+
+[project.scripts]
+cattorch-benchmark = "cattorch.benchmark:main"
 
 [tool.setuptools.packages.find]
 include = ["cattorch*"]
 
 [tool.setuptools.package-data]
-cattorch = ["templates/**/*.json", "templates/**/*.svg"]
+cattorch = ["templates/sprite/*.svg", "py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
