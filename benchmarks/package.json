@@ -1,0 +1,11 @@
+{
+  "name": "cattorch-scratch-benchmarks",
+  "private": true,
+  "scripts": {
+    "run-vm": "node run_scratch_vm.cjs artifacts/cattorch_suite.sb3"
+  },
+  "dependencies": {
+    "@scratch/scratch-vm": "15.0.1",
+    "entities": "8.0.0"
+  }
+}

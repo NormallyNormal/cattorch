@@ -117,6 +117,14 @@ ipython_config.py
 .pdm-python
 .pdm-build/
 
+# Generated real-Scratch benchmark projects
+benchmarks/artifacts/
+node_modules/
+
+# Local design/review notes (not release documentation)
+/REVIEW.md
+/CATGPT_SCRATCH_TRAINING_GUIDE.md
+
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 # pixi.lock
@@ -303,4 +311,3 @@ __marimo__/
 *.sprite3
 .idea/
 examples/
-CHANGELOG.md

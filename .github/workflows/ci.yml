@@ -10,8 +10,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          # Lowest supported dependency boundary.
+          - python-version: "3.10"
+            torch-version: "2.6.*"
+            label: minimum
+          # Current Python versions against the current CPU wheel.
+          - python-version: "3.11"
+            torch-version: ""
+            label: current
+          - python-version: "3.12"
+            torch-version: ""
+            label: current
+          - python-version: "3.13"
+            torch-version: ""
+            label: current
 
     steps:
       - uses: actions/checkout@v4
@@ -22,10 +37,36 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        env:
+          TORCH_VERSION: ${{ matrix.torch-version }}
         run: |
           pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch${TORCH_VERSION:+==$TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev]"
 
       - name: Run tests
-        run: pytest tests/test_transpile.py tests/test_llms.py tests/test_tokenizer.py -v
+        run: pytest tests/ -v
+
+      - name: Check Python sources
+        run: |
+          python -m compileall -q cattorch tests benchmarks
+          ruff check cattorch tests benchmarks
+
+      - name: Check typed public modules
+        run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/storage.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and check distributions
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*

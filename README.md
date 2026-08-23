@@ -1,181 +1,63 @@
 # cattorch
 
-Export PyTorch neural networks to [Scratch](https://scratch.mit.edu) sprites.
+cattorch exports inference-ready PyTorch neural networks as Scratch 3 sprites.
+It lowers a `torch.nn.Module` to ordinary Scratch blocks and lists, so the
+result can be imported into a project without a Scratch extension or modified
+runtime.
 
-cattorch transpiles a `torch.nn.Module` into a `.sprite3` file that can be
-imported directly into any Scratch project. The generated sprite uses only
-standard Scratch blocks, so no extensions or modifications are required.
+Try the [published TinyStories example](https://scratch.mit.edu/projects/1374224416/)
+to see an exported transformer running in vanilla Scratch.
 
-cattorch does not export training scripts, you will need to train your model
-with torch before exporting to a Scratch sprite.
+cattorch is an inference exporter, not a training framework. Train the model in
+PyTorch, put it in evaluation mode, then export it with representative inputs.
+The complete workflow is in the
+[getting-started guide](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md).
 
-## Install
+Install with:
 
 ```bash
 pip install cattorch
 ```
 
-Requires Python 3.10+ and PyTorch 2.0+.
+cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer.
 
-## Usage
+## What it supports
 
-```python
-import torch
-import torch.nn as nn
-from cattorch import transpile
+- MLPs, CNNs, and decoder-style transformer graphs with fixed export shapes.
+- Linear layers, convolution, pooling, matrix multiplication, embeddings,
+  normalization, common activations, softmax, masking, arithmetic, reductions,
+  slicing, concatenation, splitting, transposes, and shape operations.
+- Exact Scratch-specific optimizations, including constant folding, fused
+  epilogues, causal-attention specialization, and export-time weight layout.
+- An opt-in `fast` mode with approximate GELU, LayerNorm, and softmax kernels,
+  plus configurable structured pruning and low-rank weight transforms.
+- Stateful single-token generation with KV caches for recognized causal
+  decoder graphs.
+- Lossless float32 plus lossy float16, groupwise int8/int6, and packed int4
+  static-weight storage, decoded once at startup.
+- Automatic sharding of logical tensors across Scratch's 200,000-item physical
+  list limit.
+- Character, raw-text BPE, and SentencePiece BPE tokenizer/detokenizer sprites.
+- Structured export metadata, numerical verification in the included emulator,
+  and benchmark projects designed to be timed in Scratch itself.
 
-class TwoLayerNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(4, 8)
-        self.fc2 = nn.Linear(8, 3)
+The generated model sprite exposes `cattorch init`, `cattorch forward`, and
+`cattorch prepare for save` custom blocks. Model inputs use the `input`,
+`input_1`, ... lists and the single tensor result is written to `output`.
+Generated custom blocks run without screen refresh.
 
-    def forward(self, x):
-        return self.fc2(torch.relu(self.fc1(x)))
+## Documentation
 
-model = TwoLayerNet()
-# train your model first! then:
-# transpile(model, example input, sprite name)
-transpile(model, torch.randn(1, 4), "two_layer_net")
-# => two_layer_net.sprite3
-
-# optionally reduce file size by rounding weights
-transpile(model, torch.randn(1, 4), "two_layer_net", sig_figs=6)
-```
-
-cattorch uses `torch.export` under the hood, which requires a single code path
-with no data-dependent control flow. If your model has conditional returns
-(e.g. returning loss during training), add an inference-only forward method:
-
-```python
-# won't work: conditional return
-def forward(self, x, targets=None):
-    logits = self.head(x)
-    if targets is None:
-        return logits
-    return logits, F.cross_entropy(logits, targets)
-
-# will work: single return path
-def forward_inference(self, x):
-    return self.head(x)
-
-model.eval()
-model.forward = model.forward_inference
-transpile(model, example_input, "my_model")
-```
-
-Some modules (e.g. HuggingFace transformer blocks) return tuples instead of
-plain tensors. `torch.export` will fail if a downstream layer receives a tuple
-where it expects a tensor. Unpack the output in your wrapper's forward method:
-
-```python
-# won't work: block returns (hidden_states, attention_weights, ...)
-x = block(x)
-
-# will work: extract the tensor you need
-x = block(x)[0]
-```
-
-In Scratch, the sprite reads its input from a list called `input` and writes
-results to a list called `output`. It is up to you to add logic to fill the
-input tensor and run the generated code blocks.
-
-If the model takes multiple input tensors, the additional inputs are named
-`input_1`, `input_2`, etc.
-
-## Supported operations
-
-| Category | Operations |
-|---|---|
-| Convolution | `nn.Conv1d`, `nn.Conv2d` (with and without bias, stride, padding) |
-| Pooling | `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool2d` |
-| Linear layers | `nn.Linear` (with and without bias) |
-| Matrix multiply | `@` / `torch.matmul` |
-| Activations | `F.relu`, `torch.sigmoid`, `torch.tanh`, `F.gelu` (tanh approx. only), `F.silu`, `F.leaky_relu`, `F.elu` |
-| Normalization | `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.LayerNorm`, `nn.RMSNorm`, `torch.rsqrt` |
-| Softmax | `F.softmax` (any dim) |
-| Embedding | `nn.Embedding` |
-| Masking | `masked_fill` (for causal attention masks via `register_buffer`) |
-| Arithmetic | `+`, `-`, `*` (tensor and scalar), `/` (scalar), unary `-`, `torch.pow` |
-| Reduction | `torch.mean` (along a dim) |
-| Tensor creation | `torch.arange`, `torch.ones`, `torch.zeros`, `torch.full`, `torch.ones_like`, `torch.zeros_like` |
-| Shape | `view`, `reshape`, `flatten`, `contiguous`, `clone` (no-ops on flat data) |
-| Transpose | `transpose`, `permute`, `.T` (arbitrary dimensions) |
-| Split / Chunk | `split`, `split_with_sizes`, `chunk` |
-| Concatenation | `torch.cat` (any dim, any number of inputs) |
-| Slice | `tensor[:n]` style slicing along any dimension |
-
-These are sufficient for architectures like MLPs, CNNs, and transformer LLMs,
-including multi-head attention, combined QKV projections, rotary position
-embeddings (RoPE), causal masking, pre-norm blocks with residual connections,
-and SwiGLU-style gating. RNN support is planned for the future.
-
-## Tokenizers
-
-cattorch can also transpile HuggingFace tokenizers into Scratch sprites, so the
-full text → token IDs → model → token IDs → text pipeline can run inside a
-Scratch project. Two tokenizer types are supported:
-
-- `CharTokenizer` — character-level lookup. Each character maps to one ID.
-- `BPETokenizer` — byte-pair encoding. Merges are applied iteratively over the
-  full input string, including spaces.
-
-Off-the-shelf tokenizers from large models will not work here. Production
-tokenizers like GPT-2's or Llama's use byte-level pre-tokenization, regex
-splits, and other preprocessing steps that the Scratch templates don't
-implement, and their 30k–100k+ token vocabularies would cause embeddings to blow past Scratch's
-200,000 list item limit. In practice you'll
-want to train a small custom BPE tokenizer on your own corpus (with no
-pre-tokenizer), so BPE operates on the raw input string, sized to match the
-small model you're transpiling.
-
-```python
-from transformers import AutoTokenizer
-from cattorch import CharTokenizer, BPETokenizer
-
-tokenizer = AutoTokenizer.from_pretrained("my-model")
-BPETokenizer(tokenizer).save("my_tokenizer")
-# => my_tokenizer.sprite3
-```
-
-cattorch does not train tokenizers itself, the classes only transpile an
-existing HuggingFace tokenizer. To train a small BPE tokenizer from scratch,
-use the `tokenizers` library directly and wrap the result:
-
-```python
-from tokenizers import Tokenizer, models, trainers
-from transformers import PreTrainedTokenizerFast
-from cattorch import BPETokenizer
-
-corpus = ["the cat sat on the mat", "the dog sat on the log"]
-
-tok = Tokenizer(models.BPE())
-trainer = trainers.BpeTrainer(vocab_size=100, min_frequency=1, special_tokens=[])
-tok.train_from_iterator(corpus, trainer=trainer)
-
-# no pre-tokenizer: BPE operates on the raw input string, including spaces
-BPETokenizer(PreTrainedTokenizerFast(tokenizer_object=tok)).save("my_tokenizer")
-```
-
-The generated sprite has two top-level block stacks:
-
-- **Encode**: reads the `input` variable (a string) and writes token IDs to
-  the `token_ids` list.
-- **Decode**: reads the `token_ids` list and writes the decoded string to the
-  `output` variable.
-
-Token IDs are 0-based, matching PyTorch embedding conventions, so the output
-of the encode stack can be fed directly into a transpiled model. If you don't
-care about the tokenizer type, use `transpile_tokenizer(tokenizer, name)` and
-cattorch will pick `BPETokenizer` or `CharTokenizer` based on the tokenizer's
-backend.
-
-## Scratch limits
-
-- **Project size**: Scratch limits projects to 5 MB. cattorch warns at 4 MB
-  and errors at 5 MB.
-- **List length**: Scratch lists can hold at most 200,000 items. cattorch
-  raises an error if any weight tensor or intermediate list exceeds this.
+- [Getting started](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md)
+- [Supported models and operations](https://github.com/NormallyNormal/cattorch/blob/main/docs/supported-models.md)
+- [Optimization modes](https://github.com/NormallyNormal/cattorch/blob/main/docs/optimization.md)
+- [Storage and Scratch limits](https://github.com/NormallyNormal/cattorch/blob/main/docs/storage.md)
+- [Code generation and JSON size](https://github.com/NormallyNormal/cattorch/blob/main/docs/code-generation.md)
+- [KV-cached generation](https://github.com/NormallyNormal/cattorch/blob/main/docs/generation.md)
+- [Tokenizers](https://github.com/NormallyNormal/cattorch/blob/main/docs/tokenizers.md)
+- [Verification and benchmarking](https://github.com/NormallyNormal/cattorch/blob/main/docs/verification-and-benchmarking.md)
+- [Troubleshooting export failures](https://github.com/NormallyNormal/cattorch/blob/main/docs/troubleshooting.md)
+- [Kernel development](https://github.com/NormallyNormal/cattorch/blob/main/docs/kernels.md)
 
 ## License
 
