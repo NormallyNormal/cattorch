@@ -44,7 +44,9 @@ from cattorch.util.instruction.optimized_tensor import (
     OptimizedEmbeddingInstruction,
     OptimizedGetItemInstruction,
     OptimizedMaskedFillInstruction,
+    RotaryEmbeddingInstruction,
     OptimizedTransposeInstruction,
+    StridedSliceInstruction,
 )
 
 __all__ = [
@@ -75,6 +77,7 @@ __all__ = [
     "OptimizedGetItemInstruction",
     "OptimizedLayerNormInstruction",
     "OptimizedMaskedFillInstruction",
+    "RotaryEmbeddingInstruction",
     "OptimizedMatMulInstruction",
     "OptimizedMeanInstruction",
     "OptimizedPoolingInstruction",
@@ -83,5 +86,6 @@ __all__ = [
     "OptimizedSwiGLUInstruction",
     "PairedLinearSwiGLUInstruction",
     "OptimizedTransposeInstruction",
+    "StridedSliceInstruction",
     "QKVLinearInstruction",
 ]

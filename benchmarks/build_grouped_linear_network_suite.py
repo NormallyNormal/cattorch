@@ -18,7 +18,7 @@ for site_packages in (CATGPT2 / ".venv" / "lib").glob("python*/site-packages"):
 sys.path.insert(0, str(Path(__file__).parent))
 
 from catgpt2_approx_experiment import CachedMQAExportModel, load_cached_mqa_export_model
-from cattorch import GenerationConfig, StorageConfig, transpile
+from cattorch import GenerationProgram, StorageConfig, transpile
 from cattorch.benchmark import (
     SUITE_RESULTS,
     _StageBlocks,
@@ -50,13 +50,14 @@ def _compile_variant(source, name: str, threshold: float):
             base = Path(directory) / name
             transpile(
                 model,
-                prompt[:, :1],
-                str(base),
-                optimization="exact",
-                generation=GenerationConfig(
-                    CONTEXT + DECODE_ITERATIONS,
+                GenerationProgram(
+                    method="forward",
+                    example_token=prompt[:, :1],
+                    max_context=CONTEXT + DECODE_ITERATIONS,
                     hidden_prefill=True,
                 ),
+                str(base),
+                optimization="exact",
                 storage=StorageConfig(precision="float16"),
             )
             sprite_path = base.with_suffix(".sprite3")
@@ -65,23 +66,25 @@ def _compile_variant(source, name: str, threshold: float):
     finally:
         LinearInstruction.grouped_min_macs = previous_threshold
 
-    _set_inputs(sprite, (prompt,))
+    for entry in sprite.get("lists", {}).values():
+        if entry[0] == "cattorch tokens":
+            entry[1] = prompt.detach().flatten().tolist()
     _add_warp_procedure(
         sprite,
         "cattorch grouped benchmark decode",
         Program(
             "grouped_network_benchmark_decode",
-            lists=("input",),
+            lists=("cattorch tokens",),
             body=(
-                clear("input"),
-                append("input", 0),
+                clear("cattorch tokens"),
+                append("cattorch tokens", 0),
                 call("cattorch decode"),
             ),
         ),
         x=900,
         y=0,
     )
-    _merge_lists_by_name(sprite, {"input"})
+    _merge_lists_by_name(sprite, {"cattorch tokens"})
     sprite["name"] = name
     sprite["visible"] = False
     return sprite, assets, standalone_size

@@ -1,65 +1,77 @@
 # Code generation and JSON size
 
-`CodegenConfig` controls generated block density and internal Scratch IDs:
+[Documentation home](index.md)
+
+`CodegenConfig` trades generated code size against speed. The defaults suit
+most models. Use the compact settings when the sprite's expanded JSON is too
+large.
 
 ```python
 from cattorch import CodegenConfig, transpile
 
-transpile(
+artifact = transpile(
     model,
     example,
-    "model",
+    "model_compact",
     codegen=CodegenConfig(
-        target_json_bytes=4 * 1024 * 1024,
-        unrolling="auto",
-        id_namespace=None,
+        unrolling="compact",
         compact_internal_names=True,
     ),
 )
+print(artifact.expanded_json_bytes)
 ```
 
-`auto` estimates the stored-weight payload and reduces partial loop unrolling
-as that payload consumes the JSON budget. `compact` always uses factor-one
-loops; `speed` retains each kernel's maximum tested factor. The target is a
-soft code-generation budget, not a universal Scratch upload limit. cattorch
-warns if the final expanded JSON exceeds it.
+## Choose a size policy
 
-Internal IDs use the fixed `ct` marker followed by a namespace and Base64url
-counter. The marker keeps generated IDs distinct from Scratch's fixed toolbox
-block IDs. The default namespace is three random Base64url characters (18
-bits), which suits the common case of one cattorch sprite and still protects
-small multi-sprite projects from likely collisions. Set an explicit
-three-character namespace for reproducible exports:
+Loop unrolling copies a loop's body several times so each pass does more
+work, which runs faster in Scratch but adds blocks.
+
+| `unrolling` | Behavior |
+|---|---|
+| `"auto"` (default) | Adjusts unrolling to the estimated weight size and JSON budget. |
+| `"compact"` | Uses the smallest loops. |
+| `"speed"` | Uses each kernel's maximum supported unrolling, producing more blocks. |
+
+`target_json_bytes` defaults to `4 * 1024 * 1024`. `"auto"` unrolling aims to
+stay under it, and the exporter warns if the final JSON is larger. It is a
+target, not Scratch's upload limit; see [project size](storage.md#project-size).
+Set it to `None` to turn it off.
+
+To compare settings, time them in Scratch; see
+[verification and benchmarking](verification-and-benchmarking.md).
+
+## Optional compaction
+
+All three options are off by default.
+
+- `compact_internal_names=True` shortens the names of internal variables,
+  lists, and custom blocks. The documented input, output, and lifecycle names
+  don't change.
+- `compact_schema=True` leaves redundant fields out of the saved block data.
+- `layer_sharing="auto"` generates one copy of the code for repeated
+  transformer layers named `blocks.N` and shares it across them. For cached
+  generation, every layer must also have the same cache width. Layers that
+  don't fit keep their own code.
+
+Schema compaction and layer sharing are newer. After enabling either, run
+`verify` and check that the project imports, edits, runs, and saves in your
+Scratch client.
+
+## Reproducible exports and multiple sprites
+
+Generated block IDs include a random three-character namespace. For
+reproducible exports, set `id_namespace` to three characters from `A-Z`,
+`a-z`, `0-9`, `-`, or `_`:
 
 ```python
 CodegenConfig(id_namespace="m01")
 ```
 
-Set `id_namespace=""` for the smallest safe IDs (`ctA`, `ctB`, ...) only when
-the sprite will not be combined with another export whose internal IDs may
-overlap. Allowed namespace characters are `A-Z`, `a-z`, `0-9`, `-`, and `_`.
+Give each generated sprite in a project a different namespace so their IDs
+don't collide. `id_namespace=""` makes IDs shorter, but only use it when the
+sprite is the only generated sprite in the project.
 
-`compact_internal_names=True` renames private variables, lists, and custom
-blocks to short sequential display names. The documented input/output,
-lifecycle, generation, and tokenizer interfaces retain their stable names.
-`compact_schema=True` additionally omits redundant false-valued block fields;
-it is opt-in because a browser import/edit/save cycle remains the final
-compatibility authority for schema-level trimming.
+`transpile_tokenizer` and the tokenizer `.save()` methods accept the same
+`codegen=` argument.
 
-`layer_sharing="auto"` recognizes compatible stateless `blocks.N` transformer
-stacks, banks corresponding layer weights, and emits one shared warp procedure.
-It falls back without changing the graph when the stack differs, a bank would
-cross Scratch's 200,000-item list limit, or generation uses layer-specific K/V
-caches. The option is currently opt-in (`"off"` by default) pending another
-vanilla-browser correctness pass; cattorch's emulator verifies exact output for
-accepted stacks.
-
-Generation top-k selection also follows the code-size policy. `auto` and
-`compact` use a constant-size loop-based insertion selector; `speed` retains
-the larger fully unrolled selector.
-
-The same `codegen=` argument is accepted by `transpile_tokenizer` and tokenizer
-`.save()` methods. Character and raw-text BPE tokenizers are generated from the
-typed Scratch DSL. Their older JSON files are no longer part of production
-lowering. The pre-0.4 JSON-template backend has been removed; historical
-benchmark results remain documented in `benchmarks/`.
+Related: [`CodegenConfig` reference](api-reference.md#codegenconfig).

@@ -15,6 +15,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from cattorch import rotary_embedding
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CATGPT2 = ROOT.parent / "catgpt2"
@@ -28,7 +30,7 @@ from microchat.checkpoint import load_checkpoint, load_checkpoint_tokenizer
 from cattorch import (
     FastConfig,
     FastLayerConfig,
-    GenerationConfig,
+    GenerationProgram,
     StorageConfig,
     transpile,
 )
@@ -149,11 +151,6 @@ class ExportAttention(nn.Module):
                 source.v_proj.weight.repeat(repeats, 1),
             )))
         self.o_proj = copy.deepcopy(source.o_proj)
-        rotation = torch.zeros(self.head_dim, self.head_dim)
-        for index in range(0, self.head_dim, 2):
-            rotation[index, index + 1] = 1
-            rotation[index + 1, index] = -1
-        self.register_buffer("rotation", rotation)
         self.register_buffer("cos", source.rope.cos[:, :, :context].clone())
         self.register_buffer("sin", source.rope.sin[:, :, :context].clone())
         self.register_buffer(
@@ -169,8 +166,12 @@ class ExportAttention(nn.Module):
         projected_value = projected_value.view(
             batch, length, self.heads, self.head_dim,
         ).transpose(1, 2)
-        query = query * self.cos[:, :, :length] + (query @ self.rotation) * self.sin[:, :, :length]
-        key = key * self.cos[:, :, :length] + (key @ self.rotation) * self.sin[:, :, :length]
+        query = rotary_embedding(
+            query, self.cos[:, :, :length], self.sin[:, :, :length],
+        )
+        key = rotary_embedding(
+            key, self.cos[:, :, :length], self.sin[:, :, :length],
+        )
         scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(self.causal_mask[:length, :length], float("-inf"))
         attended = F.softmax(scores, dim=-1) @ projected_value
@@ -197,11 +198,6 @@ class CachedMQAExportAttention(nn.Module):
                 source.v_proj.weight,
             )))
         self.o_proj = copy.deepcopy(source.o_proj)
-        rotation = torch.zeros(self.head_dim, self.head_dim)
-        for index in range(0, self.head_dim, 2):
-            rotation[index, index + 1] = 1
-            rotation[index + 1, index] = -1
-        self.register_buffer("rotation", rotation)
         self.rope_cos = nn.Embedding.from_pretrained(
             source.rope.cos[0, 0, :context].clone(), freeze=True,
         )
@@ -225,8 +221,8 @@ class CachedMQAExportAttention(nn.Module):
         ).transpose(1, 2)
         cos = self.rope_cos(self.position).view(1, 1, 1, self.head_dim)
         sin = self.rope_sin(self.position).view(1, 1, 1, self.head_dim)
-        query = query * cos + (query @ self.rotation) * sin
-        key = key * cos + (key @ self.rotation) * sin
+        query = rotary_embedding(query, cos, sin)
+        key = rotary_embedding(key, cos, sin)
         scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(self.causal_mask, float("-inf"))
         attended = F.softmax(scores, dim=-1) @ projected_value
@@ -517,29 +513,32 @@ def _build_cached_project(
         base = Path(directory) / name
         transpile(
             model,
-            prompt[:, :1],
-            str(base),
-            optimization="exact",
-            generation=GenerationConfig(
-                prompt.shape[1] + decode_iterations,
+            GenerationProgram(
+                method="forward",
+                example_token=prompt[:, :1],
+                max_context=prompt.shape[1] + decode_iterations,
                 hidden_prefill=hidden_prefill,
             ),
+            str(base),
+            optimization="exact",
             storage=StorageConfig(precision="float16"),
         )
         sprite_path = base.with_suffix(".sprite3")
         standalone_size = sprite_path.stat().st_size
         sprite, assets = _load_sprite(sprite_path)
-    _set_inputs(sprite, (prompt,))
+    for entry in sprite.get("lists", {}).values():
+        if entry[0] == "cattorch tokens":
+            entry[1] = prompt.detach().flatten().tolist()
     decode_token = int(prompt[0, -1])
     _add_warp_procedure(
         sprite,
         "cattorch benchmark decode",
         Program(
             "catgpt2_benchmark_decode",
-            lists=("input",),
+            lists=("cattorch tokens",),
             body=(
-                clear("input"),
-                append("input", decode_token),
+                clear("cattorch tokens"),
+                append("cattorch tokens", decode_token),
                 call("cattorch decode"),
             ),
         ),

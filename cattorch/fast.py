@@ -10,7 +10,7 @@ from typing import Mapping
 
 import torch
 import torch.nn as nn
-from torch.fx import symbolic_trace
+from torch.fx import GraphModule, Tracer
 
 
 log = logging.getLogger(__name__)
@@ -264,7 +264,16 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
         nn.ELU, nn.LeakyReLU, nn.Identity,
     )
     try:
-        traced = symbolic_trace(model)
+        from cattorch.moe import _BankedSparseMoE
+
+        class _FastTransformTracer(Tracer):
+            def is_leaf_module(self, module, qualified_name):
+                if isinstance(module, _BankedSparseMoE):
+                    return True
+                return super().is_leaf_module(module, qualified_name)
+
+        tracer = _FastTransformTracer()
+        traced = GraphModule(model, tracer.trace(model))
     except Exception:
         log.warning("Skipping whole-neuron pruning because FX tracing was not available")
         return
@@ -350,18 +359,84 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
         )
 
 
+def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
+    """Remove shared hidden channels from banked SwiGLU experts.
+
+    Every expert retains the same channel IDs, so the stacked bank geometry and
+    semantic MoE lowering remain valid while gate/up/down work shrinks together.
+    """
+    if not fraction:
+        return
+    from cattorch.moe import StackedSwiGLUMoE
+
+    for name, module in model.named_modules():
+        if not isinstance(module, StackedSwiGLUMoE):
+            continue
+        hidden = module.gate_weight.shape[1]
+        keep_count = max(1, hidden - math.floor(hidden * fraction))
+        if keep_count == hidden:
+            continue
+        importance = (
+            module.gate_weight.detach().abs().sum(dim=(0, 2))
+            + module.up_weight.detach().abs().sum(dim=(0, 2))
+            + module.down_weight.detach().abs().sum(dim=(0, 1))
+        )
+        keep = torch.topk(
+            importance, keep_count, largest=True, sorted=False,
+        ).indices.sort().values
+        module.gate_weight = nn.Parameter(
+            module.gate_weight.detach()[:, keep, :].clone(),
+            requires_grad=module.gate_weight.requires_grad,
+        )
+        module.up_weight = nn.Parameter(
+            module.up_weight.detach()[:, keep, :].clone(),
+            requires_grad=module.up_weight.requires_grad,
+        )
+        module.down_weight = nn.Parameter(
+            module.down_weight.detach()[:, :, keep].clone(),
+            requires_grad=module.down_weight.requires_grad,
+        )
+        log.info(
+            "Fast pruned stacked SwiGLU hidden width %d -> %d at %s",
+            hidden, keep_count, name or "<root>",
+        )
+
+
 def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     """Return an independently transformed model for fast export."""
     if not config.has_weight_transforms:
         return model
 
+    # Generic expert templates are compiled once against fixed bank geometry.
+    # Kernel-level approximations remain valid, but changing hidden widths or
+    # replacing a template Linear with a low-rank Sequential would invalidate
+    # every expert-major stride.
+    from cattorch.moe import _BankedSparseMoE
+    generic_paths = {
+        name for name, module in model.named_modules()
+        if isinstance(module, _BankedSparseMoE)
+    }
+    expert_prefixes = tuple(
+        f"{path}.expert_family" if path else "expert_family"
+        for path in generic_paths
+    )
+    if any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for name in config.overrides for prefix in expert_prefixes
+    ):
+        raise ValueError(
+            "fast weight overrides cannot change topology inside a generic "
+            "ExpertFamily; approximate kernels remain available"
+        )
+
     transformed = copy.deepcopy(model)
     _prune_sequential_neurons(transformed, config.neuron_pruning)
+    _prune_stacked_swiglu_neurons(transformed, config.neuron_pruning)
     if isinstance(transformed, (nn.Linear, nn.Conv1d, nn.Conv2d)):
         unknown = sorted(set(config.overrides) - {"<root>"})
         if unknown:
             raise ValueError(
-                f"Unknown or ineligible fast module override(s): {', '.join(unknown)}"
+                f"unknown or ineligible fast module override(s): {', '.join(unknown)}"
             )
         policy = config.policy_for("<root>")
         rank = _selected_rank(transformed.weight, policy)
@@ -384,7 +459,7 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     known_names = {name for name, _ in eligible}
     unknown = sorted(set(config.overrides) - known_names)
     if unknown:
-        raise ValueError(f"Unknown or ineligible fast module override(s): {', '.join(unknown)}")
+        raise ValueError(f"unknown or ineligible fast module override(s): {', '.join(unknown)}")
 
     for name, module in eligible:
         policy = config.policy_for(name)

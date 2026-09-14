@@ -24,6 +24,6 @@ class BlockManager:
     def apply_to_blocks(self, blocks: dict) -> dict:
         """Remap all block IDs in a fragment to globally unique IDs."""
         if not self._suffix:
-            raise RuntimeError("Call new_context() before apply_to_blocks().")
+            raise RuntimeError("call new_context() before apply_to_blocks()")
         mapping = {bid: f"{bid}_{self._suffix}" for bid in blocks}
         return remap_ids(blocks, mapping)

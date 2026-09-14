@@ -1,15 +1,26 @@
 # Getting started
 
-## Export a model
+[Documentation home](index.md)
 
-Install cattorch from PyPI:
+This guide exports a small model, checks its output, imports it into Scratch,
+and connects it to the rest of a project.
+
+## Install
 
 ```bash
 pip install cattorch
 ```
 
-Export an evaluation-mode model with inputs that have the shapes the Scratch
-project will use:
+cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer. To use a
+specific PyTorch build, such as CPU-only, install it with the
+[PyTorch installer](https://pytorch.org/get-started/locally/) first. Tokenizer
+export needs extra packages; see [tokenizers](tokenizers.md).
+
+## Export and verify a model
+
+`example_inputs` fixes the input shapes and dtypes the sprite will accept. It
+is not a training batch. Data for quantization is passed separately as
+[calibration inputs](storage.md#gptq-calibration).
 
 ```python
 from pathlib import Path
@@ -35,8 +46,8 @@ example = torch.randn(1, 4)
 
 artifact = transpile(model, example, Path("build/two_layer_net"))
 print(artifact.path)                 # build/two_layer_net.sprite3
-print(artifact.archive_bytes)
-print(artifact.inputs, artifact.output)
+for warning in artifact.warnings:
+    print("warning:", warning)
 
 check = verify(model, example, artifact)
 assert check.passed, check
@@ -46,45 +57,105 @@ assert check.passed, check
 path does not already have that suffix. The Scratch sprite name defaults to
 the output filename stem; pass `name="My model"` to choose it independently.
 
-The returned `TranspileResult` describes the artifact without requiring code
-to parse the zip file. It includes the final path and sprite name, archive and
-expanded-JSON sizes, block and list counts, sharded list names, warnings,
-input/output tensor specifications, and generated procedure names.
+The returned `TranspileResult` describes the sprite's input/output lists,
+size, and warnings. See the [result-type reference](api-reference.md#result-types)
+for all fields.
 
-## Use the sprite in Scratch
+> **Before distribution:** inspect `artifact.warnings`, run `verify`, and test
+> an import/run/save cycle in the same Scratch client the project will use.
 
-1. Import the generated `.sprite3` into a Scratch 3 project.
-2. Put flattened tensor values in `input`. For multiple arguments, use
-   `input_1`, `input_2`, and so on.
-3. Run the `cattorch forward` custom block.
-4. Read the flattened tensor result from `output` and reshape it according to
-   `artifact.output.shape` in the surrounding project if needed.
+## Import and run the sprite
 
-`cattorch forward` initializes the sprite automatically on its first call.
-Calling `cattorch init` explicitly is useful when startup decoding should be
-kept out of a timed region. Both blocks run without screen refresh.
+1. Open the target Scratch 3 project.
+2. Choose **Upload Sprite** from the sprite chooser and select the generated
+   `.sprite3` file.
+3. Select the imported sprite. Its Code area has the `cattorch init` and
+   `cattorch forward` My Block definitions, plus a clickable block for each.
+4. Show the sprite-local `input` list and replace its contents with the model
+   input values.
+5. Click the `cattorch forward` call stack.
+6. Read the flattened result from the sprite-local `output` list.
+
+For multiple model arguments, later flattened tensors use `input_1`,
+`input_2`, and so on. Values are flattened in normal PyTorch contiguous order;
+`artifact.inputs` records the original shapes and dtypes. Scratch list
+positions are one-based, but integer values such as embedding token IDs remain
+the zero-based values expected by PyTorch.
+
+Models returning multiple tensors use `output`, `output_1`, and so on in
+PyTorch's nested-container leaf order, recorded in `artifact.outputs`.
+If an input or output exceeds 200,000 values, use all its
+[shard lists](storage.md#list-sharding) when copying data.
+
+`cattorch forward` initializes the sprite on its first call. Call
+`cattorch init` yourself to load the weights ahead of time, for example
+before timing a run. Both blocks run without screen refresh.
+
+## Connect another sprite
+
+My Blocks and sprite-local lists belong to one Scratch sprite. A controller
+sprite cannot call `cattorch forward` or directly read the generated local
+`input` and `output` lists.
+
+To drive it from another sprite, bridge through global lists:
+
+1. Create global input and output lists with your own names.
+2. On the generated processor sprite, add a `when I receive` script.
+3. In that receiver, copy the global input into local `input`, call
+   `cattorch forward`, then copy local `output` to the global output list.
+4. From the controller, use `broadcast [run model] and wait`. When it returns,
+   the global output is ready.
+
+In Scratch-like pseudocode, the receiver is:
+
+```text
+when I receive [run model]
+delete all of [input]
+copy every item of [my global input] to [input]
+cattorch forward
+delete all of [my global output]
+copy every item of [output] to [my global output]
+```
+
+Don't make a new list named `input` or `output` to replace the generated one.
+Generated blocks refer to lists by ID, not by name, so they will keep using the
+original.
+
+Tokenizer sprites have the same locality rule. See
+[tokenizer integration](tokenizers.md) and
+[cached generation](generation.md) for their additional procedures.
+
+## Prepare the project for saving
 
 Before saving a project that has run, call `cattorch prepare for save`. It
-clears decoded weights and runtime data while preserving compressed payloads,
-preventing Scratch from serializing both forms of the weights.
+clears the decoded weights and working data but keeps the compressed weights,
+so the saved project doesn't store both. The next forward call initializes the
+sprite again.
 
-## Export options
+Don't edit the generated sprite's costumes: they store the compressed weights.
+See [preserve processor costumes](storage.md#preserve-processor-costumes).
+
+## Add export options
 
 ```python
-from cattorch import FastConfig, StorageConfig, transpile
+from cattorch import StorageConfig, transpile
 
 artifact = transpile(
     model,
     example,
-    "build/two_layer_net_fast",
+    "build/two_layer_net_f16",
     name="Two-layer classifier",
-    optimization="fast",
-    fast_config=FastConfig(),
     storage=StorageConfig(precision="float16"),
-    sig_figs=6,
 )
+
+check = verify(model, example, artifact)
+print(check.passed, check.max_abs_error)
 ```
 
-Kernel optimization and serialized storage precision are independent choices.
-See [optimization modes](optimization.md) and [storage](storage.md) before
-selecting lossy settings.
+Float16 storage makes the sprite smaller but can change its output. Check the
+error on representative inputs before using it. For more options, see
+[storage and quantization](storage.md), [optimization modes](optimization.md),
+and [code generation](code-generation.md).
+
+Next: [supported models and operations](supported-models.md) or the full
+[`transpile` API](api-reference.md#transpile).

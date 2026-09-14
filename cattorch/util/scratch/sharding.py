@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import itertools
 from dataclasses import dataclass
+from cattorch.util.scratch.interface import shard_name as physical_shard_name
 
 
 SCRATCH_LIST_LIMIT = 200_000
@@ -211,6 +212,31 @@ class _BlockSharder:
                 self._set_parent(spec, current)
             current = self.blocks[current].get("next")
 
+    def _rewrite_delete(self, identifier, block, layout):
+        index = block["inputs"]["INDEX"]
+        replacements = []
+        for position, (shard, offset) in enumerate(
+            zip(layout.shards, self._offsets(layout))
+        ):
+            command_id = identifier if position == 0 else "unused"
+            replacements.append({
+                "opcode": "data_deleteoflist",
+                "inputs": {
+                    "INDEX": self._shift_index(
+                        index, offset, command_id,
+                        clone=position > 0,
+                    ),
+                },
+                "fields": {"LIST": [shard.name, shard.identifier]},
+                "shadow": False, "topLevel": False,
+            })
+        self._chain_commands(identifier, replacements)
+        current = identifier
+        for _ in replacements:
+            for spec in self.blocks[current]["inputs"].values():
+                self._set_parent(spec, current)
+            current = self.blocks[current].get("next")
+
     def _append_block(self, shard, item, parent, *, identifier=None):
         identifier = identifier or self.new_id("append")
         self.blocks[identifier] = {
@@ -269,14 +295,19 @@ class _BlockSharder:
             self.blocks[old_next]["parent"] = identifier
 
     def apply(self):
-        for identifier in list(self.blocks):
-            block = self.blocks.get(identifier)
-            if block is None:
-                continue
+        pending = []
+        priorities = {"data_lengthoflist": 0, "data_itemoflist": 1}
+        for order, (identifier, block) in enumerate(tuple(self.blocks.items())):
             field = block.get("fields", {}).get("LIST")
-            if not field or field[1] not in self.by_id:
-                continue
-            layout = self.by_id[field[1]]
+            if field and field[1] in self.by_id:
+                pending.append((
+                    priorities.get(block["opcode"], 2), order,
+                    identifier, block, self.by_id[field[1]],
+                ))
+        # Reporter subtrees must be lowered before command rewriters clone
+        # them. In particular, `delete (length of logical list)` needs the
+        # summed physical length inside every routed delete command.
+        for _priority, _order, identifier, block, layout in sorted(pending):
             opcode = block["opcode"]
             if opcode == "data_itemoflist":
                 self._rewrite_read(identifier, block, layout)
@@ -286,11 +317,13 @@ class _BlockSharder:
                 self._rewrite_clear(identifier, block, layout)
             elif opcode == "data_replaceitemoflist":
                 self._rewrite_replace(identifier, block, layout)
+            elif opcode == "data_deleteoflist":
+                self._rewrite_delete(identifier, block, layout)
             elif opcode == "data_addtolist":
                 self._rewrite_append(identifier, block, layout)
             else:
                 raise NotImplementedError(
-                    f"Sharded tensor list does not support Scratch opcode {opcode}"
+                    f"sharded tensor list does not support Scratch opcode {opcode}"
                 )
 
 
@@ -301,6 +334,7 @@ def shard_sprite_lists(
     limit: int = SCRATCH_LIST_LIMIT,
     alignments: dict[str, int] | None = None,
     limits: dict[str, int] | None = None,
+    deferred_names: frozenset[str] = frozenset(),
 ) -> dict[str, ListLayout]:
     """Split oversized logical lists and rewrite every supported list access."""
     if limit != SCRATCH_LIST_LIMIT:
@@ -312,17 +346,24 @@ def shard_sprite_lists(
     for identifier, entry in list(lists.items()):
         name, contents = entry
         logical_size = max(logical_sizes.get(name, 0), len(contents))
+        if name in deferred_names:
+            # Program boundaries are renamed and wrapped before the final
+            # shared sharding pass. Internal tensors can be lowered now.
+            layouts[name] = ListLayout(
+                name, logical_size, (ListShard(name, identifier, logical_size),),
+            )
+            continue
         alignment = alignments.get(name, 1)
         list_limit = limits.get(name, limit)
         if list_limit < 1 or list_limit > limit:
-            raise ValueError(f"Invalid physical shard limit {list_limit} for {name}")
+            raise ValueError(f"invalid physical shard limit {list_limit} for {name}")
         if alignment < 1 or alignment > list_limit:
-            raise ValueError(f"Invalid shard alignment {alignment} for {name}")
+            raise ValueError(f"invalid shard alignment {alignment} for {name}")
         shard_limit = list_limit - (list_limit % alignment)
         count = max(1, (logical_size + shard_limit - 1) // shard_limit)
         shards = []
         for position in range(count):
-            shard_name = name if position == 0 else f"{name} shard {position + 1}"
+            shard_name = physical_shard_name(name, position)
             shard_id = identifier if position == 0 else f"{identifier}__shard_{position + 1}"
             start = position * shard_limit
             capacity = min(shard_limit, max(0, logical_size - start))

@@ -34,7 +34,7 @@ class UnsupportedOperationError(CattorchError, NotImplementedError):
         if detail:
             parts.append(detail)
         parts.append(
-            "Supported operations: "
+            "supported operations: "
             "https://github.com/NormallyNormal/cattorch/blob/main/"
             "docs/supported-models.md#operations"
         )

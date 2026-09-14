@@ -1,4 +1,4 @@
-"""PyTorch export graph preparation and fusion analysis."""
+"""Captured PyTorch graph preparation and fusion analysis."""
 
 from __future__ import annotations
 
@@ -9,61 +9,29 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
-from torch.export import export
 
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
+from cattorch.frontend import CapturedGraph, Frontend, capture_model
+from cattorch.results import _tensor_spec
+from cattorch.operator_registry import MATMUL_OPS, OperatorRegistry, default_registry
 
 log = logging.getLogger(__name__)
 
 
-def _export_model(model, example_inputs):
-    """Export without inheriting old TorchDynamo's tiny process-wide limit.
-
-    PyTorch 2.6 and 2.7 count distinct ``torch.export`` calls against the
-    generic wrapper frame's eight-entry recompile cache. A process exporting
-    several unrelated models can therefore fail even though every individual
-    graph is valid. Scope a larger limit to export itself without permanently
-    changing the caller's TorchDynamo configuration.
-    """
-    config = getattr(getattr(torch, "_dynamo", None), "config", None)
-    overrides = {}
-    if config is not None:
-        for name in (
-            "cache_size_limit",
-            "recompile_limit",
-            "accumulated_cache_size_limit",
-        ):
-            value = getattr(config, name, None)
-            if isinstance(value, int) and value < 1024:
-                overrides[name] = 1024
-    if overrides and hasattr(config, "patch"):
-        with config.patch(**overrides):
-            return export(model, example_inputs)
-    return export(model, example_inputs)
-
-
 @dataclass(frozen=True)
-class GenerationConfig:
-    """Enable single-token autoregressive export with persistent KV caches."""
+class _GenerationSpec:
+    """Internal lowering policy for a validated generation program.
+
+    ``max_context`` fixes the positive token capacity. ``hidden_prefill`` uses
+    a recognized hidden-only prompt path to avoid projecting logits at every
+    prompt position. ``top_k`` optionally materializes the best 1--16 logits
+    and zero-based token IDs after prefill and decode.
+    """
 
     max_context: int
     hidden_prefill: bool = True
     top_k: int | None = None
-
-    def __post_init__(self):
-        if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
-            raise TypeError("max_context must be an integer")
-        if self.max_context < 1:
-            raise ValueError("max_context must be positive")
-        if not isinstance(self.hidden_prefill, bool):
-            raise TypeError("hidden_prefill must be a boolean")
-        if self.top_k is not None:
-            if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
-                raise TypeError("top_k must be an integer or None")
-            if not 1 <= self.top_k <= 16:
-                raise ValueError("top_k must be between 1 and 16")
-
 
 # ── Op classification ────────────────────────────────────────────────────────
 
@@ -77,6 +45,9 @@ _NOOP_OPS = {
     "aten.clone.default",
     "aten.unsqueeze.default",
     "aten.alias.default",
+    "aten.detach.default",
+    "aten.detach_.default",
+    "aten.lift_fresh_copy.default",
     "aten._assert_tensor_metadata.default",
 }
 
@@ -135,17 +106,18 @@ class _GenerationInfo:
     prepopulated_values: set[str] = field(default_factory=set)
     hidden_prefill_qkv: str | None = None
     attention_fusions: dict[str, object] = field(default_factory=dict)
+    banked_caches: bool = False
+    cache_layers: int = 1
+    cache_layer_width: int = 0
 
 
 @dataclass
 class _GraphInfo:
-    """Pre-processed PyTorch export graph, ready for compilation."""
+    """Pre-processed captured PyTorch graph, ready for compilation."""
     nodes: list
     resolve_weight: object  # callable
     input_names: dict
-    output_name: str
-    output_shape: torch.Size
-    output_dtype: torch.dtype
+    outputs: tuple[tuple[str, torch.Size, torch.dtype], ...]
     aliases: dict            # node_name → source_name for no-op ops
     split_meta: dict         # split_node_name → (input_shape, split_size, dim)
     generated_weights: dict  # node_name → tensor
@@ -163,6 +135,31 @@ class _GraphInfo:
     causal_softmaxes: dict
     causal_value_matmuls: set[str]
     fused_nodes: set[str]
+    registry: OperatorRegistry
+    dynamic_axes: dict[str, int]
+    dynamic_bounds: dict[str, tuple[str, int, int]]
+
+    @property
+    def output_name(self) -> str:
+        return self.outputs[0][0]
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.outputs[0][1]
+
+    @property
+    def output_dtype(self) -> torch.dtype:
+        return self.outputs[0][2]
+
+    def output_specs(self):
+        return tuple(
+            _tensor_spec(
+                "output" if index == 0 else f"output_{index}", shape, dtype,
+                (self.dynamic_axes[name], self.dynamic_bounds[name])
+                if name in self.dynamic_axes else None,
+            )
+            for index, (name, shape, dtype) in enumerate(self.outputs)
+        )
 
 
 def _prepare_graph(
@@ -171,52 +168,167 @@ def _prepare_graph(
     *,
     optimization: Literal["exact", "fast"] = "exact",
     fast_config: FastConfig | None = None,
-    generation: GenerationConfig | None = None,
+    generation: _GenerationSpec | None = None,
+    frontend: Frontend = "fx",
+    _registry: OperatorRegistry | None = None,
+    dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
+    _captured: CapturedGraph | None = None,
 ) -> _GraphInfo:
-    """Export the model, decompose ops, and analyze the graph structure."""
+    """Capture the model, decompose ops, and analyze the graph structure."""
     use_fusions = optimization in {"exact", "fast"}
     fast = optimization == "fast"
     fast_config = fast_config or FastConfig()
-    exported = _export_model(model, example_inputs)
-    nodes = list(exported.graph.nodes)
+    registry = _registry or default_registry()
+    from cattorch.moe import _expert_family_context
+    with _expert_family_context(registry.expert_families):
+        captured = _captured or capture_model(model, example_inputs, frontend=frontend)
+    nodes = list(captured.graph.nodes)
+    dynamic_inputs = dynamic_inputs or {}
+    placeholders = [
+        node for node in nodes
+        if node.op == "placeholder" and node.name in captured.user_input_names
+    ]
+    dynamic_axes: dict[str, int] = {}
+    dynamic_bounds: dict[str, tuple[str, int, int]] = {}
+    for index, bound in dynamic_inputs.items():
+        if index >= len(placeholders):
+            raise UnsupportedModelError("dynamic input index is outside the captured signature")
+        node = placeholders[index]
+        if len(_get_shape(node)) < 1:
+            raise UnsupportedModelError("a dynamic input must have a leading dimension")
+        dynamic_axes[node.name] = 0
+        dynamic_bounds[node.name] = bound
+
+    shape_only = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
+    elementwise = {
+        "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor",
+        "aten.neg.default", "aten.relu.default", "aten.sigmoid.default",
+        "aten.tanh.default", "aten.gelu.default", "aten.silu.default",
+        "aten.leaky_relu.default", "aten.elu.default", "aten.pow.Tensor_Scalar",
+        "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
+        "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
+        "aten.mean.dim", "aten.embedding.default",
+    }
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        dynamic_parents = [
+            value for value in node.all_input_nodes if value.name in dynamic_axes
+        ]
+        if not dynamic_parents:
+            continue
+        origins = {dynamic_bounds[value.name][0] for value in dynamic_parents}
+        if len(origins) != 1:
+            raise UnsupportedModelError(
+                f"{node.target} combines multiple independent runtime extents"
+            )
+        parent = dynamic_parents[0]
+        axis = dynamic_axes[parent.name]
+        target = str(node.target)
+        input_shape = tuple(_get_shape(parent))
+        output_shape = tuple(_get_shape(node))
+        if target == "aten.transpose.int":
+            left = int(node.args[1]) % len(input_shape)
+            right = int(node.args[2]) % len(input_shape)
+            if axis == left:
+                axis = right
+            elif axis == right:
+                axis = left
+        elif target == "aten.permute.default":
+            permutation = [int(value) % len(input_shape) for value in node.args[1]]
+            axis = permutation.index(axis)
+        elif target == "aten.numpy_T.default":
+            axis = len(input_shape) - axis - 1
+        elif target in {"aten.view.default", "aten.reshape.default", "aten._unsafe_view.default"}:
+            suffix = math.prod(input_shape[axis + 1:])
+            candidates = [
+                position for position, extent in enumerate(output_shape)
+                if extent == 1 and math.prod(output_shape[position + 1:]) == suffix
+            ]
+            if len(candidates) != 1:
+                raise UnsupportedModelError(
+                    f"{target} folds or splits the runtime extent; only a movable extent is supported"
+                )
+            axis = candidates[0]
+        elif target == "aten.unsqueeze.default":
+            inserted = int(node.args[1]) % len(output_shape)
+            if inserted <= axis:
+                axis += 1
+        elif target == "aten.squeeze.dim":
+            removed = int(node.args[1]) % len(input_shape)
+            if removed == axis:
+                raise UnsupportedModelError("cannot squeeze the runtime extent")
+            if removed < axis:
+                axis -= 1
+        elif target in {
+            "aten.conv1d.default", "aten.conv2d.default",
+            "aten.max_pool1d.default", "aten.max_pool2d.default",
+            "aten.avg_pool1d.default", "aten.avg_pool2d.default",
+            "aten.adaptive_avg_pool2d.default",
+            "aten.batch_norm.default",
+        }:
+            if axis != 0:
+                raise UnsupportedModelError(
+                    "convolution and pooling support only a dynamic batch extent"
+                )
+        elif target in {"aten._softmax.default", "aten.softmax.int"}:
+            dimension = int(node.args[1]) % len(input_shape)
+            if axis >= dimension or math.prod(input_shape[dimension + 1:]) != 1:
+                raise UnsupportedModelError(
+                    "dynamic softmax requires the runtime extent before a contiguous reduction"
+                )
+        elif target == "aten.mean.dim":
+            raw_dims = node.args[1]
+            dims = {
+                int(value) % len(input_shape)
+                for value in (raw_dims if isinstance(raw_dims, (list, tuple)) else (raw_dims,))
+            }
+            if axis in dims or axis > min(dims):
+                raise UnsupportedModelError(
+                    "mean cannot reduce or move a runtime extent into its reduction geometry"
+                )
+            axis -= sum(value < axis for value in dims)
+        elif target in {"aten.layer_norm.default", "aten.native_layer_norm.default"}:
+            normalized_rank = len(node.args[1])
+            if axis >= len(input_shape) - normalized_rank:
+                raise UnsupportedModelError("layer normalization cannot normalize the runtime extent")
+        elif target in MATMUL_OPS:
+            if parent is not node.args[0] or axis == len(input_shape) - 1:
+                raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+        elif target == "aten.slice.Tensor":
+            dimension = int(node.args[1]) % len(input_shape)
+            start = int(node.args[2]) if len(node.args) > 2 else 0
+            end = node.args[3] if len(node.args) > 3 else None
+            if dimension == axis and (start != 0 or end not in {None, 9223372036854775807}):
+                raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
+        elif target not in shape_only and target not in elementwise:
+            raise UnsupportedModelError(
+                f"{target} does not yet define runtime-extent propagation"
+            )
+        dynamic_axes[node.name] = axis
+        dynamic_bounds[node.name] = dynamic_bounds[parent.name]
     node_order = {node.name: index for index, node in enumerate(nodes)}
-    state_inputs = {}
-    user_input_placeholders = set()
-    constants = getattr(exported, "constants", {})
-    for spec in exported.graph_signature.input_specs:
-        argument_name = getattr(spec.arg, "name", None)
-        if argument_name is None:
-            continue
-        kind = getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
-        if kind == "USER_INPUT":
-            user_input_placeholders.add(argument_name)
-            continue
-        target = spec.target
-        if target in exported.state_dict:
-            state_inputs[argument_name] = exported.state_dict[target]
-        elif target in constants:
-            state_inputs[argument_name] = constants[target]
+    state_inputs = captured.state_inputs
+    user_input_placeholders = captured.user_input_names
 
     def resolve_state(arg_name):
         return state_inputs.get(arg_name)
 
-    user_outputs = [
-        spec for spec in exported.graph_signature.output_specs
-        if getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1]) == "USER_OUTPUT"
-    ]
-    if len(user_outputs) != 1:
+    if not captured.user_output_names:
         raise UnsupportedModelError(
-            "cattorch currently requires exactly one tensor output; "
-            f"the exported model has {len(user_outputs)} user outputs"
+            "cattorch requires at least one tensor output"
         )
-    output_name = getattr(user_outputs[0].arg, "name", None)
-    output_node = next((node for node in nodes if node.name == output_name), None)
-    if output_name is None or output_node is None or not hasattr(output_node.meta.get("val"), "shape"):
-        raise UnsupportedModelError(
-            "cattorch currently requires its single model output to be a tensor"
-        )
-    output_shape = _get_shape(output_node)
-    output_dtype = output_node.meta["val"].dtype
+    by_name = {node.name: node for node in nodes}
+    outputs = []
+    for index, output_name in enumerate(captured.user_output_names):
+        output_node = by_name.get(output_name) if output_name is not None else None
+        value = None if output_node is None else output_node.meta.get("val")
+        if output_node is None or not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise UnsupportedModelError(
+                f"model output leaf {index} is not a tensor"
+            )
+        outputs.append((output_name, _get_shape(output_node), value.dtype))
+    output_name, output_shape, output_dtype = outputs[0]
 
     # Materialise compile-time generated tensors as static weights.
     generated_weights = {}
@@ -300,7 +412,7 @@ def _prepare_graph(
             input_count += 1
         elif resolve_weight(node.name) is None:
             raise UnsupportedModelError(
-                f"Unable to resolve exported parameter or buffer {node.name!r} "
+                f"unable to resolve exported parameter or buffer {node.name!r} "
                 "from the PyTorch export signature"
             )
 
@@ -320,7 +432,7 @@ def _prepare_graph(
             if training:
                 raise _unsupported_operation(
                     node,
-                    "Training-mode dropout is nondeterministic and cannot be removed; "
+                    "training-mode dropout is nondeterministic and cannot be removed; "
                     "call model.eval() before exporting",
                 )
             source = node.args[0].name
@@ -335,8 +447,8 @@ def _prepare_graph(
             if source_dtype != target_dtype:
                 raise _unsupported_operation(
                     node,
-                    f"Runtime dtype conversion from {source_dtype} to {target_dtype} "
-                    "changes tensor semantics",
+                    f"converting a runtime tensor from {source_dtype} to {target_dtype} "
+                    "is not supported",
                 )
             source = node.args[0].name
             while source in aliases:
@@ -360,6 +472,11 @@ def _prepare_graph(
                 (input_shape[dim0] == 1 or input_shape[dim1] == 1)
                 and all(size == 1 for size in input_shape[low + 1:high])
             )
+            runtime_axis = dynamic_axes.get(node.args[0].name)
+            if runtime_axis in {dim0, dim1} and dim0 != dim1:
+                # The representative extent is one only for capture. It may
+                # not be erased by the ordinary singleton-transpose alias.
+                singleton_move_is_flat = False
             if dim0 == dim1 or singleton_move_is_flat:
                 source = node.args[0].name
                 while source in aliases:
@@ -399,92 +516,14 @@ def _prepare_graph(
             continue
         aten_op = str(node.target)
 
-        if aten_op in {"aten.add.Tensor", "aten.sub.Tensor"}:
-            alpha = node.kwargs.get("alpha", 1)
-            if alpha != 1:
-                raise _unsupported_operation(
-                    node, f"The alpha={alpha!r} variant is not supported",
-                )
-
-        elif aten_op == "aten.gelu.default":
-            approximate = (
-                node.args[1] if len(node.args) > 1
-                else node.kwargs.get("approximate", "none")
-            )
-            if approximate != "tanh" and not (fast and fast_config.activations):
-                raise _unsupported_operation(
-                    node,
-                    "Exact GELU requires approximate='tanh'; the default erf "
-                    "form is not implemented",
-                )
-
-        elif aten_op == "aten.mean.dim":
-            dims = node.args[1]
-            if isinstance(dims, int):
-                dims = (dims,)
-            ndim = len(_get_shape(node.args[0]))
-            normalized = sorted({dim % ndim for dim in dims})
-            if not normalized or normalized != list(
-                range(normalized[0], normalized[-1] + 1)
-            ):
-                raise _unsupported_operation(
-                    node, "Mean reduction dimensions must be consecutive",
-                )
-
-        elif aten_op == "aten.pow.Tensor_Scalar":
-            exponent = node.args[1]
-            if exponent not in {0, 2}:
-                raise _unsupported_operation(
-                    node,
-                    "Only exponents 0 and 2 are currently exact for arbitrary "
-                    "Scratch inputs",
-                )
-
-        elif aten_op in {"aten.conv1d.default", "aten.conv2d.default"}:
-            dimensions = 1 if aten_op == "aten.conv1d.default" else 2
-            input_shape = _get_shape(node.args[0])
-            dilation = node.args[5] if len(node.args) > 5 else [1] * dimensions
-            groups = node.args[6] if len(node.args) > 6 else 1
-            if len(input_shape) != dimensions + 2:
-                raise _unsupported_operation(node, "Unbatched convolution is not supported")
-            if any(value != 1 for value in dilation) or groups != 1:
-                raise _unsupported_operation(
-                    node, "Convolution dilation must be 1 and groups must be 1",
-                )
-
-        elif aten_op in {"aten.max_pool1d.default", "aten.max_pool2d.default"}:
-            dimensions = 1 if aten_op == "aten.max_pool1d.default" else 2
-            input_shape = _get_shape(node.args[0])
-            dilation = node.args[4] if len(node.args) > 4 else [1] * dimensions
-            ceil_mode = node.args[5] if len(node.args) > 5 else False
-            if len(input_shape) != dimensions + 2:
-                raise _unsupported_operation(node, "Unbatched pooling is not supported")
-            if any(value != 1 for value in dilation) or ceil_mode:
-                raise _unsupported_operation(
-                    node, "Max pooling dilation must be 1 and ceil_mode must be False",
-                )
-
-        elif aten_op in {"aten.avg_pool1d.default", "aten.avg_pool2d.default"}:
-            dimensions = 1 if aten_op == "aten.avg_pool1d.default" else 2
-            input_shape = _get_shape(node.args[0])
-            ceil_mode = node.args[4] if len(node.args) > 4 else False
-            count_include_pad = node.args[5] if len(node.args) > 5 else True
-            divisor_override = node.args[6] if len(node.args) > 6 else None
-            if len(input_shape) != dimensions + 2:
-                raise _unsupported_operation(node, "Unbatched pooling is not supported")
-            if ceil_mode or not count_include_pad or divisor_override is not None:
-                raise _unsupported_operation(
-                    node,
-                    "Average pooling requires ceil_mode=False, "
-                    "count_include_pad=True, and no divisor_override",
-                )
-
-        elif aten_op == "aten.batch_norm.default":
-            training = bool(node.args[5]) if len(node.args) > 5 else False
-            if training or node.args[3] is None or node.args[4] is None:
-                raise _unsupported_operation(
-                    node, "BatchNorm requires evaluation-mode running statistics",
-                )
+        # Matmul legality can depend on a later whole-graph fusion. It is
+        # checked by the ordinary compiler path after those fusions are known.
+        detail = (
+            None if aten_op in {"aten.matmul.default", "aten.mm.default", "aten.bmm.default"}
+            else registry.validate(node, fast=fast, config=fast_config)
+        )
+        if detail is not None:
+            raise _unsupported_operation(node, detail)
 
     linear_fusions = {}
     fused_nodes = set()
@@ -1014,13 +1053,11 @@ def _prepare_graph(
                 )
                 generation_position_embeddings[node.name] = next_score
 
-    return _GraphInfo(
+    graph = _GraphInfo(
         nodes=nodes,
         resolve_weight=resolve_weight,
         input_names=input_names,
-        output_name=output_name,
-        output_shape=output_shape,
-        output_dtype=output_dtype,
+        outputs=tuple(outputs),
         aliases=aliases,
         split_meta=split_meta,
         generated_weights=generated_weights,
@@ -1050,4 +1087,35 @@ def _prepare_graph(
         causal_softmaxes=causal_softmaxes,
         causal_value_matmuls=causal_value_matmuls,
         fused_nodes=fused_nodes,
+        registry=registry,
+        dynamic_axes=dynamic_axes,
+        dynamic_bounds=dynamic_bounds,
     )
+    _validate_lowering_operations(graph)
+    return graph
+
+
+def _validate_lowering_operations(graph: _GraphInfo) -> None:
+    """Check unfused operation contracts before either analysis or emission."""
+    skipped = set(graph.aliases) | set(graph.generated_weights) | graph.fused_nodes
+    for roots in (
+        graph.causal_score_fusions, graph.qkv_linear_fusions,
+        graph.generation.attention_fusions, graph.embedding_add_fusions,
+        graph.elementwise_fusions, graph.linear_fusions,
+        graph.paired_swiglu_fusions, graph.silu_mul_fusions,
+    ):
+        skipped.update(roots)
+    for node in graph.nodes:
+        if node.op != "call_function" or node.name in skipped:
+            continue
+        target = str(node.target)
+        if target in {"aten.cat.default", "aten.slice.Tensor"}:
+            continue
+        if node.target is operator.getitem and getattr(node.args[0], "name", None) in graph.split_meta:
+            continue
+        if graph.registry.operation(target) is None:
+            raise _unsupported_operation(node)
+        if node.name not in graph.causal_value_matmuls:
+            detail = graph.registry.validate(node, fast=graph.fast, config=graph.fast_config)
+            if detail is not None:
+                raise _unsupported_operation(node, detail)

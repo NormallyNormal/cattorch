@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cattorch"
-version = "0.4.0"
+version = "0.5.0"
 description = "Export PyTorch modules to Scratch sprites"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,7 @@ dev = ["pytest", "ruff", "mypy", "transformers", "tokenizers", "sentencepiece", 
 
 [project.urls]
 Repository = "https://github.com/NormallyNormal/cattorch"
-Documentation = "https://github.com/NormallyNormal/cattorch/tree/main/docs"
+Documentation = "https://github.com/NormallyNormal/cattorch/blob/main/docs/index.md"
 Changelog = "https://github.com/NormallyNormal/cattorch/blob/main/CHANGELOG.md"
 
 [project.scripts]

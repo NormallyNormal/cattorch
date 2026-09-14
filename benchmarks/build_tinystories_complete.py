@@ -31,7 +31,7 @@ from benchmarks.catgpt2_approx_experiment import CachedMQAExportModel
 from benchmarks.combine_sprites import combine_sprites
 from cattorch import (
     CodegenConfig,
-    GenerationConfig,
+    GenerationProgram,
     StorageConfig,
     transpile,
     transpile_tokenizer,
@@ -92,11 +92,14 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
     processor_model = CachedMQAExportModel(source, context).eval()
     processor = transpile(
         processor_model,
-        torch.tensor([[1]]),
+        GenerationProgram(
+            method="forward",
+            example_token=torch.tensor([[1]]),
+            max_context=context,
+        ),
         processor_path,
         name=f"{STEM} int8",
         optimization="exact",
-        generation=GenerationConfig(max_context=context),
         storage=storage,
         codegen=codegen,
     )
@@ -145,7 +148,7 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
             "generation_wrapper": "cached dynamic RoPE",
             "weight_precision": "int8",
             "scale_precision": "float16",
-            "compression": "costume-base85",
+            "compression": "costume-base92-huffman-int4",
             "unrolling": "compact",
             "compact_internal_names": {
                 "processor_tokenizer_and_combined_internals": True,
@@ -164,7 +167,10 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
             "eos_id": EOS_ID,
             "stop": "EOS or total context length",
         },
-        "broadcasts": ["cattorch init done", "cattorch prefill done"],
+        "broadcasts": [
+            "cattorch init complete", "cattorch reset complete",
+            "cattorch prefill complete", "cattorch decode complete",
+        ],
         "artifacts": {
             "processor": {
                 "path": processor.path.name,

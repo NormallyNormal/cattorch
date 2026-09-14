@@ -69,6 +69,12 @@ class OptimizedConvolutionInstruction(Instruction):
             self.stride_height, self.stride_width = stride
             self.padding_height, self.padding_width = padding
 
+        if self.args[0].dynamic:
+            self.batches = div(
+                length("T1"),
+                self.input_channels * self.input_height * self.input_width,
+            )
+
         self.output_height = (
             self.input_height + 2 * self.padding_height - self.kernel_height
         ) // self.stride_height + 1
@@ -325,7 +331,10 @@ class OptimizedPoolingInstruction(Instruction):
 
     def prepare(self):
         shape = self.args[0].shape
-        self.batches = shape[0]
+        self.batches = (
+            div(length("T1"), math.prod(shape[1:]))
+            if self.args[0].dynamic else shape[0]
+        )
         self.channels = shape[1]
         if len(shape) == 3:
             self.input_height, self.input_width = 1, shape[2]

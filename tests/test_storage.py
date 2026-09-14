@@ -1,6 +1,7 @@
 import json
 import math
 import zipfile
+from collections import Counter
 
 import pytest
 import torch
@@ -14,8 +15,13 @@ from cattorch import (
 )
 from cattorch.sprite import _static_storage_shard_limits
 from cattorch.storage import (
-    BASE85_ALPHABET,
+    BASE92_ALPHABET,
     EncodedList,
+    _canonical_huffman_codes,
+    _encode_bytes,
+    _encode_huffman_symbols,
+    _huffman_prefix_table,
+    _length_limited_huffman_lengths,
     build_shared_unpack_program,
     build_unpack_program,
     encode_quantized_values,
@@ -24,7 +30,7 @@ from cattorch.storage import (
     encode_values,
     rounded_values,
 )
-from cattorch.util.scratch.dsl import Program, append, item, replace
+from cattorch.util.scratch.dsl import Program, append, delete, item, length, replace
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.finalize_scratch import (
     SCRATCH_ONLINE_JSON_LIMIT,
@@ -51,8 +57,52 @@ def _load(path):
 def _codec_sprite(program):
     sprite = program.compile()
     sprite["currentCostume"] = 0
-    sprite["costumes"] = [{"name": character} for character in BASE85_ALPHABET]
+    sprite["costumes"] = [{"name": character} for character in BASE92_ALPHABET]
     return sprite
+
+
+def test_base92_uses_all_safe_costume_digits_and_exact_52_bit_groups():
+    assert len(BASE92_ALPHABET) == 92
+    assert '"' not in BASE92_ALPHABET
+    assert "\\" not in BASE92_ALPHABET
+    assert all(33 <= ord(character) <= 126 for character in BASE92_ALPHABET)
+    assert len(_encode_bytes(bytes(range(13)))) == 17  # one pad header + 16 digits
+    assert len(_encode_bytes(bytes(range(26)))) == 33
+
+
+def test_length_limited_huffman_round_trips_q4_symbols():
+    symbols = [7] * 500 + [6] * 250 + [8] * 125 + list(range(15)) * 3
+    frequencies = Counter(symbols)
+    lengths = _length_limited_huffman_lengths(frequencies)
+    codes = _canonical_huffman_codes(lengths)
+    table = _huffman_prefix_table(codes)
+    payload = _encode_huffman_symbols(symbols, codes)
+
+    assert max(lengths.values()) <= 8
+    assert len(payload) * 8 < len(symbols) * 4
+    decoded = []
+    bits = 0
+    bit_count = 0
+    cursor = 0
+    while len(decoded) < len(symbols):
+        if bit_count < 8:
+            bits = bits * 256 + payload[cursor]
+            bit_count += 8
+            cursor += 1
+        entry = table[bits // 2 ** (bit_count - 8)]
+        length_ = entry % 16
+        decoded.append(entry // 16)
+        bit_count -= length_
+        bits %= 2**bit_count
+    assert decoded == symbols
+
+
+def test_length_limiter_handles_an_extreme_fifteen_symbol_distribution():
+    frequencies = Counter({0: 10**9, **{symbol: 1 for symbol in range(1, 15)}})
+    lengths = _length_limited_huffman_lengths(frequencies)
+    assert set(lengths) == set(range(15))
+    assert max(lengths.values()) <= 8
+    assert sum(2 ** (8 - length_) for length_ in lengths.values()) <= 256
 
 
 @pytest.mark.parametrize(
@@ -62,7 +112,7 @@ def _codec_sprite(program):
         ("float16", [0.0, -0.0, 1.0, -2.5, 0.001, 123.5, 70_000, math.inf, -math.inf, math.nan]),
     ],
 )
-def test_scratch_base85_decoder_round_trips_ieee_values(precision, values):
+def test_scratch_base92_decoder_round_trips_ieee_values(precision, values):
     payload = encode_values(values, precision)
     program = build_unpack_program([
         EncodedList("weights", "payload", payload, precision),
@@ -100,7 +150,7 @@ def test_scratch_integer_decoder_dequantizes_groups_once(precision):
 
 
 @pytest.mark.parametrize("count", [1, 2, 3])
-def test_costume_base85_decoder_handles_partial_byte_groups(count):
+def test_costume_base92_decoder_handles_partial_byte_groups(count):
     values = [-0.75, 0.25, 1.5][:count]
     payload, scale_payload = encode_quantized_values(values, "int8", count)
     program = build_unpack_program([
@@ -116,17 +166,17 @@ def test_costume_base85_decoder_handles_partial_byte_groups(count):
     assert emulator.lists["weights"] == rounded_values(values, "int8", count)
 
 
-def test_packed_int4_payload_is_half_the_int8_payload_for_even_counts():
+def test_packed_int4_payload_has_half_the_int8_base92_data_groups():
     values = [math.sin(index) for index in range(96)]
     int8_payload, _ = encode_quantized_values(values, "int8", 32)
     int4_payload, _ = encode_quantized_values(values, "int4", 32)
-    assert len(int4_payload) == len(int8_payload) // 2
+    assert len(int4_payload) - 1 == (len(int8_payload) - 1) // 2
 
 
-def test_bitpacked_int6_uses_fifteen_base85_characters_per_sixteen_weights():
+def test_bitpacked_int6_uses_base92_groups_after_one_padding_digit():
     values = [math.sin(index) for index in range(96)]
     payload, _ = encode_quantized_values(values, "int6", 32)
-    assert len(payload) == 90
+    assert len(payload) == 1 + math.ceil((96 * 6 / 8) / 13) * 16
 
 
 def test_learned_codebook_quantizer_is_deterministic_and_bounded():
@@ -156,7 +206,7 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
         if "weight bank payload" in entry[0]
     ]
     assert len(weight_banks) == 1
-    assert [costume["name"] for costume in sprite["costumes"]] == list(BASE85_ALPHABET)
+    assert [costume["name"] for costume in sprite["costumes"]] == list(BASE92_ALPHABET)
     assert len({costume["md5ext"] for costume in sprite["costumes"]}) == 1
 
     emulator = ScratchEmulator(sprite)
@@ -203,7 +253,8 @@ def test_shared_unpack_splits_temporary_byte_banks_at_scratch_list_limit():
         "cattorch float32 weight bank 1 payload",
         "cattorch float32 weight bank 2 payload",
     }
-    assert all(len(payload) == 150_000 for payload in banks.values())
+    expected = 1 + math.ceil(120_000 / 13) * 16
+    assert all(len(payload) == expected for payload in banks.values())
 
 
 def test_shared_unpack_splits_quantized_banks_on_combined_scale_bytes():
@@ -230,7 +281,8 @@ def test_shared_unpack_splits_quantized_banks_on_combined_scale_bytes():
     }
     assert len(scale_banks) == 2
     assert len(weight_banks) == 2
-    assert all(len(payload) == 150_000 for payload in scale_banks.values())
+    expected = 1 + math.ceil(120_000 / 13) * 16
+    assert all(len(payload) == expected for payload in scale_banks.values())
 
 
 def test_split_scale_banks_decode_every_tensor_value(tmp_path):
@@ -246,15 +298,16 @@ def test_split_scale_banks_decode_every_tensor_value(tmp_path):
             return self.first(value) + self.second(value)
 
     model = TwoMatrices().eval()
-    result = transpile(
-        model,
-        torch.ones(1, 200),
-        tmp_path / "split-scales",
-        storage=StorageConfig(
-            precision="int8", group_size=1, min_quantized_values=1,
-        ),
-        codegen=CodegenConfig(unrolling="compact", id_namespace=""),
-    )
+    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+        result = transpile(
+            model,
+            torch.ones(1, 200),
+            tmp_path / "split-scales",
+            storage=StorageConfig(
+                precision="int8", group_size=1, min_quantized_values=1,
+            ),
+            codegen=CodegenConfig(unrolling="compact", id_namespace=""),
+        )
     emulator = ScratchEmulator(_load(result.path))
     emulator.run_procedure("cattorch init")
 
@@ -394,16 +447,17 @@ def test_integer_storage_dequantizes_before_forward_and_reinitializes(
     value = torch.tensor([[0.5, -1.0, 2.0], [-0.25, 0.75, 1.5]])
     path = tmp_path / precision
     group_size = 4
-    transpile(
-        model,
-        value,
-        str(path),
-        storage=StorageConfig(
-            precision=precision,
-            group_size=group_size,
-            min_quantized_values=1,
-        ),
-    )
+    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+        transpile(
+            model,
+            value,
+            str(path),
+            storage=StorageConfig(
+                precision=precision,
+                group_size=group_size,
+                min_quantized_values=1,
+            ),
+        )
     sprite = _load(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
 
@@ -452,16 +506,17 @@ def test_int8_has_lower_export_error_than_int4_on_same_weights(tmp_path):
     ])
     reports = {}
     for precision in ("int8", "int4"):
-        result = transpile(
-            model,
-            value,
-            tmp_path / precision,
-            storage=StorageConfig(
-                precision=precision,
-                group_size=4,
-                min_quantized_values=1,
-            ),
-        )
+        with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+            result = transpile(
+                model,
+                value,
+                tmp_path / precision,
+                storage=StorageConfig(
+                    precision=precision,
+                    group_size=4,
+                    min_quantized_values=1,
+                ),
+            )
         reports[precision] = verify(model, value, result, atol=0, rtol=0)
 
     assert reports["int8"].mean_abs_error > 0
@@ -527,17 +582,18 @@ def test_uncompressed_integer_storage_still_applies_quantization(tmp_path, preci
             [0.11, 0.57, 2.62],
         ]))
     value = torch.tensor([[0.25, -0.5, 1.25]])
-    result = transpile(
-        model,
-        value,
-        tmp_path / f"plain-{precision}",
-        storage=StorageConfig(
-            compression=False,
-            precision=precision,
-            group_size=4,
-            min_quantized_values=1,
-        ),
-    )
+    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+        result = transpile(
+            model,
+            value,
+            tmp_path / f"plain-{precision}",
+            storage=StorageConfig(
+                compression=False,
+                precision=precision,
+                group_size=4,
+                min_quantized_values=1,
+            ),
+        )
     report = verify(model, value, result, atol=0, rtol=0)
     assert report.values_compared == 2
     assert report.mean_abs_error > 0
@@ -553,6 +609,7 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
             append("output", item("input", SCRATCH_LIST_LIMIT + 1)),
             replace("input", SCRATCH_LIST_LIMIT + 2, 77),
             append("input", 88),
+            delete("input", length("input")),
         ),
     )
     sprite = program.compile()
@@ -565,7 +622,7 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
 
     second = layouts["input"].shards[1]
     assert emulator.lists["output"] == [SCRATCH_LIST_LIMIT]
-    assert emulator._lists[second.identifier] == [SCRATCH_LIST_LIMIT, 77, 88]
+    assert emulator._lists[second.identifier] == [SCRATCH_LIST_LIMIT, 77]
     assert second.name == "input shard 2"
     assert sprite["variables"]["cattorch_input_shard_count"][1] == 2
     assert sprite["variables"]["cattorch_input_logical_length"][1] == SCRATCH_LIST_LIMIT + 3
@@ -605,12 +662,13 @@ def test_small_matrices_use_float16_instead_of_integer_decoder(tmp_path, precisi
     model = TinyLinear().eval()
     value = torch.randn(1, 3)
     path = tmp_path / f"hybrid-{precision}"
-    transpile(
-        model,
-        value,
-        path,
-        storage=StorageConfig(precision=precision),
-    )
+    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+        transpile(
+            model,
+            value,
+            path,
+            storage=StorageConfig(precision=precision),
+        )
     sprite = _load(path.with_suffix(".sprite3"))
 
     assert not any(
@@ -642,13 +700,29 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
     model = torch.nn.Linear(128, 128, bias=False).eval()
     value = torch.randn(1, 128)
     path = tmp_path / f"large-{precision}"
-    transpile(model, value, path, storage=StorageConfig(precision=precision))
+    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
+        transpile(model, value, path, storage=StorageConfig(precision=precision))
     sprite = _load(path.with_suffix(".sprite3"))
 
     assert any(
         "scale bank payload" in entry[0]
         for entry in sprite["variables"].values()
     )
+    if precision == "int4":
+        weight_payloads = [
+            entry[1] for entry in sprite["variables"].values()
+            if "int4 weight bank" in entry[0]
+        ]
+        assert weight_payloads
+        assert len(weight_payloads[0]) < len(_encode_bytes(bytes(128 * 128 // 2)))
+        assert any(
+            "int4 huffman bank" in entry[0]
+            for entry in sprite["variables"].values()
+        )
+        assert next(
+            entry[1] for entry in sprite["variables"].values()
+            if entry[0] == "cattorch storage compression"
+        ) == "costume-base92-huffman-int4"
 
 
 def test_storage_benchmark_bundles_all_variants(tmp_path):
@@ -660,8 +734,8 @@ def test_storage_benchmark_bundles_all_variants(tmp_path):
     with zipfile.ZipFile(project_path) as archive:
         project = json.loads(archive.read("project.json"))
     assert {target["name"] for target in project["targets"]} == {
-        "Stage", "tiny plain-f32", "tiny base85-f32", "tiny base85-f16",
-        "tiny base85-int8", "tiny base85-int6", "tiny base85-int4",
+        "Stage", "tiny plain-f32", "tiny base92-f32", "tiny base92-f16",
+        "tiny base92-int8", "tiny base92-int6", "tiny base92-int4-huffman",
     }
     stage = next(target for target in project["targets"] if target["isStage"])
     lists = {entry[0]: entry[1] for entry in stage["lists"].values()}
@@ -670,3 +744,46 @@ def test_storage_benchmark_bundles_all_variants(tmp_path):
         block["opcode"] == "event_whenflagclicked"
         for block in stage["blocks"].values()
     )
+
+
+def test_int4_huffman_banks_split_when_compressed_stream_exceeds_list_limit():
+    import random
+
+    from cattorch.storage import (
+        BASE92_ALPHABET, EncodedList, _build_banked_unpack_program,
+    )
+    from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
+
+    def spec(index, symbols):
+        packed = bytes(
+            symbols[i] * 16 + (symbols[i + 1] if i + 1 < len(symbols) else 7)
+            for i in range(0, len(symbols), 2)
+        )
+        return EncodedList(
+            f"W_{index}", f"payload {index}", "", "int4",
+            value_count=len(symbols), group_size=len(symbols),
+            scale_precision="float16", payload_bytes=packed, scale_values=(1.0,),
+        )
+
+    # Two full-size shards of 13 common codes plus many two-value tensors holding
+    # a globally rare code. Each tiny tensor needs 9 Huffman bits, so byte
+    # alignment makes the stream longer than the 4-bit payload it replaces.
+    common = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]
+    tiny = 10_000
+    symbols = [common[i % 13] for i in range(2 * (SCRATCH_LIST_LIMIT - tiny))]
+    random.Random(0).shuffle(symbols)
+    half = len(symbols) // 2
+    specs = [spec(-1, symbols[:half]), spec(0, symbols[half:])] + [
+        spec(i + 1, [(7, 14)[i % 2], common[i % 13]]) for i in range(tiny)
+    ]
+    assert sum(len(item.payload_bytes) for item in specs) == SCRATCH_LIST_LIMIT
+
+    program = _build_banked_unpack_program(specs)
+    banks = [
+        value for name, value in program.variable_values.items()
+        if name.startswith("cattorch int4 weight bank")
+    ]
+    assert banks
+    for payload in banks:
+        decoded = 13 * ((len(payload) - 1) // 16) - BASE92_ALPHABET.index(payload[0])
+        assert decoded <= SCRATCH_LIST_LIMIT

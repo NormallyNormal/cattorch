@@ -1,9 +1,14 @@
 # Supported models and operations
 
-cattorch exports one fixed-shape inference graph with one tensor output. It is
-built on `torch.export`, so graph construction must not depend on tensor data.
-Parameters, buffers, and constants are embedded in the sprite; tensor arguments
-become Scratch input lists.
+[Documentation home](index.md)
+
+cattorch traces one fixed inference path through the model, using the shapes
+and dtypes in `example_inputs`. The Python code can't branch on tensor values.
+Parameters, buffers, and constants are stored in the sprite, and tensor
+arguments become Scratch input lists.
+
+For persistent state and bounded variable-length tensors, use an experimental
+[`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state).
 
 ## Operations
 
@@ -14,32 +19,49 @@ become Scratch input lists.
 | Linear algebra | `nn.Linear`, `@`, `torch.matmul`; two batched operands must have identical batch dimensions |
 | Activations | ReLU, sigmoid, tanh, GELU (tanh form), SiLU, leaky ReLU, ELU |
 | Normalization | BatchNorm1d/2d, LayerNorm, RMSNorm, `torch.rsqrt` |
-| Attention primitives | softmax, embeddings, registered-buffer `masked_fill` |
+| Attention primitives | softmax, embeddings, registered-buffer `masked_fill`, `cattorch.rotary_embedding` |
 | Arithmetic | tensor/scalar `+`, `-`, `*`; scalar `/`; unary `-`; `torch.pow` with exponent 0 or 2 |
 | Reduction | `torch.mean` along one dimension or consecutive dimensions |
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
 | Shape and layout | `view`, `reshape`, `flatten`, `contiguous`, `clone`, transpose, permute, `.T` |
-| Tensor composition | split, split-with-sizes, chunk, concat, dimension slicing with step 1 |
+| Tensor composition | split, split-with-sizes, chunk, concat, fixed dimension slicing with a positive step |
 
 These operations cover many MLPs and CNNs, along with transformer components
 such as multi-head attention, combined QKV projections, rotary position
-embeddings, causal masks, pre-norm residual blocks, and SwiGLU gates. Support is
-defined by the exported operation graph, not by a model family name: wrappers
-around otherwise compatible modules may still need adjustment.
+embeddings, causal masks, pre-norm residual blocks, and SwiGLU gates. Support
+depends on the operations the model actually runs, not on its architecture
+name. A wrapper around a supported module can still fail, for example when a
+block returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
 
-RNNs and multiple tensor outputs are not currently supported.
+Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
+It accepts broadcastable sine/cosine tables that do not expand `value` and
+requires an even final dimension.
 
-## Interface contract
+Mixture-of-experts layers are supported through the experimental
+`ExpertFamily` and `SparseMoE` classes; see
+[experimental programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
+
+RNNs are not supported.
+
+A listed operation can still be rejected for an unsupported shape,
+broadcasting pattern, or option. The error names the operation that failed.
+
+## Inputs and outputs
 
 - The first tensor argument is flattened into `input`; later tensor arguments
   use `input_1`, `input_2`, and so on.
-- The model must return one tensor, flattened into `output`.
-- Input shapes are specialized from the example values supplied at export.
-- Training-only semantics are not silently removed. For example, training-mode
-  dropout is rejected; call `model.eval()` before exporting.
-- Dtype conversions that would change values are rejected when no faithful
-  Scratch implementation exists.
+- The model may return a tensor or a nested tuple, list, or dictionary of
+  tensors. Leaves are flattened into `output`, `output_1`, and so on in
+  PyTorch pytree order; non-tensor leaves are rejected.
+- Input shapes are fixed to the shapes of the example values.
+- Training-mode behavior is rejected rather than dropped. For example,
+  training-mode dropout raises an error, so call `model.eval()` first.
+- Casting a runtime tensor to a different dtype, such as `x.float()` on an
+  integer input, is rejected.
 
-Unsupported operations raise `UnsupportedOperationError` with the exported
-operation, node, and module context when available. Unsupported graph-level
-contracts raise `UnsupportedModelError`.
+An unsupported operation raises `UnsupportedOperationError`, naming the
+operation and the module it came from. Other export problems, such as a
+non-tensor return value, raise `UnsupportedModelError`.
+
+Run [`verify`](api-reference.md#verify) whenever you change the model or export
+options. If export fails, see [troubleshooting](troubleshooting.md).

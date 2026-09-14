@@ -29,7 +29,7 @@ jobs:
           pytest tests/ -v
           python -m compileall -q cattorch tests benchmarks
           ruff check cattorch tests benchmarks
-          mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/storage.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py
+          mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/codegen.py cattorch/storage.py cattorch/quantization.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py cattorch/frontend.py cattorch/operator_registry.py
 
   publish:
     needs: test

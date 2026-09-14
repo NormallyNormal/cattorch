@@ -1,9 +1,11 @@
 # Verification and benchmarking
 
-Correctness and speed need different test environments. The included emulator
-is useful for deterministic functional checks. Performance must ultimately be
-timed in Scratch itself; emulator or browser measurements from another machine
-are not assumed to be proportional.
+[Documentation home](index.md)
+
+`verify` checks that a sprite's output matches PyTorch. Benchmark projects
+measure its speed in Scratch. `verify` runs in a Python emulator of Scratch, so
+it can't tell you how fast the sprite is in a browser or whether it imports and
+saves correctly.
 
 ## Numerical verification
 
@@ -18,16 +20,30 @@ print(result.max_abs_error, result.max_rel_error)
 print(result.worst_index)
 ```
 
-`verify` loads the generated sprite, runs one `cattorch forward` in the Python
-emulator, and compares the flattened result with PyTorch. It supports sharded
-input/output lists. It is especially useful after selecting float16 storage,
-significant-figure rounding, fast kernels, pruning, or low-rank transforms.
+`verify` loads the sprite, runs `cattorch forward` once in the emulator, and
+compares the result with PyTorch value by value. Sharded lists are handled.
+Run it after every change that can affect accuracy: float16 or integer storage,
+`sig_figs`, fast mode, pruning, or low-rank transforms.
 
-Verification does not estimate Scratch performance.
+For a model with several tensor outputs, `verify` returns a
+`MultiOutputVerifyResult`. `result.passed` is true only if every output passes,
+and `result.outputs` has one `VerifyResult` per output, in the same order as
+`artifact.outputs`:
+
+```python
+artifact = transpile(multi_output_model, example, "multi_output_model")
+result = verify(multi_output_model, example, artifact)
+for spec, comparison in zip(artifact.outputs, result.outputs):
+    print(spec.list_name, comparison.passed, comparison.max_abs_error)
+```
+
+A model returning one tensor gets a `VerifyResult`, even if the tensor is
+wrapped in a tuple, list, or dictionary. For stateful call sequences, see
+[program verification](programs-and-moe.md#named-entrypoints-and-state).
 
 ## Scratch benchmark projects
 
-Create a paired exact/fast project:
+Compare exact and fast mode for one model:
 
 ```python
 from cattorch import build_paired_benchmark
@@ -35,8 +51,8 @@ from cattorch import build_paired_benchmark
 build_paired_benchmark(model, example, "model_benchmark.sb3")
 ```
 
-Bundle models into one sequential suite, with each result appended to a visible
-list:
+Time several models in one project. Each result is added to a list shown on
+the stage:
 
 ```python
 from cattorch import build_benchmark_suite
@@ -51,7 +67,7 @@ build_benchmark_suite(
 )
 ```
 
-Storage and generation have dedicated suite builders:
+Separate builders compare storage formats and cached generation:
 
 ```python
 from cattorch import build_generation_benchmark_suite, build_storage_benchmark_suite
@@ -63,25 +79,23 @@ build_storage_benchmark_suite(
 )
 
 build_generation_benchmark_suite(
-    [("decoder", decoder, token_example)],
+    [("decoder", decoder, stateless_input, prompt)],
     "generation_suite.sb3",
     iterations=10,
 )
 ```
 
-In Scratch, enable Turbo Mode, click the green flag, and wait for the results
-list to complete. Initialization occurs before the timer, and generated calls
-use no-refresh custom blocks. Save the completed project and inspect it with:
+Load the project in Scratch, turn on Turbo Mode, click the green flag, and
+wait until the results list is complete. Initialization happens before timing
+starts. Save the finished project and read the results with:
 
 ```bash
 cattorch-benchmark downloaded-project.sb3
 ```
 
-Scratch's timer can advance in coarse increments (about 0.033 seconds in one
-reference browser). Increase `iterations` until fast kernels run comfortably
-longer than the timer resolution. Browser results remain specific to that OS,
-browser, and hardware; use the same target environment for comparisons.
+Scratch's timer is coarse (about 0.033-second steps in browser runs so far),
+so raise `iterations` until each result is many times longer than that. Repeat runs, and compare results only from the same
+browser, machine, and Scratch settings.
 
-See the
-[benchmark development guide](https://github.com/NormallyNormal/cattorch/blob/main/benchmarks/README.md)
-for repository scripts, suites, artifacts, and result formats.
+Related: [benchmark API reference](api-reference.md#benchmark-api) and the
+[repository benchmark guide](../benchmarks/README.md).

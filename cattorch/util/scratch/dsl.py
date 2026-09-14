@@ -73,6 +73,11 @@ class Binary(Expr):
 
 
 @dataclass(frozen=True)
+class Not(Expr):
+    value: Expr
+
+
+@dataclass(frozen=True)
 class MathOp(Expr):
     operator: str
     value: Expr
@@ -161,6 +166,10 @@ def lt(left, right) -> Binary:
 
 def gt(left, right) -> Binary:
     return _binary("operator_gt", left, right)
+
+
+def not_(expr) -> Not:
+    return Not(value(expr))
 
 
 # Statements ------------------------------------------------------------------
@@ -266,6 +275,11 @@ class SwitchCostume(Statement):
     value: Expr
 
 
+@dataclass(frozen=True)
+class BroadcastAndWait(Statement):
+    message: str
+
+
 def set_var(name: str, expr) -> SetVariable:
     return SetVariable(name, value(expr))
 
@@ -351,6 +365,12 @@ def switch_costume(expr) -> SwitchCostume:
     return SwitchCostume(value(expr))
 
 
+def broadcast_and_wait(message: str) -> BroadcastAndWait:
+    if not isinstance(message, str) or not message:
+        raise ValueError("broadcast message must be a non-empty string")
+    return BroadcastAndWait(message)
+
+
 def costume_number() -> CostumeNumber:
     return CostumeNumber()
 
@@ -410,11 +430,11 @@ class Program:
         unknown_variables = self.variable_values.keys() - set(self.variables)
         if unknown_variables:
             names = ", ".join(sorted(unknown_variables))
-            raise ValueError(f"Initial values provided for undeclared variables: {names}")
+            raise ValueError(f"initial values provided for undeclared variables: {names}")
         unknown_lists = self.list_values.keys() - set(self.lists)
         if unknown_lists:
             names = ", ".join(sorted(unknown_lists))
-            raise ValueError(f"Initial values provided for undeclared lists: {names}")
+            raise ValueError(f"initial values provided for undeclared lists: {names}")
         self.body = tuple(body)
         self.optimize_loops = optimize_loops
 
@@ -440,6 +460,7 @@ class _Lowerer:
         self.counter = 0
         self.var_ids = {name: f"cattorch_dsl_var_{name}" for name in program.variables}
         self.list_ids = {name: f"cattorch_dsl_list_{name}" for name in program.lists}
+        self.broadcast_ids: dict[str, str] = {}
 
     def _id(self) -> str:
         self.counter += 1
@@ -469,7 +490,10 @@ class _Lowerer:
                 sid: [name, self.program.list_values.get(name, [])]
                 for name, sid in self.list_ids.items()
             },
-            "broadcasts": {},
+            "broadcasts": {
+                identifier: message
+                for message, identifier in self.broadcast_ids.items()
+            },
             "blocks": self.blocks,
         }
 
@@ -571,6 +595,16 @@ class _Lowerer:
                 "proccode": statement.name, "argumentids": "[]",
             }
             self.blocks[block_id] = block
+        elif isinstance(statement, BroadcastAndWait):
+            broadcast_id = self.broadcast_ids.setdefault(
+                statement.message,
+                f"cattorch_dsl_broadcast_{len(self.broadcast_ids) + 1}",
+            )
+            block = self._base("event_broadcastandwait", parent)
+            block["inputs"]["BROADCAST_INPUT"] = [
+                1, [11, statement.message, broadcast_id],
+            ]
+            self.blocks[block_id] = block
         elif isinstance(statement, SwitchCostume):
             block = self._base("looks_switchcostumeto", parent)
             self.blocks[block_id] = block
@@ -601,7 +635,7 @@ class _Lowerer:
                     shadow_id,
                 ]
         else:
-            raise TypeError(f"Unsupported Scratch DSL statement: {type(statement).__name__}")
+            raise TypeError(f"unsupported Scratch DSL statement: {type(statement).__name__}")
 
         return block_id
 
@@ -647,6 +681,10 @@ class _Lowerer:
             left_name, right_name = _BINARY_INPUTS[expr.opcode]
             block["inputs"][left_name] = self._expr(expr.left, block_id)
             block["inputs"][right_name] = self._expr(expr.right, block_id)
+        elif isinstance(expr, Not):
+            block = self._base("operator_not", parent)
+            self.blocks[block_id] = block
+            block["inputs"]["OPERAND"] = self._expr(expr.value, block_id)
         elif isinstance(expr, MathOp):
             block = self._base("operator_mathop", parent)
             block["fields"]["OPERATOR"] = [expr.operator, None]
@@ -666,7 +704,7 @@ class _Lowerer:
             block["fields"]["NUMBER_NAME"] = ["number", None]
             self.blocks[block_id] = block
         else:
-            raise TypeError(f"Unsupported Scratch DSL expression: {type(expr).__name__}")
+            raise TypeError(f"unsupported Scratch DSL expression: {type(expr).__name__}")
         # Reporter blocks never participate in command chains.
         self.blocks[block_id]["next"] = None
         return [3, block_id, [4, 0]]
@@ -766,6 +804,8 @@ def _expr_uses_variable(expr: Expr, name: str) -> bool:
         return _expr_uses_variable(expr.left, name) or _expr_uses_variable(
             expr.right, name,
         )
+    if isinstance(expr, Not):
+        return _expr_uses_variable(expr.value, name)
     if isinstance(expr, (MathOp, Round)):
         return _expr_uses_variable(expr.value, name)
     if isinstance(expr, Random):
@@ -780,7 +820,7 @@ def _statement_accesses_variable(statement: Statement, name: str) -> bool:
         return statement.name == name or _expr_uses_variable(statement.value, name)
     if isinstance(statement, ChangeVariable):
         return statement.name == name or _expr_uses_variable(statement.value, name)
-    if isinstance(statement, (ClearList, ProcedureCall)):
+    if isinstance(statement, (ClearList, ProcedureCall, BroadcastAndWait)):
         return False
     if isinstance(statement, SwitchCostume):
         return _expr_uses_variable(statement.value, name)
@@ -943,6 +983,8 @@ def _render_expr(expr: Expr) -> str:
             "operator_equals": "==", "operator_lt": "<", "operator_gt": ">",
         }[expr.opcode]
         return f"({_render_expr(expr.left)} {symbol} {_render_expr(expr.right)})"
+    if isinstance(expr, Not):
+        return f"not({_render_expr(expr.value)})"
     if isinstance(expr, MathOp):
         return f"{expr.operator}({_render_expr(expr.value)})"
     if isinstance(expr, Round):
@@ -1001,5 +1043,7 @@ def _render_statements(statements: Iterable[Statement], lines: list[str], depth:
             _render_statements(statement.else_body, lines, depth + 1)
         elif isinstance(statement, ProcedureCall):
             lines.append(f"{indent}call {statement.name}")
+        elif isinstance(statement, BroadcastAndWait):
+            lines.append(f"{indent}broadcast and wait {statement.message}")
         elif isinstance(statement, SwitchCostume):
             lines.append(f"{indent}switch costume to {_render_expr(statement.value)}")

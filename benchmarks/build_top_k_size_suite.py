@@ -63,7 +63,9 @@ def build_top_k_size_suite(
                 sprite,
                 temporary / f"top_k_{name}.sprite3",
                 sprite_name=f"top-k {name}",
-                codegen=CodegenConfig(id_namespace=name[0]),
+                codegen=CodegenConfig(id_namespace={
+                    "unrolled": "unr", "compact": "cmp",
+                }[name]),
             )
             target, target_assets = _load_sprite(finalized.path)
             target["name"] = f"top-k {name}"

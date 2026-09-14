@@ -43,8 +43,8 @@ class TensorReplacer:
             template_name = f"T{i + 1}"
             if target_name not in name_to_id:
                 raise KeyError(
-                    f"List '{target_name}' not found in sprite lists. "
-                    f"Available: {list(name_to_id.keys())}"
+                    f"list '{target_name}' not found in sprite lists; "
+                    f"available: {list(name_to_id.keys())}"
                 )
             self._name_map[template_name] = target_name
             self._id_map[template_name] = name_to_id[target_name]

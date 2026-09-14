@@ -1,104 +1,115 @@
 # cattorch Scratch benchmarks
 
-These benchmarks measure inside the stock Scratch editor. Python and the
-test emulator are not used as performance clocks.
+These scripts build Scratch projects that time cattorch kernels and exports
+inside Scratch itself. The Python emulator is only used to check correctness,
+never for timing. For the benchmark builders in the `cattorch` package, see the
+[benchmark API reference](../docs/api-reference.md#benchmark-api).
 
-Generate the suite:
+Several suites need checkpoints from a sibling `catgpt2` checkout. Built
+projects are written to `benchmarks/artifacts/`, which is not committed.
 
-```bash
-python benchmarks/build_suite.py
-```
+## Run a suite in Scratch
 
-This writes `benchmarks/artifacts/cattorch_suite.sb3`. The project contains
-an exact/fast pair for every case and runs them sequentially. For each variant
-it runs init outside the timed region, resets the timer, executes 100 forwards,
-and appends a `name variant: seconds` entry to the visible results list. The
-analyzer can still read older legacy/exact result projects.
+1. Build a suite, for example `python benchmarks/build_suite.py`.
+2. Open <https://scratch.mit.edu/projects/editor/>.
+3. Choose **File → Load from your computer** and select the `.sb3`.
+4. Turn on Turbo Mode by shift-clicking the green flag.
+5. Click the green flag and wait until the results list on the stage has every
+   expected entry. Each entry is added after its timed section ends.
+6. Save the finished project to your computer.
+7. Run `cattorch-benchmark downloaded-project.sb3`, or
+   `python -m cattorch.benchmark downloaded-project.sb3` from a checkout.
 
-For a single project containing both the 39 operator cases and the eight
-matrix/LLM cases, generate the comprehensive suite instead:
+The report lists each named timing, the speedup for each case, output error,
+block counts, file size, and the project's SHA-256. Save the report together
+with the run date, browser version, operating system, and hardware.
 
-```bash
-python benchmarks/build_full_suite.py
-```
+In the browser, Scratch's timer advanced in steps of about 0.033 seconds during
+the August 2026 runs. Treat short results as imprecise, and raise the
+iteration count before comparing small differences.
 
-This writes `benchmarks/artifacts/full_suite.sb3` with 94 sequential result
-rows. `build_kernel_suite.py` remains useful when only operator-level results
-are wanted.
+### Headless Scratch VM
 
-To generate the focused `exact` and `fast` approximation suite, run:
-
-```bash
-python benchmarks/build_fast_suite.py
-```
-
-This writes `benchmarks/artifacts/fast_suite.sb3`. Its fast arm uses the
-default arithmetic approximations without pruning or low-rank weight changes.
-To isolate the two weight transformations in one project, generate:
+For faster iteration, run a suite in the official Scratch VM without a browser:
 
 ```bash
-python benchmarks/build_weight_suite.py
+cd benchmarks
+npm install
+npm run run-vm
 ```
 
-`benchmarks/artifacts/fast_weight_suite.sb3` contains pruning and low-rank
-pairs for Linear, Conv1d, Conv2d, Quick GPT, and CatGPT1. Arithmetic fast paths
-are disabled in this suite, so timing changes and output errors come only from
-the weight transformation. The `prune50` cases remove 50% of Scratch-friendly
-blocks; the `rank25` cases use 25% of each eligible layer's full rank.
-
-The focused generic-matmul and exact SwiGLU-fusion suite is generated with:
+`run-vm` runs `artifacts/cattorch_suite.sb3` with Turbo Mode on and prints the
+timings as JSON. To run another project, call the runner directly:
 
 ```bash
-python benchmarks/build_matmul_swiglu_suite.py
+node benchmarks/run_scratch_vm.cjs benchmarks/artifacts/costume_codec_suite.sb3 --inspect-lists
 ```
 
-This creates `benchmarks/artifacts/matmul_swiglu_suite.sb3`. Static matmul is
-tested with the same `prune50` and `rank25` settings. `swiglu_fused` computes
-`silu(gate) * value` in one traversal, while `swiglu_materialized` deliberately
-prevents fusion and provides the exact-output performance baseline.
+The VM has no renderer, so it may print warnings about missing costumes; these
+are harmless. VM timings are repeatable, which makes them good for comparing
+candidates, while browser runs show what users actually get. Neither converts
+to the other, so recheck small or sub-second differences in the browser, and
+keep both kinds of result when reporting performance.
 
-Stateful decoding has its own stateless-forward versus KV-cache project:
+## Suites
 
-```bash
-python benchmarks/build_generation_suite.py
+Each script writes its project to `benchmarks/artifacts/`, named after the
+script unless another name is shown.
+
+| Script | Measures |
+|---|---|
+| `build_suite.py` | The main suite (`cattorch_suite.sb3`), with an exact and a fast variant of every case. Each variant runs `cattorch init` untimed, then 100 timed forwards, and adds `name variant: seconds` to the results list. The analyzer can also read results from older projects that compared the legacy backend with exact mode. |
+| `build_kernel_suite.py` | Only the 39 operator-level cases. |
+| `build_full_suite.py` | The 39 operator cases plus eight matrix and language-model cases in one project (`full_suite.sb3`, 94 results). |
+| `build_fast_suite.py` | Fast mode's arithmetic approximations only, with no pruning or low-rank transforms (`fast_suite.sb3`). |
+| `build_weight_suite.py` | Pruning and low-rank transforms only, with arithmetic approximations off, for Linear, Conv1d, Conv2d, Quick GPT, and CatGPT1 (`fast_weight_suite.sb3`). `prune50` removes 50% of weight groups; `rank25` keeps 25% of each eligible layer's rank. |
+| `build_matmul_swiglu_suite.py` | Matrix multiply with the same `prune50` and `rank25` settings, and SwiGLU fused into one loop (`swiglu_fused`) versus computed in separate steps (`swiglu_materialized`). |
+| `build_generation_suite.py` | Stateless forward versus KV-cached decoding. Cached cases prefill before the timer starts. |
+| `build_storage_suite.py` | Startup and forward time for uncompressed float32 and Base92-encoded float32, float16, 8-bit, 6-bit, and 4-bit weights. Ten timed init calls, then ten forwards. A second list records each sprite's size. |
+| `build_next_optimization_suite.py` | 30 kernel candidates from an audit of the Scratch VM. See [candidate kernels](#candidate-kernels-august-21). |
+| `build_mythic_kernel_suite.py` | Techniques from MythicGPT, another transformer written in Scratch: its four-output linear loop at all three transformer matrix shapes, integer weights scaled after the dot product, exact and lookup-table softmax, and its base-66 int8 weight decoding versus cattorch's Base92 float16. 27 timings; every output list is kept. |
+| `build_mythic_append_suite.py` | Whether MythicGPT's four-output linear loop can append to its output list instead of writing into a preallocated one. 14 timings. |
+| `build_grouped_linear_whole_suite.py` | The previous exact linear kernel versus the grouped exact kernel on a complete transformer. |
+| `build_grouped_linear_network_suite.py` | The same comparison on the 998K-parameter CatGPT2 checkpoint. Its 13.2 MB of JSON may be too large for the browser editor, so run it in the VM. |
+| `build_costume_codec_suite.py` | Weight decoders that read data from costume names: the old Base64 decoder, a packed-loop Base64 decoder, and experimental Base85 decoders. Decide this one in the browser; see [costume decoders](#costume-decoders). |
+| `build_json_size_suite.py` | JSON size and speed of layer sharing and compaction on the TinyStories checkpoint. |
+| `build_cached_layer_sharing_suite.py` | Layer sharing with KV-cached generation on a 6M-parameter MoE model. |
+| `build_top_k_size_suite.py` | Size and speed of the loop-based and unrolled top-k selectors. |
+| `build_rope_redteam_suite.py` | The RoPE matrix expression versus more direct loops, at CatGPT size. |
+
+Model-level builds:
+
+| Script | Builds |
+|---|---|
+| `build_tinystories_complete.py` | The processor used by the [published TinyStories project](https://scratch.mit.edu/projects/1374224416/): cached model, SentencePiece tokenizer, and sampler, with a checksum and size manifest. Uses `add_tinystories_sampler.py` and `combine_sprites.py`. |
+| `build_catgpt3_complete.py` | The same for the CatGPT3 MoE checkpoint. |
+| `tinystories_quant_experiment.py` | Storage precision versus accuracy on the TinyStories checkpoint. See [storage accuracy](#storage-accuracy-on-tinystories). |
+| `catgpt2_approx_experiment.py` | Accuracy and VM speed of low-rank and pruned CatGPT2 exports. |
+
+### Custom suites
+
+The same comparisons can be built from Python with your own models:
+
+```python
+from cattorch import FastConfig, FastLayerConfig, build_benchmark_suite
+
+build_benchmark_suite(
+    cases,
+    "fast_weights.sb3",
+    fast_config=FastConfig(weights=FastLayerConfig(rank_ratio=0.25)),
+)
 ```
 
-`benchmarks/artifacts/generation_suite.sb3` prefills each cached arm before
-resetting the timer, runs all decode calls sequentially, and adds stateless and
-cached totals to the usual results list.
+## Recorded results
 
-The processor used by the
-[published TinyStories project](https://scratch.mit.edu/projects/1374224416/)
-is reproducible when a sibling `catgpt2` checkout and its checkpoint are
-available:
+Results below record one environment on one date. Rerun them before relying on
+them for a decision.
 
-```bash
-python benchmarks/build_tinystories_complete.py
-```
+### Storage decoding (browser, August 21)
 
-That build combines the cached model, SentencePiece tokenizer/detokenizer, and
-streaming sampler, then writes a checksum and size manifest beside the ignored
-generated artifacts. `add_tinystories_sampler.py`, `combine_sprites.py`, and
-`catgpt2_approx_experiment.py` are supporting modules for this production
-artifact and related model-level experiments.
-
-Storage encoding has a focused suite as well:
-
-```bash
-python benchmarks/build_storage_suite.py
-```
-
-`benchmarks/artifacts/storage_suite.sb3` compares uncompressed float32 with
-costume-Base85 float32, float16, groupwise int8, bit-packed int6, and packed
-int4. It accumulates ten separately timed init calls (save preparation happens
-outside each timed interval), then times ten ordinary forwards. A second
-visible list records each standalone sprite size.
-
-The completed scratch.mit.edu browser run on 2026-08-21 produced these totals
-for the superseded Base64 implementation.
-Each timing covers ten initialization or forward calls. This run predates the
-small-matrix fallback and is retained in
-`benchmarks/artifacts/storage_suite_benchmarked.sb3`.
+This run on scratch.mit.edu used the earlier Base64 codec, before small
+matrices were kept in float16. The project is saved as
+`artifacts/storage_suite_benchmarked.sb3`. Each time covers ten calls.
 
 | Case | Storage | Sprite bytes | Init | Forward |
 | --- | --- | ---: | ---: | ---: |
@@ -113,24 +124,21 @@ small-matrix fallback and is retained in
 | CatGPT1 | Base64 int8 | 96,223 | 0.396 s | 1.896 s |
 | CatGPT1 | Base64 int4 | 102,452 | 0.337 s | 1.902 s |
 
-The matrix case shows the expected payload win and no meaningful forward
-penalty from startup dequantization. On small multi-list models, the generated
-decoder blocks outweighed the shorter payload. The production exporter now
-keeps matrix shards below 16,384 values and one-dimensional parameters in
-float16. Thus small models carry no integer decoder blocks, while substantial
-weight matrices retain int8/int4 compression. Set `min_quantized_values=1` to
-force the old all-matrix behavior for isolated format measurements.
+For the large matrix, integer storage shrank the sprite and forward time didn't
+change. For the small models, the extra decoder blocks outweighed the smaller
+weights. As a result, matrices under 16,384 values and all one-dimensional
+parameters now stay float16, so small models don't carry integer decoders. Set
+`min_quantized_values=1` to quantize every matrix when measuring formats.
 
-The current TinyStories checkpoint has a reproducible model-level comparison:
+### Storage accuracy on TinyStories
 
 ```bash
 PYTHONPATH=../catgpt2/src:. ../catgpt2/.venv/bin/python \
   benchmarks/tinystories_quant_experiment.py
 ```
 
-It evaluates 256 held-out windows in PyTorch, builds four Scratch projects,
-then evaluates eight of the same kind of windows in `@scratch/scratch-vm`
-15.0.1. Results below are for checkpoint SHA-256
+This compares 256 held-out windows in PyTorch, then eight windows in
+`@scratch/scratch-vm` 15.0.1. Checkpoint SHA-256:
 `c53b7329fbe8ebf5163a15339de7b9884f65f5f6948a5496324c561829ad0d44`.
 
 | Storage | Sprite bytes | Expanded JSON | Python top-1 agreement | Mean abs logit error | VM top-1 agreement |
@@ -140,218 +148,93 @@ then evaluates eight of the same kind of windows in `@scratch/scratch-vm`
 | int8 | 863,054 | 4,226,045 | 96.09% | 0.05088 | 100% |
 | int4 | 525,264 | 4,099,935 | 53.91% | 0.95201 | 37.5% |
 
-All four VM forwards remained near 3.0 seconds per 16-token window; storage
-changes initialization and project size, not forward arithmetic. Int8 is the
-strong compressed candidate for this checkpoint. Int4 is substantially
-smaller but should be treated as an aggressive lossy option and judged on
-long-form generation, not the eight-window VM sample alone. Reports and built
-projects live under `benchmarks/artifacts/tinystories_quant/`; each report
-records the checkpoint hash because that checkpoint is actively retrained.
+Every variant took about 3.0 seconds per 16-token window in the VM: storage
+affects startup time and size, not forward speed. Int8 is the best compressed
+option for this checkpoint. Int4 is much smaller but loses a lot of accuracy;
+judge it on long generated text, not these eight windows. Reports and projects
+are in `artifacts/tinystories_quant/`, and each report records the checkpoint
+hash because the checkpoint is still being retrained.
 
-Custom suites can select the same comparison, including an explicit weight
-policy, from Python:
+The same script also tested a learned 64-entry codebook for 6-bit weights. On a
+1,024-window run, symmetric int6 kept 94.53% top-1 agreement and the codebook
+kept 91.70%, with higher logit error, so the codebook was not added.
 
-```python
-from cattorch import FastConfig, FastLayerConfig, build_benchmark_suite
+### Candidate kernels (August 21)
 
-build_benchmark_suite(
-    cases,
-    "fast_weights.sb3",
-    fast_config=FastConfig(weights=FastLayerConfig(rank_ratio=0.25)),
-)
-```
-
-To run it:
-
-1. Open <https://scratch.mit.edu/projects/editor/>.
-2. Use **File → Load from your computer** and select the `.sb3`.
-3. Enable Scratch's built-in Turbo Mode by shift-clicking the green flag.
-4. Click the green flag normally and wait for the visible results list to
-   contain every expected entry. List updates occur after each timed region.
-5. Save the completed project to your computer.
-6. Analyze it with `cattorch-benchmark downloaded-project.sb3`, or with
-   `python -m cattorch.benchmark downloaded-project.sb3` from a checkout.
-
-Both implementations use equivalent no-refresh custom blocks. The report
-includes the raw named timings, speedup for each case, output error, block
-counts, file size, and the project SHA-256.
-
-Record the Scratch run date, browser version, operating system, and hardware
-alongside saved benchmark reports. Use the official VM for controlled,
-repeatable comparisons and scratch.mit.edu runs as samples of real browser
-deployments. Neither is a universal conversion factor for all environments.
-
-The browser timer advanced in roughly 0.033-second steps in the 2026-08-20/21
-reference run. Treat short entries as resolution-limited and generate a
-focused suite with a larger `iterations` value before comparing small changes.
-
-## Next optimization screens
-
-The benchmark-only candidates found in the vanilla Scratch VM audit are
-bundled into one sequential project:
-
-```bash
-python benchmarks/build_next_optimization_suite.py
-```
-
-This writes `benchmarks/artifacts/next_optimization_suite.sb3`. Its 30 timed
-regions cover hidden `for each`, literal repeat bounds, loop unrolling,
-shard-local traversal, fused stable attention, interleaved grouped-linear
-weights, RMSNorm-to-Linear fusion, paired-projection SwiGLU, and a synthetic
-final-layer K/V-only prefill path. Every comparison retains output lists for
-numerical checking.
-
-Unlike the ordinary suites, this project times with deltas from Scratch's
-`days since 2000` reporter. The official VM updates the ordinary timer only
-once per scheduler step, whereas `days since 2000` reads the clock when the
-reporter executes. The cases are still amplified to roughly one second where
-small differences matter.
-
-Open the project on scratch.mit.edu, enable Turbo Mode, and click the green
-flag once. The visible list fills with all 30 results in order. Save the
-completed project, then verify both its timings and outputs with:
+`build_next_optimization_suite.py` times each candidate with the `days since
+2000` reporter instead of the timer, because the VM only updates the timer once
+per scheduler step. Cases are sized to take about a second. To check both timings and
+outputs of a saved project:
 
 ```bash
 node benchmarks/run_next_optimization_vm.cjs \
   benchmarks/artifacts/next_optimization_suite_benched.sb3
 ```
 
-The controlled official-VM screen on 2026-08-21 took 27.3 wall-clock seconds.
-It found the strongest exact improvements in `for each` (about 15%), direct
-shard-local traversal (about 35%), interleaved grouped weights (about 13%),
-and paired-projection SwiGLU (about 10%). Literal repeat bounds and partial
-unrolling also helped. The tested RMSNorm fusion was slower, and fused stable
-attention ranged from slightly slower to about 3% faster depending on context;
-neither should move to production from this VM result alone.
+In the VM, the whole suite took 27.3 seconds. The largest exact-mode gains were
+`for each` loops (about 15%), reading shards directly (about 35%), interleaved
+grouped weights (about 13%), and paired-projection SwiGLU (about 10%). Literal
+repeat counts and partial unrolling also helped. RMSNorm fused into Linear was
+slower, and fused stable attention ranged from slightly slower to about 3%
+faster. Neither of those two should ship based on this result alone.
 
-MythicGPT-derived instruction and storage screens are generated with:
+### MythicGPT kernels
 
-```bash
-python benchmarks/build_mythic_kernel_suite.py
-```
-
-`benchmarks/artifacts/mythic_kernel_suite.sb3` compares cattorch's current
-linear loop with Mythic's four-output loop at all three transformer matrix
-shapes. It also screens integer-weight/post-dot scaling, exact and lookup-table
-softmax, and equal-value-count cattorch costume-Base85-float16 versus Mythic-base66-int8 startup
-decoding. The project runs 27 named timings sequentially and retains every
-output list for numerical comparison.
-
-The smaller follow-up destination-list screen is generated with:
-
-```bash
-python benchmarks/build_mythic_append_suite.py
-```
-
-`benchmarks/artifacts/mythic_append_suite.sb3` contains 14 timings comparing
-four-output append and preallocated replace directly. It determines whether
-the optimized linear loop can preserve cattorch's ordinary temporary-list
-lifecycle without adding one-time buffer allocation.
-
-After production integration, build the isolated whole-transformer comparison
-with:
-
-```bash
-python benchmarks/build_grouped_linear_whole_suite.py
-```
-
-`benchmarks/artifacts/grouped_linear_whole_suite.sb3` is 0.92 MB compressed
-and has a 3.44 MB expanded `project.json`. It compares the previous exact
-linear kernel with production grouped exact over five forwards of a complete
-width-128, FFN-384 causal transformer. Initialization and one warmup are both
-outside the timer. The output head is deliberately ineligible, isolating the
-QKV, FFN-up, and FFN-down changes. The project records two named results and
-retains both output lists for an exact hash comparison.
-
-The completed browser artifact is
-`benchmarks/artifacts/grouped_linear_whole_suite_benched.sb3`. On the stock
-Scratch VM it measured 1.973 seconds for the previous path and 1.901 seconds
-for grouped exact over five forwards (3.65% less time), with identical
-1,028-item outputs. This is a Firefox/Linux measurement on one machine, not a
-browser-independent performance figure. Use the official VM result as the
-controlled comparison and browser runs as deployment samples; retain both when
-reporting performance.
-
-The case-sensitive costume-codec screen is generated with:
-
-```bash
-python benchmarks/build_costume_codec_suite.py
-```
-
-`benchmarks/artifacts/costume_codec_suite.sb3` compares the former production
-Base64 byte decoder with packed-loop Base64 and experimental Base85 decoders
-that map both letter cases through 85 costume names. Unrolled and compact
-Base85 forms are included. Each case decodes the same 49,152 bytes five times
-and leaves an output list for exact comparison. Open it on
-scratch.mit.edu, enable Turbo Mode, and click the green flag once. This case
-must be decided in the browser: changing costume updates renderer state, which
-the headless VM does not model. The VM remains useful as a renderer-free lower
-bound and correctness check:
-
-```bash
-node benchmarks/run_scratch_vm.cjs \
-  benchmarks/artifacts/costume_codec_suite.sb3 --inspect-lists
-```
-
-The JSON-size screen is generated with:
-
-```bash
-python benchmarks/build_json_size_suite.py
-```
-
-It exports the current TinyStories checkpoint as an ordinary stateless sprite,
-an opt-in shared-layer sprite, and a shared-layer sprite with internal-name and
-schema compaction. The current individual sprite measurements are 1,105,873,
-948,739, and 924,996 expanded JSON bytes respectively; layer sharing reduces
-the block count from 1,879 to 966. The suite is retained as a size/timing and
-browser-compatibility screen. Shared-layer output agrees exactly in cattorch's
-emulator, but the official headless VM currently diverges on both this model's
-ordinary and factored full-network paths, so layer sharing remains off by
-default until the vanilla browser comparison is authoritative.
-
-`tinystories_quant_experiment.py` also records the rejected learned-codebook6
-screen. On the current 1,024-window report, symmetric int6 retained 94.53% top-1
-agreement while codebook6 retained 91.70%, with larger logit MAE and RMSE, so
-codebook6 is intentionally not a public storage mode.
-
-The standalone top-k size/speed screen is generated with:
-
-```bash
-python benchmarks/build_top_k_size_suite.py
-```
-
-For `k=16` and 1,024 logits, the loop-based selector is 31,878 expanded JSON
-bytes / 69 blocks versus 135,411 bytes / 618 blocks for the unrolled ladder.
-The official VM measured 0.294 versus 0.033 seconds over 20 selections. Both
-produced identical value and token-ID hashes. This is why normal size-aware
-exports use the compact form while `CodegenConfig(unrolling="speed")` preserves
-the unrolled form.
-
-`build_grouped_linear_network_suite.py` builds an additional diagnostic pair
-from the real 998K CatGPT2 checkpoint. Its 13.2 MB expanded JSON may exceed
-Scratch's upload parser limit, so it is intended for the official VM rather
-than the browser.
-
-## Local Scratch VM screening
-
-The same suite can be run headlessly in the official Scratch VM for rapid
-iteration:
-
-```bash
-cd benchmarks
-npm install
-npm run run-vm
-```
-
-The runner enables VM Turbo Mode, waits for the green-flag stack to finish,
-and prints the same named timing entries as JSON. It does not attach a renderer,
-so harmless missing-costume warnings may be printed. Use this to screen kernel
-candidates, then periodically recalibrate against scratch.mit.edu—especially
-for small differences or sub-second cases.
-
-For the Mythic-specific suite, the paired numerical runner is:
+To check outputs of a saved MythicGPT suite:
 
 ```bash
 node benchmarks/run_mythic_kernel_vm.cjs \
   benchmarks/artifacts/mythic_kernel_suite.sb3
 ```
+
+### Grouped linear on a whole transformer (browser)
+
+The project is 0.92 MB compressed with 3.44 MB of JSON. It runs five forwards
+of a width-128 transformer with a 384-wide feed-forward layer, with init and
+one warmup untimed. The output layer doesn't qualify for the grouped kernel, so
+only the attention and feed-forward projections change.
+
+In Firefox on Linux, the previous kernel took 1.973 seconds and the grouped
+kernel 1.901 seconds (3.65% faster), with identical 1,028-value outputs. The
+saved project is `artifacts/grouped_linear_whole_suite_benched.sb3`.
+
+### Costume decoders
+
+Each case decodes the same 49,152 bytes five times. Base85 needs upper- and
+lowercase costume names, and switching costumes updates the renderer, which the
+headless VM skips. The VM result is therefore only a lower bound; decide with a
+browser run.
+
+### Layer sharing and JSON size
+
+On the TinyStories checkpoint, the normal sprite, the layer-shared sprite, and
+the layer-shared sprite with name and schema compaction have 1,105,873,
+948,739, and 924,996 bytes of JSON. Layer sharing cuts blocks from 1,879 to
+966. Its output matches exactly in cattorch's emulator, but the official VM's
+output currently differs from the emulator for this model both with and without
+sharing, so
+layer sharing stays off by default until a browser comparison settles it.
+
+### Layer sharing with cached generation (VM)
+
+The unshared and shared 4-bit MoE processor sprites have 4,826,578 and
+3,859,827 bytes of JSON. The combined project is larger than the online editor
+accepts, so load it locally, click the green flag once, and read the six rows
+of `cattorch benchmark results`.
+
+| Variant | Init | Prefill | Two decodes |
+| --- | ---: | ---: | ---: |
+| Unshared | 22.206 s | 0.703 s | 1.505 s |
+| Shared | 22.619 s | 1.192 s | 2.386 s |
+
+Both produced identical top-k values and token IDs. Layer sharing with caching
+saves space at the cost of speed.
+
+### Top-k selector size
+
+For `k=16` over 1,024 logits, the loop-based selector is 31,878 bytes of JSON
+and 69 blocks; the unrolled selector is 135,411 bytes and 618 blocks. Over 20
+selections, the VM measured 0.294 and 0.033 seconds, with identical outputs.
+Exports sized with `unrolling="auto"` or `"compact"` use the loop, and
+`unrolling="speed"` uses the unrolled form. The loop has since been sped up; see
+[OPTIMIZATION.md](OPTIMIZATION.md).

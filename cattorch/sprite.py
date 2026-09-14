@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from cattorch.graph import GenerationConfig, _GraphInfo, _get_shape
+from cattorch.graph import _GenerationSpec, _GraphInfo, _get_shape
 from cattorch.storage import (
     EncodedList,
     StorageConfig,
@@ -27,6 +27,9 @@ from cattorch.storage import (
 )
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
+from cattorch.util.scratch.interface import (
+    rename_list as _rename_list, refresh_data_display_name as _refresh_data_display_name,
+)
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, ListLayout
 
@@ -38,50 +41,27 @@ log = logging.getLogger(__name__)
 
 # ── Sprite post-processing ───────────────────────────────────────────────────
 
-def _rename_list(sprite, old_name, new_name):
-    """Rename a list's display name and update all block references."""
-    lists = sprite.get("lists", {})
-    target_id = None
-    for sid, entry in lists.items():
-        if entry[0] == old_name:
-            target_id = sid
-            entry[0] = new_name
-            break
-    if target_id is None:
-        return
-
-    raw = json.dumps(sprite["blocks"])
-    raw = raw.replace(
-        json.dumps([old_name, target_id]),
-        json.dumps([new_name, target_id]),
-    )
-    sprite["blocks"] = json.loads(raw)
-
-
-def _refresh_data_display_name(blocks: dict, identifier: str, name: str) -> None:
-    """Update Scratch's redundant display names after remapping a data ID."""
-    stack = [blocks]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            stack.extend(value.values())
-        elif isinstance(value, list):
-            for index in range(1, len(value)):
-                if value[index] == identifier and isinstance(value[index - 1], str):
-                    value[index - 1] = name
-            stack.extend(value)
-
 
 def _merge_duplicate_lists(sprite):
     """Merge local lists (names starting with '_') that have identical contents."""
     lists = sprite.get("lists", {})
 
-    by_content: dict[tuple, list[tuple[str, str]]] = {}
+    def local_base(name: str) -> str:
+        for index in range(len(name) - 1, 0, -1):
+            if name[index] == '_' and name[index + 1:].isdigit():
+                return name[:index]
+        return name
+
+    # Only combine repeated instances of the same logical local.  Two
+    # differently named empty work lists can be live simultaneously inside a
+    # single instruction (notably the MoE router's logits, IDs, and weights),
+    # so content alone is not a safe aliasing proof.
+    by_content: dict[tuple[str, tuple], list[tuple[str, str]]] = {}
     for sid, entry in lists.items():
         display_name = entry[0]
         if not display_name.startswith("_"):
             continue
-        content_key = tuple(entry[1])
+        content_key = (local_base(display_name), tuple(entry[1]))
         by_content.setdefault(content_key, []).append((sid, display_name))
 
     remap = {}
@@ -118,6 +98,8 @@ def _merge_duplicate_lists(sprite):
 def _deduplicate_static_tensors(
     sprite: dict,
     static_tensors: dict[str, torch.Tensor | None],
+    *,
+    effective_ndims: dict[str, int] | None = None,
 ) -> dict[str, torch.Tensor | None]:
     """Share bit-identical flattened tensors before storage and sharding.
 
@@ -136,7 +118,9 @@ def _deduplicate_static_tensors(
         contiguous = tensor.detach().cpu().contiguous()
         raw = contiguous.view(torch.uint8).numpy().tobytes()
         identity = (
-            str(contiguous.dtype), contiguous.numel(), hashlib.sha256(raw).digest(),
+            str(contiguous.dtype), contiguous.numel(),
+            (effective_ndims or {}).get(key, tensor.ndim),
+            hashlib.sha256(raw).digest(),
         )
         previous = winners.get(identity)
         if previous is not None and previous[1] == raw:
@@ -214,7 +198,7 @@ def _apply_tied_static_aliases(
             assert destination_layout is not None
             destination_shard = destination_layout.shards[0]
             if lists[source_shard.identifier][1] != lists[destination_shard.identifier][1]:
-                raise ValueError("Tied embedding/head shard contents do not match")
+                raise ValueError("tied embedding/head shard contents do not match")
             remap[source_shard.identifier] = destination_shard.identifier
             display_names[destination_shard.identifier] = destination_shard.name
             del lists[source_shard.identifier]
@@ -276,11 +260,11 @@ def _chain_until(blocks: dict, start: str, stop: str | None) -> list[str]:
     current = start
     while current is not None and current != stop:
         if current not in blocks or current in chain:
-            raise ValueError("Malformed generated command chain")
+            raise ValueError("malformed generated command chain")
         chain.append(current)
         current = blocks[current].get("next")
     if stop is not None and current != stop:
-        raise ValueError("Repeated layer roots are not consecutive")
+        raise ValueError("repeated layer roots are not consecutive")
     return chain
 
 
@@ -348,11 +332,14 @@ def _share_repeated_transformer_layers(
         log.info("Shared transformer layer skipped: %s", reason)
         return False
 
-    if compiler.graph.generation.first_cache is not None:
+    if (
+        compiler.graph.generation.first_cache is not None
+        and not compiler.graph.generation.banked_caches
+    ):
         # Cached K/V lists are statically named in Scratch. Until attention is
         # split into thin per-layer cache wrappers, sharing the whole slab
         # would incorrectly direct every call to layer zero's cache.
-        return reject("cached generation requires layer-specific cache wrappers")
+        return reject("cached generation requires banked caches")
 
     nodes = {node.name: node for node in compiler.graph.nodes}
     emitted = [
@@ -415,64 +402,30 @@ def _share_repeated_transformer_layers(
             continue
         entries = [sprite["lists"][list_ids[name]] for name in names]
         sizes = [len(entry[1]) for entry in entries]
-        if len(set(sizes)) != 1 or sum(sizes) > 200_000:
-            return reject("a candidate weight bank is misaligned or oversized")
+        if len(set(sizes)) != 1:
+            return reject("a candidate weight bank is misaligned")
+        # Logical layer banks may exceed one physical Scratch list. The
+        # ordinary precision-aware sharder runs after this transform and
+        # rewrites indexed reads across row-aligned physical shards.
         bank_roles.append((role, names, sizes[0]))
     if not bank_roles:
         return reject("no layer-varying static weights were found")
     log.info("Repeated layer bank roles: %s", bank_roles)
 
     layer_zero_owned = owned_groups[0]
-    base_variables = []
-    for role, names, size in bank_roles:
+
+    # Finish every fallible structural check before changing the sprite or the
+    # compiler's static tensors.  A rejected candidate must be a true no-op:
+    # leaving a half-built bank behind makes later layers silently read layer
+    # zero's weights even though no shared procedure was installed.
+    for _, names, _ in bank_roles:
         winner_id = list_ids[names[0]]
-        winner = sprite["lists"][winner_id]
-        winner[1] = [
-            value
-            for name in names
-            for value in sprite["lists"][list_ids[name]][1]
-        ]
-        for name in names[1:]:
-            sprite["lists"].pop(list_ids[name], None)
-
-        tensors = [compiler.static_lists.pop(name.removeprefix("W_")) for name in names]
-        all_matrix = all(isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 for tensor in tensors)
-        bank_tensor = torch.tensor(winner[1], dtype=torch.float32)
-        if all_matrix and size >= storage.min_quantized_values:
-            bank_tensor = bank_tensor.reshape(len(names), -1)
-        compiler.static_lists[names[0].removeprefix("W_")] = bank_tensor
-
-        base_name = f"cattorch layer weight base {role}"
-        base_id = f"cattorch_layer_weight_base_{role}_{uuid.uuid4().hex[:8]}"
-        sprite["variables"][base_id] = [base_name, 0]
-        base_variables.append((base_name, size))
-        for identifier in list(layer_zero_owned):
+        for identifier in layer_zero_owned:
             block = blocks.get(identifier)
             field = block.get("fields", {}).get("LIST") if block else None
-            if not field or field[1] != winner_id:
-                continue
-            field[0] = winner[0]
-            if block["opcode"] != "data_itemoflist":
+            if field and field[1] == winner_id and block["opcode"] != "data_itemoflist":
                 return reject("a banked tensor uses a non-read list operation")
-            add_id = f"cattorch_layer_bank_index_{uuid.uuid4().hex}"
-            old_index = block["inputs"]["INDEX"]
-            blocks[add_id] = {
-                "opcode": "operator_add", "next": None, "parent": identifier,
-                "inputs": {
-                    "NUM1": old_index,
-                    "NUM2": [3, [12, base_name, base_id], [10, ""]],
-                },
-                "fields": {}, "shadow": False, "topLevel": False,
-            }
-            if (
-                isinstance(old_index, list) and len(old_index) > 1
-                and old_index[0] == 3 and isinstance(old_index[1], str)
-                and old_index[1] in blocks
-            ):
-                blocks[old_index[1]]["parent"] = add_id
-            block["inputs"]["INDEX"] = [3, add_id, [4, 0]]
 
-    # Resolve the carried hidden state from cross-layer data dependencies.
     layer_names = [
         {node.name for node in compiler.graph.nodes if _graph_layer(node) == layer}
         for layer in layers
@@ -498,23 +451,103 @@ def _share_repeated_transformer_layers(
         arg.name
         for node in compiler.graph.nodes if node.name in layer_names[0]
         for arg in node.all_input_nodes
-        if arg.name not in layer_names[0] and arg.name in compiler.scope.assignments
+        if arg.name not in layer_names[0]
+        and (
+            arg.name in compiler.scope.assignments
+            or arg.name in compiler.graph.input_names
+        )
     ]
     if not first_inputs:
         return reject("could not identify the first layer input")
-    input_list = f"T{compiler.scope.assignments[first_inputs[-1]]}"
-    output_list = output_lists[0]
-    log.info(
-        "Repeated layer activation path: input=%s outputs=%s",
-        input_list, output_lists,
+    first_input = first_inputs[-1]
+    input_list = (
+        f"T{compiler.scope.assignments[first_input]}"
+        if first_input in compiler.scope.assignments
+        else compiler.graph.input_names[first_input]
     )
-
+    output_list = output_lists[0]
     predecessor = next(
         (identifier for identifier, block in blocks.items() if block.get("next") == starts[0]),
         None,
     )
     if predecessor is None:
         return reject("the repeated layer has no chain predecessor")
+
+    base_variables = []
+    for role, names, size in bank_roles:
+        winner_id = list_ids[names[0]]
+        winner = sprite["lists"][winner_id]
+        winner[1] = [
+            value
+            for name in names
+            for value in sprite["lists"][list_ids[name]][1]
+        ]
+        for name in names[1:]:
+            sprite["lists"].pop(list_ids[name], None)
+
+        tensors = [compiler.static_lists.pop(name.removeprefix("W_")) for name in names]
+        combined_layouts = []
+        layout_offset = 0
+        shard_alignments = []
+        for name, tensor in zip(names, tensors):
+            key = name.removeprefix("W_")
+            shard_alignments.append(compiler.static_shard_alignments.pop(name, 1))
+            for start, rows, inner in compiler.interleaved_static_layouts.pop(key, ()):
+                combined_layouts.append((layout_offset + start, rows, inner))
+            layout_offset += tensor.numel()
+        all_matrix = all(isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 for tensor in tensors)
+        bank_tensor = torch.tensor(winner[1], dtype=torch.float32)
+        if all_matrix and size >= storage.min_quantized_values:
+            matrix_shapes = {tuple(tensor.shape) for tensor in tensors}
+            if len(matrix_shapes) == 1:
+                bank_tensor = bank_tensor.reshape(len(names), *next(iter(matrix_shapes)))
+            else:
+                bank_tensor = bank_tensor.reshape(len(names), -1)
+        compiler.static_lists[names[0].removeprefix("W_")] = bank_tensor
+        bank_alignment = math.lcm(
+            *shard_alignments,
+            *(4 * inner for _, _, inner in combined_layouts),
+        )
+        if bank_alignment > 1:
+            compiler.static_shard_alignments[names[0]] = bank_alignment
+        if combined_layouts:
+            compiler.interleaved_static_layouts[
+                names[0].removeprefix("W_")
+            ] = tuple(combined_layouts)
+
+        base_name = f"cattorch layer weight base {role}"
+        base_id = f"cattorch_layer_weight_base_{role}_{uuid.uuid4().hex[:8]}"
+        sprite["variables"][base_id] = [base_name, 0]
+        base_variables.append((base_name, size))
+        for identifier in list(layer_zero_owned):
+            block = blocks.get(identifier)
+            field = block.get("fields", {}).get("LIST") if block else None
+            if not field or field[1] != winner_id:
+                continue
+            field[0] = winner[0]
+            add_id = f"cattorch_layer_bank_index_{uuid.uuid4().hex}"
+            old_index = block["inputs"]["INDEX"]
+            blocks[add_id] = {
+                "opcode": "operator_add", "next": None, "parent": identifier,
+                "inputs": {
+                    "NUM1": old_index,
+                    "NUM2": [3, [12, base_name, base_id], [10, ""]],
+                },
+                "fields": {}, "shadow": False, "topLevel": False,
+            }
+            if (
+                isinstance(old_index, list) and len(old_index) > 1
+                and old_index[0] == 3 and isinstance(old_index[1], str)
+                and old_index[1] in blocks
+            ):
+                blocks[old_index[1]]["parent"] = add_id
+            block["inputs"]["INDEX"] = [3, add_id, [4, 0]]
+
+    log.info(
+        "Repeated layer activation path: input=%s outputs=%s",
+        input_list, output_lists,
+    )
+
     first_end = command_groups[0][-1]
     blocks[first_end]["next"] = None
     procedure_name = "cattorch shared transformer layer"
@@ -542,20 +575,41 @@ def _share_repeated_transformer_layers(
     from cattorch.util.scratch.dsl import Program, append, call, clear, for_each, item, length, set_var, var
     body = []
     copy_index = "cattorch shared layer copy index"
+    cache_base = (
+        "cattorch layer cache base"
+        if compiler.graph.generation.banked_caches else None
+    )
     for layer in layers:
         body.extend(set_var(name, layer * size) for name, size in base_variables)
+        if cache_base is not None:
+            body.append(set_var(
+                cache_base,
+                layer * compiler.graph.generation.cache_layer_width,
+            ))
         body.append(call(procedure_name))
-        if layer != layers[-1]:
+        if layer != layers[-1] and input_list != output_list:
             body.extend((
                 clear(input_list),
                 for_each(copy_index, length(output_list), (
                     append(input_list, item(output_list, var(copy_index))),
                 )),
             ))
+    final_output_list = output_lists[-1]
+    if final_output_list != output_list:
+        body.extend((
+            clear(final_output_list),
+            for_each(copy_index, length(output_list), (
+                append(final_output_list, item(output_list, var(copy_index))),
+            )),
+        ))
     wrapper = Program(
         "shared_layer_calls",
-        variables=(copy_index, *(name for name, _ in base_variables)),
-        lists=(input_list, output_list),
+        variables=(
+            copy_index,
+            *(name for name, _ in base_variables),
+            *((cache_base,) if cache_base is not None else ()),
+        ),
+        lists=tuple(dict.fromkeys((input_list, output_list, final_output_list))),
         body=tuple(body),
     )
     wrapper_root, wrapper_tail = _program_stack(sprite, wrapper)
@@ -571,18 +625,6 @@ def _share_repeated_transformer_layers(
     if successor in blocks:
         blocks[successor]["parent"] = wrapper_tail
 
-    final_id = next(
-        identifier for identifier, entry in sprite["lists"].items()
-        if entry[0] == output_lists[-1]
-    )
-    canonical_id = next(
-        identifier for identifier, entry in sprite["lists"].items()
-        if entry[0] == output_list
-    )
-    if final_id != canonical_id:
-        sprite["blocks"] = remap_ids(sprite["blocks"], {final_id: canonical_id})
-        _refresh_data_display_name(sprite["blocks"], canonical_id, output_list)
-        sprite["lists"].pop(final_id, None)
     log.info(
         "Shared wrapper splice root=%s parent=%s top=%s predecessor_next=%s",
         wrapper_root,
@@ -590,6 +632,8 @@ def _share_repeated_transformer_layers(
         sprite["blocks"][wrapper_root].get("topLevel"),
         sprite["blocks"][predecessor].get("next"),
     )
+    if cache_base is not None:
+        _merge_variables_by_name(sprite, {cache_base})
     return True
 
 
@@ -687,7 +731,7 @@ def _wrap_optimized_lifecycle(sprite: dict) -> None:
         and block.get("opcode") != "procedures_definition"
     ]
     if len(roots) != 1:
-        raise ValueError(f"Expected one compiled root before lifecycle wrapping, got {roots}")
+        raise ValueError(f"expected one compiled root before lifecycle wrapping, got {roots}")
 
     suffix = uuid.uuid4().hex[:8]
     prefix = f"cattorch_lifecycle_{suffix}"
@@ -788,7 +832,7 @@ def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> 
         if block.get("topLevel") and block.get("parent") is None
     ]
     if len(roots) != 1:
-        raise ValueError(f"Expected one root for procedure {name!r}")
+        raise ValueError(f"expected one root for procedure {name!r}")
     root = roots[0]
     suffix = uuid.uuid4().hex[:8]
     definition = f"cattorch_generation_{suffix}_definition"
@@ -813,13 +857,27 @@ def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> 
     # generated ID; repeated list display names are unified afterward.
     mapping = {
         identifier: f"{identifier}_{suffix}"
-        for section in ("blocks", "variables", "lists")
+        for section in ("blocks", "variables", "lists", "broadcasts")
         for identifier in data.get(section, {})
     }
     data = remap_ids(data, mapping)
     sprite["blocks"].update(data.get("blocks", {}))
     sprite.setdefault("variables", {}).update(data.get("variables", {}))
     sprite.setdefault("lists", {}).update(data.get("lists", {}))
+    existing_broadcasts = {
+        message: identifier
+        for identifier, message in sprite.setdefault("broadcasts", {}).items()
+    }
+    broadcast_remap = {}
+    for identifier, message in data.get("broadcasts", {}).items():
+        winner = existing_broadcasts.get(message)
+        if winner is None:
+            sprite["broadcasts"][identifier] = message
+            existing_broadcasts[message] = identifier
+        else:
+            broadcast_remap[identifier] = winner
+    if broadcast_remap:
+        sprite["blocks"] = remap_ids(sprite["blocks"], broadcast_remap)
     return sprite
 
 
@@ -833,13 +891,15 @@ def _find_procedure_definition(sprite: dict, name: str) -> str:
         prototype = sprite["blocks"].get(custom[1], {})
         if prototype.get("mutation", {}).get("proccode") == name:
             return bid
-    raise ValueError(f"Procedure not found after generation wrapping: {name}")
+    raise ValueError(f"procedure not found after generation wrapping: {name}")
 
 
 def _add_procedure_completion_broadcast(
     sprite: dict,
     procedure: str,
     message: str,
+    *,
+    status: str | None = None,
 ) -> None:
     """Broadcast a public lifecycle notification after a procedure finishes.
 
@@ -864,16 +924,34 @@ def _add_procedure_completion_broadcast(
     definition = _find_procedure_definition(sprite, procedure)
     terminal = blocks[definition].get("next")
     if terminal is None:
-        raise ValueError(f"Procedure {procedure!r} has no executable body")
+        raise ValueError(f"procedure {procedure!r} has no executable body")
     while blocks[terminal].get("next") is not None:
         terminal = blocks[terminal]["next"]
 
     notification = f"cattorch_completion_{uuid.uuid4().hex[:8]}"
-    blocks[terminal]["next"] = notification
+    if status is not None:
+        status_id = next(
+            identifier
+            for identifier, entry in sprite.get("variables", {}).items()
+            if entry[0] == "cattorch status"
+        )
+        status_block = f"cattorch_completion_status_{uuid.uuid4().hex[:8]}"
+        blocks[terminal]["next"] = status_block
+        blocks[status_block] = {
+            "opcode": "data_setvariableto", "next": notification,
+            "parent": terminal,
+            "inputs": {"VALUE": [1, [10, status]]},
+            "fields": {"VARIABLE": ["cattorch status", status_id]},
+            "shadow": False, "topLevel": False,
+        }
+        notification_parent = status_block
+    else:
+        blocks[terminal]["next"] = notification
+        notification_parent = terminal
     blocks[notification] = {
         "opcode": "event_broadcastandwait",
         "next": None,
-        "parent": terminal,
+        "parent": notification_parent,
         "inputs": {
             "BROADCAST_INPUT": [1, [11, message, broadcast_id]],
         },
@@ -886,7 +964,7 @@ def _add_procedure_completion_broadcast(
 def _logical_list_sizes(
     compiler: _Compiler,
     graph: _GraphInfo,
-    generation: GenerationConfig | None,
+    generation: _GenerationSpec | None,
     output_name: str | None,
 ) -> dict[str, int]:
     """Infer peak logical capacities for every tensor list before sharding."""
@@ -942,24 +1020,104 @@ def _insert_init_call(sprite: dict, procedure: str) -> None:
 def _static_storage_precision(
     tensor: torch.Tensor | None,
     storage: StorageConfig,
+    effective_ndim: int | None = None,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
 ) -> str:
     if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
         return "float32"
-    if storage.precision in {"int8", "int6", "int4"} and tensor.ndim < 2:
+    ndim = tensor.ndim if effective_ndim is None else effective_ndim
+    if storage.precision in {"int8", "int6", "int4"} and ndim < 2:
+        return "float16"
+    if (
+        storage.precision in {"int8", "int6", "int4"}
+        and storage.grouping == "row"
+        and not _on_integer_codec_grid(tensor, storage, interleave_segments)
+    ):
+        # QuantizationConfig decides which weights are lossy. Storage must not
+        # quantize anything it did not reconstruct, such as buffers (RoPE
+        # tables, masks) or values derived from weights by other arithmetic.
+        finite = tensor.detach()[torch.isfinite(tensor.detach())]
+        if finite.numel() and float(finite.abs().max()) > 65504:
+            return "float32"
         return "float16"
     return storage.precision
+
+
+def _on_integer_codec_grid(
+    tensor: torch.Tensor,
+    storage: StorageConfig,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
+) -> bool:
+    """Return whether integer storage reproduces ``tensor`` exactly.
+
+    Grouped kernels keep static tensors in a four-row physical order. Storage
+    quantizes the logical order, so undo that permutation first.
+    """
+    values = tensor.detach().cpu().flatten()
+    for start, rows, inner in interleave_segments:
+        end = start + rows * inner
+        if rows % 4 or start < 0 or end > values.numel():
+            return False
+        physical = values[start:end].reshape(rows // 4, inner, 4)
+        values = torch.cat((
+            values[:start], physical.transpose(1, 2).flatten(), values[end:],
+        ))
+    group_size = _static_storage_group_size(tensor, storage)
+    if values.numel() == 0 or values.numel() % group_size:
+        return False
+    work = values.to(torch.float64).reshape(-1, group_size)
+    if not bool(torch.isfinite(work).all()):
+        return False
+    maximum_code = {"int8": 127, "int6": 31, "int4": 7}[storage.precision]
+    maximum = work.abs().amax(dim=1, keepdim=True)
+    scale_dtype = torch.float16 if storage.scale_precision == "float16" else torch.float32
+    scale = (maximum / maximum_code).to(scale_dtype).to(torch.float64)
+    if not bool(torch.isfinite(scale).all()):
+        return False
+    tiny = math.ldexp(1.0, -24 if storage.scale_precision == "float16" else -149)
+    scale = torch.where((maximum > 0) & (scale == 0), torch.full_like(scale, tiny), scale)
+    scale = torch.where(maximum > 0, scale, torch.ones_like(scale))
+    codes = torch.round(work / scale).clamp(-maximum_code, maximum_code)
+    reconstructed = (codes * scale).to(values.dtype).reshape(values.shape)
+    return torch.equal(reconstructed, values)
+
+
+def _static_storage_group_size(
+    tensor: torch.Tensor | None,
+    storage: StorageConfig,
+) -> int:
+    """Resolve the physical group width for one logical matrix."""
+    if (
+        storage.grouping != "row"
+        or not isinstance(tensor, torch.Tensor)
+        or tensor.ndim < 2
+        or tensor.shape[-1] < 1
+    ):
+        return storage.group_size
+    width = int(tensor.shape[-1])
+    for candidate in range(min(width, storage.group_size), 0, -1):
+        if width % candidate == 0:
+            return candidate
+    return 1
 
 
 def _static_storage_shard_limits(
     static_tensors: dict[str, torch.Tensor | None],
     storage: StorageConfig,
+    *,
+    effective_ndims: dict[str, int] | None = None,
+    interleaved_layouts: dict[str, tuple[tuple[int, int, int], ...]] | None = None,
 ) -> dict[str, int]:
     """Cap static shards so every temporary decode stream fits in Scratch."""
     if not storage.compression:
         return {}
     limits: dict[str, int] = {}
     for key, tensor in static_tensors.items():
-        precision = _static_storage_precision(tensor, storage)
+        precision = _static_storage_precision(
+            tensor, storage, (effective_ndims or {}).get(key),
+            (interleaved_layouts or {}).get(key, ()),
+        )
+        group_size = _static_storage_group_size(tensor, storage)
         if precision == "float32":
             limit = SCRATCH_LIST_LIMIT // 4
         elif precision == "float16":
@@ -967,11 +1125,18 @@ def _static_storage_shard_limits(
         else:
             scale_bytes = 4 if storage.scale_precision == "float32" else 2
             scale_groups = SCRATCH_LIST_LIMIT // scale_bytes
-            limit = min(SCRATCH_LIST_LIMIT, scale_groups * storage.group_size)
+            limit = min(SCRATCH_LIST_LIMIT, scale_groups * group_size)
             # A shard below the quantization threshold falls back to float16.
             # Keep every possible fallback shard within its byte budget too.
             if storage.min_quantized_values > SCRATCH_LIST_LIMIT // 2:
                 limit = min(limit, SCRATCH_LIST_LIMIT // 2)
+            # Each physical payload is quantized independently.  Ending a
+            # shard mid-group would restart scale selection in the next shard
+            # and change weights compared with the logical matrix (notably
+            # shared MoE banks whose effective row group is 48 values).
+            limit -= limit % group_size
+            if limit < group_size:
+                raise ValueError("quantized static shard cannot fit one group")
         limits[f"W_{key}"] = limit
     return limits
 
@@ -988,13 +1153,13 @@ def _validate_nonfloating_static_tensors(
         if not isinstance(tensor, torch.Tensor) or tensor.is_floating_point():
             continue
         if tensor.is_complex():
-            raise ValueError(f"Static tensor {key!r} has unsupported complex values")
+            raise ValueError(f"static tensor {key!r} has unsupported complex values")
         original = tensor.detach().cpu()
         try:
             round_trip = original.to(scratch_dtype).to(original.dtype)
         except (RuntimeError, TypeError) as error:
             raise ValueError(
-                f"Static tensor {key!r} cannot be represented by {label}"
+                f"static tensor {key!r} cannot be represented by {label}"
             ) from error
         if not torch.equal(original, round_trip):
             suggestion = (
@@ -1003,9 +1168,142 @@ def _validate_nonfloating_static_tensors(
                 if compressed else ""
             )
             raise ValueError(
-                f"Static tensor {key!r} contains values not exactly "
+                f"static tensor {key!r} contains values not exactly "
                 f"representable by {label}{suggestion}"
             )
+
+
+def _deinterleave_static_values(
+    values: list,
+    segments: tuple[tuple[int, int, int], ...],
+) -> list:
+    """Convert four-row physical groups back to logical output-major rows."""
+    result = list(values)
+    for start, rows, inner in segments:
+        if rows % 4 or start < 0 or start + rows * inner > len(values):
+            raise ValueError("malformed grouped static-weight layout")
+        source = values[start:start + rows * inner]
+        logical = []
+        for group_start in range(0, len(source), 4 * inner):
+            group = source[group_start:group_start + 4 * inner]
+            for lane in range(4):
+                logical.extend(group[column * 4 + lane] for column in range(inner))
+        result[start:start + rows * inner] = logical
+    return result
+
+
+def _interleave_static_values(
+    values: list,
+    segments: tuple[tuple[int, int, int], ...],
+) -> list:
+    """Apply the grouped kernel's four-row physical storage permutation."""
+    result = list(values)
+    for start, rows, inner in segments:
+        source = values[start:start + rows * inner]
+        physical = []
+        for group_start in range(0, len(source), 4 * inner):
+            group = source[group_start:group_start + 4 * inner]
+            for column in range(inner):
+                physical.extend(
+                    group[lane * inner + column] for lane in range(4)
+                )
+        result[start:start + rows * inner] = physical
+    return result
+
+
+def _physical_interleave_segments(
+    layout: ListLayout,
+    segments: tuple[tuple[int, int, int], ...],
+) -> dict[str, tuple[tuple[int, int, int], ...]]:
+    """Map logical-list segment offsets onto its physical Scratch shards."""
+    result = {}
+    shard_start = 0
+    for shard in layout.shards:
+        shard_end = shard_start + shard.capacity
+        local = []
+        for start, rows, inner in segments:
+            end = start + rows * inner
+            if end <= shard_start or start >= shard_end:
+                continue
+            overlap_start = max(start, shard_start)
+            overlap_end = min(end, shard_end)
+            group_values = 4 * inner
+            if (
+                (overlap_start - start) % group_values
+                or (overlap_end - overlap_start) % group_values
+            ):
+                raise ValueError(
+                    "grouped weight sharding must preserve complete four-row groups"
+                )
+            local.append((
+                overlap_start - shard_start,
+                (overlap_end - overlap_start) // inner,
+                inner,
+            ))
+        if local:
+            result[shard.name] = tuple(local)
+        shard_start = shard_end
+    return result
+
+
+def _build_interleave_program(
+    specs: list[tuple[str, tuple[tuple[int, int, int], ...]]],
+):
+    """Build one init-only row-major to four-row storage permutation."""
+    from cattorch.util.scratch.dsl import (
+        Program, add, append, change_var, clear, for_each, item, length,
+        repeat, set_var, var,
+    )
+
+    temporary = "cattorch interleave buffer"
+    body = []
+    for name, segments in specs:
+        body.append(clear(temporary))
+        for start, rows, inner in segments:
+            body.extend((
+                set_var("interleave group start", start + 1),
+                repeat(rows // 4, (
+                    set_var("interleave column", 0),
+                    repeat(inner, (
+                        *tuple(
+                            append(
+                                temporary,
+                                item(
+                                    name,
+                                    add(
+                                        var("interleave group start"),
+                                        add(lane * inner, var("interleave column")),
+                                    ),
+                                ),
+                            )
+                            for lane in range(4)
+                        ),
+                        change_var("interleave column", 1),
+                    )),
+                    change_var("interleave group start", 4 * inner),
+                )),
+            ))
+        body.extend((
+            clear(name),
+            for_each(
+                "interleave copy index",
+                length(temporary),
+                (append(
+                    name,
+                    item(temporary, var("interleave copy index")),
+                ),),
+            ),
+        ))
+    body.append(clear(temporary))
+    return Program(
+        "interleave_grouped_weights",
+        variables=(
+            "interleave group start", "interleave column",
+            "interleave copy index",
+        ),
+        lists=(temporary, *(name for name, _ in specs)),
+        body=tuple(body),
+    )
 
 
 def _apply_static_storage(
@@ -1013,9 +1311,23 @@ def _apply_static_storage(
     layouts: dict[str, ListLayout],
     static_tensors: dict[str, torch.Tensor | None],
     storage: StorageConfig,
+    *,
+    interleaved_layouts: dict[
+        str, tuple[tuple[int, int, int], ...]
+    ] | None = None,
+    effective_ndims: dict[str, int] | None = None,
 ) -> set[str]:
     """Encode static physical shards and install the one-time unpacker."""
     static_names = {f"W_{key}" for key in static_tensors}
+    interleaved_layouts = interleaved_layouts or {}
+    physical_interleaves = {}
+    for key, segments in interleaved_layouts.items():
+        logical_name = f"W_{key}"
+        layout = layouts.get(logical_name)
+        if layout is not None:
+            physical_interleaves.update(
+                _physical_interleave_segments(layout, segments)
+            )
     _validate_nonfloating_static_tensors(
         static_tensors, compressed=storage.compression,
     )
@@ -1025,30 +1337,52 @@ def _apply_static_storage(
                 tensor = static_tensors.get(logical_name.removeprefix("W_"))
                 if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
                     continue
-                precision = _static_storage_precision(tensor, storage)
+                precision = _static_storage_precision(
+                    tensor, storage, (effective_ndims or {}).get(
+                        logical_name.removeprefix("W_"),
+                    ),
+                    interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+                )
+                group_size = _static_storage_group_size(tensor, storage)
                 for shard in layouts.get(logical_name, ListLayout(logical_name, 0, ())).shards:
                     contents = sprite["lists"][shard.identifier][1]
+                    segments = physical_interleaves.get(shard.name, ())
+                    logical_contents = (
+                        _deinterleave_static_values(contents, segments)
+                        if segments else contents
+                    )
                     shard_precision = precision
                     if (
                         precision in {"int8", "int6", "int4"}
                         and len(contents) < storage.min_quantized_values
                     ):
                         shard_precision = "float16"
-                    sprite["lists"][shard.identifier][1] = rounded_values(
-                        contents,
+                    rounded = rounded_values(
+                        logical_contents,
                         shard_precision,
-                        storage.group_size,
+                        group_size,
                         storage.scale_precision,
+                    )
+                    sprite["lists"][shard.identifier][1] = (
+                        _interleave_static_values(rounded, segments)
+                        if segments else rounded
                     )
         return static_names
 
     specs = []
+    runtime_interleaves = []
     for logical_name in sorted(static_names):
         layout = layouts.get(logical_name)
         if layout is None:
             continue
         tensor = static_tensors.get(logical_name.removeprefix("W_"))
-        precision = _static_storage_precision(tensor, storage)
+        precision = _static_storage_precision(
+            tensor, storage, (effective_ndims or {}).get(
+                logical_name.removeprefix("W_"),
+            ),
+            interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+        )
+        group_size = _static_storage_group_size(tensor, storage)
         for position, shard in enumerate(layout.shards, 1):
             contents = sprite["lists"][shard.identifier][1]
             if not contents:
@@ -1060,11 +1394,16 @@ def _apply_static_storage(
             ):
                 shard_precision = "float16"
             payload_name = f"cattorch payload {len(specs) + 1}"
+            segments = physical_interleaves.get(shard.name, ())
+            encoded_contents = (
+                _deinterleave_static_values(contents, segments)
+                if segments else contents
+            )
             if shard_precision in {"int8", "int6", "int4"}:
                 codes, scales = quantize_values(
-                    contents,
+                    encoded_contents,
                     shard_precision,
-                    storage.group_size,
+                    group_size,
                     storage.scale_precision,
                 )
                 raw_payload = _quantized_bytes(codes, shard_precision)
@@ -1077,7 +1416,7 @@ def _apply_static_storage(
                     payload,
                     shard_precision,
                     value_count=len(contents),
-                    group_size=storage.group_size,
+                    group_size=group_size,
                     scale_list_name=f"cattorch quant scales {scale_number}",
                     scale_payload_name=f"cattorch scale payload {scale_number}",
                     scale_payload=scale_payload,
@@ -1086,14 +1425,16 @@ def _apply_static_storage(
                     scale_values=tuple(scales),
                 ))
             else:
-                raw_payload = _float_bytes(contents, shard_precision)
+                raw_payload = _float_bytes(encoded_contents, shard_precision)
                 specs.append(EncodedList(
                     shard.name,
                     payload_name,
-                    encode_values(contents, shard_precision),
+                    encode_values(encoded_contents, shard_precision),
                     shard_precision,
                     payload_bytes=raw_payload,
                 ))
+            if segments:
+                runtime_interleaves.append((shard.name, segments))
             sprite["lists"][shard.identifier][1] = []
 
     if specs:
@@ -1121,6 +1462,7 @@ def _apply_static_storage(
             | {
                 "cattorch f32 powers", "cattorch f16 powers", "cattorch decoded bytes",
                 "cattorch decoded values", "cattorch decoded scales",
+                "cattorch huffman table", "cattorch huffman powers",
             },
         )
         _merge_variables_by_name(
@@ -1132,6 +1474,29 @@ def _apply_static_storage(
                 or entry[0] == "cattorch active payload"
             },
         )
+        if runtime_interleaves:
+            _add_warp_procedure(
+                sprite,
+                "cattorch interleave grouped weights",
+                _build_interleave_program(runtime_interleaves),
+                x=640,
+                y=600,
+            )
+            _merge_lists_by_name(
+                sprite,
+                {name for name, _ in runtime_interleaves}
+                | {"cattorch interleave buffer"},
+            )
+            _merge_variables_by_name(
+                sprite,
+                {
+                    "interleave group start", "interleave column",
+                    "interleave copy index",
+                },
+            )
+            # Calls are prepended to init, so add the permutation first and
+            # unpack second to execute them in unpack -> interleave order.
+            _insert_init_call(sprite, "cattorch interleave grouped weights")
         _insert_init_call(sprite, "cattorch unpack weights")
     return static_names
 
@@ -1191,7 +1556,7 @@ def _guard_generation_output(sprite: dict, output_root: str) -> None:
     ]
     if len(predecessors) != 1:
         raise ValueError(
-            f"Expected one predecessor for output projection, got {predecessors}"
+            f"expected one predecessor for output projection, got {predecessors}"
         )
     predecessor = predecessors[0]
     suffix = uuid.uuid4().hex[:8]
@@ -1235,7 +1600,7 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     ]
     if len(predecessors) != 1:
         raise ValueError(
-            f"Expected one final QKV suffix predecessor, got {predecessors}"
+            f"expected one final QKV suffix predecessor, got {predecessors}"
         )
     predecessor = predecessors[0]
     variable_id = next(
@@ -1338,8 +1703,8 @@ def _build_top_k_program(top_k: int):
 def _build_compact_top_k_program(top_k: int):
     """Select top-k with constant-size dynamic insertion loops."""
     from cattorch.util.scratch.dsl import (
-        Program, append, change_var, clear, eq, gt, if_, if_else, item,
-        for_each, length, lt, repeat, repeat_until, replace, set_var, sub, var,
+        Program, append, change_var, clear, gt, if_, item, for_each, length,
+        repeat, repeat_until, replace, set_var, sub, var,
     )
 
     initialize = [clear(_TOP_K_VALUES), clear(_TOP_K_IDS)]
@@ -1349,34 +1714,24 @@ def _build_compact_top_k_program(top_k: int):
         "generation_top_k_compact",
         variables=(
             "top k index", "top k current", "top k rank",
-            "top k found", "top k shift",
+            "top k shift",
         ),
         lists=("output", _TOP_K_VALUES, _TOP_K_IDS),
         body=(
             *initialize,
             for_each("top k index", length("output"), (
                 set_var("top k current", item("output", var("top k index"))),
-                set_var("top k rank", 1),
-                set_var("top k found", 0),
-                repeat_until(eq(var("top k found"), 1), (
-                    if_else(
-                        gt(
-                            var("top k current"),
-                            item(_TOP_K_VALUES, var("top k rank")),
-                        ),
-                        (set_var("top k found", 1),),
-                        (
-                            change_var("top k rank", 1),
-                            if_(
-                                gt(var("top k rank"), top_k),
-                                (set_var("top k found", 1),),
-                            ),
-                        ),
-                    ),
-                )),
                 if_(
-                    lt(var("top k rank"), top_k + 1),
+                    gt(var("top k current"), item(_TOP_K_VALUES, top_k)),
                     (
+                        set_var("top k rank", 1),
+                        repeat_until(
+                            gt(
+                                var("top k current"),
+                                item(_TOP_K_VALUES, var("top k rank")),
+                            ),
+                            (change_var("top k rank", 1),),
+                        ),
                         set_var("top k shift", top_k),
                         repeat(sub(top_k, var("top k rank")), (
                             replace(

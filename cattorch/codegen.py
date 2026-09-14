@@ -15,9 +15,9 @@ class CodegenConfig:
     """Control generated-code size and Scratch identifier names.
 
     ``target_json_bytes`` is a soft budget used by automatic code generation.
-    It is not a hard Scratch limit: the ordinary online editor currently has
-    an approximately 5 MiB expanded-JSON limit, while archive import paths can
-    accept larger projects.
+    It is not Scratch's limit: the online editor rejects projects above about
+    5 MB (5,000,000 bytes) of expanded JSON when saving, while loading a file
+    locally can accept larger projects.
 
     Compact IDs always begin with ``ct`` so they cannot collide with Scratch's
     fixed toolbox IDs. ``id_namespace`` follows that marker and defaults to a
@@ -29,12 +29,14 @@ class CodegenConfig:
     display names. Public model/tokenizer interfaces keep their documented
     names so other sprites can continue to call and inspect them.
 
-    ``compact_schema`` drops redundant false-valued block fields. It remains
-    opt-in until browser import/edit/save compatibility has broader coverage.
+    ``compact_schema`` drops redundant false-valued block fields. It stays
+    opt-in until it has been tested more widely in browser import, edit, and
+    save.
 
-    ``layer_sharing="auto"`` factors compatible stateless ``blocks.N`` stacks
-    into one procedure and banks their weights. It falls back when caches or
-    incompatible layouts make the transform unsafe, and is opt-in for now.
+    ``layer_sharing="auto"`` factors compatible ``blocks.N`` transformer
+    stacks into one procedure and banks their weights. Cached generation also
+    interleaves equal-width per-layer K/V rows into shared banks. It falls back
+    when incompatible layouts make the transform unsafe, and is opt-in for now.
     """
 
     target_json_bytes: int | None = 4 * 1024 * 1024

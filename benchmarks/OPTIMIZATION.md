@@ -1,25 +1,54 @@
 # Scratch optimization audit
 
-Performance decisions are screened in the official Scratch VM and retained
-only after exact-output tests. The official VM provides the controlled,
-repeatable comparison, while browser Scratch runs sample real deployments and
-their browser, JIT, operating-system, and hardware effects. The Python
-emulator is used for correctness and opcode profiling, not timing.
+This is a dated log of kernel optimizations for contributors: what was kept,
+what was rejected, and the measurements behind each decision. Candidates are
+timed in the official Scratch VM and kept only if their output is unchanged.
+The VM gives repeatable comparisons; browser runs show the effect of real
+browsers, JITs, operating systems, and hardware. The Python emulator is used
+for correctness and opcode counts, not timing.
+
+Terms used below:
+
+- **MAC**: one multiply-accumulate, `sum += weight * value`, the unit of work
+  in a dot product.
+- **Epilogue**: the operations applied right after a kernel's main loop, such
+  as adding a bias, a residual, or an activation.
+- **Unrolling**: repeating a loop body N times per iteration ("four-way"
+  unrolling does four elements per pass).
+
+## 2026-08-24 inference red-team follow-up
+
+The semantic pairwise RoPE production lowering measured 0.160 seconds versus
+1.675 seconds for the equivalent dense signed-permutation expression over 160
+CatGPT-sized applications (96 rows by 14 features), a 10.5x speedup in the
+official VM.
+
+At the CatGPT3 expert geometry (8 experts, width 112, hidden width 192), the
+grouped top-1 stacked-SwiGLU production kernel measured 0.544 seconds for 20
+forwards. That is about 34% below the prior 0.0413-second-per-forward baseline;
+exact and fast controls produced identical output hashes when approximate
+pruning was disabled.
+
+The compact top-k selector now compares each candidate with the retained kth
+value before entering its insertion scan. At k=16 and 1,024 logits it reached
+the VM timer floor (0.032 seconds for 20 selections), matching the much larger
+unrolled selector while preserving identical value and ID hashes.
 
 ## Retained exact-mode strategies
 
-- Linear and matrix multiply use four-way partial dot-product unrolling.
-  Contiguous dense dots address the right operand as a row offset plus the
-  running left index, eliminating a second per-MAC variable mutation; strided
-  matrix products retain dual running indices. Linear folds bias initialization
-  into the accumulator and fuses
-  simple scalar, residual, and activation epilogues. Dense Linear matrices
-  with output width divisible by four and at least 49,152 MACs per input row
-  instead reuse one activation read across four output accumulators. The
-  grouped path retains clear-and-append output and the same epilogue fusion.
-  Its weights are interleaved at export time, replacing four running weight
-  indices with one. Oversized matrices are split only between complete output
-  rows/four-row groups, keeping shard selection outside every dot product.
+- Linear and matrix multiply unroll dot products four-way. Contiguous dense
+  dots index the right operand as a row offset plus the running left index,
+  saving one variable write per MAC. Strided matrix products keep two running
+  indices.
+- Linear starts the accumulator at the bias and fuses simple scalar, residual,
+  and activation epilogues.
+- Dense Linear matrices whose output width is divisible by four and that have
+  at least 49,152 MACs per input row use the grouped path: one activation read
+  feeds four output accumulators. It still clears and appends its output and
+  fuses the same epilogues. Its weights are interleaved at export time, so one
+  running weight index replaces four. Oversized matrices are only split between
+  complete output rows, or complete four-row groups on the grouped path, so
+  shard selection stays outside every dot product.
 - Elementwise kernels use one-based indices and eliminate modulo for
   equal-sized tensors. Reused exponentials and GELU intermediates are cached;
   cheap values are recomputed when Scratch variable mutation costs more.
@@ -83,7 +112,7 @@ emulator is used for correctness and opcode profiling, not timing.
   and list-size budgets. Shared spatial maps keep most of the speedup compactly.
 - Loop unroll factors above four for arithmetic-heavy dots: larger generated
   programs did not improve those matrix kernels consistently. A later vanilla
-  Scratch screen established eight-way unrolling for lightweight list loops.
+  Scratch test settled on eight-way unrolling for lightweight list loops.
 - Unrolling the outer embedding-token loop: slower even though unrolling the
   inner contiguous copy remains a clear win.
 - Static-RHS output-major matmul was about 1.8% slower than the existing
@@ -114,9 +143,9 @@ The browser timer advanced in roughly 0.033-second steps during this run.
 Consequently, individual results below about 0.2 seconds are treated as
 resolution-limited rather than evidence for small regressions or wins.
 
-## Official VM screening after the browser run
+## Official VM tests after the browser run
 
-Longer focused runs were used to screen the final small changes. At 1,000
+Longer focused runs were used to test the final small changes. At 1,000
 forwards, the uniform pooling kernels measured 0.208 s (max1d), 0.785 s
 (max2d), 0.160 s (avg1d), 0.641 s (avg2d), and 0.528 s (adaptive avg2d),
 roughly another 18–50% below the preceding exact pooling kernel. Carrying
@@ -128,7 +157,7 @@ The same VM measured a 1,024-element, three-operation arithmetic chain at
 0.192 s materialized versus 0.064 s fused over 100 forwards (3.0x). The case
 is included in the regenerated comprehensive suite for browser confirmation.
 
-The grouped-linear whole-transformer screen measured 1.907 s for five
+The grouped-linear whole-transformer suite measured 1.907 s for five
 previous-exact forwards and 1.614 s for grouped exact, a 15.4% reduction with
 identical output hashes. An oversized diagnostic pair using the real 998K
 CatGPT2 checkpoint measured hidden prefill32 at 8.169 s versus 7.581 s and
@@ -151,7 +180,7 @@ the controlled whole-transformer suite measured 1.825 s for the previous path
 and 1.500 s for production exact over five forwards, a 17.8% reduction. This
 newer production comparison still needs a scratch.mit.edu sample.
 
-## Fast-mode screening
+## Fast-mode tests
 
 Fast mode retains only arithmetic substitutions that won focused official-VM
 tests. At 1,000 forwards, QuickGELU was 2.22x faster than exact tanh GELU;

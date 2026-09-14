@@ -121,9 +121,14 @@ ipython_config.py
 benchmarks/artifacts/
 node_modules/
 
-# Local design/review notes (not release documentation)
+# Local design/review notes and one-off third-party project probes
 /REVIEW.md
 /CATGPT_SCRATCH_TRAINING_GUIDE.md
+/benchmarks/MOCHI_ANALYSIS.md
+/benchmarks/MYTHICGPT_ANALYSIS.md
+/benchmarks/build_mochi_kernel_suite.py
+/benchmarks/run_mochi_forward_vm.cjs
+/benchmarks/run_mythic_forward_vm.cjs
 
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
@@ -308,6 +313,7 @@ __marimo__/
 /.claude/
 
 # cattorch custom
+*.sb3
 *.sprite3
 .idea/
 examples/

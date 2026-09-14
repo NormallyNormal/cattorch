@@ -21,14 +21,18 @@ import torch
 
 from cattorch.fast import FastConfig
 from cattorch.storage import StorageConfig
+from cattorch.quantization import QuantizationConfig
+from cattorch.program import GenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.transpiler import (
-    GenerationConfig,
     _add_warp_procedure,
     _merge_lists_by_name,
     transpile,
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
+from cattorch.util.scratch.interface import (
+    logical_list_chunks, read_logical_list, write_sprite_list,
+)
 
 
 LEGACY_TIMINGS = "cattorch legacy timings"
@@ -37,8 +41,8 @@ FAST_TIMINGS = "cattorch fast timings"
 SUITE_RESULTS = "cattorch benchmark results"
 STORAGE_SIZES = "cattorch storage sizes"
 STORAGE_VARIANTS = (
-    "plain-f32", "base85-f32", "base85-f16", "base85-int8", "base85-int6",
-    "base85-int4",
+    "plain-f32", "base92-f32", "base92-f16", "base92-int8", "base92-int6",
+    "base92-int4-huffman",
 )
 
 
@@ -54,13 +58,11 @@ def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
 
 
 def _set_inputs(sprite: dict, example_inputs: tuple[torch.Tensor, ...]) -> None:
-    values = {
-        "input" if index == 0 else f"input_{index}": tensor.detach().flatten().tolist()
-        for index, tensor in enumerate(example_inputs)
-    }
-    for entry in sprite.get("lists", {}).values():
-        if entry[0] in values:
-            entry[1] = values[entry[0]]
+    for index, tensor in enumerate(example_inputs):
+        write_sprite_list(
+            sprite, "input" if index == 0 else f"input_{index}",
+            tensor.detach().cpu().flatten().tolist(),
+        )
 
 
 def _add_input_restore_procedure(
@@ -68,24 +70,39 @@ def _add_input_restore_procedure(
     example_inputs: tuple[torch.Tensor, ...],
 ) -> None:
     """Add an untimed benchmark-only procedure that restores model inputs."""
-    from cattorch.util.scratch.dsl import Program, append, clear
+    from cattorch.util.scratch.dsl import Program, append, clear, for_each, item, length, var
 
     values = {
-        "input" if index == 0 else f"input_{index}": tensor.detach().flatten().tolist()
+        "input" if index == 0 else f"input_{index}": tensor.detach().cpu().flatten().tolist()
         for index, tensor in enumerate(example_inputs)
     }
     body = []
+    data = {entry[0]: entry[1] for entry in sprite.get("lists", {}).values()}
+    backups = {}
+    used_lists = set()
+    index = "_cattorch benchmark restore index"
     for name, items in values.items():
-        body.append(clear(name))
-        body.extend(append(name, value) for value in items)
+        for physical, chunk in logical_list_chunks(data, name, items):
+            backup = f"_cattorch benchmark saved {physical}"
+            backups[backup] = chunk
+            used_lists.update((physical, backup))
+            body.extend((
+                clear(physical),
+                for_each(index, length(backup), (append(physical, item(backup, var(index))),)),
+            ))
     _add_warp_procedure(
         sprite,
         "cattorch restore benchmark input",
-        Program("restore_benchmark_input", lists=values, body=body),
+        Program(
+            "restore_benchmark_input", lists=used_lists,
+            variables=(index,), body=body,
+        ),
         x=640,
         y=800,
     )
-    _merge_lists_by_name(sprite, set(values))
+    _merge_lists_by_name(sprite, used_lists)
+    for name, items in backups.items():
+        write_sprite_list(sprite, name, items)
 
 
 def _add_cached_decode_procedure(sprite: dict, token: int) -> None:
@@ -97,17 +114,17 @@ def _add_cached_decode_procedure(sprite: dict, token: int) -> None:
         "cattorch benchmark decode",
         Program(
             "cached_benchmark_decode",
-            lists=("input",),
+            lists=("cattorch tokens",),
             body=(
-                clear("input"),
-                append("input", int(token)),
+                clear("cattorch tokens"),
+                append("cattorch tokens", int(token)),
                 call("cattorch decode"),
             ),
         ),
         x=640,
         y=960,
     )
-    _merge_lists_by_name(sprite, {"input"})
+    _merge_lists_by_name(sprite, {"cattorch tokens"})
 
 
 def _add_broadcast_entry(
@@ -458,7 +475,7 @@ def build_benchmark_suite(
     """
     cases = list(cases)
     if not cases:
-        raise ValueError("At least one benchmark case is required")
+        raise ValueError("at least one benchmark case is required")
     if iterations < 1 or warmups < 0:
         raise ValueError("iterations must be positive and warmups must be non-negative")
     if storage is not None and not isinstance(storage, StorageConfig):
@@ -467,18 +484,18 @@ def build_benchmark_suite(
     normalized_cases = []
     for case in cases:
         if len(case) not in {3, 4}:
-            raise ValueError("Benchmark cases must contain three or four items")
+            raise ValueError("benchmark cases must contain three or four items")
         name, model, raw_inputs = case[:3]
         case_fast_config = case[3] if len(case) == 4 else fast_config
         if case_fast_config is not None and not isinstance(case_fast_config, FastConfig):
-            raise TypeError("Per-case fast configuration must be a FastConfig")
+            raise TypeError("per-case fast configuration must be a FastConfig")
         normalized_cases.append((name, model, raw_inputs, case_fast_config))
 
     names = [case[0] for case in normalized_cases]
     if len(set(names)) != len(names):
-        raise ValueError("Benchmark case names must be unique")
+        raise ValueError("benchmark case names must be unique")
     if any(not isinstance(name, str) or not name.strip() for name in names):
-        raise ValueError("Benchmark case names must be non-empty strings")
+        raise ValueError("benchmark case names must be non-empty strings")
 
     output_path = Path(output_path)
     if output_path.suffix != ".sb3":
@@ -631,14 +648,19 @@ def build_generation_benchmark_suite(
             cached_base = temp / f"generation_{index}_cached"
             transpile(
                 model,
-                prompt_inputs[0][:, :1],
+                GenerationProgram(
+                    method="forward",
+                    example_token=prompt_inputs[0][:, :1],
+                    max_context=prompt_inputs[0].shape[1] + iterations,
+                ),
                 str(cached_base),
                 sig_figs,
                 optimization="exact",
-                generation=GenerationConfig(prompt_inputs[0].shape[1] + iterations),
             )
             cached, cached_assets = _load_sprite(cached_base.with_suffix(".sprite3"))
-            _set_inputs(cached, prompt_inputs)
+            for entry in cached.get("lists", {}).values():
+                if entry[0] == "cattorch tokens":
+                    entry[1] = prompt_inputs[0].detach().flatten().tolist()
             prompt_length = prompt_inputs[0].shape[1]
             full_tokens = stateless_inputs[0]
             decode_index = min(prompt_length, full_tokens.shape[1] - 1)
@@ -707,12 +729,14 @@ def build_storage_benchmark_suite(
 
     output_path = Path(output_path).with_suffix(".sb3")
     variants = {
-        "plain-f32": StorageConfig(compression=False, precision="float32"),
-        "base85-f32": StorageConfig(compression=True, precision="float32"),
-        "base85-f16": StorageConfig(compression=True, precision="float16"),
-        "base85-int8": StorageConfig(compression=True, precision="int8"),
-        "base85-int6": StorageConfig(compression=True, precision="int6"),
-        "base85-int4": StorageConfig(compression=True, precision="int4"),
+        "plain-f32": (StorageConfig(compression=False, precision="float32"), None),
+        "base92-f32": (StorageConfig(compression=True, precision="float32"), None),
+        "base92-f16": (StorageConfig(compression=True, precision="float16"), None),
+        "base92-int8": (StorageConfig(compression=True), QuantizationConfig(bits=8)),
+        "base92-int6": (StorageConfig(compression=True), QuantizationConfig(bits=6)),
+        "base92-int4-huffman": (
+            StorageConfig(compression=True), QuantizationConfig(bits=4),
+        ),
     }
     broadcasts = {}
     controller_cases = []
@@ -725,7 +749,7 @@ def build_storage_benchmark_suite(
         for index, (name, model, raw_inputs) in enumerate(cases):
             example_inputs = _normalise_inputs(raw_inputs)
             controller = {"name": name, "index": index}
-            for variant, storage in variants.items():
+            for variant, (storage, quantization) in variants.items():
                 base = temp / f"storage_{index}_{variant}"
                 transpile(
                     model,
@@ -734,6 +758,7 @@ def build_storage_benchmark_suite(
                     sig_figs,
                     optimization="exact",
                     storage=storage,
+                    quantization=quantization,
                 )
                 sprite_path = base.with_suffix(".sprite3")
                 sizes.append(f"{name} {variant}: {sprite_path.stat().st_size} bytes")
@@ -911,11 +936,16 @@ def _project_identity(path: str | Path) -> dict:
 
 
 def _target_output(target: dict) -> list[float]:
-    output = next(
-        (entry[1] for entry in target.get("lists", {}).values() if entry[0] == "output"),
-        [],
+    output = read_logical_list(
+        {entry[0]: entry[1] for entry in target.get("lists", {}).values()}, "output",
     )
-    return [float(item) for item in output]
+    try:
+        return [float(item) for item in output]
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"sprite {target.get('name')!r} has a non-numeric output value; "
+            "save the project after the benchmark finishes"
+        ) from error
 
 
 def _analyze_suite(path: str | Path, project: dict, stage: dict, entries: list) -> dict:
@@ -928,14 +958,14 @@ def _analyze_suite(path: str | Path, project: dict, stage: dict, entries: list) 
             name, variant = label.rsplit(" ", 1)
             elapsed = float(raw_time)
         except (ValueError, TypeError) as error:
-            raise ValueError(f"Malformed benchmark suite result: {item!r}") from error
+            raise ValueError(f"malformed benchmark suite result: {item!r}") from error
         if variant not in {"legacy", "exact", "fast"}:
-            raise ValueError(f"Unknown benchmark suite variant in {item!r}")
+            raise ValueError(f"unknown benchmark suite variant in {item!r}")
         if name not in parsed:
             parsed[name] = {}
             ordered_names.append(name)
         if variant in parsed[name]:
-            raise ValueError(f"Duplicate benchmark suite result for {name} {variant}")
+            raise ValueError(f"duplicate benchmark suite result for {name} {variant}")
         parsed[name][variant] = elapsed
 
     all_variants = set().union(*(set(values) for values in parsed.values()))
@@ -949,7 +979,7 @@ def _analyze_suite(path: str | Path, project: dict, stage: dict, entries: list) 
         if set(values) != expected_variants
     ]
     if incomplete:
-        raise ValueError(f"Benchmark suite contains incomplete cases: {', '.join(incomplete)}")
+        raise ValueError(f"benchmark suite contains incomplete cases: {', '.join(incomplete)}")
 
     variables = {entry[0]: entry[1] for entry in stage.get("variables", {}).values()}
     targets = {
@@ -1010,7 +1040,7 @@ def analyze_benchmark(path: str | Path) -> dict:
     if STORAGE_SIZES in by_name:
         raw_results = by_name.get(SUITE_RESULTS, [])
         if not raw_results:
-            raise ValueError("Storage benchmark suite has not run")
+            raise ValueError("storage benchmark suite has not run")
         timings = {
             str(entry).rsplit(": ", 1)[0]: float(str(entry).rsplit(": ", 1)[1])
             for entry in raw_results
@@ -1035,9 +1065,17 @@ def analyze_benchmark(path: str | Path) -> dict:
         for name in case_names:
             variants_result = {}
             for variant in variants:
+                keys = (f"{name} {variant} init", f"{name} {variant} forward")
+                missing = next((key for key in keys if key not in timings), None)
+                if missing is None and f"{name} {variant}" not in sizes:
+                    missing = f"{name} {variant}"
+                if missing is not None:
+                    raise ValueError(
+                        f"storage benchmark suite has not finished: missing {missing!r}"
+                    )
                 variants_result[variant] = {
-                    "init_seconds": timings[f"{name} {variant} init"],
-                    "forward_seconds": timings[f"{name} {variant} forward"],
+                    "init_seconds": timings[keys[0]],
+                    "forward_seconds": timings[keys[1]],
                     "sprite_bytes": sizes[f"{name} {variant}"],
                 }
             results.append({"name": name, "variants": variants_result})
@@ -1052,7 +1090,7 @@ def analyze_benchmark(path: str | Path) -> dict:
     if SUITE_RESULTS in by_name:
         entries = by_name[SUITE_RESULTS]
         if not entries:
-            raise ValueError("Benchmark suite has not run")
+            raise ValueError("benchmark suite has not run")
         return _analyze_suite(path, project, stage, entries)
 
     exact = [float(item) for item in by_name.get(EXACT_TIMINGS, [])]
@@ -1067,7 +1105,7 @@ def analyze_benchmark(path: str | Path) -> dict:
         baseline_name, candidate_name = "legacy", "exact"
         baseline, candidate = legacy, exact
     if not baseline or len(baseline) != len(candidate):
-        raise ValueError("Benchmark has not run or contains incomplete timing lists")
+        raise ValueError("benchmark has not run or contains incomplete timing lists")
     baseline_median = statistics.median(baseline)
     candidate_median = statistics.median(candidate)
     rng = random.Random(0)
@@ -1141,8 +1179,10 @@ def analyze_benchmark(path: str | Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze a cattorch Scratch benchmark")
-    parser.add_argument("project", help="Benchmark .sb3 saved after it ran in Scratch")
+    parser = argparse.ArgumentParser(
+        description="Print the results of a cattorch benchmark project as JSON.",
+    )
+    parser.add_argument("project", help="benchmark .sb3 saved after running in Scratch")
     args = parser.parse_args()
     print(json.dumps(analyze_benchmark(args.project), indent=2))
 

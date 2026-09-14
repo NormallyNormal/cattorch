@@ -121,15 +121,16 @@ def _static_unrolled_repeat(count: int, step, factor: int = 4):
     ),)
 
 
-def _broadcast_index(shape, output_shape, map_name: str):
+def _broadcast_index(shape, output_shape, map_name: str, index=None):
     """Return a cheap exact flat index and any required export-time map."""
+    index = var("index") if index is None else index
     shape = tuple(shape)
     output_shape = tuple(output_shape)
     size = math.prod(shape)
     if size == 1:
         return 1, None
     if shape == output_shape:
-        return var("index"), None
+        return index, None
 
     # A suffix tensor repeats as one contiguous flat span, covering common
     # bias and causal-mask broadcasting without an auxiliary list lookup.
@@ -137,9 +138,9 @@ def _broadcast_index(shape, output_shape, map_name: str):
     while trimmed and trimmed[0] == 1:
         trimmed = trimmed[1:]
     if trimmed and len(trimmed) <= len(output_shape) and trimmed == output_shape[-len(trimmed):]:
-        return add(mod(sub(var("index"), 1), math.prod(trimmed)), 1), None
+        return add(mod(sub(index, 1), math.prod(trimmed)), 1), None
 
     padded = (1,) * (len(output_shape) - len(shape)) + shape
     indices = torch.arange(size).reshape(padded).expand(output_shape).reshape(-1)
     values = (indices + 1).tolist()
-    return item(map_name, var("index")), values
+    return item(map_name, index), values

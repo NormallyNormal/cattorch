@@ -21,7 +21,7 @@ from cattorch.benchmark import (
     _write_project,
 )
 from cattorch.sprite import _add_warp_procedure
-from cattorch.storage import BASE85_ALPHABET, _encode_bytes
+from cattorch.storage import BASE85_ALPHABET
 from cattorch.util.scratch.dsl import (
     Program,
     add,
@@ -65,7 +65,14 @@ def _raw_bytes() -> bytes:
 
 
 def _encode_base85(raw: bytes) -> str:
-    return _encode_bytes(raw)
+    encoded = []
+    for offset in range(0, len(raw), 4):
+        packed = int.from_bytes(raw[offset:offset + 4], "big")
+        digits = [0] * 5
+        for index in range(4, -1, -1):
+            packed, digits[index] = divmod(packed, 85)
+        encoded.extend(BASE85_ALPHABET[digit] for digit in digits)
+    return "".join(encoded)
 
 
 def _encode_base64(raw: bytes) -> str:

@@ -1,11 +1,18 @@
 # Tokenizers
 
-cattorch can export character-level, raw-text BPE, and SentencePiece BPE
-tokenizers as separate Scratch sprites, allowing the text-to-token and
-token-to-text steps to run in the project.
+[Documentation home](index.md)
 
-Install the optional tokenizer dependencies when using Hugging Face
-tokenizers:
+cattorch can export a tokenizer as its own Scratch sprite, so a project can
+turn text into token IDs and back without leaving Scratch. Three kinds are
+supported:
+
+| Exporter | Use for | Main requirement |
+|---|---|---|
+| `CharTokenizer` | Very small character vocabularies | Requires a valid unknown-token ID. |
+| `BPETokenizer` | Raw-text Hugging Face BPE | No pre-tokenizer, dropout, subword prefix, or suffix. |
+| `SentencePieceBPETokenizer` | Raw SentencePiece BPE with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
+
+Hugging Face tokenizers need the optional dependencies:
 
 ```bash
 pip install "cattorch[tokenizers]"
@@ -20,44 +27,40 @@ result = BPETokenizer(tokenizer).save("build/my_tokenizer")
 result = transpile_tokenizer(tokenizer, "build/my_tokenizer")
 ```
 
-The returned `TokenizerResult` includes the artifact path, Scratch sprite name,
-archive and expanded-JSON sizes, block/list counts, warnings, tokenizer type,
-and token count. Parent directories are created automatically and `.sprite3`
-is appended when needed. Use `name=` to choose a Scratch sprite name that is
-different from the filename.
+The returned `TokenizerResult` gives the saved path, size, and any warnings.
+As with `transpile`, parent directories are created, `.sprite3` is added if
+missing, and `name=` sets the sprite name.
 
-The generated sprite provides two top-level stacks:
+Every tokenizer sprite has two custom blocks, which run without screen
+refresh, and a clickable stack for each:
 
-- Encode reads the `input` variable and writes zero-based IDs to `token_ids`.
-- Decode reads `token_ids` and writes text to the `output` variable.
+- `cattorch tokenize` reads the `input` variable and writes token IDs to the
+  `token_ids` list.
+- `cattorch detokenize` reads `token_ids` and writes the text to the `output`
+  variable.
 
-These interfaces are local to the tokenizer sprite. Scratch does not let one
-sprite call another sprite's custom blocks or directly read its local data. To
-connect a separately imported tokenizer and model, add project-level broadcast
-and global-data bridge scripts, or combine their blocks into one processor
-sprite before import.
+Token IDs are zero-based, as in Python, even though Scratch list positions
+start at 1. The variables and lists belong to the tokenizer sprite; to use them
+from another sprite, see the
+[global-list bridge](getting-started.md#connect-another-sprite).
 
-`CharTokenizer` maps each character directly. `BPETokenizer` repeatedly applies
-the backend's canonical merges over the full raw input string, including
-spaces. Unknown characters use the tokenizer's unknown-token ID when it has
-one. `CharTokenizer` requires such an ID. Raw Hugging Face BPE models without
-an unknown token omit unmatched characters, and the Scratch export preserves
-that backend behavior.
+`CharTokenizer` maps each character to its ID. `BPETokenizer` applies the
+tokenizer's merges, in the tokenizer's order, to the whole input string,
+spaces included. A character not in the vocabulary becomes the unknown token
+if the tokenizer has one. `CharTokenizer` requires an unknown token. A raw
+Hugging Face BPE tokenizer without one drops unknown characters, and the
+exported sprite does the same.
 
-Vanilla Scratch compares text without ASCII case distinctions. Exports reject
-case-sensitive vocabularies containing entries such as both `a` and `A`, since
-they cannot preserve token IDs. They also reject non-BMP vocabulary characters
-such as emoji: Scratch's string blocks expose their two UTF-16 surrogate halves
-rather than one character.
+Scratch compares text without regard to ASCII case, so export fails if the
+vocabulary contains entries that differ only by case, such as `a` and `A`.
+Export also fails on characters outside the Basic Multilingual Plane, such as
+emoji, because Scratch treats each one as two separate characters.
 
 ## SentencePiece BPE
 
-`SentencePieceBPETokenizer` uses DSL-generated Scratch blocks rather than a
-static JSON template. Its sprite includes run-without-screen-refresh
-`cattorch tokenize` and `cattorch detokenize` custom blocks, plus clickable
-stacks for both. It preserves zero-based SentencePiece IDs, converts the
-SentencePiece whitespace marker, skips control tokens while decoding, and
-supports ASCII byte fallback.
+The SentencePiece sprite keeps SentencePiece's token IDs, converts its `▁`
+space marker, skips control tokens when decoding, and supports byte fallback
+for ASCII.
 
 ```python
 from cattorch import SentencePieceBPETokenizer
@@ -76,29 +79,28 @@ transpile_tokenizer(
 )
 ```
 
-Set `scratch_casefold=True` only for a model trained with case-folding
-normalization. Scratch's case-insensitive comparisons then normalize ASCII case
-inside the tokenizer, with no controller-side lowercase pass.
+Set `scratch_casefold=True` only if the SentencePiece model was trained with
+case-folding normalization. The sprite then relies on Scratch's
+case-insensitive comparisons, so you don't need to lowercase text first.
 
-SentencePiece export requires a raw-text-compatible model trained with
-`add_dummy_prefix=False` and `remove_extra_whitespaces=False`. The supported
-normalizers are `identity` and `nfkc_cf`; other normalization pipelines must be
-performed by the surrounding project and are rejected when cattorch can
-inspect the serialized model.
+The SentencePiece model must be trained with `add_dummy_prefix=False` and
+`remove_extra_whitespaces=False`, and use the `identity` or `nfkc_cf`
+normalizer. When cattorch can read these settings from the model, it rejects
+anything else. Any other normalization has to be done by your project before
+tokenizing.
 
-Vanilla Scratch has no Unicode-codepoint reporter. Supported BMP characters
-represented directly in the SentencePiece vocabulary and all ASCII input
-tokenize normally, but arbitrary out-of-vocabulary Unicode cannot be converted
-to its UTF-8 byte fallback sequence. On decode, non-ASCII byte tokens remain visible as
-`<0xNN>` markers rather than silently producing incorrect text.
+Scratch can't get a character's Unicode code point, so byte fallback only works
+for ASCII. ASCII text and characters that appear in the vocabulary tokenize
+normally. Other characters can't be encoded. When decoding, non-ASCII byte
+tokens are shown as `<0xNN>` rather than turned into wrong text.
 
 ## Compatibility
 
-Large production tokenizers often depend on byte-level preprocessing, regular
-expression splitting, normalization stages, or other behavior that these
-Scratch templates do not implement. Their vocabularies can also make the model
-embedding prohibitively large. Train a small tokenizer on the model's corpus
-without a pre-tokenizer so BPE operates on the raw string.
+Tokenizers from large pretrained models usually rely on byte-level
+preprocessing, regex splitting, or normalization that these sprites don't
+implement, and their large vocabularies make the model's embedding table too
+big for Scratch. Instead, train a small BPE tokenizer on your model's data,
+without a pre-tokenizer:
 
 ```python
 from tokenizers import Tokenizer, models, trainers
@@ -115,5 +117,8 @@ tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
 BPETokenizer(tokenizer).save("small_bpe")
 ```
 
-cattorch exports existing tokenizers; it does not train them. The `tokenizers`
-and `transformers` packages are installed by the `tokenizers` extra used above.
+cattorch doesn't train tokenizers. The example uses the `tokenizers` and
+`transformers` packages, which the `cattorch[tokenizers]` extra installs.
+
+Related: [tokenizer API reference](api-reference.md#tokenizer-export) and
+[KV-cached generation](generation.md).

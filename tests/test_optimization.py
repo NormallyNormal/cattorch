@@ -5,12 +5,13 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import cattorch.graph as graph_module
+import cattorch.frontend as frontend_module
 
 from cattorch import (
+    CodegenConfig,
     FastConfig,
     FastLayerConfig,
-    GenerationConfig,
+    GenerationProgram,
     StorageConfig,
     TranspileResult,
     transpile,
@@ -18,6 +19,7 @@ from cattorch import (
     UnsupportedOperationError,
     verify,
 )
+from cattorch.graph import _GenerationSpec
 from cattorch.transpiler import _prepare_graph
 from cattorch.fast import prepare_fast_matmul_weights, prepare_fast_model
 from cattorch.benchmark import (
@@ -67,9 +69,9 @@ def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
         observed.update({name: getattr(config, name) for name in names})
         return "exported"
 
-    monkeypatch.setattr(graph_module, "export", fake_export)
+    monkeypatch.setattr(frontend_module, "export", fake_export)
     with config.patch(**{name: 1 for name in names}):
-        assert graph_module._export_model(nn.Identity(), (torch.ones(1),)) == "exported"
+        assert frontend_module._export_model(nn.Identity(), (torch.ones(1),)) == "exported"
         assert all(getattr(config, name) == 1 for name in names)
 
     assert all(value >= 1024 for value in observed.values())
@@ -262,6 +264,30 @@ def _run(sprite, values):
     emulator.lists["input"] = list(values)
     emulator.run()
     return [float(value) for value in emulator.lists["output"]]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        nn.Tanh(),
+        nn.Sequential(nn.Linear(2, 2, bias=False), nn.Tanh()),
+        nn.GELU(approximate="tanh"),
+        nn.Sequential(
+            nn.Linear(2, 2, bias=False), nn.GELU(approximate="tanh"),
+        ),
+    ],
+    ids=("tanh", "fused_tanh", "gelu_tanh", "fused_gelu_tanh"),
+)
+def test_exact_tanh_kernels_stay_finite_at_extreme_inputs(tmp_path, model):
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            with torch.no_grad():
+                module.weight.copy_(torch.eye(2))
+    model.eval()
+    value = torch.tensor([[-1000.0, 1000.0]])
+    result = transpile(model, value, tmp_path / type(model).__name__)
+    comparison = verify(model, value, result, atol=1e-5)
+    assert comparison.passed, comparison
 
 
 def test_dsl_compiles_and_renders_readable_kernel():
@@ -1156,31 +1182,35 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     path = tmp_path / "cached_generation"
     transpile(
         model,
-        torch.tensor([[1]]),
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
         str(path),
-        generation=GenerationConfig(max_context=5),
     )
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
     assert {
-        "cattorch forward", "cattorch init", "cattorch reset cache",
+        "_cattorch token step", "cattorch init", "cattorch reset",
         "cattorch prefill", "cattorch decode",
     } <= set(emulator._procedures)
+    assert "cattorch prepare for save" not in emulator._procedures
     assert set(sprite["broadcasts"].values()) == {
-        "cattorch init done", "cattorch prefill done",
+        "cattorch init complete", "cattorch reset complete",
+        "cattorch prefill complete", "cattorch decode complete",
     }
     assert emulator.variables["cattorch max context"] == 5
     assert emulator.variables["cattorch cache length"] == 0
 
+    emulator.run_procedure("cattorch init")
+    assert emulator.variables["cattorch status"] == "ok"
+
     prompt = [1, 3, 5]
-    emulator.lists["input"] = prompt
+    emulator.lists["cattorch tokens"] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     assert emulator.broadcasts == [
-        "cattorch init done", "cattorch prefill done",
+        "cattorch init complete", "cattorch prefill complete",
     ]
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
-        torch.tensor(emulator.lists["output"]), expected, atol=1e-4, rtol=0,
+        torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
     assert emulator.variables["cattorch cache length"] == 3
     assert len(emulator.lists["cattorch K cache 1"]) == 3 * 8
@@ -1188,21 +1218,21 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
 
     for token in (2, 4):
         prompt.append(token)
-        emulator.lists["input"] = [token]
+        emulator.lists["cattorch tokens"] = [token]
         emulator._exec_chain(emulator._procedures["cattorch decode"])
         expected = model(torch.tensor([prompt]))[0, -1]
         torch.testing.assert_close(
-            torch.tensor(emulator.lists["output"]), expected, atol=1e-4, rtol=0,
+            torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
         )
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator.lists["input"] = [6]
+    emulator.lists["cattorch tokens"] = [6]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["output"] == []
+    assert emulator.lists["cattorch logits"] == []
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator._exec_chain(emulator._procedures["cattorch reset cache"])
+    emulator._exec_chain(emulator._procedures["cattorch reset"])
     assert emulator.variables["cattorch status"] == "ok"
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["cattorch K cache 1"] == []
@@ -1214,30 +1244,29 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
     path = tmp_path / "cached_generation_guards"
     transpile(
         model,
-        torch.tensor([[1]]),
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=3),
         path,
-        generation=GenerationConfig(max_context=5, top_k=3),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
 
     for invalid in ([], [1, 2]):
-        emulator.lists["input"] = invalid
+        emulator.lists["cattorch tokens"] = invalid
         emulator.run_procedure("cattorch decode")
         assert emulator.variables["cattorch status"] == "decode requires exactly one token"
         assert emulator.variables["cattorch cache length"] == 0
-        assert emulator.lists["output"] == []
+        assert emulator.lists["cattorch logits"] == []
         assert emulator.lists["cattorch top k ids"] == []
 
-    emulator.lists["input"] = []
+    emulator.lists["cattorch tokens"] = []
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "prefill requires at least one token"
     assert emulator.variables["cattorch cache length"] == 0
 
-    emulator.lists["input"] = [1, 2, 3, 4, 5, 6]
+    emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "prefill exceeds maximum context"
     assert emulator.variables["cattorch cache length"] == 0
-    assert emulator.lists["output"] == []
+    assert emulator.lists["cattorch logits"] == []
 
 
 def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
@@ -1246,28 +1275,74 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     path = tmp_path / "cached_mqa_generation"
     transpile(
         model,
-        torch.tensor([[1]]),
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
         str(path),
-        generation=GenerationConfig(max_context=5),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
 
     prompt = [1, 3, 5]
-    emulator.lists["input"] = prompt
+    emulator.lists["cattorch tokens"] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
-        torch.tensor(emulator.lists["output"]), expected, atol=1e-4, rtol=0,
+        torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
     assert len(emulator.lists["cattorch K cache 1"]) == 3 * 4
     assert len(emulator.lists["cattorch V cache 2"]) == 3 * 4
 
-    emulator.lists["input"] = [2]
+    emulator.lists["cattorch tokens"] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     expected = model(torch.tensor([[*prompt, 2]]))[0, -1]
     torch.testing.assert_close(
-        torch.tensor(emulator.lists["output"]), expected, atol=1e-4, rtol=0,
+        torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
+
+
+def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path):
+    torch.manual_seed(145)
+    model = CachedLM(context=5, layers=2).eval()
+    path = tmp_path / "cached_shared_layers"
+    result = transpile(
+        model,
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        path,
+        codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
+    )
+    baseline = transpile(
+        model,
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        tmp_path / "cached_unshared_layers",
+        codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
+    )
+    assert result.block_count < baseline.block_count * 0.75
+    sprite = _load_sprite(result.path)
+    emulator = ScratchEmulator(sprite)
+    assert "cattorch shared transformer layer" in emulator._procedures
+    assert "cattorch K cache" in emulator.lists
+    assert "cattorch V cache" in emulator.lists
+    assert "cattorch K cache 1" not in emulator.lists
+
+    prompt = [1, 3, 5]
+    emulator.lists["cattorch tokens"] = prompt
+    emulator.run_procedure("cattorch prefill")
+    torch.testing.assert_close(
+        torch.tensor(emulator.lists["cattorch logits"]),
+        model(torch.tensor([prompt]))[0, -1],
+        atol=1e-4,
+        rtol=0,
+    )
+    assert len(emulator.lists["cattorch K cache"]) == len(prompt) * 2 * 8
+    assert emulator.variables["cattorch cache length"] == len(prompt)
+
+    emulator.lists["cattorch tokens"] = [2]
+    emulator.run_procedure("cattorch decode")
+    torch.testing.assert_close(
+        torch.tensor(emulator.lists["cattorch logits"]),
+        model(torch.tensor([[*prompt, 2]]))[0, -1],
+        atol=1e-4,
+        rtol=0,
+    )
+    assert emulator.variables["cattorch cache length"] == len(prompt) + 1
 
 
 def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
@@ -1276,21 +1351,20 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     path = tmp_path / "cached_top_k"
     transpile(
         model,
-        torch.tensor([[1]]),
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=5),
         str(path),
-        generation=GenerationConfig(max_context=5, top_k=5),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
     assert "cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
-    emulator.lists["input"] = prompt
+    emulator.lists["cattorch tokens"] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     expected_logits = model(torch.tensor([prompt]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
     assert emulator.lists["cattorch top k values"] == [
-        emulator.lists["output"][index] for index in expected_ids.tolist()
+        emulator.lists["cattorch logits"][index] for index in expected_ids.tolist()
     ]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch top k values"]),
@@ -1299,13 +1373,13 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["input"] = [2]
+    emulator.lists["cattorch tokens"] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     expected_logits = model(torch.tensor([[*prompt, 2]]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
     assert emulator.lists["cattorch top k values"] == [
-        emulator.lists["output"][index] for index in expected_ids.tolist()
+        emulator.lists["cattorch logits"][index] for index in expected_ids.tolist()
     ]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch top k values"]),
@@ -1314,17 +1388,17 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["input"] = [4]
+    emulator.lists["cattorch tokens"] = [4]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     assert len(emulator.lists["cattorch top k values"]) == 5
-    emulator.lists["input"] = [6]
+    emulator.lists["cattorch tokens"] = [6]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["output"] == []
+    assert emulator.lists["cattorch logits"] == []
     assert emulator.lists["cattorch top k values"] == []
     assert emulator.lists["cattorch top k ids"] == []
 
-    emulator._exec_chain(emulator._procedures["cattorch reset cache"])
+    emulator._exec_chain(emulator._procedures["cattorch reset"])
     assert emulator.lists["cattorch top k values"] == []
     assert emulator.lists["cattorch top k ids"] == []
 
@@ -1335,7 +1409,7 @@ def test_generation_layer_positions_use_their_own_attention_cache():
         model,
         (torch.tensor([[1]]),),
         optimization="exact",
-        generation=GenerationConfig(max_context=5),
+        generation=_GenerationSpec(max_context=5),
     )
     caches = [
         graph.generation.position_embeddings[node.name][0]
@@ -1357,7 +1431,7 @@ def test_long_generation_fuses_attention_and_emits_qkv_caches_directly(tmp_path)
         model,
         (token,),
         optimization="exact",
-        generation=GenerationConfig(max_context=64),
+        generation=_GenerationSpec(max_context=64),
     )
     assert len(graph.generation.qkv_caches) == 1
     assert len(graph.generation.prepopulated_scores) == 1
@@ -1369,17 +1443,16 @@ def test_long_generation_fuses_attention_and_emits_qkv_caches_directly(tmp_path)
     path = tmp_path / "long_cached_attention"
     transpile(
         model,
-        token,
+        GenerationProgram("forward", token, max_context=64),
         str(path),
-        generation=GenerationConfig(max_context=64),
         storage=StorageConfig(compression=False),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    emulator.lists["input"] = prompt
+    emulator.lists["cattorch tokens"] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
 
     torch.testing.assert_close(
-        torch.tensor(emulator.lists["output"]),
+        torch.tensor(emulator.lists["cattorch logits"]),
         model(torch.tensor([prompt]))[0, -1],
         atol=1e-4,
         rtol=0,
@@ -1405,9 +1478,8 @@ def test_transformer_sized_cached_qkv_uses_interleaved_destination_weights(tmp_p
     path = tmp_path / "grouped_cached_qkv"
     transpile(
         model,
-        token,
+        GenerationProgram("forward", token, max_context=5, hidden_prefill=False),
         str(path),
-        generation=GenerationConfig(max_context=5, hidden_prefill=False),
         storage=StorageConfig(compression=False),
     )
     sprite = _load_sprite(path.with_suffix(".sprite3"))
@@ -1424,10 +1496,10 @@ def test_transformer_sized_cached_qkv_uses_interleaved_destination_weights(tmp_p
     assert {"sum a", "sum b", "sum c", "sum d", "weight_index"} <= mutations
 
     emulator = ScratchEmulator(sprite)
-    emulator.lists["input"] = [2]
+    emulator.lists["cattorch tokens"] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     torch.testing.assert_close(
-        torch.tensor(emulator.lists["output"]),
+        torch.tensor(emulator.lists["cattorch logits"]),
         model(token).flatten(),
         atol=1e-4,
         rtol=0,
@@ -1443,21 +1515,21 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
         path = tmp_path / f"prefill_{hidden_prefill}"
         transpile(
             model,
-            torch.tensor([[1]]),
-            str(path),
-            generation=GenerationConfig(
-                max_context=5, hidden_prefill=hidden_prefill,
+            GenerationProgram(
+                "forward", torch.tensor([[1]]), max_context=5,
+                hidden_prefill=hidden_prefill,
             ),
+            str(path),
         )
         emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-        emulator.lists["input"] = prompt
+        emulator.lists["cattorch tokens"] = prompt
         emulator._exec_chain(emulator._procedures["cattorch prefill"])
         emulators[hidden_prefill] = emulator
 
     expected = model(torch.tensor([prompt]))[0, -1]
     for emulator in emulators.values():
         torch.testing.assert_close(
-            torch.tensor(emulator.lists["output"]), expected, atol=1e-4, rtol=0,
+            torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
         )
         assert emulator.variables["cattorch cache length"] == len(prompt)
     assert (
@@ -1468,19 +1540,19 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
 
 def test_generation_config_validates_hidden_prefill():
     with pytest.raises(TypeError, match="hidden_prefill must be a boolean"):
-        GenerationConfig(max_context=5, hidden_prefill=1)
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, hidden_prefill=1)
 
 
 @pytest.mark.parametrize("top_k", [True, 1.5, "5"])
 def test_generation_config_validates_top_k_type(top_k):
     with pytest.raises(TypeError, match="top_k must be an integer or None"):
-        GenerationConfig(max_context=5, top_k=top_k)
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
 
 
-@pytest.mark.parametrize("top_k", [0, 17])
+@pytest.mark.parametrize("top_k", [0, 65])
 def test_generation_config_validates_top_k_range(top_k):
-    with pytest.raises(ValueError, match="top_k must be between 1 and 16"):
-        GenerationConfig(max_context=5, top_k=top_k)
+    with pytest.raises(ValueError, match="top_k must be between 1 and 64"):
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
 
 
 def test_generation_top_k_cannot_exceed_output_size(tmp_path):
@@ -1488,24 +1560,23 @@ def test_generation_top_k_cannot_exceed_output_size(tmp_path):
     with pytest.raises(ValueError, match=r"top_k \(14\) exceeds output size \(13\)"):
         transpile(
             model,
-            torch.tensor([[1]]),
+            GenerationProgram("forward", torch.tensor([[1]]), max_context=4, top_k=14),
             str(tmp_path / "top_k_too_large"),
-            generation=GenerationConfig(max_context=4, top_k=14),
         )
 
 
 def test_generation_validates_input_shape_and_shards_oversized_cache(tmp_path):
     model = CachedLM(context=4, layers=1).eval()
-    with pytest.raises(ValueError, match=r"shape \[1, 1\]"):
+    with pytest.raises(ValueError, match="must contain one token"):
         transpile(
-            model, torch.tensor([[1, 2]]), str(tmp_path / "bad_generation"),
-            generation=GenerationConfig(4),
+            model, GenerationProgram("forward", torch.tensor([[1, 2]]), 4),
+            str(tmp_path / "bad_generation"),
         )
 
     with pytest.raises(ValueError, match="position table capacity"):
         transpile(
-            model, torch.tensor([[1]]), str(tmp_path / "position_overflow"),
-            generation=GenerationConfig(5),
+            model, GenerationProgram("forward", torch.tensor([[1]]), 5),
+            str(tmp_path / "position_overflow"),
         )
 
     class PositionlessCachedLM(CachedLM):
@@ -1516,8 +1587,7 @@ def test_generation_validates_input_shape_and_shards_oversized_cache(tmp_path):
     model = PositionlessCachedLM(context=4, layers=1).eval()
     path = tmp_path / "oversized_cache"
     transpile(
-        model, torch.tensor([[1]]), str(path),
-        generation=GenerationConfig(25_001),
+        model, GenerationProgram("forward", torch.tensor([[1]]), 25_001), str(path),
     )
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     names = {entry[0] for entry in sprite["lists"].values()}
@@ -1681,13 +1751,13 @@ def test_identity_model_materializes_a_distinct_output(tmp_path):
     )
 
 
-def test_multiple_model_outputs_are_rejected_explicitly(tmp_path):
+def test_multiple_model_outputs_are_preserved(tmp_path):
     class Pair(nn.Module):
         def forward(self, value):
             return value + 1, value * 2
 
-    with pytest.raises(UnsupportedModelError, match="exactly one tensor output"):
-        transpile(Pair(), torch.ones(2), str(tmp_path / "pair"))
+    result = transpile(Pair(), torch.ones(2), str(tmp_path / "pair"))
+    assert tuple(value.list_name for value in result.outputs) == ("output", "output_1")
 
 
 def test_training_dropout_is_rejected_instead_of_silently_removed(tmp_path):
@@ -1700,7 +1770,7 @@ def test_semantic_runtime_dtype_cast_is_rejected(tmp_path):
         def forward(self, value):
             return value.to(torch.int64)
 
-    with pytest.raises(UnsupportedOperationError, match="dtype conversion"):
+    with pytest.raises(UnsupportedOperationError, match="converting a runtime tensor"):
         transpile(ToInteger(), torch.tensor([1.2, -2.8]), str(tmp_path / "dtype"))
 
 
