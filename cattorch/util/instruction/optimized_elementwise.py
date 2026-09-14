@@ -63,7 +63,7 @@ class OptimizedElementwiseInstruction(Instruction):
             )
         else:
             self.output_shape = self.args[0].shape
-        self.size = math.prod(self.output_shape)
+        self.size = length("T1") if self.args[0].dynamic else math.prod(self.output_shape)
         self.broadcast_lists = {}
 
     def _binary_expr(self):
@@ -100,12 +100,8 @@ class OptimizedElementwiseInstruction(Instruction):
         elif self.op == "aten.rsqrt.default":
             result = div(1, mathop("sqrt", direct))
         elif self.op == "aten.tanh.default":
-            setup = (
-                set_var("exponential", mathop("e ^", mul(2, direct))),
-            )
-            result = div(
-                add(var("exponential"), -1),
-                add(var("exponential"), 1),
+            result = sub(
+                div(2, add(1, mathop("e ^", mul(-2, direct)))), 1,
             )
         elif self.op == "aten.relu.default":
             output = if_else(
@@ -127,11 +123,9 @@ class OptimizedElementwiseInstruction(Instruction):
                         add(cached, mul(0.044715, mul(mul(cached, cached), cached))),
                     ),
                 ),
-                set_var("exponential", mathop("e ^", mul(2, var("inner")))),
             )
-            tanh_inner = div(
-                add(var("exponential"), -1),
-                add(var("exponential"), 1),
+            tanh_inner = sub(
+                div(2, add(1, mathop("e ^", mul(-2, var("inner"))))), 1,
             )
             result = mul(mul(0.5, cached), add(1, tanh_inner))
         elif self.op == "aten.leaky_relu.default":
@@ -173,10 +167,15 @@ class OptimizedElementwiseInstruction(Instruction):
             lists = ("T1", "T2")
             output_name = "T2"
             setup, output = self._unary()
-            variables = ("index", "value", "inner", "exponential")
+            variables = ("index", "value", "inner")
             iteration = (*setup, output, change_var("index", 1))
 
-        if self.op == "aten.gelu.default":
+        if self.args[0].dynamic:
+            traversal = (
+                set_var("index", 1),
+                repeat(self.size, iteration),
+            )
+        elif self.op == "aten.gelu.default":
             # GELU's large reporter tree regressed when unrolled, but the
             # palette-hidden official loop still removes one index mutation.
             traversal = (for_each("index", self.size, iteration[:-1]),)
@@ -219,6 +218,17 @@ class FusedArithmeticInstruction(Instruction):
     def finalize(self):
         destination = f"T{len(self.args) + 1}"
         lists = tuple(f"T{index}" for index in range(1, len(self.args) + 2))
+        traversal = (
+            (repeat(self.size, (
+                append(destination, self.expression),
+                change_var("index", 1),
+            )),)
+            if self.args[0].dynamic
+            else _static_unrolled_repeat(self.size, (
+                append(destination, self.expression),
+                change_var("index", 1),
+            ), factor=8)
+        )
         return Program(
             "arithmetic_expression_fused",
             variables=("index",),
@@ -226,10 +236,7 @@ class FusedArithmeticInstruction(Instruction):
             body=(
                 clear(destination),
                 set_var("index", 1),
-                *_static_unrolled_repeat(self.size, (
-                    append(destination, self.expression),
-                    change_var("index", 1),
-                ), factor=8),
+                *traversal,
             ),
         ).compile()
 
@@ -252,7 +259,7 @@ class OptimizedSwiGLUInstruction(Instruction):
     """Fuse ``silu(gate) * value`` into one exact elementwise traversal."""
 
     def prepare(self):
-        self.size = math.prod(self.args[0].shape)
+        self.size = length("T1") if self.args[0].dynamic else math.prod(self.args[0].shape)
 
     def finalize(self):
         gate = var("gate")
@@ -272,7 +279,11 @@ class OptimizedSwiGLUInstruction(Instruction):
             body=(
                 clear("T3"),
                 set_var("index", 1),
-                *_static_unrolled_repeat(self.size, iteration, factor=4),
+                *(
+                    (repeat(self.size, iteration),)
+                    if self.args[0].dynamic
+                    else _static_unrolled_repeat(self.size, iteration, factor=4)
+                ),
             ),
         ).compile()
 
@@ -289,14 +300,18 @@ class PairedLinearSwiGLUInstruction(Instruction):
         gate_shape = self.args[1].shape
         value_shape = self.args[3].shape
         if gate_shape != value_shape or len(gate_shape) != 2:
-            raise ValueError("Paired SwiGLU weights must have the same matrix shape")
-        self.rows = math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1
+            raise ValueError("paired SwiGLU weights must have the same matrix shape")
+        self.rows = (
+            div(length("T1"), input_shape[-1])
+            if self.args[0].dynamic
+            else (math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1)
+        )
         self.inner = input_shape[-1]
         self.hidden = gate_shape[0]
         if not self.shard_rows:
             self.shard_rows = (self.hidden,)
         if sum(self.shard_rows) != self.hidden:
-            raise ValueError("Paired SwiGLU shards must cover every hidden row")
+            raise ValueError("paired SwiGLU shards must cover every hidden row")
         shard_count = len(self.shard_rows)
         self.weight_lists = tuple(
             (f"T{2 + 2 * index}", f"T{3 + 2 * index}")

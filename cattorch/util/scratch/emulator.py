@@ -19,6 +19,7 @@ Usage
     result = emu.lists["output"]
 """
 
+import math
 from collections import Counter
 
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
@@ -106,7 +107,7 @@ class ScratchEmulator:
         """Run a named custom block without relying on top-level stack order."""
         if name not in self._procedures:
             available = ", ".join(sorted(self._procedures)) or "none"
-            raise ValueError(f"Procedure {name!r} not found; available: {available}")
+            raise ValueError(f"procedure {name!r} not found; available: {available}")
         self._exec_chain(self._procedures[name])
 
     def _find_roots(self) -> list[str]:
@@ -116,7 +117,7 @@ class ScratchEmulator:
             and block.get("opcode") != "procedures_definition"
         ]
         if not roots:
-            raise ValueError("No topLevel roots found")
+            raise ValueError("no topLevel roots found")
         return roots
 
     def _find_procedures(self) -> dict[str, str | None]:
@@ -181,7 +182,7 @@ class ScratchEmulator:
                 lst.pop(index - 1)
 
         elif opcode == "control_repeat":
-            times = int(float(self._eval_input(inputs["TIMES"])))
+            times = self._scratch_round(self._eval_input(inputs["TIMES"]))
             substack_id = self._get_substack(inputs.get("SUBSTACK"))
             for _ in range(times):
                 self._exec_chain(substack_id)
@@ -214,7 +215,7 @@ class ScratchEmulator:
         elif opcode == "procedures_call":
             proccode = block.get("mutation", {}).get("proccode")
             if proccode not in self._procedures:
-                raise ValueError(f"Procedure not found: {proccode}")
+                raise ValueError(f"procedure not found: {proccode}")
             self._exec_chain(self._procedures[proccode])
 
         elif opcode == "looks_switchcostumeto":
@@ -237,7 +238,7 @@ class ScratchEmulator:
             return
 
         else:
-            raise NotImplementedError(f"Unknown opcode: {opcode}")
+            raise NotImplementedError(f"unknown opcode: {opcode}")
 
     def _eval_input(self, input_spec):
         """Evaluate a Scratch input specification and return a Python value."""
@@ -324,26 +325,23 @@ class ScratchEmulator:
         elif opcode == "operator_mod":
             a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
             b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
-            return a % b if b != 0 else 0
+            # JavaScript's remainder by zero is NaN; Scratch keeps it.
+            return a % b if b != 0 else math.nan
 
         elif opcode == "operator_equals":
-            a = self._eval_input(inputs["OPERAND1"])
-            b = self._eval_input(inputs["OPERAND2"])
-            na = self._scratch_number(a)
-            nb = self._scratch_number(b)
-            if na is not None and nb is not None:
-                return na == nb
-            return str(a).lower() == str(b).lower()
+            return self._scratch_compare(
+                self._eval_input(inputs["OPERAND1"]), self._eval_input(inputs["OPERAND2"]),
+            ) == 0
 
         elif opcode == "operator_gt":
-            a = self._scratch_numeric(self._eval_input(inputs["OPERAND1"]))
-            b = self._scratch_numeric(self._eval_input(inputs["OPERAND2"]))
-            return a > b
+            return self._scratch_compare(
+                self._eval_input(inputs["OPERAND1"]), self._eval_input(inputs["OPERAND2"]),
+            ) > 0
 
         elif opcode == "operator_lt":
-            a = self._scratch_numeric(self._eval_input(inputs["OPERAND1"]))
-            b = self._scratch_numeric(self._eval_input(inputs["OPERAND2"]))
-            return a < b
+            return self._scratch_compare(
+                self._eval_input(inputs["OPERAND1"]), self._eval_input(inputs["OPERAND2"]),
+            ) < 0
 
         elif opcode == "operator_and":
             a = self._eval_input(inputs["OPERAND1"])
@@ -359,17 +357,11 @@ class ScratchEmulator:
             a = self._eval_input(inputs["OPERAND"])
             return not bool(a)
 
-        elif opcode == "operator_subtract":
-            a = float(self._eval_input(inputs["NUM1"]))
-            b = float(self._eval_input(inputs["NUM2"]))
-            return a - b
-
         elif opcode == "operator_divide":
             a = self._scratch_numeric(self._eval_input(inputs["NUM1"]))
             b = self._scratch_numeric(self._eval_input(inputs["NUM2"]))
             if b != 0:
                 return a / b
-            import math
             if a == 0:
                 return math.nan
             return math.copysign(math.inf, a * math.copysign(1, b))
@@ -377,33 +369,38 @@ class ScratchEmulator:
         elif opcode == "operator_mathop":
             value = self._scratch_numeric(self._eval_input(inputs["NUM"]))
             op = fields["OPERATOR"][0]
+            # Match JavaScript's Math functions, which return Infinity or NaN
+            # where Python raises.
             if op == "e ^":
-                import math
-                return math.exp(value)
+                try:
+                    return math.exp(value)
+                except OverflowError:
+                    return math.inf
             elif op == "abs":
                 return abs(value)
-            elif op == "floor":
-                import math
-                return math.floor(value)
-            elif op == "ceiling":
-                import math
-                return math.ceil(value)
+            elif op in {"floor", "ceiling"}:
+                if not math.isfinite(value):
+                    return value
+                return math.floor(value) if op == "floor" else math.ceil(value)
             elif op == "sqrt":
-                import math
-                return math.sqrt(value)
-            elif op == "ln":
-                import math
-                return math.log(value) if value > 0 else 0
-            elif op == "log":
-                import math
-                return math.log10(value) if value > 0 else 0
+                return math.sqrt(value) if value >= 0 else math.nan
+            elif op in {"ln", "log"}:
+                if math.isnan(value) or value < 0:
+                    return math.nan
+                if value == 0:
+                    return -math.inf
+                if math.isinf(value):
+                    return math.inf
+                return math.log(value) if op == "ln" else math.log10(value)
             elif op == "10 ^":
-                return 10 ** value
+                try:
+                    return 10.0 ** value
+                except OverflowError:
+                    return math.inf
             else:
-                raise NotImplementedError(f"Unknown mathop: {op}")
+                raise NotImplementedError(f"unknown mathop: {op}")
 
         elif opcode == "operator_round":
-            import math
             value = self._scratch_numeric(self._eval_input(inputs["NUM"]))
             # Scratch uses JavaScript Math.round, including its handling of
             # negative half values.
@@ -434,12 +431,10 @@ class ScratchEmulator:
             list_id = fields["LIST"][1]
             item = self._eval_input(inputs["ITEM"])
             lst = self._lists.get(list_id, [])
-            # Scratch returns 1-based index, or 0 if not found
-            item_str = str(item).lower()
+            # Scratch returns a 1-based index, or 0 if not found. The VM uses
+            # Cast.compare, so "1" also matches " 1" and "01".
             for i, val in enumerate(lst):
-                # The official VM uses Cast.compare here, including Scratch's
-                # case-insensitive string comparison.
-                if str(val).lower() == item_str:
+                if self._scratch_compare(val, item) == 0:
                     return i + 1
             return 0
 
@@ -463,7 +458,7 @@ class ScratchEmulator:
             return self._current_costume + 1
 
         else:
-            raise NotImplementedError(f"Unknown reporter opcode: {opcode}")
+            raise NotImplementedError(f"unknown reporter opcode: {opcode}")
 
     def _get_substack(self, input_spec) -> str | None:
         """Extract a substack block ID from a SUBSTACK input."""
@@ -489,7 +484,6 @@ class ScratchEmulator:
             return value
         try:
             f = float(value)
-            import math
             if not math.isfinite(f):
                 return f
             return int(f) if f == int(f) else f
@@ -512,6 +506,41 @@ class ScratchEmulator:
             return float(s)
         except ValueError:
             return None
+
+    @classmethod
+    def _scratch_round(cls, value) -> int:
+        """Round a loop count like ``Math.round(Cast.toNumber(value))``."""
+        number = cls._scratch_numeric(value)
+        if not math.isfinite(number):
+            return 0 if math.isnan(number) or number < 0 else 2**31
+        return math.floor(number + 0.5)
+
+    @classmethod
+    def _scratch_compare(cls, left, right) -> float:
+        """Compare like the Scratch VM's ``Cast.compare``.
+
+        Empty and whitespace-only strings are not numbers here, so ``""`` is
+        not equal to ``0``. Non-numeric values compare as lowercase strings.
+        """
+        def is_whitespace(value):
+            return isinstance(value, str) and value.strip() == ""
+
+        left_number = cls._scratch_number(left)
+        right_number = cls._scratch_number(right)
+        if left_number == 0 and is_whitespace(left):
+            left_number = None
+        elif right_number == 0 and is_whitespace(right):
+            right_number = None
+        if (
+            left_number is None or right_number is None
+            or math.isnan(left_number) or math.isnan(right_number)
+        ):
+            left_text = str(left).lower()
+            right_text = str(right).lower()
+            return (left_text > right_text) - (left_text < right_text)
+        if left_number == right_number:
+            return 0
+        return left_number - right_number
 
     @classmethod
     def _scratch_numeric(cls, value):

@@ -15,7 +15,7 @@ from cattorch.benchmark import (
 )
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.storage import (
-    BASE85_ALPHABET,
+    BASE92_ALPHABET,
     EncodedList,
     build_unpack_program,
     encode_values,
@@ -474,7 +474,7 @@ def _sprite_target(name: str):
             "name": character, "bitmapResolution": 1, "dataFormat": "svg",
             "assetId": asset_id, "md5ext": md5ext,
             "rotationCenterX": 48, "rotationCenterY": 50,
-        } for character in BASE85_ALPHABET],
+        } for character in BASE92_ALPHABET],
         "sounds": [], "volume": 100, "visible": False,
         "x": 0, "y": 0, "size": 100, "direction": 90,
         "draggable": False, "rotationStyle": "all around", "layerOrder": 1,

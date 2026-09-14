@@ -1,23 +1,38 @@
-# Storage and Scratch limits
+# Storage, quantization, and Scratch limits
 
-Static tensors use a Scratch-safe costume-name Base85 codec by default.
-`cattorch init` decodes the payload once into ordinary numeric lists, so
-forward kernels do not parse encoded values. The processor sprite contains 85
-costume entries which all reference the same physical SVG asset; vanilla
-Scratch's case-sensitive costume lookup supplies the digit value.
+[Documentation home](index.md)
 
-Those 85 costume entries are reserved codec metadata. Do not rename, reorder,
-delete, or insert costumes in a generated processor sprite: changing their
-one-based positions changes decoded bytes. Keep visual costumes on another
-sprite.
+Storage settings control how parameters, buffers, and constants are saved in
+the sprite. Compressed values are decoded once during `cattorch init`, and
+inference then runs on ordinary Scratch number lists.
+
+## Choose a storage mode
+
+| Goal | Configuration | Lossy? |
+|---|---|---|
+| Preserve PyTorch float32 values | `StorageConfig()` | No |
+| Reduce size with float16 weights | `StorageConfig(precision="float16")` | Yes |
+| Quantize without calibration | `QuantizationConfig(bits=6)`; also accepts 4 or 8 | Yes |
+| Use representative data to choose low-bit weights | `QuantizationConfig(bits=4, method="gptq")` | Yes |
+| Disable compression for debugging | `StorageConfig(compression=False)` | No |
+
+Storage affects file size, startup time, and accuracy. It doesn't make
+inference faster, because inference uses the decoded weights.
+
+Start with the default float32 storage and run `verify`. Try float16 next. For
+a large model, compare symmetric Q6, symmetric Q4, and GPTQ Q4 on
+representative data. Fewer bits give a smaller sprite and can lower model
+quality. Lossy storage stays lossy with `optimization="exact"`.
+
+## Examples
 
 ```python
-from cattorch import StorageConfig, transpile
+from cattorch import QuantizationConfig, StorageConfig, transpile
 
 # Lossless for PyTorch float32 values.
 transpile(model, example, "model", storage=StorageConfig())
 
-# Smaller, explicitly lossy payload.
+# Smaller, lossy storage.
 transpile(
     model,
     example,
@@ -25,135 +40,130 @@ transpile(
     storage=StorageConfig(precision="float16"),
 )
 
-# Groupwise weight quantization, decoded once before the first forward pass.
+# Six-bit weights without calibration.
 transpile(
     model,
     example,
-    "model_int8",
-    storage=StorageConfig(precision="int8", group_size=64),
-)
-
-# Bit-packed signed 6-bit weights: just under one character each.
-transpile(
-    model,
-    example,
-    "model_int6",
-    storage=StorageConfig(precision="int6", group_size=64),
-)
-
-# Two signed weights are packed into each byte.
-transpile(
-    model,
-    example,
-    "model_int4",
-    storage=StorageConfig(precision="int4", group_size=64),
-)
-
-# Useful as an uncompressed debugging or benchmark baseline.
-transpile(
-    model,
-    example,
-    "model_plain",
-    storage=StorageConfig(compression=False),
+    "model_q6",
+    quantization=QuantizationConfig(bits=6),
 )
 ```
 
-Float32 storage uses four bytes per value before Base85 representation; float16
-uses two, int8 uses one, int6 packs four six-bit codes into three bytes, and
-packed int4 uses half a byte. Before scale metadata, that is approximately
-5.000, 2.500, 1.250, 0.938, and 0.625 safe characters per weight respectively.
-Because Scratch project JSON is textual, Base85 also
-avoids the long decimal spellings of ordinary JSON numbers. The encoded
-representation costs five characters per four bytes, not one
-character per arbitrary byte, because Scratch and JSON cannot safely carry
-every possible raw byte as a single character.
+See the [configuration reference](api-reference.md#storageconfig) for every
+field and default.
 
-Int8, int6, and int4 use symmetric quantization independently in each flat
-group. Each group's scale is compressed separately. Integer codes are centered
-so startup decoding needs no signed-value branch. Matrix-like tensors are
-dequantized into ordinary Scratch numeric lists during `cattorch init`, so
-forward kernels do not parse packed values, access scale metadata, or perform
-integer-specific arithmetic. Small one-dimensional tensors such as biases and
-normalization parameters use float16 rather than carrying their own integer
-metadata. Integer storage therefore reduces
-project size and startup decoding work, but it does not bypass the 200,000-item
-limit of each decoded list and does not inherently accelerate a forward pass.
+## Symmetric quantization behavior
 
-The default group size is 64. Scales default to float32; setting
-`scale_precision="float16"` halves their payload at the cost of a small,
-explicit additional approximation. Smaller groups usually reduce quantization error
-at the cost of more scale data. All integer formats are explicitly lossy;
-verify model-level outputs or generation quality before distribution.
+Each row of a weight matrix is split into groups, and each group gets its own
+scale. `group_size=64` is a maximum: cattorch uses the largest divisor of the
+matrix input width that doesn't exceed it, such as 56 for a width of 112.
+Smaller groups usually reduce error but store more scales. Scales are float16 by
+default.
 
-By default, matrix shards with fewer than 16,384 values remain float16. For
-small tensors, the Scratch blocks and scale payload needed by an integer
-decoder can cost more project space and startup time than they save. Set
-`min_quantized_values=1` to force integer storage for every matrix shard,
-for example when measuring the formats themselves. The selected storage
-precision therefore describes the requested maximum compression; an export
-may contain a mixture of integer matrices, float16 small matrices, and float32
-one-dimensional parameters.
+Matrices with fewer than `min_quantized_values=16384` values stay float16,
+because the integer decoder costs more than it saves on small tensors. Set
+`min_quantized_values=1` to quantize every eligible matrix. Biases,
+normalization parameters, and buffers such as RoPE tables and masks use
+float16. Values that can't safely be stored lossily stay float32.
 
-`sig_figs=N` rounds static values before storage encoding. It is an independent,
-lossy size/precision control and can be used in either optimization mode.
+Inspect `result.warnings` and `result.quantization.tensors`, then verify
+model-level output or generation quality.
 
-Static tensors with bit-identical flattened values share one physical payload,
-even when their PyTorch shapes or graph names differ. Tied token embeddings and
-four-row-grouped output heads also share one physical representation. Oversized
-tied matrices use row-group-aligned physical shards; embedding lookup routes the
-global index across those shards and reads the grouped layout with a stride-four
-loop. Startup decoding is shared per precision rather than being regenerated
-for every tensor. Encoded tensor bytes are coalesced into one payload bank per
-precision. Quantization scales are coalesced within the corresponding capped
-weight bank, and both temporary byte streams remain below Scratch's list
-limit. Tensor wrappers carry only byte/scale offsets, so adding tensors no longer duplicates
-the large Base85/IEEE decoder or creates a separate scale-payload variable for
-every matrix. Forward kernels still receive ordinary tensor-specific numeric
-lists, avoiding bank-routing work in each multiply-accumulate loop.
+## GPTQ calibration
 
-An experimental learned 64-entry scalar codebook was screened on the current
-TinyStories checkpoint. It was smaller in principle but lost substantially
-more top-1 agreement than symmetric int6, so it is not exposed as a production
-`StorageConfig` precision.
+GPTQ runs the model on representative inputs to choose better integer weights
+during export. It doesn't modify your model or slow down inference in
+Scratch.
+
+```python
+result = transpile(
+    model,
+    example,
+    "model_gptq_q4",
+    quantization=QuantizationConfig(bits=4, method="gptq"),
+    calibration_inputs=calibration_batches,
+)
+
+for tensor in result.quantization.tensors:
+    if tensor.fallback_reason:
+        print(tensor.name, tensor.fallback_reason)
+```
+
+Choose the calibration argument to match the export interface:
+
+| Export interface | Calibration argument | Items |
+|---|---|---|
+| Tensor example inputs | `calibration_inputs` | Tensors or tuples matching the eager model's inputs |
+| `ExportProgram` | `calibration_calls` | Ordered `ProgramCall` values exercising the model's methods and state |
+| `GenerationProgram` | `calibration_sequences` | Full token sequences accepted by the generation method |
+
+Calibration data is read once, so a generator works. For cached generation,
+keep the export example at one token (`[1, 1]`) but calibrate with realistic
+full sequences. The model method must accept those sequence lengths.
+
+A matrix that saw too little calibration data, such as an expert the router
+never picked, falls back to symmetric quantization. Small matrices stay
+float16. The quantization report shows which method each tensor used.
+
+The [`QuantizationConfig` reference](api-reference.md#quantizationconfig)
+lists the GPTQ settings. GPTQ reduces per-layer error, but that doesn't always
+mean better results on your task, so compare symmetric and GPTQ exports on real
+use.
+
+## Significant-figure rounding
+
+`sig_figs=N` rounds stored values to N significant figures before encoding.
+It is lossy and works in either optimization mode.
+
+When trying several lossy options (storage precision, quantization, `sig_figs`,
+fast mode), test each one on its own before combining them, so you can tell
+which one causes a drop in accuracy.
+
+## Preserve processor costumes
+
+Compressed weights are stored in the generated sprite's costume names. Don't
+rename, reorder, remove, or add costumes on that sprite, or the weights will
+load incorrectly. Put any visible costumes on a different sprite.
 
 ## List sharding
 
-Scratch limits each physical list to 200,000 items. cattorch automatically
-splits larger logical tensors:
+Scratch limits each list to 200,000 items. cattorch splits larger tensors
+across several lists, called shards:
 
-- shard one retains the original name;
-- later lists are named `<name> shard 2`, `<name> shard 3`, and so on;
-- generated kernels route reads, writes, lengths, clears, and sequential
-  appends across those physical lists;
-- visible `cattorch <name> shard count` and `cattorch <name> logical length`
-  variables describe oversized non-local tensors.
+- The first shard keeps the original name.
+- Later shards are named `<name> shard 2`, `<name> shard 3`, and so on.
+- The generated blocks read and write every shard.
+- For each split public list, the variables `cattorch <name> shard count` and
+  `cattorch <name> logical length` hold the number of shards and total items.
 
-Normal one-list kernels are retained when sharding is unnecessary, avoiding
-the extra branch and index arithmetic for typical tensors. KV caches use the
-same mechanism.
-
-Large static Linear, static-matmul, paired-SwiGLU, and cached-QKV matrices
-receive a stronger specialization: cattorch aligns physical lists to complete
-output rows or four-row groups and emits separate sequential loops for each
-list. No shard branch, modulo, or multi-list read remains inside their dot
-products. The generic router remains the correctness fallback for irregular
-dynamic access.
+If your own scripts copy a sharded input or output, copy every shard in order,
+not only the first. `result.sharded_lists` names the lists that were split.
+`verify` handles shards for you.
 
 ## Project size
 
-Scratch clients and hosting paths impose different archive, asset, and
-expanded-JSON constraints. The ordinary online editor save/upload path has an
-approximately 5 MiB expanded `project.json` limit; that is not a universal
-5 MiB cap on compressed `.sb3` or `.sprite3` archives. Legacy/offline archive
-paths have accepted larger compressed projects, while individual assets have
-their own limits. cattorch reports compressed archive and expanded sprite JSON
-sizes separately and warns as expanded JSON approaches the ordinary online
-limit. Treat a real import and save through the intended Scratch path as the
-final acceptance test.
+cattorch reports `archive_bytes` (the compressed file) and
+`expanded_json_bytes` (the uncompressed sprite data) separately. A small file
+can still hold too much JSON for Scratch.
 
-## Saving a project after running it
+The exporter warns when expanded JSON passes 4,000,000 bytes, again past
+5,000,000 bytes (the limit Scratch's online editor uses when saving), and when
+it exceeds `CodegenConfig.target_json_bytes`. No warning doesn't guarantee the
+project will upload or save: the stage and other sprites add to the total.
 
-Decoded lists coexist with compressed payloads while a project is running.
-Before saving, call `cattorch prepare for save`. It clears decoded weights and
-runtime tensor data, preserves payloads, and rearms initialization. The next
-forward call reconstructs the weights.
+To reduce size, try lower-precision storage and
+[compact code generation](code-generation.md).
+
+## Save after running
+
+After a run, the sprite holds both the compressed weights and the decoded
+copies. Model and `ExportProgram` sprites have a `cattorch prepare for save`
+block that clears the decoded weights and working data. Call it before saving;
+the next model call initializes the sprite again.
+
+`GenerationProgram` sprites don't have this block. Their `cattorch reset`
+clears the cache and outputs but leaves the decoded weights loaded, so a
+project saved after generating will be larger.
+
+Related: [verification](verification-and-benchmarking.md) and
+[result types](api-reference.md#result-types).

@@ -1,56 +1,55 @@
 # Kernel development
 
-cattorch kernels target sequential Scratch execution. Useful optimizations
-usually reduce list operations, loop bookkeeping, materialized intermediates,
-or repeated calculations. Desktop CPU/GPU techniques based on threads, SIMD,
-memory bandwidth, or conventional quantized arithmetic generally do not
-transfer directly.
+[Documentation home](index.md)
+
+This guide is for contributors adding or optimizing Scratch kernels. For
+export options, see [optimization modes](optimization.md).
+
+Scratch runs one block at a time, so kernel speedups come from doing fewer list
+operations, less loop bookkeeping, fewer temporary lists, and fewer repeated
+calculations. Techniques that rely on threads, SIMD, memory bandwidth, or fast
+integer arithmetic don't carry over.
 
 ## Production path
 
-The public `exact` and `fast` modes use code-backed kernels built with
-`cattorch.util.scratch.dsl`. The DSL represents Scratch expressions,
-statements, loops, conditions, variables, and lists in Python, then lowers that
-representation to Scratch JSON. Its `Program.pseudocode()` output is intended
-for review and benchmark discussion.
+Both `exact` and `fast` kernels are written in Python with the
+`cattorch.util.scratch.dsl` module. The DSL describes Scratch expressions,
+statements, loops, conditions, variables, and lists, and compiles them to
+Scratch JSON. `Program.pseudocode()` prints a readable version for review.
 
-Treat JSON as a lowering target, not source code. New production operations
-should be expressed in the DSL or small structured block builders, tested in
-the Python emulator for semantics, and benchmarked in Scratch for performance.
+Don't write Scratch JSON by hand. Write new operations in the DSL or with the
+small block builders, check them in the Python emulator, and benchmark them in
+Scratch.
 
-The main implementation boundaries are:
+Where things live:
 
-- `cattorch.graph` owns `torch.export`, constant folding, aliases, and fusion
-  recognition;
-- `cattorch.transpiler` turns analyzed nodes into instruction programs;
-- `cattorch.sprite` assembles lifecycle, storage, sharding, and generation
-  blocks around the compiled program;
-- `cattorch.util.instruction.dispatch` selects ordinary exact/fast kernels;
-- `optimized_linear`, `optimized_elementwise`, `optimized_normalization`,
-  `optimized_tensor`, and `optimized_convolution` contain domain kernels;
-- `optimized` is a compatibility facade, not an implementation module.
+| Module | Responsibility |
+|---|---|
+| `cattorch.frontend` | Turns FX and `torch.export` traces into one graph format. |
+| `cattorch.graph` | Constant folding, aliases, validation, and recognizing fusable patterns. |
+| `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
+| `cattorch.transpiler` | Turns graph nodes into instruction programs. |
+| `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
+| `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
+| `cattorch.util.instruction.dispatch`, `cattorch.util.instruction.optimized` | Compatibility re-exports only. Add no new code here. |
 
-An operation-level change should normally have:
+A change to an operation should come with:
 
-1. exact PyTorch comparisons covering shapes, edge cases, and broadcasting;
-2. Scratch-emulator comparisons for generated blocks;
-3. a paired or suite benchmark whose timer starts after `cattorch init`;
-4. real-Scratch results with sufficient iterations to exceed timer resolution.
+1. Tests against PyTorch covering shapes, edge cases, and broadcasting.
+2. Emulator tests of the generated blocks.
+3. A benchmark project whose timer starts after `cattorch init`.
+4. Results from real Scratch, with enough iterations to be well above the
+   timer's resolution.
 
-Fast kernels also need accuracy tests that show the intended degradation and a
-fallback to exact behavior when the approximation is not enabled.
-
-## Historical benchmark results
-
-The retired JSON-template backend is not included in cattorch 0.4. Historical
-legacy/exact Scratch results remain useful measurements, but new benchmark
-projects compare the two supported production modes: exact and fast. New
-kernels belong in the DSL-backed production registry.
+Fast kernels also need tests that measure how far the approximation drifts, and
+that the exact kernel is used when the approximation is turned off.
 
 ## Performance evidence
 
-The emulator is authoritative for the supported Scratch semantics, not speed.
-The official VM can be useful for stable local comparisons, but the deployment
-target is the real Scratch runtime. Browser, OS, hardware, Turbo Mode, and
-surrounding project overhead can affect timings. Record the environment and
-compare candidates within the same suite.
+The emulator is the reference for correctness, not speed. The official
+Scratch VM gives repeatable local timings, but users run the browser editor,
+where browser, OS, hardware, Turbo Mode, and the rest of the project all affect
+speed. Record the environment, and only compare candidates within one suite.
+
+Related: [benchmark API reference](api-reference.md#benchmark-api) and the
+[repository benchmark guide](../benchmarks/README.md).

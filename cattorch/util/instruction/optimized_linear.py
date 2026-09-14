@@ -71,7 +71,11 @@ class LinearInstruction(Instruction):
     def prepare(self):
         input_shape = self.args[0].shape
         weight_shape = self.args[1].shape
-        self.rows = math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1
+        self.rows = (
+            div(length("T1"), input_shape[-1])
+            if self.args[0].dynamic
+            else (math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1)
+        )
         self.inner = input_shape[-1]
         self.columns = weight_shape[0]
         self.has_bias = self.args[2].value is not None or bool(self.args[2].shape)
@@ -80,7 +84,7 @@ class LinearInstruction(Instruction):
         if not self.weight_shard_rows:
             self.weight_shard_rows = (self.columns,)
         if sum(self.weight_shard_rows) != self.columns:
-            raise ValueError("Linear weight shards must cover every output row")
+            raise ValueError("linear weight shards must cover every output row")
         shard_count = len(self.weight_shard_rows)
         self.weight_lists = tuple(f"T{index + 2}" for index in range(shard_count))
         self.bias_list = f"T{shard_count + 2}"
@@ -137,12 +141,8 @@ class LinearInstruction(Instruction):
                 elif operation == "sigmoid":
                     result = div(1, add(1, mathop("e ^", mul(-1, result))))
                 elif operation == "tanh":
-                    setup.append(
-                        set_var("exponential", mathop("e ^", mul(2, result))),
-                    )
-                    result = div(
-                        add(var("exponential"), -1),
-                        add(var("exponential"), 1),
+                    result = add(
+                        div(2, add(1, mathop("e ^", mul(-2, result)))), -1,
                     )
                 elif operation == "silu":
                     if result != var(sum_name):
@@ -165,16 +165,16 @@ class LinearInstruction(Instruction):
                             0.7978845608028654,
                             add(result, mul(0.044715, mul(mul(result, result), result))),
                         )
-                        setup.extend((
-                            set_var("inner", inner),
-                            set_var(
-                                "exponential",
-                                mathop("e ^", mul(2, var("inner"))),
+                        setup.append(set_var("inner", inner))
+                        tanh_inner = add(
+                            div(
+                                2,
+                                add(
+                                    1,
+                                    mathop("e ^", mul(-2, var("inner"))),
+                                ),
                             ),
-                        ))
-                        tanh_inner = div(
-                            add(var("exponential"), -1),
-                            add(var("exponential"), 1),
+                            -1,
                         )
                         result = mul(mul(0.5, result), add(1, tanh_inner))
                 elif operation == "tensor_add":
@@ -292,7 +292,7 @@ class LinearInstruction(Instruction):
                 self.weight_lists, self.weight_shard_rows,
             ):
                 if shard_rows % 4:
-                    raise ValueError("Grouped Linear shards must contain four-row groups")
+                    raise ValueError("grouped Linear shards must contain four-row groups")
                 if self.interleaved:
                     grouped_dot_step = (
                         set_var("input value", item("T1", var("left_index"))),
@@ -451,7 +451,11 @@ class OptimizedMatMulInstruction(Instruction):
             self.columns = right_shape[-1]
         else:
             self.batches = 1
-            self.rows = math.prod(left_shape[:-1]) if len(left_shape) > 1 else 1
+            self.rows = (
+                div(length("T1"), self.inner)
+                if self.args[0].dynamic
+                else (math.prod(left_shape[:-1]) if len(left_shape) > 1 else 1)
+            )
             self.columns = right_shape[-1] if len(right_shape) > 1 else 1
 
     def _dot_body(self, left_start, right_start, right_step):
@@ -692,6 +696,14 @@ class CachedCausalScoreInstruction(Instruction):
         self.query_heads_per_kv = self.heads // self.kv_heads
 
     def finalize(self):
+        cache_stride = getattr(self, "cache_stride", self.cache_embed)
+        cache_base_name = getattr(self, "cache_base_variable", None)
+        cache_base = var(cache_base_name) if cache_base_name is not None else 0
+        cache_tokens = (
+            mathop("ceiling", div(length("T3"), cache_stride))
+            if cache_base_name is not None
+            else div(length("T3"), self.cache_embed)
+        )
         dot = _unrolled_offset_dot_statements(
             self.width,
             left_list="T1",
@@ -710,14 +722,15 @@ class CachedCausalScoreInstruction(Instruction):
             variables=(
                 "copy_index", "cache_tokens", "query_start", "left_index",
                 "key_head", "key_offset", "heads_on_key", "sum",
+                *((cache_base_name,) if cache_base_name is not None else ()),
             ),
             lists=("T1", "T2", "T3", "T4"),
             body=(
                 *cache_append,
                 clear("T4"),
-                set_var("cache_tokens", div(length("T3"), self.cache_embed)),
+                set_var("cache_tokens", cache_tokens),
                 set_var("query_start", self.query_offset + 1),
-                set_var("key_head", 1),
+                set_var("key_head", add(cache_base, 1)),
                 set_var("heads_on_key", 0),
                 repeat(self.heads, (
                     set_var("key_offset", sub(var("key_head"), var("query_start"))),
@@ -726,7 +739,7 @@ class CachedCausalScoreInstruction(Instruction):
                         set_var("left_index", var("query_start")),
                         *dot,
                         append("T4", mul(var("sum"), self.scale)),
-                        change_var("key_offset", self.cache_embed),
+                        change_var("key_offset", cache_stride),
                     )),
                     change_var("query_start", self.width),
                     change_var("heads_on_key", 1),
@@ -828,6 +841,9 @@ class CachedSoftmaxValueInstruction(Instruction):
         self.query_heads_per_kv = self.heads // self.kv_heads
 
     def finalize(self):
+        cache_stride = getattr(self, "cache_stride", self.cache_embed)
+        cache_base_name = getattr(self, "cache_base_variable", None)
+        cache_base = var(cache_base_name) if cache_base_name is not None else 0
         current = item("T1", var("index"))
         return Program(
             "softmax_value_cached_fused",
@@ -835,13 +851,14 @@ class CachedSoftmaxValueInstruction(Instruction):
                 "group start", "group size", "index", "maximum",
                 "denominator", "exponential", "value head",
                 "heads on value", "feature", "value index", "sum",
+                *((cache_base_name,) if cache_base_name is not None else ()),
             ),
             lists=("T1", "T2", "T3"),
             body=(
                 clear("T3"),
                 set_var("group start", 1),
                 set_var("group size", div(length("T1"), self.heads)),
-                set_var("value head", 1),
+                set_var("value head", add(cache_base, 1)),
                 set_var("heads on value", 0),
                 repeat(self.heads, (
                     set_var("index", var("group start")),
@@ -882,7 +899,7 @@ class CachedSoftmaxValueInstruction(Instruction):
                                 ),
                             ),
                             change_var("index", 1),
-                            change_var("value index", self.cache_embed),
+                            change_var("value index", cache_stride),
                         )),
                         append("T3", div(var("sum"), var("denominator"))),
                         change_var("feature", 1),
@@ -922,6 +939,14 @@ class CachedValueMatMulInstruction(Instruction):
         self.value_offset = self.args[3].value
 
     def finalize(self):
+        cache_stride = getattr(self, "cache_stride", self.cache_embed)
+        cache_base_name = getattr(self, "cache_base_variable", None)
+        cache_base = var(cache_base_name) if cache_base_name is not None else 0
+        cache_tokens = (
+            mathop("ceiling", div(length("T3"), cache_stride))
+            if cache_base_name is not None
+            else div(length("T3"), self.cache_embed)
+        )
         cache_append = () if self.cache_prepopulated else (
             set_var("copy_index", self.value_offset + 1),
             *_static_unrolled_repeat(self.cache_embed, (
@@ -935,14 +960,15 @@ class CachedValueMatMulInstruction(Instruction):
                 "copy_index", "cache_tokens", "probability_start",
                 "probability_index", "value_head", "value_index",
                 "heads_on_value", "feature", "sum",
+                *((cache_base_name,) if cache_base_name is not None else ()),
             ),
             lists=("T1", "T2", "T3", "T4"),
             body=(
                 *cache_append,
                 clear("T4"),
-                set_var("cache_tokens", div(length("T3"), self.cache_embed)),
+                set_var("cache_tokens", cache_tokens),
                 set_var("probability_start", 1),
-                set_var("value_head", 1),
+                set_var("value_head", add(cache_base, 1)),
                 set_var("heads_on_value", 0),
                 repeat(self.heads, (
                     set_var("feature", 0),
@@ -959,7 +985,7 @@ class CachedValueMatMulInstruction(Instruction):
                                 ),
                             ),
                             change_var("probability_index", 1),
-                            change_var("value_index", self.cache_embed),
+                            change_var("value_index", cache_stride),
                         )),
                         append("T4", var("sum")),
                         change_var("feature", 1),

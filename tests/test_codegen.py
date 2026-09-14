@@ -5,7 +5,7 @@ import zipfile
 import pytest
 import torch
 
-from cattorch import CodegenConfig, StorageConfig, transpile
+from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.ids import (
@@ -321,6 +321,59 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
         rtol=0,
     )
     assert "cattorch shared transformer layer" in auto._procedures
+
+
+def test_shared_quantized_bank_can_cross_physical_list_boundary(tmp_path):
+    """A layer base may land in either shard of one logical weight bank."""
+    width = 320  # two matrices contain 204,800 values, just over Scratch's cap
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(width, width, bias=False)
+
+        def forward(self, value):
+            return torch.relu(self.linear(value))
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList((Block(), Block()))
+
+        def forward(self, value):
+            # Give the shared slab a distinct carried input buffer.
+            value = value + 0.0
+            for block in self.blocks:
+                value = block(value)
+            return value
+
+    torch.manual_seed(18)
+    model = Model().eval()
+    value = torch.randn(1, width)
+    sprites = {}
+    for mode in ("off", "auto"):
+        result = transpile(
+            model,
+            value,
+            tmp_path / f"large-bank-{mode}",
+            quantization=QuantizationConfig(
+                bits=4, method="symmetric", min_quantized_values=1,
+            ),
+            codegen=CodegenConfig(
+                id_namespace="", unrolling="compact", layer_sharing=mode,
+            ),
+        )
+        sprites[mode] = ScratchEmulator(_load(result.path))
+        sprites[mode].lists["input"] = value.flatten().tolist()
+        sprites[mode].run_procedure("cattorch forward")
+
+    assert "cattorch shared transformer layer" in sprites["auto"]._procedures
+    torch.testing.assert_close(
+        torch.tensor(sprites["auto"].lists["output"]),
+        torch.tensor(sprites["off"].lists["output"]),
+        atol=1e-6,
+        rtol=0,
+    )
 
 
 def test_tied_grouped_embedding_head_uses_one_physical_weight(tmp_path):

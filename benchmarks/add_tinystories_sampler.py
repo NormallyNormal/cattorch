@@ -55,8 +55,8 @@ EOS_ID = 2
 TEMPERATURE = 0.6
 FREQUENCY_PENALTY = 0.3
 
-MODEL_INPUT = "input"
-MODEL_OUTPUT = "output"
+MODEL_INPUT = "cattorch tokens"
+MODEL_OUTPUT = "cattorch logits"
 TOKEN_IDS = "token_ids"
 TOP_VALUES = "tinystories sampler top values"
 TOP_IDS = "tinystories sampler top ids"
@@ -95,60 +95,43 @@ def _initialize_top_k():
 
 
 def _consider_candidate():
-    """Insert one frequency-adjusted, temperature-scaled logit into top 20."""
+    """Insert one frequency-adjusted logit into top 20."""
     return (
         set_var(
             CANDIDATE,
-            div(
-                sub(
-                    item(MODEL_OUTPUT, var(INDEX)),
-                    mul(
-                        FREQUENCY_PENALTY,
-                        item(FREQUENCIES, var(INDEX)),
-                    ),
-                ),
-                TEMPERATURE,
-            ),
-        ),
-        set_var(INSERT_RANK, 0),
-        for_each(
-            SHIFT,
-            TOP_K,
-            (
-                if_(
-                    eq(var(INSERT_RANK), 0),
-                    (
-                        if_(
-                            gt(var(CANDIDATE), item(TOP_VALUES, var(SHIFT))),
-                            (set_var(INSERT_RANK, var(SHIFT)),),
-                        ),
-                    ),
+            sub(
+                item(MODEL_OUTPUT, var(INDEX)),
+                mul(
+                    FREQUENCY_PENALTY,
+                    item(FREQUENCIES, var(INDEX)),
                 ),
             ),
         ),
+        # Most vocabulary entries cannot enter the top-k. Reject them with one
+        # comparison instead of scanning all twenty retained values.
         if_(
-            gt(var(INSERT_RANK), 0),
+            gt(var(CANDIDATE), item(TOP_VALUES, TOP_K)),
             (
-                set_var(SHIFT, TOP_K + 1),
+                set_var(INSERT_RANK, 1),
+                repeat_until(
+                    gt(var(CANDIDATE), item(TOP_VALUES, var(INSERT_RANK))),
+                    (change_var(INSERT_RANK, 1),),
+                ),
+                set_var(SHIFT, TOP_K),
                 repeat(
-                    TOP_K,
+                    sub(TOP_K, var(INSERT_RANK)),
                     (
-                        change_var(SHIFT, -1),
-                        if_(
-                            gt(var(SHIFT), var(INSERT_RANK)),
-                            (
-                                replace(
-                                    TOP_VALUES,
-                                    var(SHIFT),
-                                    item(TOP_VALUES, sub(var(SHIFT), 1)),
-                                ),
-                                replace(
-                                    TOP_IDS,
-                                    var(SHIFT),
-                                    item(TOP_IDS, sub(var(SHIFT), 1)),
-                                ),
-                            ),
+                        replace(
+                            TOP_VALUES,
+                            var(SHIFT),
+                            item(TOP_VALUES, sub(var(SHIFT), 1)),
                         ),
+                        replace(
+                            TOP_IDS,
+                            var(SHIFT),
+                            item(TOP_IDS, sub(var(SHIFT), 1)),
+                        ),
+                        change_var(SHIFT, -1),
                     ),
                 ),
                 replace(TOP_VALUES, var(INSERT_RANK), var(CANDIDATE)),
@@ -172,7 +155,10 @@ def _sample_top_k():
                     WEIGHT,
                     mathop(
                         "e ^",
-                        sub(item(TOP_VALUES, var(INDEX)), var(MAXIMUM)),
+                        div(
+                            sub(item(TOP_VALUES, var(INDEX)), var(MAXIMUM)),
+                            TEMPERATURE,
+                        ),
                     ),
                 ),
                 append(TOP_WEIGHTS, var(WEIGHT)),

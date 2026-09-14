@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import struct
+from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal, cast
 
 import torch
@@ -18,6 +20,7 @@ from cattorch.util.scratch.dsl import (
     clear,
     call,
     costume_number,
+    delete,
     div,
     eq,
     gt,
@@ -42,13 +45,18 @@ from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 
 # Costume-name lookup in vanilla Scratch is case-sensitive even though its
-# ordinary string and list comparisons are not.  All entries are one-byte,
-# JSON-unescaped ASCII.  Four arbitrary bytes therefore fit in five project
-# JSON characters while the 85 costumes can share one physical SVG asset.
-BASE85_ALPHABET = "".join(
+# ordinary string and list comparisons are not. All 92 printable non-space
+# ASCII characters other than JSON's quote and backslash are one-byte and need
+# no escaping. Thirteen bytes fit in sixteen Base92 digits when represented as
+# two exact 52-bit integers; the costumes continue to share one physical SVG.
+BASE92_ALPHABET = "".join(
     chr(code) for code in range(33, 127) if chr(code) not in {'"', "\\"}
-)[:85]
-assert len(BASE85_ALPHABET) == 85 and len(set(BASE85_ALPHABET)) == 85
+)
+assert len(BASE92_ALPHABET) == 92 and len(set(BASE92_ALPHABET)) == 92
+
+# Retained as a source-level compatibility alias. New payloads and generated
+# sprites use the complete Base92 alphabet.
+BASE85_ALPHABET = BASE92_ALPHABET[:85]
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,10 @@ class StorageConfig:
     explicitly lossy and are permitted with either exact or fast kernels.
     Integer formats use symmetric quantization over fixed-size flat groups and
     are dequantized once during ``cattorch init``.
+
+    The integer ``precision`` values and their grouping fields are deprecated.
+    Use ``QuantizationConfig`` instead, which uses row-aligned groups and
+    float16 scales by default.
     """
 
     compression: bool = True
@@ -66,6 +78,7 @@ class StorageConfig:
     group_size: int = 64
     min_quantized_values: int = 16384
     scale_precision: Literal["float32", "float16"] = "float32"
+    grouping: Literal["flat", "row"] = "flat"
 
     def __post_init__(self):
         if not isinstance(self.compression, bool):
@@ -76,6 +89,8 @@ class StorageConfig:
             )
         if self.scale_precision not in {"float32", "float16"}:
             raise ValueError("scale_precision must be 'float32' or 'float16'")
+        if self.grouping not in {"flat", "row"}:
+            raise ValueError("grouping must be 'flat' or 'row'")
         if (
             isinstance(self.group_size, bool)
             or not isinstance(self.group_size, int)
@@ -91,7 +106,7 @@ class StorageConfig:
 
 
 def encode_values(values, precision: Literal["float32", "float16"]) -> str:
-    """Encode numeric values with the Scratch costume-name Base85 codec."""
+    """Encode numeric values with the Scratch costume-name Base92 codec."""
     code = ">f" if precision == "float32" else ">e"
     return _encode_bytes(_float_bytes(values, precision))
 
@@ -102,15 +117,18 @@ def _float_bytes(values, precision: Literal["float32", "float16"]) -> bytes:
 
 
 def _encode_bytes(raw: bytes) -> str:
-    encoded: list[str] = []
-    for offset in range(0, len(raw), 4):
-        chunk = raw[offset:offset + 4]
-        packed = int.from_bytes(chunk.ljust(4, b"\0"), "big")
-        digits = [0] * 5
-        for index in range(4, -1, -1):
-            packed, digits[index] = divmod(packed, 85)
-        count = 5 if len(chunk) == 4 else len(chunk) + 1
-        encoded.extend(BASE85_ALPHABET[digit] for digit in digits[:count])
+    """Encode bytes as one pad digit followed by 13-byte Base92 groups."""
+    padding = (-len(raw)) % 13
+    padded = raw + bytes(padding)
+    encoded: list[str] = [BASE92_ALPHABET[padding]]
+    mask = 2**52 - 1
+    for offset in range(0, len(padded), 13):
+        packed = int.from_bytes(padded[offset:offset + 13], "big")
+        for half in (packed >> 52, packed & mask):
+            digits = [0] * 8
+            for index in range(7, -1, -1):
+                half, digits[index] = divmod(half, 92)
+            encoded.extend(BASE92_ALPHABET[digit] for digit in digits)
     return "".join(encoded)
 
 
@@ -148,12 +166,12 @@ def quantize_values(
             scale = struct.unpack(scale_code, struct.pack(scale_code, scale))[0]
         except OverflowError as error:
             raise ValueError(
-                f"Quantization scale {scale!r} is outside the finite "
+                f"quantization scale {scale!r} is outside the finite "
                 f"{scale_precision} range; {scale_guidance}"
             ) from error
         if not math.isfinite(scale):
             raise ValueError(
-                f"Quantization scale is outside the finite {scale_precision} "
+                f"quantization scale is outside the finite {scale_precision} "
                 f"range; {scale_guidance}"
             )
         if maximum and scale == 0:
@@ -224,14 +242,14 @@ def encode_quantized_values(
 def _quantized_bytes(
     codes: list[int], precision: Literal["int8", "int6", "int4"],
 ) -> bytes:
-    """Pack centered integer codes before their common Base85 encoding."""
+    """Pack centered integer codes before their common Base92 encoding."""
     if precision == "int8":
         # Code 255 is deliberately unused. Centering removes a sign branch
         # from the Scratch startup decoder.
         return bytes(code + 127 for code in codes)
     if precision == "int6":
-        # Four centered six-bit codes occupy three bytes. Continuous Base85
-        # packing approaches 15 characters per 16 weights (0.9375 each) while
+        # Four centered six-bit codes occupy three bytes. Continuous Base92
+        # packing approaches 12 characters per 13 bytes while
         # sharing the faster costume decoder with every format.
         packed: list[int] = []
         for index in range(0, len(codes), 4):
@@ -252,6 +270,131 @@ def _quantized_bytes(
             packed.append(high * 16 + low)
         return bytes(packed)
     raise ValueError("precision must be 'int8', 'int6', or 'int4'")
+
+
+def _int4_symbols(spec: EncodedList):
+    """Yield the centered unsigned q4 symbols stored by one encoded list."""
+    if spec.precision != "int4" or spec.payload_bytes is None:
+        raise ValueError("Huffman coding requires an int4 byte payload")
+    remaining = spec.value_count
+    if remaining is None:
+        remaining = len(spec.payload_bytes) * 2
+    for byte in spec.payload_bytes:
+        if remaining <= 0:
+            break
+        yield byte // 16
+        remaining -= 1
+        if remaining:
+            yield byte % 16
+            remaining -= 1
+
+
+def _length_limited_huffman_lengths(
+    frequencies: Counter[int], *, maximum_bits: int = 8,
+) -> dict[int, int]:
+    """Return optimal prefix lengths for this tiny alphabet.
+
+    A dynamic program chooses how many leaves to place at each depth. The q4
+    alphabet has only fifteen live symbols, so this is both simpler and more
+    auditable than a general package-merge implementation.
+    """
+    ordered = sorted(
+        (symbol for symbol, count in frequencies.items() if count > 0),
+        key=lambda symbol: (-frequencies[symbol], symbol),
+    )
+    if not ordered:
+        return {}
+    if len(ordered) == 1:
+        return {ordered[0]: 1}
+    if len(ordered) > 2**maximum_bits:
+        raise ValueError("Huffman alphabet exceeds its maximum code length")
+    weights = tuple(frequencies[symbol] for symbol in ordered)
+    prefix = [0]
+    for weight in weights:
+        prefix.append(prefix[-1] + weight)
+
+    @lru_cache(maxsize=None)
+    def solve(depth: int, assigned: int, slots: int):
+        remaining = len(ordered) - assigned
+        if depth == maximum_bits:
+            if remaining <= slots:
+                return (depth * (prefix[-1] - prefix[assigned]), (remaining,))
+            return None
+        best = None
+        for leaves in range(min(slots, remaining) + 1):
+            after = remaining - leaves
+            local = depth * (prefix[assigned + leaves] - prefix[assigned])
+            if after == 0:
+                candidate = (local, (leaves,))
+            else:
+                next_slots = (slots - leaves) * 2
+                maximum_leaves = next_slots * 2 ** (maximum_bits - depth - 1)
+                if next_slots == 0 or after > maximum_leaves:
+                    continue
+                suffix = solve(depth + 1, assigned + leaves, next_slots)
+                if suffix is None:
+                    continue
+                candidate = (local + suffix[0], (leaves, *suffix[1]))
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    solution = solve(1, 0, 2)
+    if solution is None:
+        raise ValueError("could not construct a length-limited Huffman code")
+    lengths = {}
+    cursor = 0
+    for depth, leaves in enumerate(solution[1], 1):
+        for symbol in ordered[cursor:cursor + leaves]:
+            lengths[symbol] = depth
+        cursor += leaves
+    if cursor != len(ordered):
+        raise AssertionError("Huffman construction did not assign every symbol")
+    return lengths
+
+
+def _canonical_huffman_codes(lengths: dict[int, int]) -> dict[int, tuple[int, int]]:
+    codes = {}
+    code = 0
+    previous_length = 0
+    for symbol, bit_length in sorted(lengths.items(), key=lambda item: (item[1], item[0])):
+        code <<= bit_length - previous_length
+        codes[symbol] = (code, bit_length)
+        code += 1
+        previous_length = bit_length
+    return codes
+
+
+def _huffman_prefix_table(
+    codes: dict[int, tuple[int, int]], *, lookup_bits: int = 8,
+) -> bytes:
+    table = bytearray(2**lookup_bits)
+    for symbol, (code, bit_length) in codes.items():
+        if bit_length > lookup_bits:
+            raise ValueError("Huffman code exceeds the prefix table width")
+        start = code << (lookup_bits - bit_length)
+        stop = (code + 1) << (lookup_bits - bit_length)
+        table[start:stop] = bytes([symbol * 16 + bit_length]) * (stop - start)
+    return bytes(table)
+
+
+def _encode_huffman_symbols(
+    symbols, codes: dict[int, tuple[int, int]],
+) -> bytes:
+    encoded = bytearray()
+    bits = 0
+    bit_count = 0
+    for symbol in symbols:
+        code, length_ = codes[symbol]
+        bits = (bits << length_) | code
+        bit_count += length_
+        while bit_count >= 8:
+            bit_count -= 8
+            encoded.append((bits >> bit_count) & 255)
+            bits &= (1 << bit_count) - 1
+    if bit_count:
+        encoded.append(bits << (8 - bit_count))
+    return bytes(encoded)
 
 
 def rounded_values(
@@ -425,63 +568,77 @@ def _emit_byte(byte, spec: EncodedList):
     )
 
 
-def _consume_base85_digit(payload_name: str, offset: int):
+def _consume_base92_digit(payload_name: str, offset: int, accumulator: str):
     return (
         switch_costume(
             letter(var(payload_name), add(var("decode cursor"), offset)),
         ),
         set_var("decode digit", sub(costume_number(), 1)),
         set_var(
-            "decode packed",
-            add(mul(var("decode packed"), 85), var("decode digit")),
+            accumulator,
+            add(mul(var(accumulator), 92), var("decode digit")),
         ),
     )
 
 
-def _base85_decoded_bytes():
+def _base92_decoded_bytes():
     return (
-        mathop("floor", div(var("decode packed"), 16_777_216)),
-        mod(mathop("floor", div(var("decode packed"), 65_536)), 256),
-        mod(mathop("floor", div(var("decode packed"), 256)), 256),
-        mod(var("decode packed"), 256),
+        mathop("floor", div(var("decode high"), 2**44)),
+        mod(mathop("floor", div(var("decode high"), 2**36)), 256),
+        mod(mathop("floor", div(var("decode high"), 2**28)), 256),
+        mod(mathop("floor", div(var("decode high"), 2**20)), 256),
+        mod(mathop("floor", div(var("decode high"), 2**12)), 256),
+        mod(mathop("floor", div(var("decode high"), 2**4)), 256),
+        add(
+            mul(mod(var("decode high"), 16), 16),
+            mathop("floor", div(var("decode low"), 2**48)),
+        ),
+        mod(mathop("floor", div(var("decode low"), 2**40)), 256),
+        mod(mathop("floor", div(var("decode low"), 2**32)), 256),
+        mod(mathop("floor", div(var("decode low"), 2**24)), 256),
+        mod(mathop("floor", div(var("decode low"), 2**16)), 256),
+        mod(mathop("floor", div(var("decode low"), 2**8)), 256),
+        mod(var("decode low"), 256),
     )
 
 
 def _decode_payload(spec: EncodedList):
-    full_groups, remainder = divmod(len(spec.payload), 5)
-    decoded_bytes = _base85_decoded_bytes()
-    group_body: list[Statement] = [set_var("decode packed", 0)]
-    for offset in range(5):
-        group_body.extend(_consume_base85_digit(spec.payload_name, offset))
-    group_body.append(change_var("decode cursor", 5))
+    if not spec.payload:
+        raise ValueError("Base92 payload is missing its padding header")
+    padding = BASE92_ALPHABET.index(spec.payload[0])
+    data_characters = len(spec.payload) - 1
+    if data_characters % 16:
+        raise ValueError("invalid Base92 payload length")
+    groups = data_characters // 16
+    decoded_bytes = _base92_decoded_bytes()
+    parser: list[Statement] = [
+        set_var("decode high", 0), set_var("decode low", 0),
+    ]
+    for offset in range(8):
+        parser.extend(_consume_base92_digit(
+            spec.payload_name, offset, "decode high",
+        ))
+    for offset in range(8, 16):
+        parser.extend(_consume_base92_digit(
+            spec.payload_name, offset, "decode low",
+        ))
+    parser.append(change_var("decode cursor", 16))
+    group_body = list(parser)
     for byte in decoded_bytes:
         group_body.extend(_emit_byte(byte, spec))
     body = [
-        set_var("decode cursor", 1),
+        set_var("decode cursor", 2),
         set_var("decode bits", 0),
         set_var("decode byte count", 0),
-        repeat(full_groups, tuple(group_body)),
     ]
-    if remainder:
-        if remainder not in {2, 3, 4}:
-            raise ValueError("Invalid partial Base85 payload length")
-        body.append(set_var("decode packed", 0))
-        for offset in range(5):
-            if offset < remainder:
-                body.extend(_consume_base85_digit(spec.payload_name, offset))
-            else:
-                body.extend((
-                    set_var("decode digit", 84),
-                    set_var(
-                        "decode packed",
-                        add(
-                            mul(var("decode packed"), 85),
-                            var("decode digit"),
-                        ),
-                    ),
-                ))
-        for byte in decoded_bytes[:remainder - 1]:
+    if groups > 1:
+        body.append(repeat(groups - 1, tuple(group_body)))
+    if groups:
+        body.extend(parser)
+        for byte in decoded_bytes[:13 - padding]:
             body.extend(_emit_byte(byte, spec))
+    elif padding:
+        raise ValueError("empty Base92 payload has nonzero padding")
     return tuple(body)
 
 
@@ -495,7 +652,7 @@ def _decode_list(spec: EncodedList):
         or spec.scale_payload_name is None
         or spec.scale_payload is None
     ):
-        raise ValueError("Quantized encoded lists require count, group, and scale metadata")
+        raise ValueError("quantized encoded lists require count, group, and scale metadata")
     scale_spec = EncodedList(
         spec.scale_list_name,
         spec.scale_payload_name,
@@ -517,59 +674,58 @@ _ACTIVE_PAYLOAD = "cattorch active payload"
 _DECODED_BYTES = "cattorch decoded bytes"
 _DECODED_VALUES = "cattorch decoded values"
 _DECODED_SCALES = "cattorch decoded scales"
-_BYTE_DECODER = "cattorch decode costume base85 bytes"
+_HUFFMAN_TABLE = "cattorch huffman table"
+_HUFFMAN_POWERS = "cattorch huffman powers"
+_BYTE_DECODER = "cattorch decode costume base92 bytes"
 
 
-def _shared_base85_decoder() -> Program:
-    """Decode the active costume-name Base85 payload into reusable bytes."""
-    decoded_bytes = _base85_decoded_bytes()
-    full_group: list[Statement] = [set_var("decode packed", 0)]
-    for offset in range(5):
-        full_group.extend(_consume_base85_digit(_ACTIVE_PAYLOAD, offset))
-    full_group.extend(append(_DECODED_BYTES, byte) for byte in decoded_bytes)
-    full_group.append(change_var("decode cursor", 5))
-
-    partial: list[Statement] = [set_var("decode packed", 0)]
-    for offset in range(5):
-        partial.extend((
-            set_var("decode digit", 84),
-            if_(
-                gt(var("decode remainder"), offset),
-                (
-                    switch_costume(letter(
-                        var(_ACTIVE_PAYLOAD),
-                        add(var("decode cursor"), offset),
-                    )),
-                    set_var("decode digit", sub(costume_number(), 1)),
-                ),
-            ),
-            set_var(
-                "decode packed",
-                add(mul(var("decode packed"), 85), var("decode digit")),
-            ),
+def _shared_base92_decoder() -> Program:
+    """Decode the active costume-name Base92 payload into reusable bytes."""
+    decoded_bytes = _base92_decoded_bytes()
+    group: list[Statement] = [
+        set_var("decode high", 0), set_var("decode low", 0),
+    ]
+    for offset in range(8):
+        group.extend(_consume_base92_digit(
+            _ACTIVE_PAYLOAD, offset, "decode high",
         ))
-    for index, byte in enumerate(decoded_bytes):
-        partial.append(if_(
-            gt(var("decode remainder"), index + 1),
-            (append(_DECODED_BYTES, byte),),
+    for offset in range(8, 16):
+        group.extend(_consume_base92_digit(
+            _ACTIVE_PAYLOAD, offset, "decode low",
         ))
+    group.extend(append(_DECODED_BYTES, byte) for byte in decoded_bytes)
+    group.append(change_var("decode cursor", 16))
 
     return Program(
-        "shared_base85_decoder",
+        "shared_base92_decoder",
         variables=(
-            _ACTIVE_PAYLOAD, "decode cursor", "decode remainder",
-            "decode packed", "decode digit",
+            _ACTIVE_PAYLOAD, "decode cursor", "decode padding",
+            "decode high", "decode low", "decode digit", "decode raw length",
         ),
         lists=(_DECODED_BYTES,),
         body=(
             clear(_DECODED_BYTES),
-            set_var("decode cursor", 1),
+            switch_costume(letter(var(_ACTIVE_PAYLOAD), 1)),
+            set_var("decode padding", sub(costume_number(), 1)),
+            set_var("decode cursor", 2),
             repeat(
-                mathop("floor", div(string_length(var(_ACTIVE_PAYLOAD)), 5)),
-                tuple(full_group),
+                div(sub(string_length(var(_ACTIVE_PAYLOAD)), 1), 16),
+                tuple(group),
             ),
-            set_var("decode remainder", mod(string_length(var(_ACTIVE_PAYLOAD)), 5)),
-            if_(gt(var("decode remainder"), 0), tuple(partial)),
+            set_var(
+                "decode raw length",
+                sub(
+                    mul(
+                        13,
+                        div(sub(string_length(var(_ACTIVE_PAYLOAD)), 1), 16),
+                    ),
+                    var("decode padding"),
+                ),
+            ),
+            repeat(
+                sub(length(_DECODED_BYTES), var("decode raw length")),
+                (delete(_DECODED_BYTES, length(_DECODED_BYTES)),),
+            ),
         ),
     )
 
@@ -705,19 +861,96 @@ def _shared_quant_decoder(
     )
 
 
+def _shared_huffman_int4_decoder() -> Program:
+    """Decode byte-aligned canonical q4 Huffman streams into float weights."""
+    load_byte = (
+        set_var(
+            "huffman bits",
+            add(
+                mul(var("huffman bits"), 256),
+                item(_DECODED_BYTES, var("decode cursor")),
+            ),
+        ),
+        change_var("decode cursor", 1),
+        change_var("huffman bit count", 8),
+    )
+    return Program(
+        "shared_huffman_int4_decoder",
+        variables=(
+            "decode cursor", "decode byte start", "decode value",
+            "decode value count", "decode total values", "decode group offset",
+            "decode group size", "decode scale index", "decode scale",
+            "decode scale start", "huffman bits", "huffman bit count",
+            "huffman prefix", "huffman entry", "huffman length",
+        ),
+        lists=(
+            _DECODED_BYTES, _DECODED_VALUES, _DECODED_SCALES,
+            _HUFFMAN_TABLE, _HUFFMAN_POWERS,
+        ),
+        list_values={_HUFFMAN_POWERS: [2**index for index in range(16)]},
+        body=(
+            clear(_DECODED_VALUES),
+            set_var("decode cursor", var("decode byte start")),
+            set_var("decode value count", 0),
+            set_var("decode group offset", 0),
+            set_var("decode scale index", var("decode scale start")),
+            set_var("decode scale", item(_DECODED_SCALES, var("decode scale start"))),
+            set_var("huffman bits", 0),
+            set_var("huffman bit count", 0),
+            repeat(
+                var("decode total values"),
+                (
+                    if_(lt(var("huffman bit count"), 8), load_byte),
+                    set_var(
+                        "huffman prefix",
+                        mathop("floor", div(
+                            var("huffman bits"),
+                            item(
+                                _HUFFMAN_POWERS,
+                                sub(var("huffman bit count"), 7),
+                            ),
+                        )),
+                    ),
+                    set_var(
+                        "huffman entry",
+                        item(_HUFFMAN_TABLE, add(var("huffman prefix"), 1)),
+                    ),
+                    set_var("huffman length", mod(var("huffman entry"), 16)),
+                    *_quant_append(sub(
+                        mathop("floor", div(var("huffman entry"), 16)), 7,
+                    )),
+                    change_var("huffman bit count", mul(-1, var("huffman length"))),
+                    set_var(
+                        "huffman bits",
+                        mod(
+                            var("huffman bits"),
+                            item(
+                                _HUFFMAN_POWERS,
+                                add(var("huffman bit count"), 1),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 def build_decoder_programs(specs: list[EncodedList]) -> dict[str, Program]:
     """Return the shared startup procedures required by ``specs``."""
     precisions = {spec.precision for spec in specs}
     scale_precisions = {
         spec.scale_precision for spec in specs if spec.precision.startswith("int")
     }
-    programs = {_BYTE_DECODER: _shared_base85_decoder()}
+    programs = {_BYTE_DECODER: _shared_base92_decoder()}
     for precision in sorted((precisions | scale_precisions) & {"float32", "float16"}):
         float_precision = cast(Literal["float32", "float16"], precision)
         programs[f"cattorch decode {precision}"] = _shared_float_decoder(float_precision)
     for precision in sorted(precisions & {"int8", "int6", "int4"}):
         integer_precision = cast(Literal["int8", "int6", "int4"], precision)
         programs[f"cattorch decode {precision}"] = _shared_quant_decoder(integer_precision)
+    if "int4" in precisions:
+        programs["cattorch decode int4 huffman"] = _shared_huffman_int4_decoder()
     return programs
 
 
@@ -741,7 +974,7 @@ def build_shared_unpack_program(specs: list[EncodedList]) -> Program:
     for spec in specs:
         if spec.precision in {"int8", "int6", "int4"}:
             if not spec.scale_payload_name or spec.scale_payload is None:
-                raise ValueError("Quantized encoded lists require scale metadata")
+                raise ValueError("quantized encoded lists require scale metadata")
             body.extend((
                 set_var(_ACTIVE_PAYLOAD, var(spec.scale_payload_name)),
                 call(_BYTE_DECODER),
@@ -801,13 +1034,51 @@ def build_shared_unpack_program(specs: list[EncodedList]) -> Program:
     )
 
 
+def _huffman_bank(
+    bank: list[EncodedList],
+) -> tuple[dict[int, tuple[int, int]], list[bytes]]:
+    """Return one bank's canonical codes and each tensor's byte-aligned stream."""
+    frequencies: Counter[int] = Counter()
+    for spec in bank:
+        frequencies.update(_int4_symbols(spec))
+    codes = _canonical_huffman_codes(_length_limited_huffman_lengths(frequencies))
+    return codes, [_encode_huffman_symbols(_int4_symbols(spec), codes) for spec in bank]
+
+
+def _fit_huffman_banks(
+    banks: list[list[EncodedList]],
+    encoded: dict[int, tuple[dict[int, tuple[int, int]], list[bytes]]],
+) -> list[list[EncodedList]]:
+    """Split int4 banks whose Huffman stream would overflow a Scratch list.
+
+    Banks are sized by their 4-bit payloads. Byte-aligning each tensor's
+    stream can make the Huffman form slightly longer, and Scratch silently
+    drops appends past 200,000 items. A single tensor always fits, because a
+    Huffman code built for it alone is never longer than fixed 4-bit codes.
+    """
+    fitted: list[list[EncodedList]] = []
+    pending = list(reversed(banks))
+    while pending:
+        bank = pending.pop()
+        codes, chunks = _huffman_bank(bank)
+        if len(bank) > 1 and sum(len(chunk) for chunk in chunks) > SCRATCH_LIST_LIMIT:
+            middle = len(bank) // 2
+            pending.extend((bank[middle:], bank[:middle]))
+            continue
+        encoded[id(bank)] = (codes, chunks)
+        fitted.append(bank)
+    return fitted
+
+
 def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
     """Decode jointly capped weight and quantization-scale banks.
 
-    The Base85 decoder materializes bytes in a Scratch list. Vanilla Scratch
+    The Base92 decoder materializes bytes in a Scratch list. Vanilla Scratch
     silently ignores appends after 200,000 items, so neither a weight stream
     nor its scale stream may exceed that limit. Scales use bank-local offsets
-    and are discarded before the next bank.
+    and are discarded before the next bank. Int4 banks use one canonical,
+    length-limited Huffman table and byte-align each physical tensor so it can
+    decode directly into its destination without a second oversized code list.
     """
     integer_precisions = {"int8", "int6", "int4"}
     body: list[Statement] = []
@@ -826,11 +1097,11 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
             scale_bytes = 0
             if spec.precision in integer_precisions:
                 if spec.value_count is None or spec.group_size is None:
-                    raise ValueError("Quantized encoded lists require count and group metadata")
+                    raise ValueError("quantized encoded lists require count and group metadata")
                 expected_scales = math.ceil(spec.value_count / spec.group_size)
                 if len(spec.scale_values) != expected_scales:
                     raise ValueError(
-                        f"Encoded list {spec.name!r} has {len(spec.scale_values)} "
+                        f"encoded list {spec.name!r} has {len(spec.scale_values)} "
                         f"scales, expected {expected_scales}"
                     )
                 scale_bytes = len(spec.scale_values) * (
@@ -838,12 +1109,12 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                 )
             if weight_bytes > SCRATCH_LIST_LIMIT:
                 raise ValueError(
-                    f"Encoded list {spec.name!r} needs {weight_bytes} temporary "
+                    f"encoded list {spec.name!r} needs {weight_bytes} temporary "
                     f"weight bytes, exceeding Scratch's {SCRATCH_LIST_LIMIT}-item limit"
                 )
             if scale_bytes > SCRATCH_LIST_LIMIT:
                 raise ValueError(
-                    f"Encoded list {spec.name!r} needs {scale_bytes} temporary "
+                    f"encoded list {spec.name!r} needs {scale_bytes} temporary "
                     f"scale bytes, exceeding Scratch's {SCRATCH_LIST_LIMIT}-item limit"
                 )
             exceeds_weight_bank = current_weight_bytes + weight_bytes > SCRATCH_LIST_LIMIT
@@ -863,6 +1134,9 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                 current_scale_bytes[spec.scale_precision] += scale_bytes
         if current:
             banks.append(current)
+        huffman_banks: dict[int, tuple[dict[int, tuple[int, int]], list[bytes]]] = {}
+        if precision == "int4":
+            banks = _fit_huffman_banks(banks, huffman_banks)
 
         for bank_index, bank in enumerate(banks, 1):
             suffix = f" {bank_index}" if len(banks) > 1 else ""
@@ -904,8 +1178,34 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                     ))
                     scale_cursor += len(scale_values)
 
+            huffman_offsets: dict[int, int] = {}
+            if precision == "int4":
+                codes, chunks = huffman_banks[id(bank)]
+                table_name = f"cattorch int4 huffman bank{suffix} table"
+                payload_values[table_name] = _encode_bytes(
+                    _huffman_prefix_table(codes),
+                )
+                body.extend((
+                    set_var(_ACTIVE_PAYLOAD, var(table_name)),
+                    call(_BYTE_DECODER),
+                    clear(_HUFFMAN_TABLE),
+                    for_each(
+                        "decode copy index", 256,
+                        (append(
+                            _HUFFMAN_TABLE,
+                            item(_DECODED_BYTES, var("decode copy index")),
+                        ),),
+                    ),
+                ))
+                compressed_cursor = 1
+                for spec, chunk in zip(bank, chunks):
+                    huffman_offsets[id(spec)] = compressed_cursor
+                    compressed_cursor += len(chunk)
+                raw = b"".join(chunks)
+            else:
+                raw = b"".join(spec.payload_bytes or b"" for spec in bank)
+
             payload_name = f"cattorch {precision} weight bank{suffix} payload"
-            raw = b"".join(spec.payload_bytes or b"" for spec in bank)
             payload_values[payload_name] = _encode_bytes(raw)
             body.extend((
                 set_var(_ACTIVE_PAYLOAD, var(payload_name)),
@@ -915,7 +1215,10 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
             for spec in bank:
                 assert spec.payload_bytes is not None
                 body.extend((
-                    set_var("decode byte start", byte_offset),
+                    set_var(
+                        "decode byte start",
+                        huffman_offsets.get(id(spec), byte_offset),
+                    ),
                     set_var("decode byte length", len(spec.payload_bytes)),
                 ))
                 if precision in integer_precisions:
@@ -923,14 +1226,21 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                         set_var("decode scale start", scale_offsets[id(spec)]),
                         set_var("decode total values", spec.value_count or 0),
                         set_var("decode group size", spec.group_size or 1),
-                        call(f"cattorch decode {precision}"),
+                        call(
+                            "cattorch decode int4 huffman"
+                            if precision == "int4"
+                            else f"cattorch decode {precision}"
+                        ),
                     ))
                 else:
                     body.append(call(f"cattorch decode {precision}"))
                 body.extend(_copy_decoded(spec.name))
                 byte_offset += len(spec.payload_bytes)
 
-    body.extend((clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES)))
+    body.extend((
+        clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES),
+        clear(_HUFFMAN_TABLE),
+    ))
     return Program(
         "unpack_banked_weights",
         variables=(
@@ -940,7 +1250,7 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
         ),
         variable_values=payload_values,
         lists=(
-            _DECODED_BYTES, _DECODED_VALUES, _DECODED_SCALES,
+            _DECODED_BYTES, _DECODED_VALUES, _DECODED_SCALES, _HUFFMAN_TABLE,
             *(spec.name for spec in specs),
         ),
         body=tuple(body),
@@ -958,7 +1268,7 @@ def build_unpack_program(specs: list[EncodedList]) -> Program:
         raise ValueError("int6 requires the shared production decoder")
     variables = (
         "decode cursor", "decode bits", "decode byte count",
-        "decode packed", "decode digit",
+        "decode high", "decode low", "decode digit",
         "decode sign", "decode exponent", "decode mantissa", "decode value",
         "decode value count", "decode group offset", "decode scale index",
         "decode scale",

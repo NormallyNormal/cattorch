@@ -25,14 +25,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cattorch.codegen import CodegenConfig
-from cattorch.storage import BASE85_ALPHABET
+from cattorch.storage import BASE92_ALPHABET
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.scratch.ids import compact_sprite_ids
 
 log = logging.getLogger(__name__)
 
-SCRATCH_ONLINE_JSON_LIMIT = 5 * 1024 * 1024
-SCRATCH_ONLINE_JSON_WARN_SIZE = 4 * 1024 * 1024
+SCRATCH_ONLINE_JSON_LIMIT = 5_000_000
+SCRATCH_ONLINE_JSON_WARN_SIZE = 4_000_000
 SCRATCH_MAX_LIST_LENGTH = 200_000
 
 SPRITE_ASSET_DIR = TEMPLATE_DIR / "sprite"
@@ -50,21 +50,21 @@ class FinalizedSprite:
 def online_json_size_warning(byte_count: int, subject: str) -> str | None:
     """Describe risk on Scratch's ordinary expanded-JSON save/upload path.
 
-    Scratch does not have a universal 5 MiB cap on compressed ``.sb3`` or
+    Scratch does not have a universal 5 MB cap on compressed ``.sb3`` or
     ``.sprite3`` archives. The commonly encountered limit applies to the
     expanded project JSON sent by the ordinary online editor. Other import and
     legacy archive-upload paths can behave differently.
     """
-    size_mib = byte_count / 1024 / 1024
+    size_mb = byte_count / 1_000_000
     if byte_count > SCRATCH_ONLINE_JSON_LIMIT:
         return (
-            f"{subject} is {size_mib:.1f} MiB, above the roughly 5 MiB "
+            f"{subject} is {size_mb:.1f} MB, above the conservative 5 MB "
             "project.json limit used by Scratch's ordinary online save/upload "
             "path. Local import or an archive-based path may still work."
         )
     if byte_count > SCRATCH_ONLINE_JSON_WARN_SIZE:
         return (
-            f"{subject} is {size_mib:.1f} MiB, approaching the roughly 5 MiB "
+            f"{subject} is {size_mb:.1f} MB, approaching the conservative 5 MB "
             "project.json limit used by Scratch's ordinary online save/upload path."
         )
     return None
@@ -97,7 +97,7 @@ def _make_asset_id(sprite_name: str) -> str:
 
 
 _PUBLIC_DATA_NAMES = {
-    "input", "output", "token_ids",
+    "input", "output", "token_ids", "cattorch tokens", "cattorch logits",
     "cattorch status", "cattorch cache length", "cattorch max context",
     "cattorch top k values", "cattorch top k ids",
     "cattorch storage compression", "cattorch storage precision",
@@ -105,12 +105,17 @@ _PUBLIC_DATA_NAMES = {
 }
 _PUBLIC_PROCEDURES = {
     "cattorch init", "cattorch forward", "cattorch prepare for save",
-    "cattorch reset cache", "cattorch prefill", "cattorch decode",
+    "cattorch reset", "cattorch reset cache", "cattorch prefill", "cattorch decode",
     "cattorch tokenize", "cattorch detokenize",
 }
 
 
-def _compact_internal_display_names(sprite: dict) -> None:
+def _compact_internal_display_names(
+    sprite: dict,
+    *,
+    public_data_names: frozenset[str] = frozenset(),
+    public_procedures: frozenset[str] = frozenset(),
+) -> None:
     """Shorten private UI names while preserving documented interfaces."""
     data_names: dict[str, str] = {}
     counters = {"variables": 0, "lists": 0}
@@ -118,7 +123,13 @@ def _compact_internal_display_names(sprite: dict) -> None:
     for section in ("variables", "lists"):
         for identifier, entry in sprite.get(section, {}).items():
             old_name = entry[0]
-            if old_name in _PUBLIC_DATA_NAMES or old_name.startswith("input_"):
+            # Physical shards belong to the same public tensor interface.
+            public_base = old_name.split(" shard ", 1)[0]
+            if (
+                public_base in _PUBLIC_DATA_NAMES
+                or public_base in public_data_names
+                or public_base.startswith(("input_", "output_"))
+            ):
                 continue
             new_name = f"{prefixes[section]}{counters[section]}"
             counters[section] += 1
@@ -135,6 +146,7 @@ def _compact_internal_display_names(sprite: dict) -> None:
         if (
             isinstance(proccode, str)
             and proccode not in _PUBLIC_PROCEDURES
+            and proccode not in public_procedures
             and proccode not in procedure_names
         ):
             procedure_names[proccode] = f"p{procedure_counter}"
@@ -180,6 +192,8 @@ def finalize_sprite(
     sprite_name: str = "cattorch",
     *,
     codegen: CodegenConfig | None = None,
+    public_data_names: frozenset[str] = frozenset(),
+    public_procedures: frozenset[str] = frozenset(),
 ) -> FinalizedSprite:
     """
     Finalize a sprite dict and write it as a .sprite3 zip file.
@@ -206,7 +220,11 @@ def finalize_sprite(
     _ensure_costume_menu_shadows(sprite)
     sprite = compact_sprite_ids(sprite, namespace=codegen.id_namespace)
     if codegen.compact_internal_names:
-        _compact_internal_display_names(sprite)
+        _compact_internal_display_names(
+            sprite,
+            public_data_names=public_data_names,
+            public_procedures=public_procedures,
+        )
     if codegen.compact_schema:
         _trim_safe_schema_defaults(sprite)
 
@@ -218,8 +236,8 @@ def finalize_sprite(
     source_svg_candidates = list(SPRITE_ASSET_DIR.glob("*.svg"))
     if not source_svg_candidates:
         raise FileNotFoundError(
-            f"No SVG costume found in {SPRITE_ASSET_DIR}. "
-            "Add a .svg file there to use as the sprite costume."
+            f"no SVG costume found in {SPRITE_ASSET_DIR}; the cattorch "
+            "installation may be incomplete, so try reinstalling it"
         )
     source_svg = source_svg_candidates[0]
 
@@ -235,7 +253,7 @@ def finalize_sprite(
         block.get("opcode") == "looks_switchcostumeto"
         for block in sprite.get("blocks", {}).values()
     )
-    costume_names = BASE85_ALPHABET if uses_costume_codec else ("cat",)
+    costume_names = BASE92_ALPHABET if uses_costume_codec else ("cat",)
 
     # Codec costumes share one physical SVG, adding only their JSON metadata.
     sprite.update({
@@ -259,8 +277,8 @@ def finalize_sprite(
         name, contents = entry[0], entry[1]
         if len(contents) > SCRATCH_MAX_LIST_LENGTH:
             raise ValueError(
-                f"List \"{name}\" has {len(contents):,} items, "
-                f"which exceeds Scratch's limit of {SCRATCH_MAX_LIST_LENGTH:,}."
+                f"list \"{name}\" has {len(contents):,} items, "
+                f"which exceeds Scratch's limit of {SCRATCH_MAX_LIST_LENGTH:,}"
             )
 
     # Write into a temp dir then zip

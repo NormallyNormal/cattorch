@@ -6,7 +6,7 @@ import copy
 import logging
 
 import torch
-from torch.fx import symbolic_trace
+from torch.fx import Tracer
 
 
 log = logging.getLogger(__name__)
@@ -22,7 +22,9 @@ def _set_submodule(
     setattr(parent, name, replacement)
 
 
-def fold_eval_batch_norms(model: torch.nn.Module) -> torch.nn.Module:
+def fold_eval_batch_norms(
+    model: torch.nn.Module, *, methods: tuple[str, ...] = ("forward",),
+) -> torch.nn.Module:
     """Fold dataflow-connected eval Conv/Linear + BatchNorm pairs on a copy."""
     eligible = (
         (torch.nn.Conv1d, torch.nn.BatchNorm1d),
@@ -40,15 +42,23 @@ def fold_eval_batch_norms(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
     try:
-        traced = symbolic_trace(model)
+        graphs = []
+        for method in dict.fromkeys(methods):
+            tracer = Tracer()
+            tracer.traced_func_name = method
+            graphs.append(tracer.trace(model))
     except Exception:
         log.info("Skipping BatchNorm folding because FX tracing was not available")
         return model
 
     calls_by_target: dict[str, list] = {}
-    for node in traced.graph.nodes:
-        if node.op == "call_module":
-            calls_by_target.setdefault(str(node.target), []).append(node)
+    attributes = set()
+    for graph in graphs:
+        for node in graph.nodes:
+            if node.op == "call_module":
+                calls_by_target.setdefault(str(node.target), []).append(node)
+            elif node.op == "get_attr":
+                attributes.add(str(node.target))
 
     pairs = []
     for batch_norm_path, batch_norm_calls in calls_by_target.items():
@@ -79,6 +89,12 @@ def fold_eval_batch_norms(model: torch.nn.Module) -> torch.nn.Module:
         if not any(
             isinstance(layer, left) and isinstance(batch_norm, right)
             for left, right in eligible
+        ):
+            continue
+        # A different method may consume a layer's parameters directly.
+        if any(
+            target.startswith((f"{producer_path}.", f"{batch_norm_path}."))
+            for target in attributes
         ):
             continue
         pairs.append((producer_path, batch_norm_path))

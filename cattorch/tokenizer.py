@@ -171,14 +171,14 @@ def _reject_scratch_text_ambiguity(
             continue
         if any(ord(character) > 0xFFFF for character in token):
             raise ValueError(
-                "Tokenizer vocabulary contains a non-BMP character which "
+                "tokenizer vocabulary contains a non-BMP character which "
                 "vanilla Scratch splits into UTF-16 surrogate halves"
             )
         key = token.lower()
         previous = seen.get(key)
         if previous is not None and previous != token:
             raise ValueError(
-                "Tokenizer vocabulary contains text which Scratch compares "
+                "tokenizer vocabulary contains text which Scratch compares "
                 f"as equal: {previous!r} and {token!r}"
             )
         seen[key] = token
@@ -238,14 +238,14 @@ class BPETokenizer(_TokenizerBase):
         try:
             model = json.loads(backend.to_str())["model"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise TypeError("Unable to read the tokenizer's BPE model") from exc
+            raise TypeError("unable to read the tokenizer's BPE model") from exc
         if model.get("type") != "BPE":
             raise TypeError("BPETokenizer requires a BPE backend model")
         if model.get("dropout") is not None:
             raise ValueError("BPE dropout is nondeterministic and cannot be exported")
         if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):
             raise ValueError(
-                "Raw-text BPETokenizer does not support subword prefixes or suffixes"
+                "raw-text BPETokenizer does not support subword prefixes or suffixes"
             )
 
         vocab = self.tokenizer.get_vocab()
@@ -256,10 +256,10 @@ class BPETokenizer(_TokenizerBase):
             elif isinstance(raw_pair, str):
                 parts = raw_pair.split(" ", 1)
                 if len(parts) != 2:
-                    raise ValueError(f"Malformed BPE merge entry: {raw_pair!r}")
+                    raise ValueError(f"malformed BPE merge entry: {raw_pair!r}")
                 left, right = parts
             else:
-                raise ValueError(f"Malformed BPE merge entry: {raw_pair!r}")
+                raise ValueError(f"malformed BPE merge entry: {raw_pair!r}")
             merged = f"{left}{right}"
             if left not in vocab or right not in vocab or merged not in vocab:
                 raise ValueError(
@@ -290,11 +290,21 @@ def _build_character_tokenizer_sprite(
         if bpe else ("input", "output", "idx", "lookup")
     )
     lists = (
-        ("tokens", "token_ids", "splitlist", "merge_keys", "merge_ids")
-        if bpe else ("tokens", "token_ids")
+        ("tokens", "token_ids", "_characters", "_character ids")
+        + (("splitlist", "merge_keys", "merge_ids") if bpe else ())
     )
+    # Look characters up among single-character tokens only. Scratch's
+    # item # of compares numbers by value, so searching every token would let
+    # "1" match an earlier " 1" or "01".
+    characters: list[str] = []
+    character_ids: list[int] = []
+    for token_id, token in enumerate(tokens):
+        if len(token) == 1:
+            characters.append(token)
+            character_ids.append(token_id)
     values: dict[str, Sequence[int | float | str]] = {
         "tokens": tokens, "token_ids": [],
+        "_characters": characters, "_character ids": character_ids,
     }
     if bpe:
         values["splitlist"] = []
@@ -305,11 +315,11 @@ def _build_character_tokenizer_sprite(
     def append_lookup(destination: str) -> tuple[Statement, ...]:
         missing = () if unknown_id is None else (append(destination, unknown_id),)
         return (
-            set_var("lookup", index_of("tokens", letter(var("input"), var("idx")))),
+            set_var("lookup", index_of("_characters", letter(var("input"), var("idx")))),
             if_else(
                 eq(var("lookup"), 0),
                 missing,
-                (append(destination, sub(var("lookup"), 1)),),
+                (append(destination, item("_character ids", var("lookup"))),),
             ),
         )
 
@@ -481,7 +491,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
     ----------
     tokenizer:
         A ``SentencePieceProcessor`` or an object exposing one as
-        ``.processor`` (such as catgpt2's ``SentencePieceTokenizer``).
+        ``.processor``.
     scratch_casefold:
         Whether the model was trained with case-folding normalization.
     """
@@ -530,7 +540,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                 try:
                     model.ParseFromString(serialized())
                 except Exception as exc:
-                    raise ValueError("Unable to inspect the SentencePiece model") from exc
+                    raise ValueError("unable to inspect the SentencePiece model") from exc
                 normalizer = model.normalizer_spec
                 if normalizer.add_dummy_prefix:
                     raise ValueError(
@@ -596,7 +606,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                     byte_value = int(raw_piece[3:5], 16)
                 except (ValueError, IndexError) as exc:
                     raise ValueError(
-                        f"Malformed SentencePiece byte token: {raw_piece!r}"
+                        f"malformed SentencePiece byte token: {raw_piece!r}"
                     ) from exc
                 literal = chr(byte_value)
                 # Do not expose byte forms which would shadow a normal token

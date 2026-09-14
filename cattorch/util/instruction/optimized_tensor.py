@@ -13,6 +13,7 @@ from cattorch.util.scratch.dsl import (
     clear,
     div,
     eq,
+    for_each,
     gt,
     if_,
     if_else,
@@ -23,6 +24,7 @@ from cattorch.util.scratch.dsl import (
     mod,
     mul,
     repeat,
+    static_unrolled_repeat,
     replace,
     set_var,
     sub,
@@ -77,6 +79,62 @@ class OptimizedEmbeddingInstruction(Instruction):
                     )),
                     change_var("token", 1),
                 )),
+            ),
+        ).compile()
+
+
+class RotaryEmbeddingInstruction(Instruction):
+    """Fused exact pairwise rotary embedding application."""
+
+    def prepare(self):
+        self.output_shape = tuple(self.args[0].shape)
+        self.size = math.prod(self.output_shape)
+        if not self.output_shape or self.output_shape[-1] % 2:
+            raise ValueError("rotary embedding requires an even final dimension")
+
+    def finalize(self):
+        even = var("index")
+        odd = add(var("index"), 1)
+        cos_even, cos_even_map = _broadcast_index(
+            self.args[1].shape, self.output_shape, "_rope cos map", even,
+        )
+        cos_odd, cos_odd_map = _broadcast_index(
+            self.args[1].shape, self.output_shape, "_rope cos map", odd,
+        )
+        sin_even, sin_even_map = _broadcast_index(
+            self.args[2].shape, self.output_shape, "_rope sin map", even,
+        )
+        sin_odd, sin_odd_map = _broadcast_index(
+            self.args[2].shape, self.output_shape, "_rope sin map", odd,
+        )
+        list_values = {}
+        if cos_even_map is not None or cos_odd_map is not None:
+            list_values["_rope cos map"] = cos_even_map or cos_odd_map
+        if sin_even_map is not None or sin_odd_map is not None:
+            list_values["_rope sin map"] = sin_even_map or sin_odd_map
+        lists = ["T1", "T2", "T3", "T4", *list_values]
+        pair = (
+            append("T4", add(
+                mul(item("T1", even), item("T2", cos_even)),
+                mul(mul(-1, item("T1", odd)), item("T3", sin_even)),
+            )),
+            append("T4", add(
+                mul(item("T1", odd), item("T2", cos_odd)),
+                mul(item("T1", even), item("T3", sin_odd)),
+            )),
+            change_var("index", 2),
+        )
+        return Program(
+            "rotary_embedding_fused",
+            variables=("index",),
+            lists=tuple(lists),
+            list_values=list_values,
+            body=(
+                clear("T4"),
+                set_var("index", 1),
+                static_unrolled_repeat(
+                    self.size // 2, pair, max_factor=4, priority=3,
+                ),
             ),
         ).compile()
 
@@ -226,17 +284,57 @@ class OptimizedTransposeInstruction(Instruction):
         else:
             raise NotImplementedError(op)
 
-        self.total = math.prod(input_shape)
-        indices = torch.arange(self.total).reshape(input_shape)
-        self.input_order = (indices.permute(permutation).flatten() + 1).tolist()
+        self.permutation = permutation
+        if self.args[0].dynamic:
+            static_width = math.prod(
+                extent for index, extent in enumerate(input_shape)
+                if index != self.args[0].dynamic_axis
+            )
+            self.runtime_extent = div(length("T1"), static_width)
+            self.total = length("T1")
+            self.input_order = None
+        else:
+            self.total = math.prod(input_shape)
+            indices = torch.arange(self.total).reshape(input_shape)
+            self.input_order = (indices.permute(permutation).flatten() + 1).tolist()
+
+    def _dynamic_input_index(self):
+        input_shape = list(self.args[0].shape)
+        input_shape[self.args[0].dynamic_axis] = self.runtime_extent
+        output_shape = [input_shape[index] for index in self.permutation]
+
+        def product(values):
+            result = 1
+            for value in values:
+                result = mul(result, value)
+            return result
+
+        flat = sub(var("index"), 1)
+        input_index = 0
+        for output_axis, input_axis in enumerate(self.permutation):
+            output_stride = product(output_shape[output_axis + 1:])
+            coordinate = mod(
+                mathop("floor", div(flat, output_stride)),
+                output_shape[output_axis],
+            )
+            input_stride = product(input_shape[input_axis + 1:])
+            input_index = add(input_index, mul(coordinate, input_stride))
+        return add(input_index, 1)
 
     def finalize(self):
-        return Program(
-            "transpose_optimized",
-            variables=("index",),
-            lists=("T1", "T2", "_transpose_input_order"),
-            list_values={"_transpose_input_order": self.input_order},
-            body=(
+        if self.input_order is None:
+            body = (
+                clear("T2"),
+                set_var("index", 1),
+                repeat(self.total, (
+                    append("T2", item("T1", self._dynamic_input_index())),
+                    change_var("index", 1),
+                )),
+            )
+            lists = ("T1", "T2")
+            values = {}
+        else:
+            body = (
                 clear("T2"),
                 set_var("index", 1),
                 *_static_unrolled_repeat(self.total, (
@@ -249,7 +347,15 @@ class OptimizedTransposeInstruction(Instruction):
                     ),
                     change_var("index", 1),
                 )),
-            ),
+            )
+            lists = ("T1", "T2", "_transpose_input_order")
+            values = {"_transpose_input_order": self.input_order}
+        return Program(
+            "transpose_optimized",
+            variables=("index",),
+            lists=lists,
+            list_values=values,
+            body=body,
         ).compile()
 
 
@@ -324,8 +430,24 @@ class OptimizedGetItemInstruction(Instruction):
         self.rows = self.args[2].value
         self.skip = self.args[3].value
         self.offset = self.args[4].value
+        self.dynamic_copy = (
+            self.args[0].dynamic and self.rows == 1 and not self.skip and not self.offset
+        )
 
     def finalize(self):
+        if self.dynamic_copy:
+            return Program(
+                "getitem_dynamic_copy",
+                variables=("source_index",),
+                lists=("T1", "T2"),
+                body=(
+                    clear("T2"),
+                    for_each(
+                        "source_index", length("T1"),
+                        (append("T2", item("T1", var("source_index"))),),
+                    ),
+                ),
+            ).compile()
         copy = ()
         if self.chunk:
             copy = _unrolled_copy_statements(
@@ -342,5 +464,38 @@ class OptimizedGetItemInstruction(Instruction):
                 clear("T2"),
                 set_var("source_index", self.offset + 1),
                 *traversal,
+            ),
+        ).compile()
+
+
+class StridedSliceInstruction(Instruction):
+    """Copy a fixed positive-step dimension slice without index maps."""
+
+    def prepare(self):
+        self.rows = self.args[1].value
+        self.selected = self.args[2].value
+        self.trailing = self.args[3].value
+        self.row_stride = self.args[4].value
+        self.offset = self.args[5].value
+        self.step_skip = self.args[6].value
+
+    def finalize(self):
+        return Program(
+            "slice_strided",
+            variables=("outer start", "source index"),
+            lists=("T1", "T2"),
+            body=(
+                clear("T2"),
+                set_var("outer start", self.offset + 1),
+                repeat(self.rows, (
+                    set_var("source index", var("outer start")),
+                    repeat(self.selected, (
+                        *_unrolled_copy_statements(
+                            "T1", "source index", self.trailing, destination="T2",
+                        ),
+                        change_var("source index", self.step_skip),
+                    )),
+                    change_var("outer start", self.row_stride),
+                )),
             ),
         ).compile()

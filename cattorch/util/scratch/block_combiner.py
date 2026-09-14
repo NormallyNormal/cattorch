@@ -39,11 +39,11 @@ def _find_top_level_root(blocks: dict) -> str:
         if block.get("topLevel") and block.get("parent") is None
     ]
     if not roots:
-        raise ValueError("No topLevel root block found.")
+        raise ValueError("no topLevel root block found")
     if len(roots) > 1:
         raise ValueError(
-            f"Multiple topLevel root blocks found: {roots}. "
-            "Ensure the fragment has a single entry point."
+            f"multiple topLevel root blocks found: {roots}; "
+            "the fragment must have a single entry point"
         )
     return roots[0]
 

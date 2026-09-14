@@ -302,6 +302,22 @@ class TestBPETokenizerEncode:
         assert tokenizer.encode("aza") == [0, 0]
         assert [int(value) for value in _encode(sprite, "aza")] == [0, 0]
 
+    def test_digit_lookup_ignores_numerically_equal_tokens(self):
+        # Scratch's item # of treats "1", " 1", and "01" as equal numbers.
+        backend = Tokenizer(models.BPE(
+            vocab={"<unk>": 0, " 1": 1, "01": 2, " ": 3, "0": 4, "1": 5, "a": 6},
+            merges=[(" ", "1"), ("0", "1")],
+            unk_token="<unk>",
+        ))
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="<unk>",
+        )
+        BPETokenizer(tokenizer).save(SPRITE_PATH)
+        sprite = _load_sprite()
+
+        for text in ("a1 1", "1", "01 0"):
+            assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text)
+
     def test_rejects_case_colliding_bpe_vocab(self):
         backend = Tokenizer(models.BPE(
             vocab={"<unk>": 0, "a": 1, "A": 2}, merges=[], unk_token="<unk>",

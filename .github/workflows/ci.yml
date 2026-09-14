@@ -44,8 +44,11 @@ jobs:
           pip install "torch${TORCH_VERSION:+==$TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev]"
 
+      - name: Validate Markdown documentation
+        run: pytest tests/test_docs.py -q
+
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v --ignore=tests/test_docs.py
 
       - name: Check Python sources
         run: |
@@ -53,7 +56,7 @@ jobs:
           ruff check cattorch tests benchmarks
 
       - name: Check typed public modules
-        run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/storage.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py
+        run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/codegen.py cattorch/storage.py cattorch/quantization.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py cattorch/frontend.py cattorch/operator_registry.py
 
   package:
     runs-on: ubuntu-latest

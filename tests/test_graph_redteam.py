@@ -40,13 +40,11 @@ def test_slices_normalize_negative_and_empty_bounds(tmp_path, optimization):
     )
 
 
-def test_stepped_slice_is_rejected(tmp_path):
-    with pytest.raises(UnsupportedOperationError, match="step of 1"):
-        transpile(
-            FunctionModel(lambda x: x[:, ::2, :]),
-            torch.randn(2, 5, 3),
-            tmp_path / "stepped",
-        )
+def test_stepped_slice_uses_flat_trailing_geometry(tmp_path):
+    value = torch.randn(2, 5, 3)
+    _assert_exact(
+        tmp_path, "stepped", lambda x: x[:, ::2, :], (value,),
+    )
 
 
 @pytest.mark.parametrize("dim", [0, 1, 2])

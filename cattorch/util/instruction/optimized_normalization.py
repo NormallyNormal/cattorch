@@ -48,14 +48,22 @@ class OptimizedSoftmaxInstruction(Instruction):
             dim += len(shape)
         self.dim_size = shape[dim]
         self.stride = math.prod(shape[dim + 1:]) if dim + 1 < len(shape) else 1
-        self.total = math.prod(shape)
-        self.num_groups = self.total // self.dim_size
+        self.total = length("T1") if self.args[0].dynamic else math.prod(shape)
+        self.num_groups = (
+            div(length("T1"), self.dim_size)
+            if self.args[0].dynamic else self.total // self.dim_size
+        )
         block_size = self.dim_size * self.stride
-        self.group_starts = [
-            base + offset + 1
-            for base in range(0, self.total, block_size)
-            for offset in range(self.stride)
-        ]
+        # Contiguous groups advance a running index in Scratch, including
+        # bounded runtime rows. Only fixed strided reductions need a table.
+        self.group_starts = (
+            [
+                base + offset + 1
+                for base in range(0, math.prod(shape), block_size)
+                for offset in range(self.stride)
+            ]
+            if self.stride != 1 else []
+        )
 
     def finalize(self):
         current = item("T1", var("index"))
@@ -195,7 +203,11 @@ class OptimizedMeanInstruction(Instruction):
         self.reduce_size = math.prod(shape[dim] for dim in dims)
         trailing = first + len(dims)
         self.inner = math.prod(shape[trailing:]) if trailing < ndim else 1
-        self.outer = math.prod(shape[:first]) if first else 1
+        self.outer = (
+            div(length("T1"), self.reduce_size * self.inner)
+            if self.args[0].dynamic
+            else (math.prod(shape[:first]) if first else 1)
+        )
         self.block_advance = (self.reduce_size - 1) * self.inner
 
     def finalize(self):
@@ -226,7 +238,11 @@ class OptimizedMeanInstruction(Instruction):
 class OptimizedLayerNormInstruction(Instruction):
     def prepare(self):
         self.norm_size = math.prod(self.args[1].value)
-        self.groups = math.prod(self.args[0].shape) // self.norm_size
+        self.groups = (
+            div(length("T1"), self.norm_size)
+            if self.args[0].dynamic
+            else math.prod(self.args[0].shape) // self.norm_size
+        )
         self.eps = self.args[4].value if len(self.args) > 4 else 1e-5
         self.has_weight = self.args[2].value is not None or bool(self.args[2].shape)
         self.has_bias = self.args[3].value is not None or bool(self.args[3].shape)
@@ -346,7 +362,11 @@ class FastLayerNormInstruction(OptimizedLayerNormInstruction):
 class OptimizedRMSNormInstruction(Instruction):
     def prepare(self):
         self.norm_size = math.prod(self.args[1].value)
-        self.groups = math.prod(self.args[0].shape) // self.norm_size
+        self.groups = (
+            div(length("T1"), self.norm_size)
+            if self.args[0].dynamic
+            else math.prod(self.args[0].shape) // self.norm_size
+        )
         self.eps = (
             self.args[3].value
             if len(self.args) > 3
@@ -392,7 +412,10 @@ class OptimizedRMSNormInstruction(Instruction):
 class OptimizedBatchNormInstruction(Instruction):
     def prepare(self):
         shape = self.args[0].shape
-        self.batches = shape[0]
+        self.batches = (
+            div(length("T1"), math.prod(shape[1:]))
+            if self.args[0].dynamic else shape[0]
+        )
         self.channels = shape[1]
         self.spatial = math.prod(shape[2:])
         self.has_weight = self.args[1].value is not None or bool(self.args[1].shape)
@@ -448,5 +471,3 @@ class OptimizedBatchNormInstruction(Instruction):
                 )),
             ),
         ).compile()
-
-
