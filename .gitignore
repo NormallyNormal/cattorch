@@ -123,6 +123,7 @@ node_modules/
 
 # Local design/review notes and one-off third-party project probes
 /REVIEW.md
+/ROADMAP.md
 /CATGPT_SCRATCH_TRAINING_GUIDE.md
 /benchmarks/MOCHI_ANALYSIS.md
 /benchmarks/MYTHICGPT_ANALYSIS.md
