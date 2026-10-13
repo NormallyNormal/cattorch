@@ -18,6 +18,7 @@ def validate_export_options(
     sig_figs=None,
     frontend="fx",
     adapters=(),
+    example_kwargs=None,
 ) -> None:
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise ValueError("name must be a non-empty string")
@@ -45,3 +46,8 @@ def validate_export_options(
         raise ValueError("sig_figs must be a positive integer or None")
     if any(not isinstance(adapter, ModuleAdapter) for adapter in adapters):
         raise TypeError("adapters must contain ModuleAdapter values")
+    if example_kwargs is not None and (
+        not isinstance(example_kwargs, dict)
+        or any(not isinstance(key, str) for key in example_kwargs)
+    ):
+        raise TypeError("example_kwargs must be a dict with string keys")

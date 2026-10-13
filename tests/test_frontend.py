@@ -76,7 +76,7 @@ def test_public_capture_serializes_process_global_tracing_state(monkeypatch):
     active = 0
     maximum = 0
 
-    def fake_capture(model, example_inputs):
+    def fake_capture(model, example_inputs, example_kwargs=None):
         nonlocal active, maximum
         with guard:
             active += 1
@@ -105,7 +105,7 @@ def test_frontends_preserve_multiple_tensor_outputs(tmp_path, frontend):
 
     value = torch.ones(2)
     result = transpile(
-        Multiple(), value, tmp_path / f"multiple-{frontend}", frontend=frontend,
+        Multiple().eval(), value, tmp_path / f"multiple-{frontend}", frontend=frontend,
     )
     assert tuple(output.list_name for output in result.outputs) == ("output", "output_1")
     assert all(output.shape == (2,) for output in result.outputs)
@@ -119,7 +119,7 @@ def test_fx_rejects_data_dependent_python_control_flow(tmp_path):
             return value - 1
 
     with pytest.raises(UnsupportedModelError, match="FX frontend could not trace"):
-        transpile(DataDependent(), torch.ones(2), tmp_path / "data-dependent")
+        transpile(DataDependent().eval(), torch.ones(2), tmp_path / "data-dependent")
 
 
 def test_public_transpile_captures_an_export_owned_copy(tmp_path):
@@ -132,7 +132,7 @@ def test_public_transpile_captures_an_export_owned_copy(tmp_path):
             self.calls += 1
             return -value
 
-    model = StatefulForward()
+    model = StatefulForward().eval()
     transpile(model, torch.ones(2), tmp_path / "owned")
     assert model.calls == 0
 
@@ -165,7 +165,7 @@ def test_private_registry_supports_module_adapters_and_semantic_ops(tmp_path):
         exact_kernel=OptimizedElementwiseInstruction,
         lowering_target=torch.ops.aten.neg.default,
     ))
-    model = AdaptedNeg()
+    model = AdaptedNeg().eval()
     result = _transpile(
         model,
         torch.tensor([1.0, -2.0]),
@@ -177,7 +177,7 @@ def test_private_registry_supports_module_adapters_and_semantic_ops(tmp_path):
 
 def test_unknown_semantic_op_still_fails_closed(tmp_path):
     with pytest.raises(UnsupportedOperationError, match="cattorch_test.neg.default"):
-        transpile(OpaqueNeg(), torch.ones(2), tmp_path / "unknown")
+        transpile(OpaqueNeg().eval(), torch.ones(2), tmp_path / "unknown")
 
 
 def test_runtime_full_slice_followed_by_view_resolves_complete_alias_chain(tmp_path):
@@ -220,7 +220,7 @@ def test_positive_strided_slice_lowers_without_an_index_map(tmp_path):
         def forward(self, value):
             return value[:, ::2]
 
-    model = EvenFeatures()
+    model = EvenFeatures().eval()
     value = torch.randn(3, 7)
     result = transpile(model, value, tmp_path / "strided")
     assert verify(model, value, result).passed

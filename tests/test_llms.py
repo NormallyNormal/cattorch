@@ -22,6 +22,7 @@ TOLERANCE = 1e-4
 
 def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
     """Transpile a model, run through emulator, return (expected, actual)."""
+    model = model.eval()
     with torch.no_grad():
         expected = model(x).flatten().tolist()
 

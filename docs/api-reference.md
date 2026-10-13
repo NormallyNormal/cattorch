@@ -31,14 +31,15 @@ transpile(
     adapters=(),
     calibration_calls=None,
     calibration_sequences=None,
+    example_kwargs=None,
 ) -> TranspileResult
 ```
 
-Export an evaluation-mode `torch.nn.Module` as a Scratch `.sprite3` file.
+Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 
 | Parameter | Meaning |
 |---|---|
-| `model` | Module to export, in evaluation mode. Weight transforms and GPTQ work on a copy. |
+| `model` | Module to export. Export works on a copy; a model with modules in training mode is exported in evaluation mode, with a warning. |
 | `example_inputs` | A tensor or tuple of tensors, an `ExportProgram`, or a `GenerationProgram`. Programs carry their own examples. |
 | `output_path` | Destination. `.sprite3` is appended when absent and missing parent directories are created. |
 | `sig_figs` | Round stored values to this many significant figures. Lossy. |
@@ -53,6 +54,7 @@ Export an evaluation-mode `torch.nn.Module` as a Scratch `.sprite3` file.
 | `adapters` | `ModuleAdapter`s for an `ExportProgram` or `GenerationProgram`. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
+| `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
 
 Tensor-input and generation exports return a `TranspileResult`. An
 `ExportProgram` export returns a `ProgramResult`. Export raises
@@ -150,6 +152,7 @@ verify(
     calls=None,
     adapters=(),
     quantization=None,
+    example_kwargs=None,
 ) -> VerifyResult | MultiOutputVerifyResult | ProgramVerifyResult
 ```
 
@@ -160,8 +163,12 @@ must be non-negative. `verify` checks correctness, not speed.
 A model with one tensor output returns a `VerifyResult`, even if the tensor is
 inside a container. A model with several returns a `MultiOutputVerifyResult`,
 whose `outputs` are in the same order as `TranspileResult.outputs` and whose
-`passed` requires all of them to pass. Non-tensor outputs, or outputs that
-don't match the sprite's lists, raise `UnsupportedModelError`.
+`passed` requires all of them to pass. Non-tensor outputs are ignored, as in
+`transpile`. Outputs that don't match the sprite's lists raise
+`UnsupportedModelError`.
+
+Pass the same `example_kwargs` used at export. A model in training mode is
+compared as an evaluation-mode copy, with a warning.
 
 The remaining arguments apply only to an `ExportProgram`:
 

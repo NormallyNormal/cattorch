@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch.utils._pytree import tree_flatten
 
 from cattorch.errors import UnsupportedModelError
 from cattorch.adapters import ModuleAdapter
-from cattorch.operator_registry import default_registry
+from cattorch.export_options import validate_export_options
+from cattorch.frontend import flat_example_inputs, tensor_output_leaves
+from cattorch.operator_registry import default_registry, eval_mode_copy_warning
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
@@ -233,6 +236,7 @@ def verify(
     calls: tuple[ProgramCall, ...] | None = None,
     adapters: tuple[ModuleAdapter, ...] = (),
     quantization: QuantizationConfig | None = None,
+    example_kwargs: dict[str, Any] | None = None,
 ):
     """Run one generated forward in the emulator and compare it with PyTorch.
 
@@ -250,9 +254,17 @@ def verify(
     with state carried between them, ``adapters`` must match the export, and a
     symmetric ``quantization`` config makes PyTorch use the quantized weights.
     The result is a ``ProgramVerifyResult``.
+
+    ``example_kwargs`` must match the export: tensor values are written to the
+    inputs after the positional ones, and all of them are passed to the model.
+    A model in training mode is run as an evaluation-mode copy, with a warning.
+    Non-tensor output leaves are ignored, as in ``transpile``.
     """
     if atol < 0 or rtol < 0:
         raise ValueError("atol and rtol must be non-negative")
+    validate_export_options(example_kwargs=example_kwargs)
+    if example_kwargs is not None and isinstance(example_inputs, ExportProgram):
+        raise ValueError("example_kwargs cannot be used with an ExportProgram")
     if isinstance(example_inputs, ExportProgram):
         if isinstance(sprite, TranspileResult):
             raise TypeError("an ExportProgram must be verified with a ProgramResult or path")
@@ -273,16 +285,17 @@ def verify(
     with zipfile.ZipFile(path) as archive:
         project = json.loads(archive.read("sprite.json"))
     emulator = ScratchEmulator(project)
-    for index, value in enumerate(inputs):
+    for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
         name = "input" if index == 0 else f"input_{index}"
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
     emulator.run_procedure("cattorch forward")
 
+    if any(module.training for module in model.modules()):
+        model = copy.deepcopy(model).eval()
+        eval_mode_copy_warning()
     with torch.no_grad():
-        expected = model(*inputs)
-    leaves, _ = tree_flatten(expected)
-    if not leaves or any(not isinstance(value, torch.Tensor) for value in leaves):
-        raise UnsupportedModelError("verify() requires one or more tensor output leaves")
+        expected = model(*inputs, **(example_kwargs or {}))
+    leaves = tensor_output_leaves(expected, warn=False)
     output_names = tuple(
         "output" if index == 0 else f"output_{index}"
         for index in range(len(leaves))

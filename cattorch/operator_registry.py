@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Iterable, Literal
 
@@ -68,6 +69,15 @@ class OperationRule:
             if enabled:
                 return self.fast_kernel
         return self.exact_kernel
+
+
+def eval_mode_copy_warning() -> None:
+    warnings.warn(
+        "the model has modules in training mode; it was exported in evaluation "
+        "mode (dropout disabled, batch norm using running statistics)",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 class OperatorRegistry:
@@ -149,6 +159,9 @@ class OperatorRegistry:
     ) -> torch.nn.Module:
         """Apply registered adapters to an export-owned model copy."""
         model = copy.deepcopy(model)
+        if any(module.training for module in model.modules()):
+            model.eval()
+            eval_mode_copy_warning()
         replacements: dict[int, torch.nn.Module] = {}
 
         def adapt(module: torch.nn.Module, path: str) -> torch.nn.Module:

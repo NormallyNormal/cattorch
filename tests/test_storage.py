@@ -193,7 +193,7 @@ def test_learned_codebook_quantizer_is_deterministic_and_bounded():
 
 def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path):
     torch.manual_seed(40)
-    model = TinyLinear()
+    model = TinyLinear().eval()
     value = torch.randn(2, 3)
     path = tmp_path / "compressed"
     transpile(model, value, str(path))
@@ -410,7 +410,7 @@ def test_emulator_enforces_vanilla_scratch_list_item_limit(monkeypatch):
 
 def test_float16_storage_is_explicitly_lossy_in_exact_mode(tmp_path):
     torch.manual_seed(41)
-    model = TinyLinear()
+    model = TinyLinear().eval()
     value = torch.randn(2, 3)
     path = tmp_path / "float16"
     transpile(
@@ -524,7 +524,7 @@ def test_int8_has_lower_export_error_than_int4_on_same_weights(tmp_path):
 
 
 def test_uncompressed_prepare_save_keeps_static_weights(tmp_path):
-    model = TinyLinear()
+    model = TinyLinear().eval()
     value = torch.randn(1, 3)
     path = tmp_path / "plain"
     transpile(
@@ -568,7 +568,7 @@ def test_nonfloating_static_tensor_cannot_silently_round_through_float32(tmp_pat
 
     with pytest.raises(ValueError, match="not exactly representable"):
         transpile(
-            IntegerBuffer(2**53 + 1), value, tmp_path / "outside-double",
+            IntegerBuffer(2**53 + 1).eval(), value, tmp_path / "outside-double",
             storage=StorageConfig(compression=False),
         )
 
@@ -727,7 +727,7 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
 
 def test_storage_benchmark_bundles_all_variants(tmp_path):
     project_path = build_storage_benchmark_suite(
-        [("tiny", TinyLinear(), torch.randn(1, 3))],
+        [("tiny", TinyLinear().eval(), torch.randn(1, 3))],
         tmp_path / "storage_suite",
         iterations=2,
     )

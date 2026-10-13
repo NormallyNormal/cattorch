@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import RLock
 from typing import Literal
 
 import contextlib
 import functools
+import logging
 import math
+import warnings
 
 import torch
 from torch.fx import Graph, GraphModule, Node
+import torch.fx.experimental.proxy_tensor as proxy_tensor
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.export import export
 from torch.utils._pytree import tree_flatten
@@ -19,6 +23,8 @@ from torch._decomp import core_aten_decompositions, get_decompositions
 
 from cattorch.errors import UnsupportedModelError
 
+
+log = logging.getLogger(__name__)
 
 Frontend = Literal["fx", "export"]
 _CAPTURE_LOCK = RLock()
@@ -43,7 +49,55 @@ class CapturedGraph:
     frontend: Frontend
 
 
-def _export_model(model, example_inputs):
+def flat_example_inputs(example_inputs, example_kwargs=None) -> tuple[torch.Tensor, ...]:
+    """Return the tensors a traced graph takes as inputs, in placeholder order.
+
+    Positional tensors come first, then tensor-valued keyword arguments in
+    dict order. Non-tensor keyword arguments are constants of the trace.
+    """
+    return (*example_inputs, *(
+        value for value in (example_kwargs or {}).values()
+        if isinstance(value, torch.Tensor)
+    ))
+
+
+def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
+    """Return the tensor leaves of a model output, in traversal order.
+
+    Mappings (including Hugging Face ``ModelOutput``), tuples, lists, and
+    namedtuples are searched. Every other leaf, such as ``None``, a Python
+    number, or a ``DynamicCache``, is dropped; ``warn`` reports the dropped
+    paths once. Raises when no tensor is found.
+    """
+    leaves: list[torch.Tensor] = []
+    dropped: list[tuple[str, str]] = []
+
+    def visit(item, path: str) -> None:
+        if isinstance(item, torch.Tensor):
+            leaves.append(item)
+        elif isinstance(item, Mapping):
+            for key, child in item.items():
+                visit(child, f"{path}[{key!r}]")
+        elif isinstance(item, (tuple, list)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
+        else:
+            dropped.append((path, type(item).__name__))
+
+    visit(value, "output")
+    if not leaves:
+        raise UnsupportedModelError("cattorch requires at least one tensor output")
+    if warn and dropped:
+        warnings.warn(
+            "ignoring non-tensor model outputs: "
+            + ", ".join(f"{path} ({kind})" for path, kind in dropped),
+            UserWarning,
+            stacklevel=2,
+        )
+    return leaves
+
+
+def _export_model(model, example_inputs, example_kwargs=None):
     """Export without inheriting old TorchDynamo's tiny process-wide limit."""
     config = getattr(getattr(torch, "_dynamo", None), "config", None)
     overrides = {}
@@ -58,12 +112,12 @@ def _export_model(model, example_inputs):
                 overrides[name] = 1024
     if overrides and hasattr(config, "patch"):
         with config.patch(**overrides):
-            return export(model, example_inputs)
-    return export(model, example_inputs)
+            return export(model, example_inputs, example_kwargs or None)
+    return export(model, example_inputs, example_kwargs or None)
 
 
-def _capture_export(model, example_inputs) -> CapturedGraph:
-    exported = _export_model(model, example_inputs)
+def _capture_export(model, example_inputs, example_kwargs=None) -> CapturedGraph:
+    exported = _export_model(model, example_inputs, example_kwargs)
     state_inputs: dict[str, torch.Tensor] = {}
     user_inputs: set[str] = set()
     constants = getattr(exported, "constants", {})
@@ -229,6 +283,36 @@ def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
     )
 
 
+def _static_scalar_decomposition(operator):
+    """Evaluate ``.item()`` on values that don't depend on the model inputs.
+
+    Hugging Face mask construction branches on tensors built from ``arange``.
+    Those are fixed for the traced shapes, so the Python value is specialised.
+    Values reachable from an input placeholder return ``NotImplemented`` and
+    keep the data-dependent error.
+    """
+    def decomposition(value, *args, **kwargs):
+        mode = proxy_tensor.get_proxy_mode()
+        slot = proxy_tensor.get_proxy_slot(value, mode.tracer, None)
+        proxy = getattr(slot, "proxy", slot)
+        if not isinstance(proxy, torch.fx.Proxy):
+            return NotImplemented
+        seen, stack = set(), [proxy.node]
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node.op == "placeholder":
+                return NotImplemented
+            stack.extend(node.all_input_nodes)
+        with proxy_tensor.disable_proxy_modes_tracing():
+            result = operator(value, *args, **kwargs)
+        log.info("specialised %s on input-independent value: %r", operator, result)
+        return result
+    return decomposition
+
+
 def _resolve_operator(name: str):
     """Return the ``OpOverload`` for a dispatcher name like ``aten::outer``."""
     qualified, _, overload = name.partition(".")
@@ -345,6 +429,10 @@ def _fx_decompositions() -> dict:
         ),
         torch.ops.aten.topk.default: _topk_decomposition,
     })
+    for operator in (
+        torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
+    ):
+        table[operator] = _static_scalar_decomposition(operator)
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
     return table
@@ -419,11 +507,47 @@ def _onednn_disabled():
         torch._C._set_mkldnn_enabled(enabled)
 
 
-def _capture_fx(model, example_inputs) -> CapturedGraph:
+# Mode switches that make_fx records but that have no effect on a traced
+# inference graph. Enter-autocast results are consumed by the matching exit.
+_IGNORED_CALLS = tuple(
+    target for target in (
+        getattr(torch._C, "_set_grad_enabled", None),
+        getattr(getattr(torch.amp, "autocast_mode", None), "_enter_autocast", None),
+        getattr(getattr(torch.amp, "autocast_mode", None), "_exit_autocast", None),
+    ) if target is not None
+)
+
+
+def _erase_mode_switches(graph: Graph) -> None:
+    for node in reversed(list(graph.nodes)):
+        if node.op == "call_function" and any(node.target is t for t in _IGNORED_CALLS):
+            node.replace_all_uses_with(None)
+            graph.erase_node(node)
+
+
+def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
+    example_kwargs = dict(example_kwargs or {})
+    tensor_names = [
+        key for key, value in example_kwargs.items()
+        if isinstance(value, torch.Tensor)
+    ]
+    positional_count = len(example_inputs)
+    # Program entrypoints keep their explicit contract: every returned leaf
+    # must be a tensor, so nothing is dropped for them.
+    from cattorch.program_runtime import MethodModule
+    keep_all_leaves = isinstance(model, MethodModule)
+
     # make_fx only records module ownership when the traced callable exposes
     # the original module through this conventional attribute.
-    def forward(*args):
-        return model(*args)
+    def forward(*flat):
+        # Tensor keywords arrive after the positional tensors; every other
+        # keyword is bound as a constant of the trace.
+        kwargs = dict(example_kwargs)
+        kwargs.update(zip(tensor_names, flat[positional_count:]))
+        output = model(*flat[:positional_count], **kwargs)
+        if keep_all_leaves:
+            return output
+        return tuple(tensor_output_leaves(output, warn=True))
 
     forward._orig_mod = model  # type: ignore[attr-defined]
     try:
@@ -437,7 +561,9 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
                 pre_dispatch=True,
                 record_module_stack=True,
                 _error_on_data_dependent_ops=True,
-            )(*example_inputs)
+            )(*flat_example_inputs(example_inputs, example_kwargs))
+    except UnsupportedModelError:
+        raise
     except Exception as exc:
         raise UnsupportedModelError(
             "the FX frontend could not trace this model "
@@ -446,6 +572,9 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
             "https://github.com/NormallyNormal/cattorch/blob/main/docs/"
             "troubleshooting.md#keep-one-inference-return-path"
         ) from exc
+
+    _erase_mode_switches(graph_module.graph)
+    graph_module.recompile()
 
     nodes = list(graph_module.graph.nodes)
     state_inputs: dict[str, torch.Tensor] = {}
@@ -481,7 +610,9 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
     )
 
 
-def capture_model(model, example_inputs, *, frontend: Frontend = "fx") -> CapturedGraph:
+def capture_model(
+    model, example_inputs, *, frontend: Frontend = "fx", example_kwargs=None,
+) -> CapturedGraph:
     """Capture ``model`` and normalize frontend-specific state and outputs."""
     # ProxyTensor and TorchDynamo both manipulate process-global tracing state.
     # Concurrent captures can therefore corrupt one another even for unrelated
@@ -489,10 +620,13 @@ def capture_model(model, example_inputs, *, frontend: Frontend = "fx") -> Captur
     # to call from worker threads; RLock also permits internal nested captures.
     with _CAPTURE_LOCK:
         if frontend == "fx":
-            return _capture_fx(model, example_inputs)
+            return _capture_fx(model, example_inputs, example_kwargs)
         if frontend == "export":
-            return _capture_export(model, example_inputs)
+            return _capture_export(model, example_inputs, example_kwargs)
         raise ValueError(f"frontend must be 'fx' or 'export', got {frontend!r}")
 
 
-__all__ = ["CapturedGraph", "Frontend", "capture_model"]
+__all__ = [
+    "CapturedGraph", "Frontend", "capture_model", "flat_example_inputs",
+    "tensor_output_leaves",
+]

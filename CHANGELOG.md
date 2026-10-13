@@ -2,6 +2,20 @@
 
 ## New features
 
+- Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
+  a wrapper. Pass `example_kwargs={"use_cache": False}` to skip building the
+  cache for decoders.
+- `transpile` and `verify` take `example_kwargs`. Tensor values become input
+  lists after the positional inputs; other values are fixed for the export.
+- Non-tensor outputs, such as `None` or a `DynamicCache`, are skipped with a
+  warning instead of rejected, and `ModelOutput` is unwrapped.
+- `.item()` and Python branches on tensors that don't depend on the model's
+  inputs, such as masks built from `torch.arange`, are evaluated during export.
+- `torch.no_grad()` and `torch.autocast` blocks inside `forward` no longer
+  block export.
+- A model with modules in training mode is exported as an evaluation-mode
+  copy with a warning, instead of being rejected for training-mode dropout.
+  `verify` compares against the same evaluation-mode copy.
 - Computations whose inputs are all parameters, buffers, or constants now run
   during export, whatever operations they use. nanoGPT's `bias == 0` causal
   mask and RoPE tables built with `torch.outer` in `forward` no longer need
@@ -36,6 +50,8 @@
 
 ## Fixes
 
+- Concatenating with an empty tensor, as Hugging Face caches do on their
+  first step, failed during code generation.
 - A tensor read through a view after its last direct use could be overwritten
   by a later operation, giving wrong output. Graph outputs that are also used
   later were affected the same way.

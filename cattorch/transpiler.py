@@ -4,7 +4,7 @@ import operator
 import warnings
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 import torch
 
@@ -12,7 +12,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
-from cattorch.frontend import Frontend
+from cattorch.frontend import Frontend, flat_example_inputs
 from cattorch.graph import (
     _GenerationSpec,
     _GraphInfo,
@@ -1611,14 +1611,16 @@ def transpile(
     calibration_sequences: Iterable[
         torch.Tensor | tuple[torch.Tensor, ...]
     ] | None = None,
+    example_kwargs: dict[str, Any] | None = None,
 ):
     """Export a PyTorch module as a Scratch ``.sprite3`` file.
 
     Parameters
     ----------
     model:
-        Evaluation-mode module to trace. Export-time weight transforms operate
-        on a copy and do not mutate this object.
+        Module to trace. Export-time weight transforms operate on an
+        evaluation-mode copy and do not mutate this object; modules left in
+        training mode are exported in evaluation mode with a warning.
     example_inputs:
         One tensor or a tuple defining a fixed interface, an ``ExportProgram``
         defining named methods and state, or a ``GenerationProgram`` defining
@@ -1657,6 +1659,12 @@ def transpile(
     adapters:
         Scoped module adapters for an ``ExportProgram`` or
         ``GenerationProgram``. They apply to an export-owned model copy.
+    example_kwargs:
+        Keyword arguments for the traced call, like ``torch.export``'s
+        ``kwargs``. Tensor values become inputs after the positional ones
+        (``input_k`` in order); other values, such as ``use_cache=False``, are
+        constants of the trace. Not valid for programs, and tensor values
+        cannot be combined with GPTQ ``calibration_inputs``.
 
     Returns
     -------
@@ -1674,7 +1682,14 @@ def transpile(
         name=name, optimization=optimization, fast_config=fast_config,
         storage=storage, quantization=quantization, codegen=codegen,
         sig_figs=sig_figs, frontend=frontend, adapters=adapters,
+        example_kwargs=example_kwargs,
     )
+    if example_kwargs is not None and isinstance(
+        example_inputs, (ExportProgram, GenerationProgram),
+    ):
+        raise ValueError(
+            "example_kwargs cannot be used with an ExportProgram or GenerationProgram"
+        )
     if isinstance(example_inputs, ExportProgram):
         if frontend != "fx":
             raise ValueError("ExportProgram is supported only by the FX frontend")
@@ -1756,6 +1771,7 @@ def transpile(
         calibration_inputs=calibration_inputs,
         codegen=codegen,
         frontend=frontend,
+        example_kwargs=example_kwargs,
     )
 
 
@@ -1776,6 +1792,7 @@ def _transpile(
     ] | None = None,
     codegen: CodegenConfig | None = None,
     frontend: Frontend = "fx",
+    example_kwargs: dict[str, Any] | None = None,
     _registry: OperatorRegistry | None = None,
     _generation_public_interface: bool = False,
     _prepared_model: bool = False,
@@ -1813,6 +1830,14 @@ def _transpile(
         quantization is None or quantization.method != "gptq"
     ):
         raise ValueError("calibration_inputs can only be used with GPTQ quantization")
+    if (
+        quantization is not None and quantization.method == "gptq"
+        and any(isinstance(value, torch.Tensor) for value in (example_kwargs or {}).values())
+    ):
+        raise ValueError(
+            "tensor-valued example_kwargs cannot be combined with GPTQ "
+            "calibration_inputs; pass those tensors positionally"
+        )
     quantization_report = _prepared_quantization_report
     if not _prepared_model:
         model = registry.adapt_model(model)
@@ -1820,13 +1845,12 @@ def _transpile(
             model = prepare_fast_model(model, config)
         model = fold_eval_batch_norms(model)
         if quantization is not None:
-            if quantization.method == "gptq" and model.training:
-                raise ValueError("GPTQ calibration requires model.eval()")
             quantization_report = quantize_model(
                 model,
                 quantization,
                 calibration_inputs,
                 orientation_inputs=[tuple(example_inputs)],
+                call_kwargs=example_kwargs,
                 _registry=registry,
             )
     elif calibration_inputs is not None:
@@ -1850,6 +1874,7 @@ def _transpile(
         frontend=frontend,
         _registry=registry,
         dynamic_inputs=_dynamic_inputs,
+        example_kwargs=example_kwargs,
     )
     if generation is not None and codegen.layer_sharing == "auto":
         if _bank_generation_caches(graph):
@@ -2141,7 +2166,7 @@ def _transpile(
                 else None
             ),
         )
-        for index, value in enumerate(example_inputs)
+        for index, value in enumerate(flat_example_inputs(example_inputs, example_kwargs))
     )
     procedures = ["cattorch init", "cattorch forward", "cattorch prepare for save"]
     if generation is not None:

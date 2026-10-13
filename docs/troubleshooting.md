@@ -14,14 +14,18 @@ Problems usually happen at one of three stages:
 
 ## Put the model in evaluation mode
 
-Call `model.eval()` before export. cattorch raises an error on training-mode
-dropout instead of quietly removing it.
+Call `model.eval()` before export. A model with modules still in training mode
+is exported as an evaluation-mode copy with a warning: dropout is disabled
+and batch norm uses its running statistics. Your model itself is unchanged.
 
 ## Keep one inference return path
 
 Tracing records a single path through `forward`. It can't follow `if`
-statements or loops that depend on tensor values. If training and inference
-return different things, export an inference-only method:
+statements or loops that depend on the model's inputs. Branches on values
+that only depend on shapes, parameters, buffers, or constants, such as a mask
+built from `torch.arange`, are fine: they are evaluated once during export.
+If training and inference return different things, export an inference-only
+method:
 
 ```python
 def forward(self, x, targets=None):
@@ -50,9 +54,11 @@ x = block(x)
 x = block(x)[0]
 ```
 
-The model's return value can only contain tensors. Several tensors, even in
-nested tuples, lists, or dictionaries, become `output`, `output_1`, and so on.
-Remove anything that isn't a tensor.
+Several returned tensors, even in nested tuples, lists, or dictionaries,
+become `output`, `output_1`, and so on. Anything that isn't a tensor, such as
+`None` or a Hugging Face `DynamicCache`, is skipped with a warning naming it.
+For Hugging Face decoders, pass `example_kwargs={"use_cache": False}` to skip
+building the cache.
 
 ## Treat example inputs as the interface
 

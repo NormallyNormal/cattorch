@@ -13,6 +13,7 @@ class Outputs(torch.nn.Module):
     def __init__(self, function):
         super().__init__()
         self.function = function
+        self.eval()
 
     def forward(self, value):
         return self.function(value)

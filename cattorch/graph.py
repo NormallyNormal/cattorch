@@ -215,6 +215,29 @@ class _GraphInfo:
         )
 
 
+def _drop_empty_cat_inputs(graph) -> None:
+    """Remove zero-element tensors from ``cat`` and the nodes only they fed.
+
+    Caches start as empty tensors that are concatenated with the first keys
+    and values. Scratch has nothing to copy for them, so they never reach
+    lowering.
+    """
+    def empty(value) -> bool:
+        meta = getattr(value, "meta", {}).get("val")
+        return isinstance(meta, torch.Tensor) and meta.numel() == 0
+
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.cat.default":
+            continue
+        pieces = list(node.args[0])
+        kept = [value for value in pieces if not empty(value)]
+        if kept and len(kept) != len(pieces):
+            node.args = (kept,) + tuple(node.args[1:])
+    for node in reversed(list(graph.nodes)):
+        if node.op in {"call_function", "get_attr"} and not node.users and empty(node):
+            graph.erase_node(node)
+
+
 def _prepare_graph(
     model,
     example_inputs,
@@ -225,6 +248,7 @@ def _prepare_graph(
     frontend: Frontend = "fx",
     _registry: OperatorRegistry | None = None,
     dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
+    example_kwargs: dict | None = None,
     _captured: CapturedGraph | None = None,
 ) -> _GraphInfo:
     """Capture the model, decompose ops, and analyze the graph structure."""
@@ -234,7 +258,10 @@ def _prepare_graph(
     registry = _registry or default_registry()
     from cattorch.moe import _expert_family_context
     with _expert_family_context(registry.expert_families):
-        captured = _captured or capture_model(model, example_inputs, frontend=frontend)
+        captured = _captured or capture_model(
+            model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
+        )
+    _drop_empty_cat_inputs(captured.graph)
     nodes = list(captured.graph.nodes)
     dynamic_inputs = dynamic_inputs or {}
     placeholders = [

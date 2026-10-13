@@ -37,7 +37,7 @@ def test_program_exports_multiple_named_outputs(tmp_path):
         returns=(Output("plus one"), Output("doubled")),
     ),))
     result = transpile(
-        Model(), program, tmp_path / "program",
+        Model().eval(), program, tmp_path / "program",
         codegen=CodegenConfig(compact_internal_names=True),
     )
     assert isinstance(result, ProgramResult)
@@ -68,7 +68,7 @@ def test_program_replace_state_is_transactional_and_resettable(tmp_path):
             returns=(Output("value"), StateUpdate("counter")),
         ),),
     )
-    result = transpile(Counter(), program, tmp_path / "state")
+    result = transpile(Counter().eval(), program, tmp_path / "state")
     emulator = _emulator(result)
     emulator.lists["cattorch step delta"] = [3.0, 4.0]
     emulator.run_procedure("cattorch step")
@@ -82,7 +82,7 @@ def test_program_replace_state_is_transactional_and_resettable(tmp_path):
     emulator.run_procedure("cattorch reset")
     assert emulator.lists["cattorch state counter"] == [1.0, 2.0]
     comparison = verify(
-        Counter(), program, result,
+        Counter().eval(), program, result,
         calls=(
             ProgramCall("step", (torch.tensor([3.0, 4.0]),)),
         ),
@@ -116,7 +116,7 @@ def test_scoped_public_adapter_uses_module_path_and_does_not_mutate_source(tmp_p
     program = ExportProgram(entrypoints=(EntryPoint(
         "forward", arguments=(Input("value", example),), returns=(Output("value"),),
     ),))
-    model = Model()
+    model = Model().eval()
     result = transpile(model, program, tmp_path / "adapter", adapters=(adapter,))
     emulator = _emulator(result)
     emulator.lists["cattorch forward value"] = [2.0]
@@ -189,7 +189,7 @@ def test_program_merges_multiple_entrypoints_and_shared_state(tmp_path):
             ),
         ),
     )
-    result = transpile(Model(), program, tmp_path / "multiple")
+    result = transpile(Model().eval(), program, tmp_path / "multiple")
     emulator = _emulator(result)
     emulator.lists["cattorch add value"] = [3.0]
     emulator.run_procedure("cattorch add")
@@ -215,7 +215,7 @@ def test_append_state_capacity_failure_does_not_partially_commit(tmp_path):
             returns=(StateUpdate("rows"),),
         ),),
     )
-    result = transpile(Writer(), program, tmp_path / "append")
+    result = transpile(Writer().eval(), program, tmp_path / "append")
     emulator = _emulator(result)
     emulator.lists["cattorch write value"] = [1.0, 2.0]
     emulator.run_procedure("cattorch write")
@@ -276,7 +276,7 @@ def test_runtime_extent_can_move_through_transpose(tmp_path):
             returns=(Output("values"),),
         ),),
     )
-    result = transpile(Reader(), program, tmp_path / "dynamic-transpose")
+    result = transpile(Reader().eval(), program, tmp_path / "dynamic-transpose")
     assert result.entrypoints[0].outputs[0].shape == (
         2, BoundedDimension("rows", 0, 4), 3,
     )

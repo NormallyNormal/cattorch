@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch import CattorchError, StorageConfig, transpile, verify
+from cattorch import CattorchError, UnsupportedModelError, StorageConfig, transpile, verify
 from cattorch.graph import _prepare_graph
 
 
@@ -230,6 +230,225 @@ def test_huggingface_bert_classifier(tmp_path):
             return self.model(input_ids=tokens).logits
 
     _export_and_verify(tmp_path, Wrapper(), (torch.tensor([[2, 7, 4, 3]]),))
+
+
+class StaticBranch(nn.Module):
+    def forward(self, x):
+        # Depends only on a shape, so the branch is fixed while tracing.
+        if (torch.arange(x.shape[-1]) == 0).any():
+            return x * 2.0
+        return x + 1.0
+
+
+class NoGradInside(nn.Module):
+    def forward(self, x):
+        with torch.no_grad():
+            scale = x.new_ones(1) * 3.0
+        return x * scale
+
+
+class CatEmpty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("past", torch.zeros(2, 0))
+
+    def forward(self, x):
+        return torch.cat([self.past, x, torch.empty(2, 0)], dim=1) * 2.0
+
+
+def test_static_item_branch_exports(tmp_path):
+    _export_and_verify(tmp_path, StaticBranch(), (VECTOR,))
+
+
+def test_input_dependent_item_still_rejected(tmp_path):
+    for function in (lambda x: x * x.sum().item(), lambda x: x * 2 if x.sum() > 0 else x):
+        with pytest.raises(UnsupportedModelError):
+            transpile(Lambda(function).eval(), (VECTOR,), tmp_path / "model")
+
+
+def test_no_grad_inside_forward_exports(tmp_path):
+    _export_and_verify(tmp_path, NoGradInside(), (VECTOR,))
+
+
+def test_cat_with_empty_tensor_exports(tmp_path):
+    _export_and_verify(tmp_path, CatEmpty(), (VECTOR,))
+
+
+def _tiny_decoder(kind):
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(5)
+    common = dict(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, vocab_size=64,
+        max_position_embeddings=16,
+    )
+    if kind == "gpt2":
+        return transformers.GPT2LMHeadModel(transformers.GPT2Config(
+            n_embd=32, n_layer=1, n_head=2, vocab_size=64, n_positions=16,
+        ))
+    if kind == "llama":
+        return transformers.LlamaForCausalLM(transformers.LlamaConfig(**common))
+    return transformers.Qwen2ForCausalLM(transformers.Qwen2Config(**common))
+
+
+class LogitsOnly(nn.Module):
+    def __init__(self, model, use_cache):
+        super().__init__()
+        self.model = model
+        self.use_cache = use_cache
+
+    def forward(self, tokens):
+        return self.model(tokens, use_cache=self.use_cache).logits
+
+
+@pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
+def test_huggingface_decoder_logits(tmp_path, kind):
+    wrapper = LogitsOnly(_tiny_decoder(kind), use_cache=False)
+    _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
+
+
+def test_huggingface_gpt2_with_cache_dropped(tmp_path):
+    wrapper = LogitsOnly(_tiny_decoder("gpt2"), use_cache=True)
+    _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
+
+
+@pytest.mark.parametrize("kind", ["gpt2", "llama"])
+@pytest.mark.parametrize("cache", ["off", "left on"])
+def test_unwrapped_huggingface_decoder(tmp_path, kind, cache):
+    model = _tiny_decoder(kind).eval()
+    ids = torch.randint(0, 64, (1, 8))
+    kwargs = {"use_cache": False} if cache == "off" else None
+    if kwargs is None:
+        with pytest.warns(UserWarning, match="past_key_values"):
+            result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
+    else:
+        result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
+    assert verify(model, (ids,), result, example_kwargs=kwargs).passed
+
+
+def test_huggingface_model_in_training_mode_warns_and_stays_training(tmp_path):
+    model = _tiny_decoder("gpt2")
+    assert model.training
+    ids = torch.randint(0, 64, (1, 8))
+    kwargs = {"use_cache": False}
+    with pytest.warns(UserWarning, match="training mode"):
+        result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
+    with pytest.warns(UserWarning, match="training mode"):
+        assert verify(model, (ids,), result, example_kwargs=kwargs).passed
+    assert model.training
+
+
+class KeywordMask(nn.Module):
+    def forward(self, x, *, mask, scale=1.0, label=None):
+        return x * mask * scale
+
+
+def test_tensor_keyword_becomes_next_input(tmp_path):
+    x, mask = torch.randn(2, 4), torch.tensor([[1.0, 0.0, 1.0, 1.0]])
+    kwargs = {"mask": mask, "scale": 2.0, "label": "ignored"}
+    model = KeywordMask().eval()
+    result = transpile(model, (x,), tmp_path / "model", example_kwargs=kwargs)
+    assert [spec.list_name for spec in result.inputs] == ["input", "input_1"]
+    assert tuple(result.inputs[1].shape) == (1, 4)
+    assert verify(model, (x,), result, example_kwargs=kwargs).passed
+
+
+def test_tensor_keyword_with_export_frontend(tmp_path):
+    x, mask = torch.randn(2, 4), torch.ones(1, 4)
+    kwargs = {"mask": mask}
+    model = KeywordMask().eval()
+    result = transpile(
+        model, (x,), tmp_path / "model", example_kwargs=kwargs, frontend="export",
+    )
+    assert verify(model, (x,), result, example_kwargs=kwargs).passed
+
+
+class DictOutputs(nn.Module):
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+
+    def forward(self, x):
+        if self.kind == "dict":
+            return {"logits": x * 2.0, "cache": None, "count": 3, "extra": (x + 1.0, None)}
+        transformers = pytest.importorskip("transformers")
+        return transformers.modeling_outputs.CausalLMOutputWithPast(
+            logits=x * 2.0, past_key_values=transformers.DynamicCache(),
+            hidden_states=(x + 1.0,),
+        )
+
+
+@pytest.mark.parametrize("kind", ["dict", "model output"])
+def test_non_tensor_output_leaves_are_dropped_with_a_warning(tmp_path, kind):
+    model = DictOutputs(kind).eval()
+    with pytest.warns(UserWarning, match="ignoring non-tensor model outputs") as record:
+        result = transpile(model, (VECTOR,), tmp_path / "model")
+    assert len(result.outputs) == 2
+    text = str(record[0].message)
+    assert ("output['cache'] (NoneType)" in text) if kind == "dict" else (
+        "output['past_key_values'] (DynamicCache)" in text
+    )
+    assert verify(model, (VECTOR,), result).passed
+
+
+def test_output_without_tensors_is_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match="at least one tensor output"):
+        transpile(Lambda(lambda x: {"a": None, "b": 1}).eval(), (VECTOR,), tmp_path / "model")
+
+
+class WithDropout(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(8, 8)
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        return self.dropout(self.linear(x))
+
+
+def test_training_mode_model_exports_in_evaluation_mode(tmp_path):
+    torch.manual_seed(3)
+    model = WithDropout().train()
+    with pytest.warns(UserWarning) as record:
+        result = transpile(model, (VECTOR,), tmp_path / "model")
+    assert [str(w.message).count("evaluation mode") for w in record] == [1]
+    assert model.training and model.dropout.training
+    with pytest.warns(UserWarning, match="training mode"):
+        assert verify(model, (VECTOR,), result).passed
+    assert model.training
+
+
+def test_example_kwargs_rejections(tmp_path):
+    from cattorch import QuantizationConfig
+    from cattorch.experimental import (
+        EntryPoint, ExportProgram, GenerationProgram, Input, Output,
+    )
+    model = KeywordMask().eval()
+    x, mask = torch.randn(2, 4), torch.ones(1, 4)
+    program = ExportProgram(entrypoints=(
+        EntryPoint("run", arguments=(Input("x", x),), returns=(Output("y"),)),
+    ))
+    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+        transpile(model, program, tmp_path / "a", example_kwargs={"mask": mask})
+    generation = GenerationProgram(
+        "forward", torch.zeros(1, 1, dtype=torch.long), max_context=4,
+    )
+    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+        transpile(model, generation, tmp_path / "b", example_kwargs={"mask": mask})
+    with pytest.raises(TypeError, match="dict with string keys"):
+        transpile(model, (x,), tmp_path / "c", example_kwargs=[("mask", mask)])
+    with pytest.raises(TypeError, match="dict with string keys"):
+        transpile(model, (x,), tmp_path / "c", example_kwargs={1: mask})
+    with pytest.raises(ValueError, match="GPTQ"):
+        transpile(
+            WithDropout().eval(), (VECTOR,), tmp_path / "d",
+            quantization=QuantizationConfig(bits=4, method="gptq"),
+            calibration_inputs=[VECTOR],
+            example_kwargs={"mask": mask},
+        )
+    result = transpile(model, (x,), tmp_path / "e", example_kwargs={"mask": mask})
+    with pytest.raises(ValueError, match="ExportProgram"):
+        verify(model, program, result, example_kwargs={"mask": mask})
 
 
 IMAGE = torch.randn(1, 4, 6, 6)

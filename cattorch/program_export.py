@@ -403,8 +403,6 @@ def transpile_program(
     quantization_report = None
     resolved_storage = storage or StorageConfig()
     if quantization is not None:
-        if quantization.method == "gptq" and prepared_model.training:
-            raise ValueError("GPTQ calibration requires model.eval()")
         gptq = quantization.method == "gptq"
         observed_calls = calls if gptq else default_program_calls(program)
         calibration_model = _ProgramCalibrationModule(

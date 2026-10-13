@@ -65,7 +65,7 @@ def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
     ]
     observed = {}
 
-    def fake_export(model, inputs):
+    def fake_export(model, inputs, kwargs=None):
         observed.update({name: getattr(config, name) for name in names})
         return "exported"
 
@@ -446,7 +446,7 @@ def test_dsl_auto_lowers_safe_index_mutation_to_for_each():
 @pytest.mark.parametrize("mode", ["exact", "fast"])
 def test_optimization_modes_preserve_results(tmp_path, mode):
     torch.manual_seed(4)
-    model = LinearActivation()
+    model = LinearActivation().eval()
     x = torch.randn(2, 3)
     expected = model(x).flatten().tolist()
     path = tmp_path / mode
@@ -487,7 +487,7 @@ def test_fast_layer_config_rejects_invalid_values(kwargs):
 @pytest.mark.parametrize("mode", ["exact", "fast"])
 def test_multi_head_causal_softmax_broadcasts_mask_and_stays_finite(tmp_path, mode):
     torch.manual_seed(8)
-    model = MultiHeadCausalSoftmax()
+    model = MultiHeadCausalSoftmax().eval()
     scores = torch.randn(1, 2, 4, 4)
     path = tmp_path / f"causal_{mode}"
     transpile(model, scores, str(path), optimization=mode)
@@ -501,7 +501,7 @@ def test_multi_head_causal_softmax_broadcasts_mask_and_stays_finite(tmp_path, mo
 
 def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
     torch.manual_seed(5)
-    model = LinearActivation()
+    model = LinearActivation().eval()
     first = torch.randn(2, 3)
     second = torch.randn(2, 3)
     path = tmp_path / "lifecycle"
@@ -525,7 +525,7 @@ def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
 
 
 def test_exact_linear_uses_direct_weight_layout_and_fuses_epilogue(tmp_path):
-    model = LinearActivation()
+    model = LinearActivation().eval()
     x = torch.randn(2, 3)
     base = tmp_path / "exact"
     transpile(model, x, str(base), optimization="exact")
@@ -636,7 +636,7 @@ def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
 
 def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
     torch.manual_seed(27)
-    model = ArithmeticChain()
+    model = ArithmeticChain().eval()
     inputs = tuple(torch.randn(2, 3) for _ in range(3))
     graph = _prepare_graph(model, inputs, optimization="exact")
     assert len(graph.elementwise_fusions) == 1
@@ -660,7 +660,7 @@ def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
 
 def test_paired_benchmark_project_and_analyzer(tmp_path):
     project_path = build_paired_benchmark(
-        LinearActivation(), torch.randn(2, 3), tmp_path / "paired.sb3",
+        LinearActivation().eval(), torch.randn(2, 3), tmp_path / "paired.sb3",
         warmups=1, repeats=3,
     )
     with zipfile.ZipFile(project_path) as archive:
@@ -711,8 +711,8 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
 def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
     suite_path = build_benchmark_suite(
         [
-            ("first", LinearActivation(), torch.randn(2, 3)),
-            ("second", LinearActivation(), torch.randn(2, 3)),
+            ("first", LinearActivation().eval(), torch.randn(2, 3)),
+            ("second", LinearActivation().eval(), torch.randn(2, 3)),
         ],
         tmp_path / "suite.sb3",
         iterations=3,
@@ -785,7 +785,7 @@ def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
         weights=FastLayerConfig(pruning=0.5),
     )
     suite_path = build_benchmark_suite(
-        [("linear", nn.Linear(16, 12), torch.randn(2, 16), case_config)],
+        [("linear", nn.Linear(16, 12).eval(), torch.randn(2, 16), case_config)],
         tmp_path / "fast_suite.sb3",
         iterations=10,
     )
@@ -820,7 +820,7 @@ def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
 
 def test_nonfinite_values_are_valid_json_and_keep_scratch_semantics(tmp_path):
     path = tmp_path / "causal"
-    transpile(CausalMask(), torch.randn(3, 3), str(path))
+    transpile(CausalMask().eval(), torch.randn(3, 3), str(path))
     with zipfile.ZipFile(path.with_suffix(".sprite3")) as archive:
         raw = archive.read("sprite.json").decode()
 
@@ -835,7 +835,7 @@ def test_nonfinite_values_are_valid_json_and_keep_scratch_semantics(tmp_path):
 
 def test_exact_adaptive_pool_handles_nonuniform_receptive_fields(tmp_path):
     torch.manual_seed(19)
-    model = NonDivisibleAdaptivePool()
+    model = NonDivisibleAdaptivePool().eval()
     x = torch.randn(1, 2, 5, 7)
     expected = model(x)
     path = tmp_path / "adaptive_nonuniform"
@@ -849,7 +849,7 @@ def test_exact_adaptive_pool_handles_nonuniform_receptive_fields(tmp_path):
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        (nn.GELU(approximate="tanh"), lambda x: x * torch.sigmoid(1.702 * x)),
+        (nn.GELU(approximate="tanh").eval(), lambda x: x * torch.sigmoid(1.702 * x)),
     ],
     ids=("quick_gelu",),
 )
@@ -909,7 +909,7 @@ def test_swiglu_fusion_is_exact_in_both_modes(tmp_path, mode):
 
 def test_fast_layernorm_matches_one_pass_formula(tmp_path):
     torch.manual_seed(23)
-    model = nn.LayerNorm(8)
+    model = nn.LayerNorm(8).eval()
     x = torch.randn(4, 8)
     mean = x.double().mean(dim=-1, keepdim=True)
     variance = x.double().square().mean(dim=-1, keepdim=True) - mean.square()
@@ -1114,7 +1114,7 @@ def test_fast_transposed_static_matmul_is_transformed(tmp_path):
 
 def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
     torch.manual_seed(38)
-    model = DynamicMatmul()
+    model = DynamicMatmul().eval()
     left = torch.randn(2, 3, 8)
     right = torch.randn(2, 8, 5)
     path = tmp_path / "dynamic_matmul"
@@ -1723,7 +1723,7 @@ def test_exact_elementwise_supports_general_pytorch_broadcasting(
     left = torch.randn(left_shape)
     right = torch.randn(right_shape)
     path = tmp_path / f"broadcast_{len(left_shape)}_{len(right_shape)}"
-    transpile(Add(), (left, right), str(path), storage=StorageConfig(compression=False))
+    transpile(Add().eval(), (left, right), str(path), storage=StorageConfig(compression=False))
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
@@ -1743,7 +1743,7 @@ def test_identity_model_materializes_a_distinct_output(tmp_path):
 
     value = torch.randn(2, 3)
     path = tmp_path / "identity"
-    transpile(Identity(), value, str(path))
+    transpile(Identity().eval(), value, str(path))
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     assert {entry[0] for entry in sprite["lists"].values()} >= {"input", "output"}
     torch.testing.assert_close(
@@ -1756,13 +1756,17 @@ def test_multiple_model_outputs_are_preserved(tmp_path):
         def forward(self, value):
             return value + 1, value * 2
 
-    result = transpile(Pair(), torch.ones(2), str(tmp_path / "pair"))
+    result = transpile(Pair().eval(), torch.ones(2), str(tmp_path / "pair"))
     assert tuple(value.list_name for value in result.outputs) == ("output", "output_1")
 
 
-def test_training_dropout_is_rejected_instead_of_silently_removed(tmp_path):
-    with pytest.raises(UnsupportedOperationError, match=r"model\.eval\(\)"):
-        transpile(nn.Dropout(0.5).train(), torch.ones(4), str(tmp_path / "dropout"))
+def test_training_dropout_is_exported_as_an_evaluation_copy(tmp_path):
+    model = nn.Dropout(0.5).train()
+    with pytest.warns(UserWarning, match="training mode"):
+        result = transpile(model, torch.ones(4), str(tmp_path / "dropout"))
+    assert model.training
+    with pytest.warns(UserWarning, match="training mode"):
+        assert verify(model, torch.ones(4), result).passed
 
 
 def test_runtime_integer_cast_truncates_toward_zero(tmp_path):
@@ -1772,7 +1776,7 @@ def test_runtime_integer_cast_truncates_toward_zero(tmp_path):
 
     value = torch.tensor([1.2, -2.8, 0.0, 3.0])
     path = tmp_path / "dtype"
-    transpile(ToInteger(), value, str(path))
+    transpile(ToInteger().eval(), value, str(path))
     assert _run(_load_sprite(path.with_suffix(".sprite3")), value.tolist()) == [1, -2, 0, 3]
 
 
@@ -1795,7 +1799,7 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
     mask = torch.tensor([[True], [False]])
     path = tmp_path / "broadcast_mask"
     transpile(
-        Mask(), (value, mask), str(path),
+        Mask().eval(), (value, mask), str(path),
         storage=StorageConfig(compression=False),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
@@ -1853,7 +1857,7 @@ def test_transpile_returns_metadata_and_separates_path_from_sprite_name(tmp_path
 
 
 def test_transpile_defaults_sprite_name_to_path_stem_and_avoids_double_extension(tmp_path):
-    result = transpile(nn.ReLU(), torch.ones(2), tmp_path / "folder" / "relu.sprite3")
+    result = transpile(nn.ReLU().eval(), torch.ones(2), tmp_path / "folder" / "relu.sprite3")
     assert result.path.name == "relu.sprite3"
     assert result.sprite_name == "relu"
 
@@ -1861,7 +1865,7 @@ def test_transpile_defaults_sprite_name_to_path_stem_and_avoids_double_extension
 @pytest.mark.parametrize("sig_figs", [True, 0, -1, 1.5])
 def test_transpile_validates_significant_figures(tmp_path, sig_figs):
     with pytest.raises(ValueError, match="sig_figs"):
-        transpile(nn.ReLU(), torch.ones(2), tmp_path / "bad_sig_figs", sig_figs=sig_figs)
+        transpile(nn.ReLU().eval(), torch.ones(2), tmp_path / "bad_sig_figs", sig_figs=sig_figs)
 
 
 def test_verify_reports_exact_and_lossy_export_error(tmp_path):
@@ -1901,7 +1905,7 @@ def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
             return self.features(value)
 
     with pytest.raises(UnsupportedOperationError) as caught:
-        transpile(Model(), torch.ones(2), tmp_path / "lgamma")
+        transpile(Model().eval(), torch.ones(2), tmp_path / "lgamma")
     message = str(caught.value)
     assert "aten.lgamma.default" in message
     assert "module: features" in message

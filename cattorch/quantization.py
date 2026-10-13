@@ -348,6 +348,7 @@ def quantize_model(
     calibration_inputs: Iterable | None,
     *,
     orientation_inputs: Iterable | None = None,
+    call_kwargs: dict | None = None,
     _registry: OperatorRegistry | None = None,
 ) -> QuantizationReport:
     """Quantize eligible weights in-place and return a structured report.
@@ -359,6 +360,7 @@ def quantize_model(
     whether each matrix is used as a linear weight or on the right of a
     matmul. Both are then grouped over the matrix's input width, the layout
     Scratch storage uses. Without it, matrices keep their stored orientation.
+    ``call_kwargs`` are passed to every observed model call.
     """
     effective_ndims = expert_bank_effective_ndims(model)
 
@@ -400,7 +402,7 @@ def quantize_model(
         from cattorch.moe import _expert_family_context
         with torch.inference_mode(), _expert_family_context(registry.expert_families), capture:
             for raw_batch in observed_inputs:
-                model(*_normalize_batch(raw_batch))
+                model(*_normalize_batch(raw_batch), **(call_kwargs or {}))
                 batches += 1
         if config.method == "gptq" and batches == 0:
             raise ValueError("GPTQ requires nonempty calibration_inputs")

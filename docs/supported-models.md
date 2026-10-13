@@ -42,6 +42,18 @@ Llama-style attention written in plain PyTorch export without changes. A
 wrapper around a supported module can still fail, for example when a block
 returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
 
+Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without a
+wrapper. Their `ModelOutput` is unwrapped, and the cache is skipped:
+
+```python
+cattorch.transpile(model, (input_ids,), "model.sprite3",
+                   example_kwargs={"use_cache": False})
+```
+
+This exports a stateless forward pass over the example's sequence length. It
+doesn't add a KV cache; cached generation still uses
+[`GenerationProgram`](generation.md).
+
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
 requires an even final dimension.
@@ -65,13 +77,16 @@ broadcasting pattern, or option. The error names the operation that failed.
 ## Inputs and outputs
 
 - The first tensor argument is flattened into `input`; later tensor arguments
-  use `input_1`, `input_2`, and so on.
-- The model may return a tensor or a nested tuple, list, or dictionary of
-  tensors. Leaves are flattened into `output`, `output_1`, and so on in
-  PyTorch pytree order; non-tensor leaves are rejected.
+  use `input_1`, `input_2`, and so on. Tensor values in `example_kwargs`
+  follow the positional ones, in dict order.
+- The model may return a tensor or a nested tuple, list, dictionary, or
+  Hugging Face `ModelOutput` of tensors. Leaves are flattened into `output`,
+  `output_1`, and so on in order. Non-tensor leaves are skipped with a
+  warning; at least one tensor is required.
 - Input shapes are fixed to the shapes of the example values.
-- Training-mode behavior is rejected rather than dropped. For example,
-  training-mode dropout raises an error, so call `model.eval()` first.
+- A model with modules in training mode is exported as an evaluation-mode
+  copy, with a warning.
+- `torch.no_grad()` and `torch.autocast` blocks inside `forward` are ignored.
 - Scratch stores every value as a double. Conversions to a floating dtype,
   such as `x.float()` on integer token IDs, keep the value unchanged, including
   conversions to `float16`. Conversions to an integer dtype truncate toward zero,
@@ -79,7 +94,7 @@ broadcasting pattern, or option. The error names the operation that failed.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
-non-tensor return value, raise `UnsupportedModelError`.
+return value without any tensors, raise `UnsupportedModelError`.
 
 Run [`verify`](api-reference.md#verify) whenever you change the model or export
 options. If export fails, see [troubleshooting](troubleshooting.md).

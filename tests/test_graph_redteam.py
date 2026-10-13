@@ -13,6 +13,7 @@ class FunctionModel(nn.Module):
     def __init__(self, function):
         super().__init__()
         self.function = function
+        self.eval()
 
     def forward(self, *inputs):
         return self.function(*inputs)
@@ -169,12 +170,12 @@ def test_unsupported_semantic_variants_are_rejected(
 @pytest.mark.parametrize(
     "model",
     [
-        nn.Conv2d(2, 3, 3, dilation=2),
-        nn.Conv2d(4, 4, 3, groups=2),
-        nn.MaxPool2d(2, dilation=2),
-        nn.MaxPool2d(2, ceil_mode=True),
-        nn.AvgPool2d(3, padding=1, count_include_pad=False),
-        nn.AvgPool2d(2, divisor_override=7),
+        nn.Conv2d(2, 3, 3, dilation=2).eval(),
+        nn.Conv2d(4, 4, 3, groups=2).eval(),
+        nn.MaxPool2d(2, dilation=2).eval(),
+        nn.MaxPool2d(2, ceil_mode=True).eval(),
+        nn.AvgPool2d(3, padding=1, count_include_pad=False).eval(),
+        nn.AvgPool2d(2, divisor_override=7).eval(),
     ],
 )
 def test_unimplemented_convolution_and_pooling_options_are_rejected(
