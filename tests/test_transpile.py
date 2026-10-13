@@ -1344,7 +1344,7 @@ def test_pow_squared():
 def test_pow_general_is_rejected():
     model = PowGeneral()
     x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs for ln
-    with pytest.raises(UnsupportedOperationError, match="exponents 0 and 2"):
+    with pytest.raises(UnsupportedOperationError, match="integer exponents"):
         _run_sprite(model, x)
 
 

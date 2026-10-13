@@ -12,18 +12,34 @@ class ScopeManager:
         self.peak_lists = 0
         # Tracks how many times a node's output will be used
         self.ref_counts = defaultdict(int)
+        self._aliases = {}
 
-    def analyze_lifetimes(self, nodes, skip=None):
-        # Step 1: Count how many times each node is used as an input
-        # Skipped (aliased) nodes don't get counted — their consumers
-        # count against the source node instead.
+    def analyze_lifetimes(self, nodes, skip=None, aliases=None):
+        # Step 1: Count how many times each node is used as an input.
+        # Skipped (aliased) nodes don't get counted, and every use is charged
+        # to the alias root that owns the data, so a list stays live until
+        # the last read through any of its views. Graph outputs are pinned.
         skip = skip or set()
+        self._aliases = dict(aliases or {})
         for node in nodes:
             if node.name in skip:
                 continue
-            for arg in node.args:
-                if hasattr(arg, 'name'):
-                    self.ref_counts[arg.name] += 1
+            for root in self._roots(node):
+                self.ref_counts[root] += 1
+                if node.op == "output":
+                    # Never released: output lists are read after the run.
+                    self.ref_counts[root] += 1
+
+    def _roots(self, node):
+        roots = []
+        for value in node.all_input_nodes:
+            name = value.name
+            visited = set()
+            while name in self._aliases and name not in visited:
+                visited.add(name)
+                name = self._aliases[name]
+            roots.append(name)
+        return roots
 
     def get_list_for_node(self, node):
         # Step 2: Assign a list from the pool or create a new one
@@ -45,12 +61,9 @@ class ScopeManager:
 
     def release_dependencies(self, node):
         # Step 3: Check if inputs are finished. If so, recycle their lists.
-        for arg in node.args:
-            if hasattr(arg, 'name'):
-                if arg.name in self.assignments:
-                    self.ref_counts[arg.name] -= 1
-                    if self.ref_counts[arg.name] == 0:
-                        # Input is no longer needed by any future node!
-                        list_id = self.assignments[arg.name]
-                        self.release_list(list_id)
-                        # Optional: print(f"Recycling List T{list_id} (last used by {node.name})")
+        for name in self._roots(node):
+            if name in self.assignments:
+                self.ref_counts[name] -= 1
+                if self.ref_counts[name] == 0:
+                    # Input is no longer needed by any future node!
+                    self.release_list(self.assignments[name])

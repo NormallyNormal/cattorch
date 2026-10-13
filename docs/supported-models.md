@@ -15,23 +15,32 @@ For persistent state and bounded variable-length tensors, use an experimental
 | Category | Operations |
 |---|---|
 | Convolution | Batched `nn.Conv1d`, `nn.Conv2d`, with optional bias, stride, and padding; dilation and groups must be 1 |
-| Pooling | Batched `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool2d`; non-default dilation, ceiling, padding-count, and divisor options are rejected |
+| Pooling | Batched `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool1d/2d`, `nn.AdaptiveMaxPool1d/2d`; non-default dilation, ceiling, padding-count, and divisor options are rejected |
 | Linear algebra | `nn.Linear`, `@`, `torch.matmul`; two batched operands must have identical batch dimensions |
-| Activations | ReLU, sigmoid, tanh, GELU (tanh form), SiLU, leaky ReLU, ELU |
-| Normalization | BatchNorm1d/2d, LayerNorm, RMSNorm, `torch.rsqrt` |
-| Attention primitives | softmax, embeddings, registered-buffer `masked_fill`, `cattorch.rotary_embedding` |
-| Arithmetic | tensor/scalar `+`, `-`, `*`; scalar `/`; unary `-`; `torch.pow` with exponent 0 or 2 |
-| Reduction | `torch.mean` along one dimension or consecutive dimensions |
+| Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
+| Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
+| Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
+| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`; unary `-`; `exp`, `log`, `log10`, `sqrt`, `rsqrt`, `abs`, `floor`, `ceil`, `reciprocal`, `erf`, `sin`, `cos`; `clamp`; `torch.pow` with an integer exponent from -4 to 4 or ±0.5 |
+| Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `cumsum`, over any dimensions; `torch.topk` |
+| Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
-| Shape and layout | `view`, `reshape`, `flatten`, `contiguous`, `clone`, transpose, permute, `.T` |
-| Tensor composition | split, split-with-sizes, chunk, concat, fixed dimension slicing with a positive step |
+| Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
+| Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling, and `gather`, `index_select`, or indexing with indices that don't depend on the input |
+
+Any computation whose inputs are all parameters, buffers, or constants runs
+once during export, whatever operations it uses. Masks such as
+`self.bias[:, :, :T, :T] == 0` and RoPE tables built with `torch.arange` and
+`torch.outer` in `forward` are stored as weights and never run in Scratch.
 
 These operations cover many MLPs and CNNs, along with transformer components
 such as multi-head attention, combined QKV projections, rotary position
 embeddings, causal masks, pre-norm residual blocks, and SwiGLU gates. Support
 depends on the operations the model actually runs, not on its architecture
-name. A wrapper around a supported module can still fail, for example when a
-block returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
+name. `nn.MultiheadAttention`, `nn.TransformerEncoder`, and nanoGPT- or
+Llama-style attention written in plain PyTorch export without changes. A
+wrapper around a supported module can still fail, for example when a block
+returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
@@ -41,7 +50,14 @@ Mixture-of-experts layers are supported through the experimental
 `ExpertFamily` and `SparseMoE` classes; see
 [experimental programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
-RNNs are not supported.
+Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
+`var`, export when PyTorch can express them in terms of supported
+operations. They may run slower than an operation with a dedicated kernel.
+
+`nn.LSTM` and `nn.GRU` export for the fixed sequence length of the example,
+including stacked and bidirectional layers. Every time step is unrolled into
+its own blocks, so sprite size grows with sequence length and layer count.
+Check `expanded_json_bytes` for longer sequences.
 
 A listed operation can still be rejected for an unsupported shape,
 broadcasting pattern, or option. The error names the operation that failed.
@@ -56,8 +72,10 @@ broadcasting pattern, or option. The error names the operation that failed.
 - Input shapes are fixed to the shapes of the example values.
 - Training-mode behavior is rejected rather than dropped. For example,
   training-mode dropout raises an error, so call `model.eval()` first.
-- Casting a runtime tensor to a different dtype, such as `x.float()` on an
-  integer input, is rejected.
+- Scratch stores every value as a double. Conversions to a floating dtype,
+  such as `x.float()` on integer token IDs, keep the value unchanged, including
+  conversions to `float16`. Conversions to an integer dtype truncate toward zero,
+  and conversions to `bool` produce 0 or 1.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a

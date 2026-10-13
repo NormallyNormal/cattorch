@@ -392,6 +392,12 @@ class ScratchEmulator:
                 if math.isinf(value):
                     return math.inf
                 return math.log(value) if op == "ln" else math.log10(value)
+            elif op in {"sin", "cos"}:
+                # scratch-vm: Math.round(Math.sin(Math.PI * n / 180) * 1e10) / 1e10
+                if not math.isfinite(value):
+                    return math.nan
+                function = math.sin if op == "sin" else math.cos
+                return math.floor(function(math.pi * value / 180) * 1e10 + 0.5) / 1e10
             elif op == "10 ^":
                 try:
                     return 10.0 ** value

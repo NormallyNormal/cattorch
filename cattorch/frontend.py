@@ -6,13 +6,16 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Literal
 
-import torch
+import contextlib
+import functools
 import math
+
+import torch
 from torch.fx import Graph, GraphModule, Node
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.export import export
 from torch.utils._pytree import tree_flatten
-from torch._decomp import get_decompositions
+from torch._decomp import core_aten_decompositions, get_decompositions
 
 from cattorch.errors import UnsupportedModelError
 
@@ -142,11 +145,6 @@ def _sdpa_decomposition(
     """Fixed-shape math SDPA using operations with proven Scratch kernels."""
     if dropout_p != 0:
         raise RuntimeError("cattorch SDPA decomposition requires dropout_p=0")
-    if attn_mask is not None:
-        raise RuntimeError(
-            "cattorch SDPA decomposition currently requires attn_mask=None; "
-            "express a static mask with masked_fill outside SDPA"
-        )
     if enable_gqa:
         repeats = query.shape[-3] // key.shape[-3]
         key = _repeat_interleave_decomposition(key, repeats, -3)
@@ -164,18 +162,261 @@ def _sdpa_decomposition(
             dtype=torch.bool,
         )
         scores = torch.ops.aten.masked_fill.Scalar(scores, mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = torch.ops.aten.masked_fill.Scalar(
+                scores, torch.ops.aten.logical_not.default(attn_mask), float("-inf"),
+            )
+        else:
+            scores = torch.ops.aten.add.Tensor(scores, attn_mask)
     probabilities = torch.ops.aten.softmax.int(scores, -1)
     return torch.ops.aten.matmul.default(probabilities, value)
 
 
+def _extreme_with_index(extreme, argument):
+    def decomposition(value, dim, keepdim=False):
+        return (
+            extreme(value, [dim], keepdim),
+            argument(value, dim, keepdim),
+        )
+    return decomposition
+
+
+def _prims_var(value, dims, correction, *, output_dtype=None):
+    dims = list(range(value.ndim)) if dims is None else list(dims)
+    count = 1
+    for dim in dims:
+        count *= value.shape[dim]
+    centered = torch.ops.aten.sub.Tensor(
+        value, torch.ops.aten.mean.dim(value, dims, True),
+    )
+    squares = torch.ops.aten.mul.Tensor(centered, centered)
+    total = torch.ops.aten.sum.dim_IntList(squares, dims)
+    return torch.ops.aten.div.Tensor(total, max(count - correction, 0))
+
+
+def _prims_broadcast_in_dim(value, shape, broadcast_dimensions):
+    view_shape = [1] * len(shape)
+    for source, target in enumerate(broadcast_dimensions):
+        view_shape[target] = value.shape[source]
+    return torch.ops.aten.expand.default(
+        torch.ops.aten.reshape.default(value, view_shape), list(shape),
+    )
+
+
+# Some PyTorch decompositions are written against primitives. Map the ones
+# that reach models back to ATen operations cattorch lowers.
+_PRIMITIVE_DECOMPOSITIONS = {
+    "var": _prims_var,
+    "broadcast_in_dim": _prims_broadcast_in_dim,
+    "sum": lambda value, dims, *, output_dtype=None: torch.ops.aten.sum.dim_IntList(
+        value, list(dims) if dims is not None else None,
+    ),
+    "log1p": lambda value: torch.ops.aten.log.default(
+        torch.ops.aten.add.Tensor(value, 1),
+    ),
+    "expm1": lambda value: torch.ops.aten.sub.Tensor(
+        torch.ops.aten.exp.default(value), 1,
+    ),
+}
+
+
+def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
+    # Scratch always produces sorted results; unsorted order is unspecified.
+    return (
+        torch.ops.cattorch.topk_values(value, k, dim, largest),
+        torch.ops.cattorch.topk_indices(value, k, dim, largest),
+    )
+
+
+def _resolve_operator(name: str):
+    """Return the ``OpOverload`` for a dispatcher name like ``aten::outer``."""
+    qualified, _, overload = name.partition(".")
+    packet_name = qualified.split("::", 1)[1]
+    try:
+        packet = getattr(torch.ops.aten, packet_name)
+        return getattr(packet, overload or "default")
+    except (AttributeError, RuntimeError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _available_decompositions() -> dict:
+    """Every ATen decomposition PyTorch provides, by operator overload.
+
+    Registered decompositions come first. Composite operations, which PyTorch
+    implements in terms of other operations but keeps whole when capturing
+    before autograd, decompose through ``OpOverload.decompose``.
+    """
+    table = {}
+    for source in (core_aten_decompositions(), torch._decomp.decomposition_table):
+        for operator, function in source.items():
+            if isinstance(operator, torch._ops.OpOverload):
+                table.setdefault(operator, function)
+    for name in torch._C._dispatch_get_all_op_names():
+        if not name.startswith("aten::") or not torch._C._dispatch_has_kernel_for_dispatch_key(
+            name, "CompositeImplicitAutograd",
+        ):
+            continue
+        operator = _resolve_operator(name)
+        if operator is not None and operator not in table:
+            table[operator] = operator.decompose
+    return table
+
+
+class _TensorView:
+    """Minimal ``fx.Node`` stand-in so validators can inspect live arguments."""
+
+    name = "argument"
+
+    def __init__(self, value):
+        self.meta = {"val": value}
+
+
+class _CallView:
+    def __init__(self, operator, args, kwargs):
+        self.target = operator
+        self.args = tuple(
+            _TensorView(value) if isinstance(value, torch.Tensor) else value
+            for value in args
+        )
+        self.kwargs = kwargs
+
+
+def _decompose_when_rejected(operator, validator, decomposition):
+    from cattorch.fast import FastConfig
+
+    def conditional(*args, **kwargs):
+        if validator(_CallView(operator, args, kwargs), FastConfig(), False) is None:
+            return NotImplemented
+        return decomposition(*args, **kwargs)
+    return conditional
+
+
+# Operations with a kernel whose validator can reject some calls, and whose
+# PyTorch decomposition leads to operations cattorch supports. Other rejected
+# calls keep their operation so the error names it and gives the reason.
+# ``matmul`` stays whole even when rejected: the cached-attention recognizer
+# depends on seeing broadcasting matmuls as written.
+_DECOMPOSE_WHEN_REJECTED = frozenset({"aten.batch_norm.default"})
+
+
 def _fx_decompositions() -> dict:
-    table = get_decompositions((torch.ops.aten.stack.default,))
+    """Decompose every operation cattorch can't lower directly.
+
+    Operations with a registered kernel, or that graph analysis handles itself,
+    are kept whole. Everything else becomes PyTorch's decomposition, repeated
+    until the graph only contains kept operations or ones with no
+    decomposition.
+    """
+    from cattorch.graph import _graph_handled_operations
+    from cattorch.operator_registry import default_registry
+
+    registry = default_registry()
+    kept = _graph_handled_operations()
+    primitives = _primitive_decompositions()
+    table = {}
+    for operator, decomposition in _available_decompositions().items():
+        name = str(operator)
+        rule = registry.operation(name)
+        # An operation whose reference is a same-named primitive with no
+        # mapping back to ATen would only rename the unsupported operation.
+        packet = operator.overloadpacket.__name__
+        dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
+        if rule is None and name not in kept and not dead_end:
+            table[operator] = decomposition
+        elif (
+            rule is not None and rule.validator is not None
+            and name in _DECOMPOSE_WHEN_REJECTED
+        ):
+            table[operator] = _decompose_when_rejected(
+                operator, rule.validator, decomposition,
+            )
+    table.update(get_decompositions((torch.ops.aten.stack.default,)))
     table.update({
         torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
         torch.ops.aten.select.int: _select_decomposition,
         torch.ops.aten.scaled_dot_product_attention.default: _sdpa_decomposition,
+        torch.ops.aten.max.dim: _extreme_with_index(
+            torch.ops.aten.amax.default, torch.ops.aten.argmax.default,
+        ),
+        torch.ops.aten.min.dim: _extreme_with_index(
+            torch.ops.aten.amin.default, torch.ops.aten.argmin.default,
+        ),
+        torch.ops.aten.topk.default: _topk_decomposition,
+    })
+    for name, decomposition in primitives.items():
+        table[getattr(torch.ops.prims, name).default] = decomposition
+    return table
+
+
+# Elementwise primitives with an ATen operation of the same name and meaning.
+_ELEMENTWISE_PRIMITIVES = (
+    "add", "sub", "mul", "neg", "exp", "log", "sqrt", "rsqrt", "abs", "sin",
+    "cos", "tanh", "erf", "floor", "ceil", "reciprocal", "maximum", "minimum",
+    "where", "eq", "ne", "lt", "le", "gt", "ge", "bitwise_not", "sign",
+)
+
+
+def _primitive_decompositions() -> dict:
+    aten = torch.ops.aten
+
+    def same_named(name):
+        packet = getattr(aten, name)
+        overload = "Tensor" if "Tensor" in packet.overloads() else (
+            "self" if "self" in packet.overloads() else "default"
+        )
+        return getattr(packet, overload)
+
+    def divide(left, right):
+        integers = all(
+            not isinstance(value, torch.Tensor) or not value.is_floating_point()
+            for value in (left, right)
+        ) and not any(isinstance(value, float) for value in (left, right))
+        if integers:
+            return aten.div.Tensor_mode(left, right, rounding_mode="trunc")
+        return aten.div.Tensor(left, right)
+
+    def power(base, exponent):
+        if isinstance(exponent, torch.Tensor):
+            return aten.pow.Tensor_Tensor(base, exponent)
+        return aten.pow.Tensor_Scalar(base, exponent)
+
+    table = {}
+    for name in _ELEMENTWISE_PRIMITIVES:
+        try:
+            table[name] = same_named(name)
+        except AttributeError:
+            continue
+    table.update(_PRIMITIVE_DECOMPOSITIONS)
+    table.update({
+        "div": divide,
+        "pow": power,
+        "convert_element_type": lambda value, dtype: aten.to.dtype(value, dtype),
+        "reshape": lambda value, shape: aten.reshape.default(value, list(shape)),
+        "squeeze": lambda value, dims: aten.squeeze.dims(value, list(dims)),
+        "transpose": lambda value, permutation: aten.permute.default(
+            value, list(permutation),
+        ),
+        "view_of": lambda value: aten.alias.default(value),
+        "amax": lambda value, dims, *, output_dtype=None: aten.amax.default(
+            value, list(dims) if dims is not None else [],
+        ),
+        "amin": lambda value, dims, *, output_dtype=None: aten.amin.default(
+            value, list(dims) if dims is not None else [],
+        ),
     })
     return table
+
+
+@contextlib.contextmanager
+def _onednn_disabled():
+    enabled = torch._C._get_mkldnn_enabled()
+    torch._C._set_mkldnn_enabled(False)
+    try:
+        yield
+    finally:
+        torch._C._set_mkldnn_enabled(enabled)
 
 
 def _capture_fx(model, example_inputs) -> CapturedGraph:
@@ -186,14 +427,17 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
 
     forward._orig_mod = model  # type: ignore[attr-defined]
     try:
-        graph_module = make_fx(
-            forward,
-            decomposition_table=_fx_decompositions(),
-            tracing_mode="real",
-            pre_dispatch=True,
-            record_module_stack=True,
-            _error_on_data_dependent_ops=True,
-        )(*example_inputs)
+        # With oneDNN enabled, PyTorch's LSTM decomposition emits an
+        # oneDNN-only operation instead of the portable cell arithmetic.
+        with _onednn_disabled():
+            graph_module = make_fx(
+                forward,
+                decomposition_table=_fx_decompositions(),
+                tracing_mode="real",
+                pre_dispatch=True,
+                record_module_stack=True,
+                _error_on_data_dependent_ops=True,
+            )(*example_inputs)
     except Exception as exc:
         raise UnsupportedModelError(
             "the FX frontend could not trace this model "

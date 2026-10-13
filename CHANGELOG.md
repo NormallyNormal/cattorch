@@ -1,3 +1,47 @@
+# Unreleased
+
+## New features
+
+- Computations whose inputs are all parameters, buffers, or constants now run
+  during export, whatever operations they use. nanoGPT's `bias == 0` causal
+  mask and RoPE tables built with `torch.outer` in `forward` no longer need
+  rewriting.
+- New elementwise operations: `exp`, `log`, `log10`, `sqrt`, `abs`, `floor`,
+  `ceil`, `reciprocal`, `erf`, `clamp`, `hardtanh`/`relu6`, comparisons,
+  logical not (including `~` on bool tensors), `torch.where`, `torch.maximum`,
+  and `torch.minimum`.
+  `torch.pow` accepts integer exponents from -4 to 4 and ±0.5.
+- Exact GELU (the `nn.GELU()` default) is supported, so Hugging Face BERT
+  models export without changes.
+- `F.log_softmax` is supported.
+- `unflatten` and `squeeze` are supported. With them, `nn.MultiheadAttention`
+  and `nn.TransformerEncoder` export.
+- Conversions to floating dtypes, such as `x.float()` on integer inputs, are
+  no longer rejected. Conversions to integer dtypes truncate, and conversions
+  to `bool` produce 0 or 1.
+- Operations without a dedicated kernel now export through PyTorch's own
+  decompositions when those lead to supported operations. Among them are
+  `nn.LSTM` and `nn.GRU` (unrolled over the example's sequence length),
+  GroupNorm, InstanceNorm, `F.normalize`, Mish, softplus, hardswish, `var`,
+  `std`, and `cumsum`.
+- New reductions over any dimensions: `sum`, `mean`, `prod`, `amax`, `amin`,
+  `max`/`min` with indices, `argmax`, `argmin`, `any`, and `all`. `torch.topk`
+  is supported.
+- New data-movement operations: `expand`, `repeat`, `flip`, `roll`, padding,
+  `tril`/`triu`, nearest upsampling, and `gather`/`index_select`/indexing with
+  indices that don't depend on the input.
+- `sin` and `cos`, adaptive max pooling, and
+  `F.scaled_dot_product_attention` with a static `attn_mask`.
+- BatchNorm without running statistics uses batch statistics, as PyTorch does.
+
+## Fixes
+
+- A tensor read through a view after its last direct use could be overwritten
+  by a later operation, giving wrong output. Graph outputs that are also used
+  later were affected the same way.
+- `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
+  failed during export.
+
 # 0.5.0 - 2026-09-14
 
 ## Breaking changes

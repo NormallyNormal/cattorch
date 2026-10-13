@@ -48,4 +48,38 @@ def rotary_embedding(
     return _rotary_embedding(value, cosine, sine)
 
 
+@torch.library.custom_op("cattorch::topk_values", mutates_args=())
+def _topk_values(
+    value: torch.Tensor, k: int, dim: int, largest: bool,
+) -> torch.Tensor:
+    """Sorted top-k values; the capture frontend splits ``torch.topk`` into this."""
+    return torch.topk(value, k, dim, largest, True).values
+
+
+@_topk_values.register_fake
+def _topk_values_fake(value, k, dim, largest):
+    shape = list(value.shape)
+    shape[dim] = k
+    return value.new_empty(shape)
+
+
+@torch.library.custom_op("cattorch::topk_indices", mutates_args=())
+def _topk_indices(
+    value: torch.Tensor, k: int, dim: int, largest: bool,
+) -> torch.Tensor:
+    """Zero-based positions matching ``cattorch::topk_values``.
+
+    Ties keep the lower position, which is also what the Scratch kernel does.
+    """
+    order = torch.sort(value, dim=dim, descending=largest, stable=True).indices
+    return order.narrow(dim, 0, k)
+
+
+@_topk_indices.register_fake
+def _topk_indices_fake(value, k, dim, largest):
+    shape = list(value.shape)
+    shape[dim] = k
+    return value.new_empty(shape, dtype=torch.int64)
+
+
 __all__ = ["rotary_embedding"]

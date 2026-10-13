@@ -65,6 +65,12 @@ class OptimizedSoftmaxInstruction(Instruction):
             if self.stride != 1 else []
         )
 
+    def _after_sum(self):
+        return ()
+
+    def _normalized(self, current):
+        return div(mathop("e ^", sub(current, var("max"))), var("sum"))
+
     def finalize(self):
         current = item("T1", var("index"))
         maximum_scan = ()
@@ -107,17 +113,18 @@ class OptimizedSoftmaxInstruction(Instruction):
                     change_var("sum", mathop("e ^", sub(current, var("max")))),
                     change_var("index", self.stride),
                 )),
+                *self._after_sum(),
                 set_var("index", start),
                 *_static_unrolled_repeat(self.dim_size, (
                     (
                         append(
                             "T2",
-                            div(mathop("e ^", sub(current, var("max"))), var("sum")),
+                            self._normalized(current),
                         )
                         if self.stride == 1
                         else replace(
                             "T2", var("index"),
-                            div(mathop("e ^", sub(current, var("max"))), var("sum")),
+                            self._normalized(current),
                         )
                     ),
                     change_var("index", self.stride),
@@ -132,6 +139,17 @@ class OptimizedSoftmaxInstruction(Instruction):
             list_values=list_values,
             body=body,
         ).compile()
+
+
+class OptimizedLogSoftmaxInstruction(OptimizedSoftmaxInstruction):
+    """Stable log-softmax: ``x - max - ln(sum(exp(x - max)))``."""
+
+    def _after_sum(self):
+        # Reuse ``sum`` for the per-group log normalizer.
+        return (set_var("sum", add(var("max"), mathop("ln", var("sum")))),)
+
+    def _normalized(self, current):
+        return sub(current, var("sum"))
 
 
 class FastSoftmaxInstruction(OptimizedSoftmaxInstruction):

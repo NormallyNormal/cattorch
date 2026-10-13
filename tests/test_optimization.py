@@ -1765,13 +1765,15 @@ def test_training_dropout_is_rejected_instead_of_silently_removed(tmp_path):
         transpile(nn.Dropout(0.5).train(), torch.ones(4), str(tmp_path / "dropout"))
 
 
-def test_semantic_runtime_dtype_cast_is_rejected(tmp_path):
+def test_runtime_integer_cast_truncates_toward_zero(tmp_path):
     class ToInteger(nn.Module):
         def forward(self, value):
             return value.to(torch.int64)
 
-    with pytest.raises(UnsupportedOperationError, match="converting a runtime tensor"):
-        transpile(ToInteger(), torch.tensor([1.2, -2.8]), str(tmp_path / "dtype"))
+    value = torch.tensor([1.2, -2.8, 0.0, 3.0])
+    path = tmp_path / "dtype"
+    transpile(ToInteger(), value, str(path))
+    assert _run(_load_sprite(path.with_suffix(".sprite3")), value.tolist()) == [1, -2, 0, 3]
 
 
 def test_evaluation_dropout_remains_a_safe_alias(tmp_path):
@@ -1886,21 +1888,21 @@ def test_verify_reports_exact_and_lossy_export_error(tmp_path):
 
 
 def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
-    class CosineBlock(nn.Module):
+    class LogGammaBlock(nn.Module):
         def forward(self, value):
-            return torch.cos(value)
+            return torch.lgamma(value)
 
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.features = CosineBlock()
+            self.features = LogGammaBlock()
 
         def forward(self, value):
             return self.features(value)
 
     with pytest.raises(UnsupportedOperationError) as caught:
-        transpile(Model(), torch.ones(2), tmp_path / "cosine")
+        transpile(Model(), torch.ones(2), tmp_path / "lgamma")
     message = str(caught.value)
-    assert "aten.cos.default" in message
+    assert "aten.lgamma.default" in message
     assert "module: features" in message
-    assert "exported node: cos" in message
+    assert "exported node: lgamma" in message

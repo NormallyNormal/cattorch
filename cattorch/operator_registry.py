@@ -21,6 +21,7 @@ from cattorch.util.instruction.optimized import (
     OptimizedElementwiseInstruction,
     OptimizedEmbeddingInstruction,
     OptimizedLayerNormInstruction,
+    OptimizedLogSoftmaxInstruction,
     OptimizedMaskedFillInstruction,
     OptimizedMatMulInstruction,
     OptimizedMeanInstruction,
@@ -32,6 +33,9 @@ from cattorch.util.instruction.optimized import (
 )
 from cattorch.util.instruction.optimized_moe import (
     ExpertFamilyMoEInstruction, StackedSwiGLUMoEInstruction,
+)
+from cattorch.util.instruction.generic import (
+    IndexMapInstruction, REDUCTIONS, ReductionInstruction, TopKInstruction,
 )
 
 
@@ -199,6 +203,34 @@ ELEMENTWISE_OPS = frozenset({
     "aten.tanh.default", "aten.gelu.default", "aten.silu.default",
     "aten.leaky_relu.default", "aten.elu.default", "aten.pow.Tensor_Scalar",
     "aten.rsqrt.default",
+    "aten.exp.default", "aten.log.default", "aten.log10.default",
+    "aten.sqrt.default", "aten.abs.default", "aten.floor.default",
+    "aten.ceil.default", "aten.reciprocal.default", "aten.erf.default",
+    "aten.logical_not.default", "aten.clamp.default", "aten.clamp_min.default",
+    "aten.clamp_max.default", "aten.hardtanh.default", "aten.relu6.default",
+    "aten.bitwise_not.default", "aten.to.dtype",
+    "aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
+    "aten.gt.Tensor", "aten.gt.Scalar", "aten.lt.Tensor", "aten.lt.Scalar",
+    "aten.ge.Tensor", "aten.ge.Scalar", "aten.le.Tensor", "aten.le.Scalar",
+    "aten.maximum.default", "aten.minimum.default",
+    "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
+    "aten.where.Scalar", "aten.sin.default", "aten.cos.default",
+})
+
+# Pure data-movement operations. The transpiler describes each call as a
+# static index table (``generic.index_map``); only the first argument may vary
+# at runtime.
+INDEX_MAP_OPS = frozenset({
+    "aten.expand.default", "aten.repeat.default", "aten.flip.default",
+    "aten.roll.default", "aten.constant_pad_nd.default",
+    "aten.reflection_pad1d.default", "aten.reflection_pad2d.default",
+    "aten.replication_pad1d.default", "aten.replication_pad2d.default",
+    "aten.gather.default", "aten.index_select.default", "aten.index.Tensor",
+    "aten._unsafe_index.Tensor", "aten.tril.default", "aten.triu.default",
+    "aten.unfold.default", "aten.diagonal.default", "aten.narrow.default",
+    "aten.as_strided.default", "aten.upsample_nearest1d.vec",
+    "aten.upsample_nearest2d.vec", "aten.upsample_nearest1d.default",
+    "aten.upsample_nearest2d.default",
 })
 
 MATMUL_OPS = frozenset({
@@ -215,29 +247,41 @@ def _validate_add_sub(node, _config, _fast) -> str | None:
     return None if alpha == 1 else f"The alpha={alpha!r} variant is not supported"
 
 
-def _validate_gelu(node, config, fast) -> str | None:
-    approximate = node.args[1] if len(node.args) > 1 else node.kwargs.get("approximate", "none")
-    if approximate == "tanh" or (fast and config.activations):
-        return None
-    return "Exact GELU requires approximate='tanh'; the default erf form is not implemented"
-
-
-def _validate_mean(node, _config, _fast) -> str | None:
-    dims = node.args[1]
+def _mean_kernel(torch_name, output, *args):
+    """Use the tuned mean kernel for consecutive dimensions, else the generic one."""
+    dims = args[1].value
     if isinstance(dims, int):
         dims = (dims,)
-    ndim = len(_shape(node.args[0]))
-    normalized = sorted({dim % ndim for dim in dims})
+    ndim = len(args[0].shape)
+    normalized = sorted({dim % ndim for dim in dims or range(ndim)})
     if normalized and normalized == list(range(normalized[0], normalized[-1] + 1)):
-        return None
-    return "Mean reduction dimensions must be consecutive"
+        return OptimizedMeanInstruction(torch_name, output, *args)
+    return ReductionInstruction(torch_name, output, *args)
 
 
 def _validate_power(node, _config, _fast) -> str | None:
     exponent = node.args[1]
-    if exponent in {0, 2}:
+    if exponent in {0.5, -0.5} or (
+        float(exponent).is_integer() and abs(exponent) <= 4
+    ):
         return None
-    return "Only exponents 0 and 2 are currently exact for arbitrary Scratch inputs"
+    return (
+        "Only integer exponents from -4 to 4 and exponents of 0.5 and -0.5 "
+        "are exact for arbitrary Scratch inputs"
+    )
+
+
+def _validate_bitwise_not(node, _config, _fast) -> str | None:
+    value = node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
+    if value is not None and value.dtype == torch.bool:
+        return None
+    return "Bitwise not is only supported on bool tensors"
+
+
+def _validate_clamp(node, _config, _fast) -> str | None:
+    if any(hasattr(bound, "name") for bound in node.args[1:]):
+        return "Clamp bounds must be numbers, not tensors"
+    return None
 
 
 def _validate_convolution(node, _config, _fast) -> str | None:
@@ -446,7 +490,16 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
         "aten.linear.default": LinearInstruction,
         "aten.softmax.int": OptimizedSoftmaxInstruction,
-        "aten.mean.dim": OptimizedMeanInstruction,
+        "aten.log_softmax.int": OptimizedLogSoftmaxInstruction,
+        "aten._log_softmax.default": OptimizedLogSoftmaxInstruction,
+        "aten.mean.dim": _mean_kernel,
+        **{
+            operation: ReductionInstruction
+            for operation in REDUCTIONS if operation != "aten.mean.dim"
+        },
+        **{operation: IndexMapInstruction for operation in INDEX_MAP_OPS},
+        "cattorch.topk_values.default": TopKInstruction,
+        "cattorch.topk_indices.default": TopKInstruction,
         "aten.layer_norm.default": OptimizedLayerNormInstruction,
         "aten.rms_norm.default": OptimizedRMSNormInstruction,
         "aten.batch_norm.default": OptimizedBatchNormInstruction,
@@ -469,8 +522,8 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.rotary_embedding.default": _validate_rotary_embedding,
         "aten.add.Tensor": _validate_add_sub,
         "aten.sub.Tensor": _validate_add_sub,
-        "aten.gelu.default": _validate_gelu,
-        "aten.mean.dim": _validate_mean,
+        "aten.clamp.default": _validate_clamp,
+        "aten.bitwise_not.default": _validate_bitwise_not,
         "aten.pow.Tensor_Scalar": _validate_power,
         "aten.conv1d.default": _validate_convolution,
         "aten.conv2d.default": _validate_convolution,
@@ -520,6 +573,6 @@ def default_registry() -> OperatorRegistry:
 
 
 __all__ = [
-    "ELEMENTWISE_OPS", "MATMUL_OPS", "OperationRule", "OperatorRegistry",
+    "ELEMENTWISE_OPS", "INDEX_MAP_OPS", "MATMUL_OPS", "OperationRule", "OperatorRegistry",
     "default_registry",
 ]

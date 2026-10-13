@@ -39,6 +39,29 @@ from cattorch.util.instruction.optimized_common import (
     _unrolled_offset_dot_statements,
 )
 
+# Numerical Recipes ``erfcc`` coefficients: fractional error below 1.2e-7
+# everywhere, so the negative GELU tail keeps its relative accuracy.
+_ERFC_COEFFICIENTS = (
+    -1.26551223, 1.00002368, 0.37409196, 0.09678418, -0.18628806,
+    0.27886807, -1.13520398, 1.48851587, -0.82215223, 0.17087277,
+)
+
+
+def _erfc_statements(value, target: str):
+    """Set variable ``target`` to ``erfc(|value|)``; ``value`` is evaluated twice."""
+    magnitude = mathop("abs", value)
+    t = var(target)
+    polynomial = _ERFC_COEFFICIENTS[-1]
+    for coefficient in reversed(_ERFC_COEFFICIENTS[:-1]):
+        polynomial = add(coefficient, mul(t, polynomial))
+    return (
+        set_var(target, div(1, add(1, mul(0.5, magnitude)))),
+        set_var(target, mul(t, mathop(
+            "e ^", sub(polynomial, mul(magnitude, magnitude)),
+        ))),
+    )
+
+
 class OptimizedElementwiseInstruction(Instruction):
     """One-based, shape-specialized elementwise kernels.
 
@@ -55,16 +78,81 @@ class OptimizedElementwiseInstruction(Instruction):
         "aten.div.Tensor": div,
     }
 
+    # Binary operations whose result is chosen by a condition. Each maps to
+    # ``(condition(left, right), value_if_true, value_if_false)`` where the
+    # values are "left", "right", or a constant.
+    _SELECT = {
+        "aten.eq.Tensor": (eq, 1, 0), "aten.eq.Scalar": (eq, 1, 0),
+        "aten.ne.Tensor": (eq, 0, 1), "aten.ne.Scalar": (eq, 0, 1),
+        "aten.gt.Tensor": (gt, 1, 0), "aten.gt.Scalar": (gt, 1, 0),
+        "aten.lt.Tensor": (lt, 1, 0), "aten.lt.Scalar": (lt, 1, 0),
+        "aten.ge.Tensor": (lt, 0, 1), "aten.ge.Scalar": (lt, 0, 1),
+        "aten.le.Tensor": (gt, 0, 1), "aten.le.Scalar": (gt, 0, 1),
+        "aten.maximum.default": (gt, "left", "right"),
+        "aten.minimum.default": (lt, "left", "right"),
+    }
+    _WHERE = frozenset({
+        "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
+        "aten.where.Scalar",
+    })
+
     def prepare(self):
         self.op = str(self.torch_name)
-        if self.op in self._BINARY and self.args[1].value is None:
-            self.output_shape = torch.broadcast_shapes(
-                self.args[0].shape, self.args[1].shape,
-            )
+        # Tensor list slots are numbered over every non-constant argument,
+        # including explicit ``_none`` placeholders, followed by the output.
+        self.slots = {}
+        for position, argument in enumerate(self.args):
+            if not str(argument.name).startswith("C_"):
+                self.slots[position] = f"T{len(self.slots) + 1}"
+        self.output_list = f"T{len(self.slots) + 1}"
+        tensor_shapes = [
+            self.args[position].shape for position in self.slots
+            if self.args[position].name != "_none"
+        ]
+        if self._is_nary():
+            self.output_shape = torch.broadcast_shapes(*tensor_shapes)
         else:
             self.output_shape = self.args[0].shape
         self.size = length("T1") if self.args[0].dynamic else math.prod(self.output_shape)
         self.broadcast_lists = {}
+
+    def _is_nary(self):
+        return (
+            self.op in self._WHERE
+            or ((self.op in self._BINARY or self.op in self._SELECT)
+                and self.args[1].value is None)
+        )
+
+    def _operand(self, position, map_name):
+        """Expression for argument ``position`` at the current output index."""
+        argument = self.args[position]
+        if position not in self.slots:
+            return argument.value
+        index, values = _broadcast_index(argument.shape, self.output_shape, map_name)
+        if values is not None:
+            self.broadcast_lists[map_name] = values
+        return item(self.slots[position], index)
+
+    def _select(self):
+        condition, if_true, if_false = self._SELECT[self.op]
+        left = self._operand(0, "_left_broadcast_map")
+        right = self._operand(1, "_right_broadcast_map")
+        choices = {"left": left, "right": right}
+        return (), if_else(
+            condition(left, right),
+            (append(self.output_list, choices.get(if_true, if_true)),),
+            (append(self.output_list, choices.get(if_false, if_false)),),
+        )
+
+    def _where(self):
+        condition = self._operand(0, "_condition_broadcast_map")
+        left = self._operand(1, "_left_broadcast_map")
+        right = self._operand(2, "_right_broadcast_map")
+        return (), if_else(
+            eq(condition, 0),
+            (append(self.output_list, right),),
+            (append(self.output_list, left),),
+        )
 
     def _binary_expr(self):
         operation = self._BINARY[self.op]
@@ -113,6 +201,22 @@ class OptimizedElementwiseInstruction(Instruction):
         elif self.op == "aten.silu.default":
             setup = (set_var("value", direct),)
             result = mul(cached, div(1, add(1, mathop("e ^", mul(-1, cached)))))
+        elif self.op == "aten.gelu.default" and self._exact_gelu():
+            # 0.5 x (1 + erf(x / sqrt(2))), using erfc for accuracy in the
+            # negative tail: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
+            setup = (
+                set_var("value", direct),
+                *_erfc_statements(mul(cached, 0.7071067811865476), "inner"),
+            )
+            output = if_else(
+                lt(cached, 0),
+                (append(self.output_list, mul(mul(0.5, cached), var("inner"))),),
+                (append(
+                    self.output_list,
+                    mul(cached, sub(1, mul(0.5, var("inner")))),
+                ),),
+            )
+            result = None
         elif self.op == "aten.gelu.default":
             setup = (
                 set_var("value", direct),
@@ -146,16 +250,109 @@ class OptimizedElementwiseInstruction(Instruction):
             result = None
         elif self.op == "aten.pow.Tensor_Scalar":
             exponent = self.args[1].value
-            if exponent == 2:
-                result = mul(direct, direct)
+            if exponent == 0:
+                result = 1
+            elif exponent == 0.5:
+                result = mathop("sqrt", direct)
+            elif exponent == -0.5:
+                result = div(1, mathop("sqrt", direct))
+            elif float(exponent).is_integer() and 1 <= abs(exponent) <= 4:
+                setup = (set_var("value", direct),)
+                result = cached
+                for _ in range(int(abs(exponent)) - 1):
+                    result = mul(result, cached)
+                if exponent < 0:
+                    result = div(1, result)
             else:
                 result = mathop("e ^", mul(exponent, mathop("ln", direct)))
+        elif self.op in self._MATHOP:
+            result = mathop(self._MATHOP[self.op], direct)
+        elif self.op in {"aten.sin.default", "aten.cos.default"}:
+            # Scratch's trigonometry takes degrees.
+            name = "sin" if self.op == "aten.sin.default" else "cos"
+            result = mathop(name, mul(direct, 57.29577951308232))
+        elif self.op == "aten.reciprocal.default":
+            result = div(1, direct)
+        elif self.op == "aten.erf.default":
+            setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
+            output = if_else(
+                lt(cached, 0),
+                (append(self.output_list, sub(var("inner"), 1)),),
+                (append(self.output_list, sub(1, var("inner"))),),
+            )
+            result = None
+        elif self.op in {"aten.logical_not.default", "aten.bitwise_not.default"}:
+            output = if_else(
+                eq(direct, 0),
+                (append(self.output_list, 1),),
+                (append(self.output_list, 0),),
+            )
+            result = None
+        elif self.op in self._CLAMP:
+            low, high = self._clamp_bounds()
+            setup = (set_var("value", direct),)
+            if low is not None:
+                setup += (if_(lt(cached, low), (set_var("value", low),)),)
+            if high is not None:
+                setup += (if_(gt(cached, high), (set_var("value", high),)),)
+            result = cached
+        elif self.op == "aten.to.dtype":
+            output = self._cast(direct)
+            result = None
         else:
             raise NotImplementedError(self.op)
 
         if output is None:
-            output = append("T2", result)
+            output = append(self.output_list, result)
         return setup, output
+
+    _MATHOP = {
+        "aten.exp.default": "e ^",
+        "aten.log.default": "ln",
+        "aten.log10.default": "log",
+        "aten.sqrt.default": "sqrt",
+        "aten.abs.default": "abs",
+        "aten.floor.default": "floor",
+        "aten.ceil.default": "ceiling",
+    }
+    _CLAMP = frozenset({
+        "aten.clamp.default", "aten.clamp_min.default", "aten.clamp_max.default",
+        "aten.hardtanh.default", "aten.relu6.default",
+    })
+
+    def _clamp_bounds(self):
+        values = [argument.value for argument in self.args[1:]]
+        if self.op == "aten.clamp_min.default":
+            return values[0], None
+        if self.op == "aten.clamp_max.default":
+            return None, values[0]
+        if self.op == "aten.relu6.default":
+            return 0, 6
+        if self.op == "aten.hardtanh.default":
+            values = values + [-1.0, 1.0][len(values):]
+        values = values + [None, None][len(values):]
+        return values[0], values[1]
+
+    def _cast(self, direct):
+        # Only value-changing conversions reach the kernel; graph analysis
+        # aliases conversions to floating point and same-dtype conversions.
+        target = self.args[1].value
+        if target == torch.bool:
+            return if_else(
+                eq(direct, 0),
+                (append(self.output_list, 0),),
+                (append(self.output_list, 1),),
+            )
+        # Integer conversion truncates toward zero like PyTorch.
+        return if_else(
+            lt(direct, 0),
+            (append(self.output_list, mathop("ceiling", direct)),),
+            (append(self.output_list, mathop("floor", direct)),),
+        )
+
+    def _exact_gelu(self):
+        approximate = self.args[1].value if len(self.args) > 1 else "none"
+        return approximate != "tanh"
 
     def finalize(self):
         if self.op in self._BINARY:
@@ -164,9 +361,14 @@ class OptimizedElementwiseInstruction(Instruction):
             variables = ("index",)
             iteration = (append(output_name, expression), change_var("index", 1))
         else:
-            lists = ("T1", "T2")
-            output_name = "T2"
-            setup, output = self._unary()
+            if self.op in self._SELECT:
+                setup, output = self._select()
+            elif self.op in self._WHERE:
+                setup, output = self._where()
+            else:
+                setup, output = self._unary()
+            output_name = self.output_list
+            lists = (*self.slots.values(), *self.broadcast_lists, output_name)
             variables = ("index", "value", "inner")
             iteration = (*setup, output, change_var("index", 1))
 
@@ -175,7 +377,7 @@ class OptimizedElementwiseInstruction(Instruction):
                 set_var("index", 1),
                 repeat(self.size, iteration),
             )
-        elif self.op == "aten.gelu.default":
+        elif self.op in {"aten.gelu.default", "aten.erf.default"}:
             # GELU's large reporter tree regressed when unrolled, but the
             # palette-hidden official loop still removes one index mutation.
             traversal = (for_each("index", self.size, iteration[:-1]),)

@@ -363,7 +363,8 @@ class OptimizedPoolingInstruction(Instruction):
             self.kernel_area = None
         else:
             kernel = self.args[1].value
-            stride = self.args[2].value
+            # An omitted or empty stride means the kernel size, as in PyTorch.
+            stride = (self.args[2].value if len(self.args) > 2 else None) or kernel
             padding = self.args[3].value if len(self.args) > 3 else [0]
             if len(shape) == 3:
                 kernel_height, kernel_width = 1, kernel[0]

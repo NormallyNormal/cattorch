@@ -52,7 +52,10 @@ from cattorch.sprite import (
 from cattorch.storage import StorageConfig
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
-from cattorch.operator_registry import MATMUL_OPS, OperatorRegistry, default_registry
+from cattorch.operator_registry import (
+    INDEX_MAP_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
+)
+from cattorch.util.instruction.generic import IndexMapInstruction, index_map
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
@@ -261,6 +264,7 @@ class _Compiler:
         self.scope.analyze_lifetimes(
             self.graph.nodes,
             skip=set(self.graph.aliases) | set(self.graph.generated_weights),
+            aliases=self.graph.aliases,
         )
         for node in self.graph.nodes:
             if node.op != 'call_function':
@@ -386,9 +390,52 @@ class _Compiler:
               and hasattr(node.args[0], 'name')
               and node.args[0].name in self.graph.split_meta):
             self._compile_getitem(node, target_list)
+        elif aten_op in INDEX_MAP_OPS:
+            self._compile_index_map(node, target_list)
         else:
             self._compile_instruction(node, target_list, aten_op)
         self.scope.release_dependencies(node)
+
+    def _compile_index_map(self, node, target_list):
+        """Lower a data-movement operation through a static index table."""
+        source = node.args[0]
+
+        def static(value):
+            if hasattr(value, "name"):
+                name = value.name
+                while name in self.graph.aliases:
+                    name = self.graph.aliases[name]
+                tensor = self.graph.resolve_weight(name)
+                if not isinstance(tensor, torch.Tensor):
+                    raise _unsupported_operation(
+                        node, "only the first argument can vary at runtime",
+                    )
+                return tensor
+            if isinstance(value, (list, tuple)):
+                return type(value)(static(entry) for entry in value)
+            return value
+
+        if not hasattr(source, "name"):
+            raise _unsupported_operation(node, "the first argument must be a tensor")
+        if node.name in self.graph.dynamic_axes or source.name in self.graph.dynamic_axes:
+            raise _unsupported_operation(
+                node, "data movement on a runtime extent is not supported",
+            )
+        try:
+            indices, fill = index_map(
+                node.target, tuple(_get_shape(source)),
+                static(tuple(node.args[1:])), static(dict(node.kwargs)),
+            )
+        except ValueError as error:
+            raise _unsupported_operation(node, str(error)) from error
+        if len(indices) != math.prod(_get_shape(node)):
+            raise _unsupported_operation(node, "unexpected output size")
+        input_list = self._resolve_name(source.name)
+        instruction = IndexMapInstruction(
+            node.target, target_list, self._argument(input_list, source),
+            indices=indices, fill=fill,
+        )
+        self._emit(instruction, [input_list], target_list)
 
     def _compile_causal_score(self, node):
         final_node, q, k, scale, transposed_k, scale_node = (
@@ -794,6 +841,11 @@ class _Compiler:
         if aten_op == "aten.linear.default":
             node_args.append(None)
             input_lists.append("_none")
+        # GELU's form is keyword-only in the captured graph.
+        if aten_op == "aten.gelu.default" and len(node_args) == 1:
+            approximate = node.kwargs.get("approximate", "none")
+            node_args.append(approximate)
+            input_lists.append(f"C_{approximate}")
         if aten_op in {"aten.conv1d.default", "aten.conv2d.default"}:
             dimensions = 1 if aten_op == "aten.conv1d.default" else 2
             defaults = (None, [1] * dimensions, [0] * dimensions)

@@ -14,7 +14,9 @@ from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
 from cattorch.frontend import CapturedGraph, Frontend, capture_model
 from cattorch.results import _tensor_spec
-from cattorch.operator_registry import MATMUL_OPS, OperatorRegistry, default_registry
+from cattorch.operator_registry import (
+    ELEMENTWISE_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +51,10 @@ _NOOP_OPS = {
     "aten.detach_.default",
     "aten.lift_fresh_copy.default",
     "aten._assert_tensor_metadata.default",
+    "aten.unflatten.int",
+    "aten.squeeze.dim",
+    "aten.squeeze.dims",
+    "aten.squeeze.default",
 }
 
 # Ops that split a tensor into multiple outputs. The split itself is a no-op;
@@ -67,6 +73,53 @@ _TENSOR_GENERATORS = {
     "aten.zeros.default": lambda args: torch.zeros(args[0], dtype=torch.float32),
     "aten.full.default": lambda args: torch.full(args[0], args[1], dtype=torch.float32),
 }
+
+
+def _graph_handled_operations() -> frozenset[str]:
+    """Operations graph analysis lowers itself, without a registry kernel."""
+    return frozenset(
+        _NOOP_OPS | _SPLIT_OPS | set(_TENSOR_GENERATORS) | {
+            "aten.to.dtype", "aten.dropout.default", "aten.slice.Tensor",
+            "aten.cat.default", "aten.ones_like.default", "aten.zeros_like.default",
+            "aten.transpose.int", "aten.permute.default", "aten.numpy_T.default",
+        }
+    )
+
+
+# Folding a static subgraph never stores a result larger than this. A larger
+# tensor would usually come from an expand that is cheaper to compute in Scratch.
+_FOLD_ELEMENT_LIMIT = 1 << 20
+
+
+def _is_foldable(node) -> bool:
+    """Whether ``node`` may be evaluated at export time on static inputs."""
+    if node.target is operator.getitem:
+        return True
+    schema = getattr(node.target, "_schema", None)
+    if schema is None or schema.is_mutable:
+        return False
+    tags = getattr(node.target, "tags", ())
+    return torch.Tag.nondeterministic_seeded not in tags
+
+
+def _is_value_preserving_cast(source: torch.dtype, target: torch.dtype) -> bool:
+    """Whether a conversion leaves every Scratch number unchanged.
+
+    Scratch numbers are doubles, so conversions to a floating type, and from
+    bool or integer to integer, keep the stored value. Float-to-integer
+    truncation and conversion to bool need a kernel.
+    """
+    if source == target or target.is_floating_point:
+        return True
+    if target == torch.bool:
+        return source == torch.bool
+    return not source.is_floating_point
+
+
+def _gelu_approximation(node) -> str:
+    if len(node.args) > 1:
+        return node.args[1]
+    return node.kwargs.get("approximate", "none")
 
 
 # ── Graph preparation ────────────────────────────────────────────────────────
@@ -208,7 +261,7 @@ def _prepare_graph(
         "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
         "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
         "aten.mean.dim", "aten.embedding.default",
-    }
+    } | ELEMENTWISE_OPS
     for node in nodes:
         if node.op != "call_function":
             continue
@@ -239,7 +292,10 @@ def _prepare_graph(
             axis = permutation.index(axis)
         elif target == "aten.numpy_T.default":
             axis = len(input_shape) - axis - 1
-        elif target in {"aten.view.default", "aten.reshape.default", "aten._unsafe_view.default"}:
+        elif target in {
+            "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
+            "aten.unflatten.int",
+        }:
             suffix = math.prod(input_shape[axis + 1:])
             candidates = [
                 position for position, extent in enumerate(output_shape)
@@ -254,12 +310,20 @@ def _prepare_graph(
             inserted = int(node.args[1]) % len(output_shape)
             if inserted <= axis:
                 axis += 1
-        elif target == "aten.squeeze.dim":
-            removed = int(node.args[1]) % len(input_shape)
-            if removed == axis:
+        elif target in {"aten.squeeze.dim", "aten.squeeze.dims", "aten.squeeze.default"}:
+            if target == "aten.squeeze.default":
+                candidates = range(len(input_shape))
+            elif target == "aten.squeeze.dim":
+                candidates = (int(node.args[1]),)
+            else:
+                candidates = tuple(int(value) for value in node.args[1])
+            removed = {
+                value % len(input_shape) for value in candidates
+                if input_shape[value % len(input_shape)] == 1
+            }
+            if axis in removed:
                 raise UnsupportedModelError("cannot squeeze the runtime extent")
-            if removed < axis:
-                axis -= 1
+            axis -= sum(value < axis for value in removed)
         elif target in {
             "aten.conv1d.default", "aten.conv2d.default",
             "aten.max_pool1d.default", "aten.max_pool2d.default",
@@ -271,7 +335,10 @@ def _prepare_graph(
                 raise UnsupportedModelError(
                     "convolution and pooling support only a dynamic batch extent"
                 )
-        elif target in {"aten._softmax.default", "aten.softmax.int"}:
+        elif target in {
+            "aten._softmax.default", "aten.softmax.int",
+            "aten._log_softmax.default", "aten.log_softmax.int",
+        }:
             dimension = int(node.args[1]) % len(input_shape)
             if axis >= dimension or math.prod(input_shape[dimension + 1:]) != 1:
                 raise UnsupportedModelError(
@@ -350,25 +417,20 @@ def _prepare_graph(
                      else tuple(ref.meta['tensor_meta'].shape))
             generated_weights[node.name] = torch.zeros(shape, dtype=torch.float32)
 
-    # Exact mode evaluates pure all-static tensor subgraphs during export. This
-    # catches registered-buffer slicing/permutation and explicit static tensor
-    # arithmetic without introducing a general-purpose graph interpreter.
+    # Evaluate every deterministic, non-mutating operation whose tensor inputs
+    # are all static during export. Registered-buffer masks (`bias == 0`),
+    # RoPE tables (`torch.outer(arange, inv_freq)`), and similar setup code
+    # then never reach Scratch, whatever operations they happen to use.
     if use_fusions:
-        foldable_ops = {
-            "aten.numpy_T.default", "aten.transpose.int", "aten.permute.default",
-            "aten.slice.Tensor", "aten.view.default", "aten.reshape.default",
-            "aten._unsafe_view.default", "aten.flatten.using_ints",
-            "aten.contiguous.default", "aten.clone.default", "aten.unsqueeze.default",
-            "aten.alias.default", "aten.to.dtype", "aten.cat.default",
-            "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor",
-            "aten.neg.default", "aten.pow.Tensor_Scalar", "aten.rsqrt.default",
-        }
         missing = object()
+        static_results: dict[str, object] = {}
 
         def static_value(arg):
             if hasattr(arg, "name"):
                 if arg.name in generated_weights:
                     return generated_weights[arg.name]
+                if arg.name in static_results:
+                    return static_results[arg.name]
                 found = resolve_state(arg.name)
                 return found if found is not None else missing
             if isinstance(arg, (list, tuple)):
@@ -380,8 +442,7 @@ def _prepare_graph(
 
         with torch.no_grad():
             for node in nodes:
-                target = str(node.target)
-                if node.op != "call_function" or target not in foldable_ops:
+                if node.op != "call_function" or not _is_foldable(node):
                     continue
                 args = static_value(node.args)
                 kwargs = static_value(node.kwargs)
@@ -389,11 +450,19 @@ def _prepare_graph(
                     continue
                 try:
                     result = node.target(*args, **kwargs)
-                except (RuntimeError, TypeError, ValueError):
+                except (RuntimeError, TypeError, ValueError, IndexError):
                     continue
                 if isinstance(result, torch.Tensor):
+                    if result.numel() > _FOLD_ELEMENT_LIMIT:
+                        continue
                     generated_weights[node.name] = result.detach().contiguous()
-                    log.info("Constant-folded %s as static weight %s", target, node.name)
+                    log.info("Constant-folded %s as static weight %s", node.target, node.name)
+                elif isinstance(result, (tuple, list)) and all(
+                    isinstance(value, torch.Tensor) for value in result
+                ):
+                    # Keep multi-output results (split, max.dim) only as
+                    # intermediates; their getitem users become the weights.
+                    static_results[node.name] = result
 
     def resolve_weight(arg_name):
         if arg_name in generated_weights:
@@ -444,17 +513,19 @@ def _prepare_graph(
         elif aten_op == "aten.to.dtype":
             source_dtype = node.args[0].meta.get("val").dtype
             target_dtype = node.args[1]
-            if source_dtype != target_dtype:
+            if source_dtype.is_complex or target_dtype.is_complex:
                 raise _unsupported_operation(
-                    node,
-                    f"converting a runtime tensor from {source_dtype} to {target_dtype} "
-                    "is not supported",
+                    node, "complex tensors are not supported",
                 )
+            if not _is_value_preserving_cast(source_dtype, target_dtype):
+                # Truncation to an integer or conversion to bool runs as an
+                # elementwise kernel.
+                continue
             source = node.args[0].name
             while source in aliases:
                 source = aliases[source]
             aliases[node.name] = source
-            log.info("Alias: %s -> %s (same-dtype conversion)", node.name, source)
+            log.info("Alias: %s -> %s (dtype conversion)", node.name, source)
 
         elif aten_op in _NOOP_OPS and hasattr(node.args[0], 'name'):
             source = node.args[0].name
@@ -571,6 +642,12 @@ def _prepare_graph(
                     epilogue.append(("tensor_add", other))
                 elif target in activation_ops:
                     if user.args[0] is not current:
+                        break
+                    # The fused linear epilogue only implements tanh GELU;
+                    # exact GELU runs as its own elementwise kernel.
+                    if target == "aten.gelu.default" and _gelu_approximation(user) != "tanh" and not (
+                        fast and fast_config.activations
+                    ):
                         break
                     # Leave SiLU materialization to the broader SiLU-times-
                     # tensor fusion below when it feeds a single multiply.

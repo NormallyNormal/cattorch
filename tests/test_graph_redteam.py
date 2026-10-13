@@ -153,14 +153,9 @@ def test_linear_division_by_zero_falls_back_from_epilogue(tmp_path):
             "alpha=2",
         ),
         (
-            FunctionModel(lambda value: value.mean((0, 2))),
-            (torch.randn(2, 3, 4),),
-            "consecutive",
-        ),
-        (
-            FunctionModel(lambda value: torch.pow(value, 3)),
+            FunctionModel(lambda value: torch.pow(value, 1.5)),
             (torch.randn(2, 3),),
-            "exponents 0 and 2",
+            "integer exponents",
         ),
     ],
 )
@@ -190,20 +185,28 @@ def test_unimplemented_convolution_and_pooling_options_are_rejected(
         transpile(model, torch.randn(1, channels, 8, 8), tmp_path / "options")
 
 
-def test_batchnorm_without_running_statistics_is_rejected(tmp_path):
+def test_batchnorm_without_running_statistics_uses_batch_statistics(tmp_path):
     model = nn.BatchNorm2d(3, track_running_stats=False).eval()
-    with pytest.raises(UnsupportedOperationError, match="running statistics"):
-        transpile(model, torch.randn(2, 3, 4, 4), tmp_path / "batchnorm")
+    value = torch.randn(2, 3, 4, 4)
+    result = transpile(model, value, tmp_path / "batchnorm")
+    assert verify(model, value, result, atol=1e-5).passed
 
 
-def test_default_gelu_requires_fast_activations(tmp_path):
+def test_mean_over_separated_dimensions(tmp_path):
+    model = FunctionModel(lambda value: value.mean((0, 2)))
+    value = torch.randn(2, 3, 4)
+    result = transpile(model, value, tmp_path / "mean")
+    assert verify(model, value, result).passed
+
+
+def test_default_gelu_is_exact_unless_fast_activations(tmp_path):
     model = nn.GELU().eval()
     value = torch.randn(2, 3)
-    with pytest.raises(UnsupportedOperationError, match="approximate='tanh'"):
-        transpile(model, value, tmp_path / "exact_gelu")
-    with pytest.raises(UnsupportedOperationError, match="approximate='tanh'"):
-        transpile(
-            model, value, tmp_path / "disabled_fast_gelu",
-            optimization="fast", fast_config=FastConfig(activations=False),
-        )
+    exact = transpile(model, value, tmp_path / "exact_gelu")
+    assert verify(model, value, exact, atol=1e-6).passed
+    disabled = transpile(
+        model, value, tmp_path / "disabled_fast_gelu",
+        optimization="fast", fast_config=FastConfig(activations=False),
+    )
+    assert verify(model, value, disabled, atol=1e-6).passed
     transpile(model, value, tmp_path / "fast_gelu", optimization="fast")
