@@ -8,9 +8,10 @@ import torch
 
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized_common import _static_unrolled_repeat
+from cattorch.util.instruction.optimized_elementwise import _erfc_statements
 from cattorch.util.scratch.dsl import (
     Program, add, append, change_var, clear, div, eq, gt, if_, index_of, item,
-    if_else, length, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
+    if_else, length, lt, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
 )
 
 
@@ -453,6 +454,8 @@ class ExpertFamilyMoEInstruction(Instruction):
         statements = []
         declared = ["_expert input"]
         list_values = {}
+        # Variables only some expert programs need; declared after the fixed set.
+        self.extra_variables = []
 
         def tensor_name(argument):
             if argument.op == "get_attr":
@@ -577,18 +580,41 @@ class ExpertFamilyMoEInstruction(Instruction):
                 "aten.relu.default", "aten.sigmoid.default", "aten.silu.default",
                 "aten.tanh.default", "aten.gelu.default", "aten.neg.default",
             }:
-                if target == "aten.gelu.default":
-                    approximate = (
-                        node.args[1] if len(node.args) > 1
-                        else node.kwargs.get("approximate", "none")
-                    )
-                    if approximate != "tanh" and not self.fast_activations:
-                        raise ValueError(
-                            "unsupported operation inside generic ExpertFamily: "
-                            "exact GELU requires approximate='tanh'"
-                        )
                 source_name = tensor_name(node.args[0])
                 size = math.prod(output_shape)
+                approximate = (
+                    node.args[1] if len(node.args) > 1
+                    else node.kwargs.get("approximate", "none")
+                )
+                if (
+                    target == "aten.gelu.default" and approximate != "tanh"
+                    and not self.fast_activations
+                ):
+                    # 0.5 x (1 + erf(x / sqrt(2))) through erfc, as in the
+                    # elementwise kernel: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
+                    for name in ("expert gelu value", "expert gelu erfc"):
+                        if name not in self.extra_variables:
+                            self.extra_variables.append(name)
+                    value = var("expert gelu value")
+                    erfc = var("expert gelu erfc")
+                    statements.extend((
+                        set_var("expert index", 1),
+                        repeat(size, (
+                            set_var("expert gelu value", item(
+                                source_name, var("expert index"),
+                            )),
+                            *_erfc_statements(
+                                mul(value, 0.7071067811865476), "expert gelu erfc",
+                            ),
+                            if_else(
+                                lt(value, 0),
+                                (append(output_name, mul(mul(0.5, value), erfc)),),
+                                (append(output_name, mul(value, sub(1, mul(0.5, erfc)))),),
+                            ),
+                            change_var("expert index", 1),
+                        )),
+                    ))
+                    continue
                 statements.extend((
                     set_var("expert index", 1),
                     repeat(size, (
@@ -858,6 +884,7 @@ class ExpertFamilyMoEInstruction(Instruction):
                 "expert index", "expert input index", "expert weight index", "expert sum",
                 "expert mean", "expert variance", "expert centered", "expert scale",
                 "expert norm index", "expert source base", "candidate score",
+                *self.extra_variables,
             ),
             lists=("T1", "T2", "T3", *bank_lists, target_list, routes, weights, *expert_lists),
             list_values=expert_list_values,

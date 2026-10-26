@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import RLock
-from typing import Literal
+from typing import Callable, Literal
 
 import contextlib
 import functools
@@ -332,7 +332,7 @@ def _available_decompositions() -> dict:
     implements in terms of other operations but keeps whole when capturing
     before autograd, decompose through ``OpOverload.decompose``.
     """
-    table = {}
+    table: dict[torch._ops.OpOverload, Callable] = {}
     for source in (core_aten_decompositions(), torch._decomp.decomposition_table):
         for operator, function in source.items():
             if isinstance(operator, torch._ops.OpOverload):

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from cattorch.operator_registry import ELEMENTWISE_OPS, MATMUL_OPS, default_registry
-from cattorch.util.instruction.instruction import Instruction
+from cattorch.operator_registry import (
+    ELEMENTWISE_OPS, MATMUL_OPS, KernelFactory, default_registry,
+)
 
 
 def production_kernel(
@@ -12,7 +13,7 @@ def production_kernel(
     fast_activations: bool = False,
     fast_layer_norm: bool = False,
     fast_softmax: bool = False,
-) -> type[Instruction] | None:
+) -> KernelFactory | None:
     """Select the ordinary production kernel for an ATen operation.
 
     Graph-pattern specializations such as cached attention are handled before

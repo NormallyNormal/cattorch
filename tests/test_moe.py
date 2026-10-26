@@ -397,6 +397,26 @@ def test_generic_exact_tanh_activations_stay_finite_at_extremes(tmp_path):
 
 
 @torch.no_grad()
+def test_generic_exact_gelu_expert_matches_eager_including_the_tail(tmp_path):
+    torch.manual_seed(14)
+    model = SparseMoE(
+        nn.Linear(3, 3),
+        ExpertFamily.from_modules(
+            [nn.Sequential(nn.Linear(3, 6), nn.GELU(), nn.Linear(6, 3)) for _ in range(3)],
+            example_input=torch.ones(1, 3),
+        ),
+        top_k=2,
+    ).eval()
+    value = torch.tensor([[-12.0, 0.5, 3.0], [0.0, -2.0, 40.0], [1e-3, -0.3, -50.0]])
+    result = transpile(model, value, tmp_path / "exact-gelu-expert")
+    comparison = verify(model, value, result, atol=1e-5)
+    assert comparison.passed, comparison
+    with zipfile.ZipFile(result.path) as archive:
+        variables = json.loads(archive.read("sprite.json"))["variables"].values()
+    assert "expert gelu erfc" in {name for name, _ in variables}
+
+
+@torch.no_grad()
 def test_stacked_swiglu_semantic_module_lowers_to_scratch(tmp_path):
     torch.manual_seed(42)
     model = StackedSwiGLUMoE(

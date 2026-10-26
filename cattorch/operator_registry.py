@@ -42,6 +42,8 @@ from cattorch.util.instruction.generic import (
 )
 
 
+# An Instruction subclass, or a function that picks one from the arguments.
+KernelFactory = Callable[..., Instruction]
 Validator = Callable[[torch.fx.Node, FastConfig, bool], str | None]
 Observation = tuple[torch.Tensor, torch.Tensor, str]
 Observer = Callable[[object, tuple, dict, object], Iterable[Observation]]
@@ -58,14 +60,14 @@ class OperationRule:
     """
 
     target: str
-    exact_kernel: type[Instruction] | None = None
-    fast_kernel: type[Instruction] | None = None
+    exact_kernel: KernelFactory | None = None
+    fast_kernel: KernelFactory | None = None
     fast_flag: Literal["activations", "layer_norm", "softmax"] | None = None
     validator: Validator | None = None
     observer: Observer | None = None
     lowering_target: object | None = None
 
-    def kernel(self, *, fast: bool, config: FastConfig) -> type[Instruction] | None:
+    def kernel(self, *, fast: bool, config: FastConfig) -> KernelFactory | None:
         if fast and self.fast_kernel is not None:
             enabled = self.fast_flag is None or bool(getattr(config, self.fast_flag))
             if enabled:
@@ -146,7 +148,7 @@ class OperatorRegistry:
 
     def kernel(
         self, target: str, *, fast: bool, config: FastConfig,
-    ) -> type[Instruction] | None:
+    ) -> KernelFactory | None:
         rule = self.operation(target)
         return None if rule is None else rule.kernel(fast=fast, config=config)
 
@@ -534,7 +536,7 @@ def _observe_routed_family(value, ids, banks, handle):
 
 def _build_default_registry() -> OperatorRegistry:
     registry = OperatorRegistry()
-    exact: dict[str, type[Instruction]] = {
+    exact: dict[str, KernelFactory] = {
         "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
         "cattorch.routed_experts.default": RoutedExpertsInstruction,
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
@@ -592,7 +594,7 @@ def _build_default_registry() -> OperatorRegistry:
     fast: dict[
         str,
         tuple[
-            type[Instruction] | None,
+            KernelFactory | None,
             Literal["activations", "layer_norm", "softmax"] | None,
         ],
     ] = {

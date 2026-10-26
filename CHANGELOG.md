@@ -37,7 +37,8 @@
   and `torch.minimum`.
   `torch.pow` accepts integer exponents from -4 to 4 and ±0.5.
 - Exact GELU (the `nn.GELU()` default) is supported, so Hugging Face BERT
-  models export without changes.
+  models export without changes. This includes `ExpertFamily` experts, which
+  previously required `approximate="tanh"`.
 - `F.log_softmax` is supported.
 - `unflatten` and `squeeze` are supported. With them, `nn.MultiheadAttention`
   and `nn.TransformerEncoder` export.
