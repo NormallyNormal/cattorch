@@ -149,13 +149,34 @@ def test_sigmoid_router_with_shared_expert_lowers_to_scratch(tmp_path):
     assert comparison.passed, comparison
 
 
+class RoutesAsInputs(nn.Module):
+    def __init__(self, experts):
+        super().__init__()
+        self.experts = family(experts)
+
+    def forward(self, value, ids, weights):
+        return routed_experts(value, ids, weights, self.experts)
+
+
+@torch.no_grad()
+def test_routes_from_inputs_lower_to_scratch(tmp_path):
+    torch.manual_seed(4)
+    model = RoutesAsInputs(4).eval()
+    inputs = (torch.randn(3, 4), torch.tensor([[3, 0], [1, 1], [2, 3]]), torch.rand(3, 2))
+    result = transpile(model, inputs, tmp_path / "inputs")
+    comparison = verify(model, inputs, result, atol=1e-4)
+    assert comparison.passed, comparison
+
+
 @torch.no_grad()
 def test_block_count_does_not_grow_with_expert_count(tmp_path):
+    # Routes come in as inputs, so only the expert kernel sees the expert count.
     counts = []
     for experts in (2, 8):
         torch.manual_seed(4)
-        model = TopKBlock(experts=experts, top_k=1).eval()
-        result = transpile(model, torch.ones(1, 4), tmp_path / f"experts-{experts}")
+        model = RoutesAsInputs(experts).eval()
+        inputs = (torch.ones(1, 4), torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1))
+        result = transpile(model, inputs, tmp_path / f"experts-{experts}")
         with zipfile.ZipFile(result.path) as archive:
             counts.append(len(json.loads(archive.read("sprite.json"))["blocks"]))
     assert counts[1] == counts[0]

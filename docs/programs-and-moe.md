@@ -215,7 +215,7 @@ class Block(nn.Module):
         return routed_experts(value, ids, weights, self.experts)
 
 model = Block().eval()
-example = torch.zeros(3, 4)
+example = torch.randn(3, 4)
 artifact = transpile(model, example, "routed-moe")
 assert verify(model, example, artifact).passed
 ```
@@ -227,6 +227,10 @@ is ordinary exported code, so softmax or sigmoid scoring, normalization,
 shared experts, and other variations need no special support. Expert IDs are
 zero-based, as `torch.topk` returns them. In PyTorch, IDs outside the expert
 bank raise `IndexError`; in Scratch they aren't checked.
+
+When router scores tie exactly, Scratch's `topk` picks the lower expert ID.
+PyTorch doesn't define which of the tied experts `torch.topk` returns, so
+`verify` can fail on inputs that make scores tie, such as all zeros.
 
 For GPTQ, use calibration data that routes tokens the way real use does.
 Experts that receive too little data fall back to symmetric quantization; see
