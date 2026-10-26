@@ -15,7 +15,7 @@ from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.frontend import capture_model
 from cattorch.graph import _prepare_graph
 from cattorch.moe import (
-    SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
+    ExpertFamily, SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
 )
 from cattorch.operator_registry import default_registry
 from cattorch.program import ExportProgram, Output
@@ -107,10 +107,22 @@ def analyze(
     generic_expert_errors = []
     from cattorch.util.argument import Argument
     from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
+    probed = set()
     for path, module in owned.named_modules():
-        if not isinstance(module, _BankedSparseMoE):
+        # A SparseMoE's family is probed with its routing; a family used
+        # through ``routed_experts`` takes its routes from the graph, and the
+        # expert program doesn't depend on ``top_k``.
+        if isinstance(module, _BankedSparseMoE):
+            family, top_k, normalize = (
+                module.expert_family, module.top_k, module.normalize_selected,
+            )
+        elif isinstance(module, ExpertFamily):
+            family, top_k, normalize = module, 1, False
+        else:
             continue
-        family = module.expert_family
+        if id(family) in probed:
+            continue
+        probed.add(id(family))
         probe_args = [
             Argument("value", family.example_input.shape),
             Argument("selection", torch.Size((1, family.expert_count))),
@@ -123,8 +135,7 @@ def analyze(
         try:
             instruction = ExpertFamilyMoEInstruction(
                 "cattorch.expert_family_moe.default", "output", *probe_args,
-                family=family, top_k=module.top_k,
-                normalize_selected=module.normalize_selected,
+                family=family, top_k=top_k, normalize_selected=normalize,
             )
             instruction._expert_program()
         except ValueError as error:

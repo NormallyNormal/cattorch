@@ -3,8 +3,8 @@
 from cattorch.adapters import AdapterContext, ModuleAdapter
 from cattorch.analysis import AnalysisReport, EntryPointAnalysis, analyze
 from cattorch.moe import (
-    ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, select_routes,
-    stacked_swiglu_moe_adapter,
+    ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, routed_experts,
+    select_routes, stacked_swiglu_moe_adapter,
 )
 from cattorch.program import (
     EntryPoint,
@@ -22,6 +22,6 @@ __all__ = [
     "AdapterContext", "AnalysisReport", "EntryPoint", "EntryPointAnalysis",
     "ExpertFamily", "ExportProgram", "GenerationProgram", "Input", "ModuleAdapter", "Output",
     "ProgramCall", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE", "State", "StateInput",
-    "StateUpdate", "analyze", "select_routes",
+    "StateUpdate", "analyze", "routed_experts", "select_routes",
     "stacked_swiglu_moe_adapter",
 ]

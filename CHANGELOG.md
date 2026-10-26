@@ -58,6 +58,13 @@
 - `sin` and `cos`, adaptive max pooling, and
   `F.scaled_dot_product_attention` with a static `attn_mask`.
 - BatchNorm without running statistics uses batch statistics, as PyTorch does.
+- Experimental: `routed_experts(value, expert_ids, weights, experts)` runs an
+  `ExpertFamily` on routes computed by your own router code, such as a linear
+  layer, softmax or sigmoid, and `torch.topk`. It replaces the value-dependent
+  expert loop of a typical MoE block, so shared experts and other router
+  variations export without rebuilding the block as a `SparseMoE`. Only the
+  selected experts run in Scratch. See
+  [routing with your own router code](docs/programs-and-moe.md#routing-with-your-own-router-code).
 
 ## Fixes
 

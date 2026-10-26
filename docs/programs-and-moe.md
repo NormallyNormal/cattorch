@@ -184,6 +184,50 @@ implementation. If your MoE module has `router.weight`, `gate.weight`,
 `up.weight`, and `down.weight` attributes, `stacked_swiglu_moe_adapter(YourMoEClass)`
 converts it.
 
+### Routing with your own router code
+
+A typical MoE block picks experts with `torch.topk` and then loops over the
+experts with `torch.where` and `index_add_`. That loop depends on tensor
+values, so it can't be traced. Keep the router as it is and replace only the
+loop with `routed_experts(value, expert_ids, weights, experts)`:
+
+```python
+import torch
+from torch import nn
+from cattorch import transpile, verify
+from cattorch.experimental import ExpertFamily, routed_experts
+
+class Block(nn.Module):
+    def __init__(self, width=4, experts=4, top_k=2):
+        super().__init__()
+        self.gate = nn.Linear(width, experts, bias=False)
+        self.experts = ExpertFamily.from_modules(
+            [nn.Sequential(nn.Linear(width, 8), nn.SiLU(), nn.Linear(8, width))
+             for _ in range(experts)],
+            example_input=torch.zeros(1, width),
+        )
+        self.top_k = top_k
+
+    def forward(self, value):
+        probabilities = torch.softmax(self.gate(value), dim=-1)
+        weights, ids = torch.topk(probabilities, self.top_k, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return routed_experts(value, ids, weights, self.experts)
+
+model = Block().eval()
+example = torch.zeros(3, 4)
+artifact = transpile(model, example, "routed-moe")
+assert verify(model, example, artifact).passed
+```
+
+`expert_ids` and `weights` have shape `[..., top_k]`, where `value` has shape
+`[..., width]`. Each token's output is the sum of `weights[t, r]` times
+expert `expert_ids[t, r]` applied to the token, over its routes `r`. The router
+is ordinary exported code, so softmax or sigmoid scoring, normalization,
+shared experts, and other variations need no special support. Expert IDs are
+zero-based, as `torch.topk` returns them. In PyTorch, IDs outside the expert
+bank raise `IndexError`; in Scratch they aren't checked.
+
 For GPTQ, use calibration data that routes tokens the way real use does.
 Experts that receive too little data fall back to symmetric quantization; see
 [GPTQ calibration](storage.md#gptq-calibration).

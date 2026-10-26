@@ -360,6 +360,8 @@ class ExpertFamilyMoEInstruction(Instruction):
     the base index used by static-list reporters.
     """
 
+    program_name = "expert_family_moe"
+
     def __init__(
         self, torch_name, output, *args, family, top_k: int,
         normalize_selected: bool, fast_activations: bool = False,
@@ -757,12 +759,8 @@ class ExpertFamilyMoEInstruction(Instruction):
             result = result[0]
         return tuple(statements), tensor_name(result), tuple(declared), list_values
 
-    def finalize(self):
-        expert_body, expert_output, expert_lists, expert_list_values = (
-            self._expert_program()
-        )
-        routes = "_moe route ids"
-        weights = "_moe route weights"
+    def _route_statements(self, routes, weights):
+        """Fill ``routes`` (one-based expert numbers) and ``weights`` for ``token``."""
         normalize = ()
         if self.normalize_selected:
             normalize = (
@@ -792,10 +790,68 @@ class ExpertFamilyMoEInstruction(Instruction):
                     ),
                 ),
             )
+        return (
+            set_var("route", 0),
+            repeat(self.top_k, (
+                set_var("expert", 1), set_var("best", "-Infinity"),
+                set_var("selected", 0),
+                repeat(self.experts, (
+                    if_(eq(index_of(routes, var("expert")), 0), (
+                        set_var("candidate score", item(
+                            "T2", add(
+                                mul(var("token"), self.experts),
+                                var("expert"),
+                            ),
+                        )),
+                        if_else(
+                            eq(var("selected"), 0),
+                            (
+                                set_var("best", var("candidate score")),
+                                set_var("selected", var("expert")),
+                            ),
+                            (if_else(
+                                not_(eq(
+                                    var("candidate score"),
+                                    var("candidate score"),
+                                )),
+                                (if_(eq(var("best"), var("best")), (
+                                    set_var("best", var("candidate score")),
+                                    set_var("selected", var("expert")),
+                                )),),
+                                (if_(eq(var("best"), var("best")), (
+                                    if_(gt(
+                                        var("candidate score"), var("best"),
+                                    ), (
+                                        set_var(
+                                            "best", var("candidate score"),
+                                        ),
+                                        set_var("selected", var("expert")),
+                                    )),
+                                )),),
+                            ),),
+                        ),
+                    )),
+                    change_var("expert", 1),
+                )),
+                append(routes, var("selected")),
+                append(weights, item(
+                    "T3", add(mul(var("token"), self.experts), var("selected")),
+                )),
+                change_var("route", 1),
+            )),
+            *normalize,
+        )
+
+    def finalize(self):
+        expert_body, expert_output, expert_lists, expert_list_values = (
+            self._expert_program()
+        )
+        routes = "_moe route ids"
+        weights = "_moe route weights"
         bank_lists = tuple(f"T{index}" for index in range(4, 4 + len(self.args) - 3))
         target_list = f"T{len(self.args) + 1}"
         return Program(
-            "expert_family_moe",
+            self.program_name,
             variables=(
                 "token", "expert", "best", "selected", "route", "active expert",
                 "input index", "output index", "selected denominator", "expert row",
@@ -811,55 +867,7 @@ class ExpertFamilyMoEInstruction(Instruction):
                 repeat(self.tokens, (
                     repeat(self.output_width, (append(target_list, 0),)),
                     clear(routes), clear(weights),
-                    set_var("route", 0),
-                    repeat(self.top_k, (
-                        set_var("expert", 1), set_var("best", "-Infinity"),
-                        set_var("selected", 0),
-                        repeat(self.experts, (
-                            if_(eq(index_of(routes, var("expert")), 0), (
-                                set_var("candidate score", item(
-                                    "T2", add(
-                                        mul(var("token"), self.experts),
-                                        var("expert"),
-                                    ),
-                                )),
-                                if_else(
-                                    eq(var("selected"), 0),
-                                    (
-                                        set_var("best", var("candidate score")),
-                                        set_var("selected", var("expert")),
-                                    ),
-                                    (if_else(
-                                        not_(eq(
-                                            var("candidate score"),
-                                            var("candidate score"),
-                                        )),
-                                        (if_(eq(var("best"), var("best")), (
-                                            set_var("best", var("candidate score")),
-                                            set_var("selected", var("expert")),
-                                        )),),
-                                        (if_(eq(var("best"), var("best")), (
-                                            if_(gt(
-                                                var("candidate score"), var("best"),
-                                            ), (
-                                                set_var(
-                                                    "best", var("candidate score"),
-                                                ),
-                                                set_var("selected", var("expert")),
-                                            )),
-                                        )),),
-                                    ),),
-                                ),
-                            )),
-                            change_var("expert", 1),
-                        )),
-                        append(routes, var("selected")),
-                        append(weights, item(
-                            "T3", add(mul(var("token"), self.experts), var("selected")),
-                        )),
-                        change_var("route", 1),
-                    )),
-                    *normalize,
+                    *self._route_statements(routes, weights),
                     set_var("route", 1),
                     repeat(self.top_k, (
                         set_var("active expert", sub(item(routes, var("route")), 1)),
@@ -891,4 +899,37 @@ class ExpertFamilyMoEInstruction(Instruction):
         ).compile()
 
 
-__all__ = ["ExpertFamilyMoEInstruction", "StackedSwiGLUMoEInstruction"]
+class RoutedExpertsInstruction(ExpertFamilyMoEInstruction):
+    """Banked experts whose routes (zero-based IDs and weights) are inputs.
+
+    ``T2`` and ``T3`` hold ``[tokens, top_k]`` expert IDs and weights, computed
+    by ordinary router code earlier in the graph.
+    """
+
+    program_name = "routed_experts"
+
+    def __init__(
+        self, torch_name, output, *args, family, fast_activations: bool = False,
+        fast_layer_norm: bool = False,
+    ):
+        super().__init__(
+            torch_name, output, *args, family=family, top_k=args[1].shape[-1],
+            normalize_selected=False, fast_activations=fast_activations,
+            fast_layer_norm=fast_layer_norm,
+        )
+
+    def _route_statements(self, routes, weights):
+        position = add(mul(var("token"), self.top_k), var("route"))
+        return (
+            set_var("route", 1),
+            repeat(self.top_k, (
+                append(routes, add(item("T2", position), 1)),
+                append(weights, item("T3", position)),
+                change_var("route", 1),
+            )),
+        )
+
+
+__all__ = [
+    "ExpertFamilyMoEInstruction", "RoutedExpertsInstruction", "StackedSwiGLUMoEInstruction",
+]

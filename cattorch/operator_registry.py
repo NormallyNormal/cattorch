@@ -35,7 +35,7 @@ from cattorch.util.instruction.optimized import (
     OptimizedTransposeInstruction,
 )
 from cattorch.util.instruction.optimized_moe import (
-    ExpertFamilyMoEInstruction, StackedSwiGLUMoEInstruction,
+    ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
 )
 from cattorch.util.instruction.generic import (
     IndexMapInstruction, REDUCTIONS, ReductionInstruction,
@@ -108,6 +108,9 @@ class OperatorRegistry:
             raise ValueError(f"unknown ExpertFamily handle {handle}") from error
 
     def _register_expert_family(self, family) -> int:
+        for handle, registered in self._expert_families.items():
+            if registered is family:
+                return handle
         handle = self._next_expert_family
         self._next_expert_family += 1
         self._expert_families[handle] = family
@@ -224,7 +227,13 @@ class OperatorRegistry:
             # than a user adapter. Register their canonical program only on
             # this export-owned registry so concurrent exports cannot leak
             # template handles into one another.
-            from cattorch.moe import SparseMoE, _BankedSparseMoE, _specialize_sparse_swiglu
+            from cattorch.moe import (
+                ExpertFamily, SparseMoE, _BankedSparseMoE, _specialize_sparse_swiglu,
+            )
+            if isinstance(module, ExpertFamily):
+                # ``routed_experts`` reads the handle from the export copy.
+                module._cattorch_handle = self._register_expert_family(module)
+                return module
             if isinstance(module, SparseMoE):
                 specialized = _specialize_sparse_swiglu(module)
                 if specialized is not None:
@@ -441,17 +450,29 @@ def _observe_expert_family(_func, args, _kwargs, _result):
     value, selection, combination, banks, handle, top_k, normalize, _ = args[:8]
     if not isinstance(value, torch.Tensor):
         return ()
-    from cattorch.moe import (
-        RoutingScores, _ACTIVE_EXPERT_FAMILIES, select_routes,
-    )
-    family = _ACTIVE_EXPERT_FAMILIES.get().get(int(handle))
-    if family is None:
-        return ()
+    from cattorch.moe import RoutingScores, select_routes
     ids, _weights = select_routes(
         RoutingScores(selection, combination, bool(normalize)), int(top_k),
     )
+    return _observe_routed_family(value, ids, banks, handle)
+
+
+def _observe_routed_experts(_func, args, _kwargs, _result):
+    if len(args) < 6:
+        return ()
+    value, ids, _weights, banks, handle, _ = args[:6]
+    if not isinstance(value, torch.Tensor) or not isinstance(ids, torch.Tensor):
+        return ()
+    return _observe_routed_family(value, ids, banks, handle)
+
+
+def _observe_routed_family(value, ids, banks, handle):
+    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES
+    family = _ACTIVE_EXPERT_FAMILIES.get().get(int(handle))
+    if family is None:
+        return ()
     flat = value.detach().reshape(-1, value.shape[-1])
-    flat_ids = ids.reshape(-1, int(top_k))
+    flat_ids = ids.reshape(-1, ids.shape[-1])
     observations = []
     from cattorch.frontend import capture_model
     captured = getattr(family, "_gptq_captured_template", None)
@@ -515,6 +536,7 @@ def _build_default_registry() -> OperatorRegistry:
     registry = OperatorRegistry()
     exact: dict[str, type[Instruction]] = {
         "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
+        "cattorch.routed_experts.default": RoutedExpertsInstruction,
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
         "aten.linear.default": LinearInstruction,
         "aten.softmax.int": OptimizedSoftmaxInstruction,
@@ -562,6 +584,7 @@ def _build_default_registry() -> OperatorRegistry:
     observers = {
         "cattorch.stacked_swiglu_moe.default": _observe_stacked_swiglu,
         "cattorch.expert_family_moe.default": _observe_expert_family,
+        "cattorch.routed_experts.default": _observe_routed_experts,
         "aten.linear.default": _observe_linear,
         "aten.mm.default": _observe_rhs_matmul,
         "aten.matmul.default": _observe_rhs_matmul,

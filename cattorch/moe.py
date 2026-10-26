@@ -186,6 +186,10 @@ class ExpertFamily(nn.Module):
     module (and one copy of its graph) per expert.
     """
 
+    # Set on the export copy when a registry registers this family, so
+    # ``routed_experts`` can name it in the traced graph.
+    _cattorch_handle: int | None = None
+
     def __init__(
         self,
         template: nn.Module,
@@ -450,6 +454,69 @@ class ExpertFamily(nn.Module):
         )
 
 
+def _check_routes(
+    value: torch.Tensor, expert_ids: torch.Tensor, weights: torch.Tensor, experts: int,
+) -> None:
+    """Validate explicit routes; expert ID values are checked only for real tensors."""
+    if value.ndim < 1:
+        raise ValueError("routed expert input must have a feature dimension")
+    if expert_ids.ndim != value.ndim or tuple(expert_ids.shape[:-1]) != tuple(value.shape[:-1]):
+        raise ValueError(
+            f"expert_ids must have shape [{', '.join(map(str, value.shape[:-1]))}, top_k], "
+            f"got {list(expert_ids.shape)}"
+        )
+    if expert_ids.shape[-1] < 1:
+        raise ValueError("expert_ids must select at least one expert per token")
+    if weights.shape != expert_ids.shape:
+        raise ValueError(
+            f"weights shape {list(weights.shape)} must equal expert_ids shape "
+            f"{list(expert_ids.shape)}"
+        )
+    if expert_ids.dtype.is_floating_point or expert_ids.dtype.is_complex:
+        raise TypeError("expert_ids must be an integer tensor")
+    if not weights.dtype.is_floating_point:
+        raise TypeError("routing weights must be a floating-point tensor")
+    if (
+        expert_ids.numel()
+        and not isinstance(expert_ids, torch._subclasses.FakeTensor)
+        and expert_ids.device.type != "meta"
+        and (int(expert_ids.min()) < 0 or int(expert_ids.max()) >= experts)
+    ):
+        raise IndexError(f"expert_ids must be between 0 and {experts - 1}")
+
+
+def _combine_routes(
+    family: "ExpertFamily",
+    banks: Sequence[torch.Tensor],
+    value: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    output_width: int,
+) -> torch.Tensor:
+    """Run each token through its routed experts and sum the weighted outputs."""
+    top_k = expert_ids.shape[-1]
+    flat = value.reshape(-1, value.shape[-1])
+    flat_ids = expert_ids.reshape(-1, top_k)
+    flat_weights = weights.reshape(-1, top_k)
+    output = flat.new_zeros((flat.shape[0], output_width))
+    for expert_id in range(family.expert_count):
+        token, route = torch.nonzero(flat_ids == expert_id, as_tuple=True)
+        if token.numel() == 0:
+            continue
+        selected = flat.index_select(0, token)
+        state = family._state_from_banks(banks, expert_id)
+        expert_output = torch.func.functional_call(
+            family.template, state, (selected,), strict=False, tie_weights=True,
+        )
+        output.index_add_(
+            0, token,
+            expert_output * flat_weights[token, route].to(
+                expert_output.dtype,
+            ).unsqueeze(-1),
+        )
+    return output.reshape(*value.shape[:-1], output_width)
+
+
 @torch.library.custom_op("cattorch::expert_family_moe", mutates_args=())
 def _expert_family_moe(
     value: torch.Tensor,
@@ -475,26 +542,7 @@ def _expert_family_moe(
     ids, weights = select_routes(
         RoutingScores(selection, combination, normalize_selected), top_k,
     )
-    flat = value.reshape(-1, value.shape[-1])
-    flat_ids = ids.reshape(-1, top_k)
-    flat_weights = weights.reshape(-1, top_k)
-    output = flat.new_zeros((flat.shape[0], output_width))
-    for expert_id in range(family.expert_count):
-        token, route = torch.nonzero(flat_ids == expert_id, as_tuple=True)
-        if token.numel() == 0:
-            continue
-        selected = flat.index_select(0, token)
-        state = family._state_from_banks(banks, expert_id)
-        expert_output = torch.func.functional_call(
-            family.template, state, (selected,), strict=False, tie_weights=True,
-        )
-        output.index_add_(
-            0, token,
-            expert_output * flat_weights[token, route].to(
-                expert_output.dtype,
-            ).unsqueeze(-1),
-        )
-    return output.reshape(*value.shape[:-1], output_width)
+    return _combine_routes(family, banks, value, ids, weights, output_width)
 
 
 @_expert_family_moe.register_fake
@@ -503,6 +551,56 @@ def _expert_family_moe_fake(
     normalize_selected, output_width,
 ):
     return value.new_empty((*value.shape[:-1], output_width))
+
+
+@torch.library.custom_op("cattorch::routed_experts", mutates_args=())
+def _routed_experts(
+    value: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    banks: Sequence[torch.Tensor],
+    family_handle: int,
+    output_width: int,
+) -> torch.Tensor:
+    """Opaque semantic boundary for banked experts with caller-chosen routes."""
+    family = _ACTIVE_EXPERT_FAMILIES.get().get(family_handle)
+    if family is None:
+        raise RuntimeError("routed ExpertFamily executed outside its export context")
+    _check_routes(value, expert_ids, weights, family.expert_count)
+    return _combine_routes(family, banks, value, expert_ids, weights, output_width)
+
+
+@_routed_experts.register_fake
+def _routed_experts_fake(value, expert_ids, weights, banks, family_handle, output_width):
+    return value.new_empty((*value.shape[:-1], output_width))
+
+
+def routed_experts(
+    value: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    experts: "ExpertFamily",
+) -> torch.Tensor:
+    """Run each token through the experts its router chose.
+
+    ``value`` is ``[..., width]``. ``expert_ids`` and ``weights`` are
+    ``[..., top_k]``: token ``t`` sums ``weights[t, r] * experts(expert_ids[t, r],
+    value[t])`` over its routes ``r``. The router producing them is ordinary
+    traced code, such as a linear layer, softmax, and ``torch.topk``. In
+    Scratch, only the selected experts run.
+    """
+    if not isinstance(experts, ExpertFamily):
+        raise TypeError("experts must be an ExpertFamily")
+    handle = experts._cattorch_handle
+    if handle is not None:
+        return _routed_experts(
+            value, expert_ids, weights, list(experts.unique_banks()),
+            handle, experts.output_width,
+        )
+    _check_routes(value, expert_ids, weights, experts.expert_count)
+    return _combine_routes(
+        experts, experts.unique_banks(), value, expert_ids, weights, experts.output_width,
+    )
 
 
 class _BankedSparseMoE(nn.Module):
@@ -876,5 +974,5 @@ def stacked_swiglu_moe_adapter(
 
 __all__ = [
     "ExpertFamily", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE",
-    "select_routes", "stacked_swiglu_moe_adapter",
+    "routed_experts", "select_routes", "stacked_swiglu_moe_adapter",
 ]

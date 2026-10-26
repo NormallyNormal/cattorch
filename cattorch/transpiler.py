@@ -845,7 +845,9 @@ class _Compiler:
         )
         if detail is not None:
             raise _unsupported_operation(node, detail)
-        if aten_op == "cattorch.expert_family_moe.default":
+        if aten_op in {
+            "cattorch.expert_family_moe.default", "cattorch.routed_experts.default",
+        }:
             value_nodes = list(node.args[:3])
             bank_nodes = list(node.args[3])
             tensor_nodes = [*value_nodes, *bank_nodes]
@@ -855,19 +857,27 @@ class _Compiler:
                 for name, value in zip(input_lists, tensor_nodes)
             ]
             handle = int(node.args[4])
-            from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
-            instruction = ExpertFamilyMoEInstruction(
-                node.target, target_list, *args,
-                family=self.graph.registry.expert_family(handle),
-                top_k=int(node.args[5]),
-                normalize_selected=bool(node.args[6]),
-                fast_activations=(
-                    self.graph.fast and self.graph.fast_config.activations
-                ),
-                fast_layer_norm=(
-                    self.graph.fast and self.graph.fast_config.layer_norm
-                ),
+            from cattorch.util.instruction.optimized_moe import (
+                ExpertFamilyMoEInstruction, RoutedExpertsInstruction,
             )
+            fast_options = {
+                "fast_activations": self.graph.fast and self.graph.fast_config.activations,
+                "fast_layer_norm": self.graph.fast and self.graph.fast_config.layer_norm,
+            }
+            if aten_op == "cattorch.routed_experts.default":
+                instruction = RoutedExpertsInstruction(
+                    node.target, target_list, *args,
+                    family=self.graph.registry.expert_family(handle),
+                    **fast_options,
+                )
+            else:
+                instruction = ExpertFamilyMoEInstruction(
+                    node.target, target_list, *args,
+                    family=self.graph.registry.expert_family(handle),
+                    top_k=int(node.args[5]),
+                    normalize_selected=bool(node.args[6]),
+                    **fast_options,
+                )
             family = self.graph.registry.expert_family(handle)
             template_state = {}
             template_state.update(dict(
