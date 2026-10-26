@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import operator
 
 import torch
 
@@ -13,6 +14,18 @@ from cattorch.util.scratch.dsl import (
     Program, add, append, change_var, clear, div, eq, gt, if_, index_of, item,
     if_else, length, lt, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
 )
+
+
+# Data movement inside an expert, lowered through static index tables.
+_EXPERT_MOVES = frozenset({
+    "aten.slice.Tensor", "aten.narrow.default", "aten.select.int",
+    "aten.transpose.int", "aten.permute.default", "aten.t.default",
+})
+# Multi-output moves; each ``getitem`` of one is lowered like a move.
+_EXPERT_SPLITS = frozenset({
+    "aten.split.Tensor", "aten.split_with_sizes.default", "aten.chunk.default",
+    "aten.unbind.int",
+})
 
 
 class StackedSwiGLUMoEInstruction(Instruction):
@@ -521,9 +534,18 @@ class ExpertFamilyMoEInstruction(Instruction):
                 "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
                 "aten.flatten.using_ints", "aten.contiguous.default", "aten.clone.default",
                 "aten.detach.default", "aten.alias.default",
-            }:
+            } or (
+                # Scratch keeps one number type, so float casts change nothing.
+                target in {"aten.to.dtype", "aten._to_copy.default"}
+                and node.meta["val"].dtype.is_floating_point
+                and node.args[0].meta["val"].dtype.is_floating_point
+            ):
                 names[node.name] = tensor_name(node.args[0])
                 shapes[node.name] = tuple(node.meta["val"].shape)
+                continue
+            if target in _EXPERT_SPLITS:
+                # Each output is lowered at its ``getitem``.
+                shapes[node.name] = tuple(node.args[0].meta["val"].shape)
                 continue
 
             output_name = f"_expert {len(declared)}"
@@ -532,6 +554,70 @@ class ExpertFamilyMoEInstruction(Instruction):
             shapes[node.name] = output_shape
             declared.append(output_name)
             statements.append(clear(output_name))
+
+            if target in _EXPERT_MOVES or (
+                node.target is operator.getitem and str(node.args[0].target) in _EXPERT_SPLITS
+            ):
+                # A static index table found by running the move on positions.
+                parent = node.args[0] if target in _EXPERT_MOVES else node.args[0].args[0]
+                source_shape = tensor_shape(parent)
+                positions = torch.arange(1, math.prod(source_shape) + 1, dtype=torch.float64)
+                positions = positions.reshape(source_shape)
+                with torch.no_grad():
+                    if target in _EXPERT_MOVES:
+                        moved = node.target(positions, *node.args[1:], **node.kwargs)
+                    else:
+                        split = node.args[0]
+                        moved = split.target(positions, *split.args[1:], **split.kwargs)
+                        moved = moved[node.args[1]]
+                map_name = f"_expert map {len(list_values)}"
+                list_values[map_name] = [int(value) for value in moved.reshape(-1).tolist()]
+                declared.append(map_name)
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(moved.numel(), (
+                        append(output_name, item(
+                            tensor_name(parent), item(map_name, var("expert index")),
+                        )),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
+
+            if target in {"aten.clamp.default", "aten.clamp_min.default", "aten.clamp_max.default"}:
+                low = high = None
+                if target == "aten.clamp_min.default":
+                    low = node.args[1]
+                elif target == "aten.clamp_max.default":
+                    high = node.args[1]
+                else:
+                    low = node.args[1] if len(node.args) > 1 else node.kwargs.get("min")
+                    high = node.args[2] if len(node.args) > 2 else node.kwargs.get("max")
+                if any(hasattr(bound, "op") for bound in (low, high)):
+                    raise ValueError(
+                        "unsupported operation inside generic ExpertFamily: "
+                        "clamp with tensor bounds"
+                    )
+                if "expert clamp value" not in self.extra_variables:
+                    self.extra_variables.append("expert clamp value")
+                value = var("expert clamp value")
+                limits = []
+                if low is not None:
+                    limits.append(if_(lt(value, low), (set_var("expert clamp value", low),)))
+                if high is not None:
+                    limits.append(if_(gt(value, high), (set_var("expert clamp value", high),)))
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(math.prod(output_shape), (
+                        set_var("expert clamp value", item(
+                            tensor_name(node.args[0]), var("expert index"),
+                        )),
+                        *limits,
+                        append(output_name, value),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
 
             if target == "aten.linear.default":
                 source, weight = node.args[:2]

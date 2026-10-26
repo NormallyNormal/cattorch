@@ -80,7 +80,7 @@
   classes marked with transformers' `@use_experts_implementation` run through
   `routed_experts` on the export copy, whatever their weight layout, biases,
   gating, or post-expert norm. Experts with their own gate function, such as
-  GPT-OSS, are rejected with a message naming the class.
+  GPT-OSS's clamped GLU, run it inside the expert program.
 - In-place updates of computed tensors, such as `x /= x.sum()` or `x.mul_(2)`,
   export as ordinary operations. Updates seen through a view taken before the
   update are still rejected.

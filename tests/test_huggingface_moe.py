@@ -66,8 +66,7 @@ def experts_class(*, gated=True, transposed=False, bias=False, norm=False, act="
 
                     projected = project(self.up_name, value)
                     if gated:
-                        gate, up = projected.chunk(2, dim=-1)
-                        hidden = self.act_fn(gate) * up
+                        hidden = self._apply_gate(projected)
                     else:
                         hidden = self.act_fn(projected)
                     result = project("down_proj", hidden)
@@ -133,11 +132,72 @@ def test_experts_block_lowers_to_scratch(tmp_path, variant):
     assert comparison.passed, comparison
 
 
-def test_custom_gate_is_rejected_with_its_class_name():
-    experts = experts_class()
-    experts._apply_gate = lambda self, value: value[..., :HIDDEN]
-    with pytest.raises(UnsupportedModelError, match="_apply_gate"):
-        default_registry().clone().adapt_model(Block(experts(Config())).eval())
+def gpt_oss_gate(self, gate_up):
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=self.limit)
+    up = up.clamp(min=-self.limit, max=self.limit)
+    return (up + 1) * (gate * torch.sigmoid(gate * self.alpha))
+
+
+def clamped_swiglu_gate(self, gate_up):
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate = gate.clamp(max=self.limit)
+    up = up.clamp(min=-self.limit, max=self.limit)
+    return (self.act_fn(gate.float()) * up.float()).to(gate.dtype)
+
+
+CUSTOM_GATES = {
+    "gpt-oss": (gpt_oss_gate, {"bias": True, "transposed": True}),
+    "clamped swiglu": (clamped_swiglu_gate, {}),
+}
+
+
+def custom_gate_class(case):
+    gate, options = CUSTOM_GATES[case]
+    experts = experts_class(**options)
+    experts._apply_gate = gate
+    original = experts.__init__
+
+    def init(self, config):
+        original(self, config)
+        # Small limits so the clamps change some values.
+        self.limit, self.alpha = 0.6, 1.702
+
+    experts.__init__ = init
+    return experts
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("case", sorted(CUSTOM_GATES))
+def test_custom_gates_export_through_the_class_gate(tmp_path, case):
+    torch.manual_seed(4)
+    experts = custom_gate_class(case)(Config()).eval()
+    value = torch.randn(5, WIDTH)
+    ids = torch.tensor([[0, 3], [2, 2], [1, 0], [3, 1], [2, 0]])
+    weights = torch.rand(5, 2)
+    expected = torch.zeros(5, WIDTH)
+    for token in range(5):
+        for route in range(2):
+            expert = int(ids[token, route])
+            up = experts.gate_up_proj[expert]
+            projected = value[token] @ up if experts.is_transposed else up @ value[token]
+            if experts.has_bias:
+                projected = projected + experts.gate_up_proj_bias[expert]
+            hidden = experts._apply_gate(projected)
+            down = experts.down_proj[expert]
+            result = hidden @ down if experts.is_transposed else down @ hidden
+            if experts.has_bias:
+                result = result + experts.down_proj_bias[expert]
+            expected[token] += weights[token, route] * result
+    registry = default_registry().clone()
+    converted = registry.adapt_model(experts)
+    with _expert_family_context(registry.expert_families):
+        torch.testing.assert_close(converted(value, ids, weights), expected, atol=1e-5, rtol=0)
+    model = Block(custom_gate_class(case)(Config())).eval()
+    block_value = torch.randn(1, 3, WIDTH)
+    result = transpile(model, block_value, tmp_path / "custom-gate")
+    comparison = verify(model, block_value, result, atol=1e-4)
+    assert comparison.passed, comparison
 
 
 def test_the_original_experts_module_is_unchanged():
@@ -160,6 +220,10 @@ MODELS = {
         num_experts=4, num_experts_per_tok=2, moe_intermediate_size=12, head_dim=8,
     )),
     "olmoe": ("OlmoeConfig", dict(num_experts=4, num_experts_per_tok=2)),
+    # Interleaved gate/up with a clamped GLU in its own _apply_gate.
+    "gpt_oss": ("GptOssConfig", dict(
+        num_local_experts=4, num_experts_per_tok=2, head_dim=8, sliding_window=4,
+    )),
     # Multi-head latent attention fills its keys by slice assignment, and the
     # router picks expert groups with scatter and gather.
     "deepseek_v3": ("DeepseekV3Config", dict(

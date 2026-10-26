@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 
@@ -95,6 +96,37 @@ class _HuggingFaceExpert(torch.nn.Module):
         return output if self.norm is None else self.norm(output)
 
 
+class _HuggingFaceGate(torch.nn.Module):
+    """A class's own ``_apply_gate`` with the settings it reads (limits, alpha)."""
+
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self._gate = type(module)._apply_gate
+        for name, value in vars(module).items():
+            if not name.startswith("_") and isinstance(value, (bool, int, float, str)):
+                setattr(self, name, value)
+        if isinstance(getattr(module, "act_fn", None), torch.nn.Module):
+            self.act_fn = copy.deepcopy(module.act_fn)
+
+    def forward(self, gate_up):
+        return self._gate(self, gate_up)
+
+
+class _HuggingFaceCustomGateExpert(torch.nn.Module):
+    """One expert whose combined gate/up output goes through a custom gate."""
+
+    def __init__(self, width, combined, hidden, bias, gate, norm):
+        super().__init__()
+        self.gate_up = torch.nn.Linear(width, combined, bias=bias)
+        self.down = torch.nn.Linear(hidden, width, bias=bias)
+        self.gate = gate
+        self.norm = norm
+
+    def forward(self, value):
+        output = self.down(self.gate(self.gate_up(value)))
+        return output if self.norm is None else self.norm(output)
+
+
 class HuggingFaceExperts(torch.nn.Module):
     """Export form of a Hugging Face experts module: routed banked experts."""
 
@@ -111,24 +143,19 @@ class HuggingFaceExperts(torch.nn.Module):
 
 def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFaceExperts:
     """Build the ``routed_experts`` form of a Hugging Face experts module."""
-    import copy
-
     from transformers.integrations.moe import _default_apply_gate
 
     from cattorch.errors import UnsupportedModelError
-    from cattorch.moe import ExpertFamily
 
     where = path or "<root>"
     name = type(module).__name__
-    if module.has_gate and getattr(type(module), "_apply_gate", None) is not _default_apply_gate:
-        raise UnsupportedModelError(
-            f"{name} at {where} uses its own expert gate (_apply_gate), which cattorch "
-            "can't export yet; rebuild the block with ExpertFamily and routed_experts"
-        )
 
     def matrix(stack):
         # Linear layout is [experts, out, in]; transposed classes store [experts, in, out].
         return stack.detach().transpose(1, 2) if module.is_transposed else stack.detach()
+
+    if module.has_gate and getattr(type(module), "_apply_gate", None) is not _default_apply_gate:
+        return _convert_custom_gate(module, matrix, where, name)
 
     up_name = "gate_up_proj" if module.has_gate else "up_proj"
     up = matrix(getattr(module, up_name))
@@ -163,6 +190,12 @@ def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFa
     template = _HuggingFaceExpert(
         module.has_gate, width, hidden, module.has_bias, copy.deepcopy(module.act_fn), norm,
     )
+    return _family(module, template, banks, experts, width, down.dtype, where, name)
+
+
+def _family(module, template, banks, experts, width, dtype, where, name) -> HuggingFaceExperts:
+    from cattorch.moe import ExpertFamily
+
     # Every template tensor needs a bank; the shared norm and activation state
     # is the same for every expert.
     for state_name, value in (
@@ -171,10 +204,35 @@ def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFa
     ):
         if state_name not in banks:
             banks[state_name] = value.detach().unsqueeze(0).expand(experts, *value.shape)
-    dtype = down.dtype
     family = ExpertFamily(
         template.to(dtype), banks, example_input=torch.zeros(1, width, dtype=dtype),
     )
     family.train(module.training)
     log.info("exporting %s at %s through routed_experts (%d experts)", name, where, experts)
     return HuggingFaceExperts(family)
+
+
+def _convert_custom_gate(module, matrix, where, name) -> HuggingFaceExperts:
+    """Experts whose class defines ``_apply_gate``, such as GPT-OSS's clamped GLU."""
+    from cattorch.errors import UnsupportedModelError
+
+    gate_up = matrix(module.gate_up_proj)
+    down = matrix(module.down_proj)
+    experts, width, hidden = down.shape
+    banks = {"gate_up.weight": gate_up, "down.weight": down}
+    if module.has_bias:
+        banks["gate_up.bias"] = module.gate_up_proj_bias.detach()
+        banks["down.bias"] = module.down_proj_bias.detach()
+    gate = _HuggingFaceGate(module)
+    with torch.no_grad():
+        probe = gate(torch.zeros(1, gate_up.shape[1], dtype=down.dtype))
+    if gate_up.shape[2] != width or probe.shape[-1] != hidden:
+        raise UnsupportedModelError(
+            f"{name} at {where} has expert weights shaped {tuple(module.gate_up_proj.shape)} "
+            f"and {tuple(module.down_proj.shape)}, which its _apply_gate doesn't connect"
+        )
+    norm = copy.deepcopy(module.post_expert_norm) if module.has_post_expert_norm else None
+    template = _HuggingFaceCustomGateExpert(
+        width, gate_up.shape[1], hidden, module.has_bias, gate, norm,
+    )
+    return _family(module, template, banks, experts, width, down.dtype, where, name)

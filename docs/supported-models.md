@@ -76,10 +76,11 @@ Qwen3-MoE, OLMoE, and DeepSeek-V3, export the same way, with or without a
 `GenerationProgram`. Their experts classes, marked with transformers'
 `@use_experts_implementation`, are replaced on the export copy by banked experts
 that take their routes from the model's own router, and only the selected experts
-run in Scratch. Two kinds of experts can't export yet: those with their own gate
-function, such as GPT-OSS, and those using operations that
+run in Scratch. Experts with their own gate function, such as GPT-OSS's
+clamped GLU, run that function in Scratch. Experts using operations that
 [experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
-hand-written normalization.
+hand-written normalization, can't export yet. GPT-OSS exports with `transpile`;
+its attention sinks aren't supported by `GenerationProgram` yet.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
