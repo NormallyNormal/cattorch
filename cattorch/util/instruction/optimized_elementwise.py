@@ -159,6 +159,11 @@ class OptimizedElementwiseInstruction(Instruction):
         if self.args[1].value is not None:
             left = item("T1", var("index"))
             return operation(left, self.args[1].value), ("T1", "T2")
+        if self.args[0].value is not None:
+            # A constant left operand, as in ``1 - x``.
+            right = self._operand(1, "_right_broadcast_map")
+            lists = (*self.slots.values(), *self.broadcast_lists, self.output_list)
+            return operation(self.args[0].value, right), lists
 
         left_index, left_map = _broadcast_index(
             self.args[0].shape, self.output_shape, "_left_broadcast_map",
@@ -241,11 +246,17 @@ class OptimizedElementwiseInstruction(Instruction):
             )
             result = None
         elif self.op == "aten.elu.default":
-            alpha = self.args[1].value if len(self.args) > 1 else 1.0
+            # scale * x, or scale * alpha * (exp(input_scale * x) - 1); SELU
+            # and CELU use the scale arguments.
+            alpha, scale, input_scale = (
+                self.args[index].value if len(self.args) > index else 1.0
+                for index in (1, 2, 3)
+            )
+            exponent = direct if input_scale == 1 else mul(input_scale, direct)
             output = if_else(
                 gt(direct, 0),
-                (append("T2", direct),),
-                (append("T2", mul(alpha, add(mathop("e ^", direct), -1))),),
+                (append("T2", direct if scale == 1 else mul(scale, direct)),),
+                (append("T2", mul(alpha * scale, add(mathop("e ^", exponent), -1))),),
             )
             result = None
         elif self.op == "aten.pow.Tensor_Scalar":

@@ -317,8 +317,15 @@ Fields shared by model and tokenizer results:
 ### `TranspileResult`
 
 `ArtifactResult` plus `inputs`, `output`, `additional_outputs`, `procedures`
-(the custom block names), and `quantization` (a `QuantizationReport`, or
-`None`). The `outputs` property lists every output's `TensorSpec` in order.
+(the custom block names), `quantization` (a `QuantizationReport`, or
+`None`), and `fallback_operations`. The `outputs` property lists every
+output's `TensorSpec` in order.
+
+`fallback_operations` lists the operations that have no kernel of their own
+and ran as PyTorch's decomposition into simpler operations, as
+`(operation, calls)` pairs such as `("aten.mish.default", 2)`. These usually
+run slower than a dedicated kernel would, and `warnings` names them too.
+Calls that depend only on weights are computed at export and aren't listed.
 
 ### `TokenizerResult`
 

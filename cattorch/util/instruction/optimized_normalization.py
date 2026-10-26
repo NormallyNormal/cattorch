@@ -443,10 +443,18 @@ class OptimizedBatchNormInstruction(Instruction):
         eps = self.args[7].value
         var_key = self.args[4].name
         raw_key = var_key[2:] if var_key.startswith("W_") else var_key
-        if raw_key in static_lists:
+        # A stored variance becomes its standard deviation at export; one
+        # given as an input is converted in Scratch.
+        self.stored_std = raw_key in static_lists
+        if self.stored_std:
             static_lists[raw_key] = torch.sqrt(static_lists[raw_key] + eps)
 
     def finalize(self):
+        variance = item("T5", var("channel"))
+        std = (
+            variance if getattr(self, "stored_std", True)
+            else mathop("sqrt", add(variance, self.args[7].value))
+        )
         result = add(
             mul(
                 div(
@@ -471,7 +479,7 @@ class OptimizedBatchNormInstruction(Instruction):
                     set_var("channel", 1),
                     repeat(self.channels, (
                         set_var("mean", item("T4", var("channel"))),
-                        set_var("std", item("T5", var("channel"))),
+                        set_var("std", std),
                         set_var(
                             "scale",
                             item("T2", var("channel")) if self.has_weight else 1,

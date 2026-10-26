@@ -95,6 +95,9 @@ class TranspileResult(ArtifactResult):
 
     ``quantization`` is set when ``QuantizationConfig`` was used, and records
     whether each parameter used GPTQ, symmetric quantization, or float16.
+    ``fallback_operations`` lists operations without a kernel of their own,
+    which run as PyTorch's decomposition into simpler operations, with how
+    many calls of each the sprite runs.
     """
 
     inputs: tuple[TensorSpec, ...]
@@ -102,11 +105,26 @@ class TranspileResult(ArtifactResult):
     procedures: tuple[str, ...]
     quantization: QuantizationReport | None = None
     additional_outputs: tuple[TensorSpec, ...] = ()
+    fallback_operations: tuple[tuple[str, int], ...] = ()
 
     @property
     def outputs(self) -> tuple[TensorSpec, ...]:
         """All tensor output leaves in their original pytree order."""
         return (self.output, *self.additional_outputs)
+
+
+def fallback_warning(fallbacks: tuple[tuple[str, int], ...]) -> str | None:
+    """One warning naming the operations that ran as decompositions."""
+    if not fallbacks:
+        return None
+    listed = ", ".join(
+        f"{name} ({count} call{'s' if count != 1 else ''})" for name, count in fallbacks
+    )
+    return (
+        f"{len(fallbacks)} operation{'s' if len(fallbacks) != 1 else ''} without "
+        f"a kernel of their own ran as PyTorch decompositions, which can be "
+        f"slower than a dedicated kernel: {listed}"
+    )
 
 
 @dataclass(frozen=True)

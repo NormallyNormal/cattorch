@@ -50,6 +50,12 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v -n auto --ignore=tests/test_docs.py
 
+      # Every recorded OpInfo case; the test suite checks one per operator.
+      # Skips itself when the PyTorch version differs from the recorded one.
+      - name: Check OpInfo conformance
+        if: matrix.label == 'current' && matrix.python-version == '3.13'
+        run: python tests/opinfo_conformance.py --check
+
       - name: Check Python sources
         run: |
           python -m compileall -q cattorch tests benchmarks

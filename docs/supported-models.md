@@ -94,7 +94,10 @@ through the experimental `ExpertFamily` and `SparseMoE` classes, or
 
 Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
 `var`, export when PyTorch can express them in terms of supported
-operations. They may run slower than an operation with a dedicated kernel.
+operations. They may run slower than an operation with a dedicated kernel;
+`TranspileResult.fallback_operations` and `warnings` list the ones a sprite
+uses. [Operator coverage](operator-coverage.md) shows which operators pass
+PyTorch's own test samples.
 
 `nn.LSTM` and `nn.GRU` export for the fixed sequence length of the example,
 including stacked and bidirectional layers. Every time step is unrolled into

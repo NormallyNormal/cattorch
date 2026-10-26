@@ -111,6 +111,27 @@ registry.register_kernel(Kernel("mylib.scale_shift.default", emit_scale_shift))
   quantization observer and the other (exact or fast) kernel. Register on a
   cloned registry, never on `default_registry()`.
 
+## Operator conformance
+
+`tests/opinfo_conformance.py` runs PyTorch's OpInfo samples, up to four per
+operator, through `transpile` and `verify`. Each sample's tensors are Scratch
+inputs, so a sample that only passes with constant indices is reported
+separately. A full run takes about two minutes on four cores:
+
+```bash
+python tests/opinfo_conformance.py --check   # every recorded case still passes
+python tests/opinfo_conformance.py --write   # record new passes, regenerate the page
+python tests/opinfo_conformance.py sign round   # try a few operators
+```
+
+`--write` updates `tests/opinfo_passing.json` and
+[`docs/operator-coverage.md`](operator-coverage.md). The test suite runs the
+first recorded sample of each operator, and CI runs `--check`, so a case that
+passes once has to keep passing. Record new passes with `--write` in the same
+change that adds them. The list is tied to one PyTorch minor version, because
+OpInfo's samples change between releases; with another version both checks
+skip and ask for a refresh.
+
 ## Performance evidence
 
 The emulator is the reference for correctness, not speed. The official

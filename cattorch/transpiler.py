@@ -23,7 +23,9 @@ from cattorch.graph import (
     _unsupported_operation,
 )
 from cattorch.graph_transforms import fold_eval_batch_norms
-from cattorch.results import TensorSpec, TranspileResult, _tensor_spec as boundary_spec
+from cattorch.results import (
+    TensorSpec, TranspileResult, _tensor_spec as boundary_spec, fallback_warning,
+)
 from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
 from cattorch.adapters import ModuleAdapter
 from cattorch.quantization import (
@@ -2247,6 +2249,7 @@ def _transpile(
             f"GPTQ fallback for {item.name}: {item.fallback_reason}"
             for item in (quantization_report.tensors if quantization_report else ())
             if item.method == "symmetric" and item.fallback_reason is not None
-        ),
+        ) + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
         quantization=quantization_report,
+        fallback_operations=graph.fallbacks(),
     )

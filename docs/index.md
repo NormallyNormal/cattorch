@@ -12,6 +12,8 @@ connecting it to the rest of a project.
 - [Getting started](getting-started.md): export and integrate a small model.
 - [Supported models and operations](supported-models.md): which models and
   PyTorch operations can be exported.
+- [Operator coverage](operator-coverage.md): how PyTorch's own operator samples
+  fare, generated from a test run.
 - [Optimization modes](optimization.md): exact or faster approximate kernels.
 - [Storage and quantization](storage.md): float16, integer quantization, GPTQ,
   and Scratch's size limits.

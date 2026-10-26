@@ -20,7 +20,7 @@ from cattorch.moe import (
 from cattorch.operator_registry import default_registry
 from cattorch.program import ExportProgram, Output
 from cattorch.program_runtime import MethodModule, entry_examples, validate_entry_outputs
-from cattorch.results import TensorSpec
+from cattorch.results import TensorSpec, fallback_warning
 from cattorch.storage import StorageConfig
 
 
@@ -34,6 +34,8 @@ class EntryPointAnalysis:
     module_paths: tuple[str, ...]
     unsupported_operations: tuple[str, ...]
     outputs: tuple[TensorSpec, ...]
+    # Operations that ran as PyTorch decompositions, with their call counts.
+    fallback_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -159,11 +161,13 @@ def analyze(
         }
         unsupported = list(generic_expert_errors)
         outputs = ()
+        fallbacks: tuple[tuple[str, int], ...] = ()
         try:
             graph = _prepare_graph(
                 wrapper, args, optimization=optimization,
                 _registry=registry, dynamic_inputs=dynamic_inputs, _captured=captured,
             )
+            fallbacks = graph.fallbacks()
             specs = graph.output_specs()
             validate_entry_outputs(program, entrypoint, specs)
             outputs = tuple(
@@ -180,6 +184,7 @@ def analyze(
             module_paths=tuple(sorted(paths)),
             unsupported_operations=tuple(dict.fromkeys(unsupported)),
             outputs=outputs,
+            fallback_operations=fallbacks,
         ))
 
     moe_reports = []
@@ -224,6 +229,11 @@ def analyze(
     })
     if unsupported_count:
         warnings.append(f"{unsupported_count} captured operation contracts are unsupported")
+    fallbacks = Counter()
+    for entry in entries:
+        fallbacks.update(dict(entry.fallback_operations))
+    if (message := fallback_warning(tuple(sorted(fallbacks.items())))) is not None:
+        warnings.append(message)
     return AnalysisReport(
         entrypoints=tuple(entries),
         moe=tuple(moe_reports),

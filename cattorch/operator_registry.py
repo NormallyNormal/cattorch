@@ -317,6 +317,8 @@ def _mean_kernel(torch_name, output, *args):
     if isinstance(dims, int):
         dims = (dims,)
     ndim = len(args[0].shape)
+    if ndim == 0:
+        return ReductionInstruction(torch_name, output, *args)
     normalized = sorted({dim % ndim for dim in dims or range(ndim)})
     if normalized and normalized == list(range(normalized[0], normalized[-1] + 1)):
         return OptimizedMeanInstruction(torch_name, output, *args)
@@ -359,10 +361,17 @@ def _validate_convolution(node, _config, _fast) -> str | None:
     return None
 
 
+def _validate_pool_rank(node, dimensions) -> str | None:
+    # Unbatched inputs have the same layout as a batch of one.
+    if len(_shape(node.args[0])) not in {dimensions + 1, dimensions + 2}:
+        return f"Pooling needs a {dimensions + 1}D or {dimensions + 2}D input"
+    return None
+
+
 def _validate_max_pool(node, _config, _fast) -> str | None:
     dimensions = 1 if str(node.target) == "aten.max_pool1d.default" else 2
-    if len(_shape(node.args[0])) != dimensions + 2:
-        return "Unbatched pooling is not supported"
+    if (error := _validate_pool_rank(node, dimensions)) is not None:
+        return error
     dilation = node.args[4] if len(node.args) > 4 else [1] * dimensions
     ceil_mode = node.args[5] if len(node.args) > 5 else False
     if any(value != 1 for value in dilation) or ceil_mode:
@@ -370,10 +379,14 @@ def _validate_max_pool(node, _config, _fast) -> str | None:
     return None
 
 
+def _validate_adaptive_pool(node, _config, _fast) -> str | None:
+    return _validate_pool_rank(node, 2)
+
+
 def _validate_avg_pool(node, _config, _fast) -> str | None:
     dimensions = 1 if str(node.target) == "aten.avg_pool1d.default" else 2
-    if len(_shape(node.args[0])) != dimensions + 2:
-        return "Unbatched pooling is not supported"
+    if (error := _validate_pool_rank(node, dimensions)) is not None:
+        return error
     ceil_mode = node.args[4] if len(node.args) > 4 else False
     count_include_pad = node.args[5] if len(node.args) > 5 else True
     divisor_override = node.args[6] if len(node.args) > 6 else None
@@ -591,6 +604,7 @@ def _build_default_registry() -> OperatorRegistry:
         "aten.max_pool2d.default": _validate_max_pool,
         "aten.avg_pool1d.default": _validate_avg_pool,
         "aten.avg_pool2d.default": _validate_avg_pool,
+        "aten.adaptive_avg_pool2d.default": _validate_adaptive_pool,
         "aten.batch_norm.default": _validate_batch_norm,
         **{operation: _validate_matmul for operation in MATMUL_OPS},
     }

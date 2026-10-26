@@ -9,8 +9,10 @@ from typing import Any, Callable, Literal
 
 import contextlib
 import functools
+import itertools
 import logging
 import math
+import threading
 import warnings
 
 import torch
@@ -275,6 +277,155 @@ _PRIMITIVE_DECOMPOSITIONS = {
 }
 
 
+_aten = torch.ops.aten
+
+
+def _sign(value):
+    positive = _aten.gt.Scalar(value, 0)
+    negative = _aten.lt.Scalar(value, 0)
+    result = _aten.where.ScalarSelf(positive, 1, _aten.where.ScalarSelf(
+        negative, -1, _aten.zeros_like.default(value),
+    ))
+    return _aten.to.dtype(result, value.dtype)
+
+
+def _trunc(value):
+    if not value.is_floating_point():
+        return value
+    return _aten.where.self(
+        _aten.lt.Scalar(value, 0), _aten.ceil.default(value), _aten.floor.default(value),
+    )
+
+
+def _round(value):
+    """Round half to even, as PyTorch does; Scratch's round goes half up."""
+    if not value.is_floating_point():
+        return value
+    floor = _aten.floor.default(value)
+    fraction = _aten.sub.Tensor(value, floor)
+    # 1 when ``floor`` is odd, so ``floor + odd`` is the even neighbour.
+    odd = _aten.sub.Tensor(floor, _aten.mul.Tensor(
+        _aten.floor.default(_aten.mul.Tensor(floor, 0.5)), 2,
+    ))
+    up = _aten.add.Tensor(floor, 1)
+    return _aten.where.self(
+        _aten.gt.Scalar(fraction, 0.5), up,
+        _aten.where.self(
+            _aten.lt.Scalar(fraction, 0.5), floor, _aten.add.Tensor(floor, odd),
+        ),
+    )
+
+
+def _divide(left, right, rounding_mode=None):
+    quotient = _aten.div.Tensor(left, right)
+    if rounding_mode == "floor":
+        quotient = _aten.floor.default(quotient)
+    elif rounding_mode == "trunc":
+        quotient = _trunc(quotient)
+    elif rounding_mode is not None:
+        return NotImplemented
+    dtype = torch.result_type(left, right)
+    if rounding_mode is not None and not dtype.is_floating_point:
+        quotient = _aten.to.dtype(quotient, dtype)
+    return quotient
+
+
+def _remainder(left, right):
+    """Python's ``%``: the result takes the divisor's sign."""
+    quotient = _divide(left, right, "floor")
+    return _aten.sub.Tensor(left, _aten.mul.Tensor(quotient, right))
+
+
+def _fmod(left, right):
+    """C's ``fmod``: the result takes the dividend's sign."""
+    quotient = _divide(left, right, "trunc")
+    return _aten.sub.Tensor(left, _aten.mul.Tensor(quotient, right))
+
+
+def _boolean(operation):
+    """``&``, ``|`` and ``^`` on boolean masks; integer bitwise stays unsupported."""
+    def decomposition(left, right):
+        boolean = (
+            isinstance(left, torch.Tensor) and left.dtype == torch.bool
+            and (not isinstance(right, torch.Tensor) or right.dtype == torch.bool)
+            and (isinstance(right, torch.Tensor) or isinstance(right, bool))
+        )
+        if not boolean:
+            return NotImplemented
+        if not isinstance(right, torch.Tensor):
+            right = _aten.full_like.default(left, right)
+        if operation == "and":
+            return _aten.logical_and.default(left, right)
+        if operation == "or":
+            return _aten.logical_or.default(left, right)
+        return _aten.ne.Tensor(left, right)
+    return decomposition
+
+
+def _logical(operation):
+    def decomposition(left, right):
+        left = _aten.ne.Scalar(left, 0)
+        right = _aten.ne.Scalar(right, 0)
+        if operation == "and":
+            return _aten.where.self(left, right, _aten.zeros_like.default(left))
+        if operation == "or":
+            return _aten.where.self(left, _aten.ones_like.default(left), right)
+        return _aten.ne.Tensor(left, right)
+    return decomposition
+
+
+def _full_like(value, fill, *, dtype=None, layout=None, device=None,
+               pin_memory=None, memory_format=None):
+    return _aten.full.default(
+        list(value.shape), fill, dtype=dtype or value.dtype, device=value.device,
+    )
+
+
+def _addmm(bias, left, right, *, beta=1, alpha=1):
+    """GPT-2's ``Conv1D``: ``bias + left @ right`` is a linear layer.
+
+    Other calls, with scaling or a bias that isn't one value per output
+    column, use PyTorch's decomposition.
+    """
+    if beta != 1 or alpha != 1 or bias.shape != (right.shape[-1],):
+        generic = _available_decompositions()[_aten.addmm.default]
+        return _recorded_fallback("aten.addmm.default", generic)(
+            bias, left, right, beta=beta, alpha=alpha,
+        )
+    return _aten.linear.default(left, _aten.t.default(right), bias)
+
+
+# Pointwise operations whose PyTorch decompositions end in primitives
+# cattorch can't lower, written with ones it can.
+_POINTWISE_DECOMPOSITIONS = {
+    _aten.sign.default: _sign,
+    _aten.sgn.default: _sign,
+    _aten.signbit.default: lambda value: _aten.lt.Scalar(value, 0),
+    _aten.trunc.default: _trunc,
+    _aten.fix.default: _trunc,
+    _aten.round.default: _round,
+    _aten.div.Tensor_mode: _divide,
+    _aten.div.Scalar_mode: _divide,
+    _aten.floor_divide.default: lambda left, right: _divide(left, right, "floor"),
+    _aten.floor_divide.Scalar: lambda left, right: _divide(left, right, "floor"),
+    _aten.remainder.Tensor: _remainder,
+    _aten.remainder.Scalar: _remainder,
+    _aten.fmod.Tensor: _fmod,
+    _aten.fmod.Scalar: _fmod,
+    _aten.bitwise_and.Tensor: _boolean("and"),
+    _aten.bitwise_and.Scalar: _boolean("and"),
+    _aten.bitwise_or.Tensor: _boolean("or"),
+    _aten.bitwise_or.Scalar: _boolean("or"),
+    _aten.bitwise_xor.Tensor: _boolean("xor"),
+    _aten.bitwise_xor.Scalar: _boolean("xor"),
+    _aten.logical_and.default: _logical("and"),
+    _aten.logical_or.default: _logical("or"),
+    _aten.logical_xor.default: _logical("xor"),
+    _aten.full_like.default: _full_like,
+    _aten.addmm.default: _addmm,
+}
+
+
 def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
     # Scratch always produces sorted results; unsorted order is unspecified.
     return (
@@ -367,6 +518,35 @@ class _CallView:
         self.kwargs = kwargs
 
 
+# ``node.meta`` key naming the operation whose generic PyTorch decomposition
+# produced the node, and which call of it, as ``(operation, call)``.
+FALLBACK_META = "cattorch_fallback"
+_fallback_calls = itertools.count()
+
+
+def _recorded_fallback(name: str, decomposition):
+    """Tag the nodes ``decomposition`` traces with the operation it replaces.
+
+    Lowering reports these as operations without a kernel of their own. An
+    outer decomposition runs after its inner ones and overwrites their tags,
+    so each node names the operation the model called.
+    """
+    def record(*args, **kwargs):
+        mode = proxy_tensor.get_proxy_mode()
+        if mode is None:
+            return decomposition(*args, **kwargs)
+        graph = mode.tracer.graph
+        last = graph._root.prev
+        result = decomposition(*args, **kwargs)
+        call = (name, next(_fallback_calls))
+        node = last.next
+        while node is not graph._root:
+            node.meta[FALLBACK_META] = call
+            node = node.next
+        return result
+    return record
+
+
 def _decompose_when_rejected(operator, validator, decomposition):
     from cattorch.fast import FastConfig
 
@@ -408,14 +588,14 @@ def _fx_decompositions() -> dict:
         packet = operator.overloadpacket.__name__
         dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
         if rule is None and name not in kept and not dead_end:
-            table[operator] = decomposition
+            table[operator] = _recorded_fallback(name, decomposition)
         elif (
             rule is not None and rule.validator is not None
             and name in _DECOMPOSE_WHEN_REJECTED
         ):
-            table[operator] = _decompose_when_rejected(
+            table[operator] = _recorded_fallback(name, _decompose_when_rejected(
                 operator, rule.validator, decomposition,
-            )
+            ))
     table.update(get_decompositions((torch.ops.aten.stack.default,)))
     table.update({
         torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
@@ -429,13 +609,39 @@ def _fx_decompositions() -> dict:
         ),
         torch.ops.aten.topk.default: _topk_decomposition,
     })
+    table.update(_POINTWISE_DECOMPOSITIONS)
     for operator in (
         torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
     ):
         table[operator] = _static_scalar_decomposition(operator)
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
-    return table
+    return {
+        operator: _without_cycles(operator, decomposition)
+        for operator, decomposition in table.items()
+    }
+
+
+_decomposing = threading.local()
+
+
+def _without_cycles(operator, decomposition):
+    """Keep ``operator`` whole when its decomposition leads back to it.
+
+    ``aten.sign`` decomposes to ``prims.sign``, which maps back to
+    ``aten.sign``. The inner call is traced as written, so lowering names the
+    operation instead of the trace failing with a recursion error.
+    """
+    def decompose(*args, **kwargs):
+        active = _decomposing.__dict__.setdefault("operators", set())
+        if operator in active:
+            return NotImplemented
+        active.add(operator)
+        try:
+            return decomposition(*args, **kwargs)
+        finally:
+            active.discard(operator)
+    return decompose
 
 
 # Elementwise primitives with an ATen operation of the same name and meaning.

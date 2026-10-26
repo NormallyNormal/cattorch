@@ -331,6 +331,10 @@ class OptimizedPoolingInstruction(Instruction):
 
     def prepare(self):
         shape = self.args[0].shape
+        op = str(self.torch_name)
+        if len(shape) == (2 if "pool1d" in op else 3):
+            # Unbatched: the same layout as a batch of one.
+            shape = (1, *shape)
         self.batches = (
             div(length("T1"), math.prod(shape[1:]))
             if self.args[0].dynamic else shape[0]
@@ -341,7 +345,6 @@ class OptimizedPoolingInstruction(Instruction):
         else:
             self.input_height, self.input_width = shape[2:]
         self.input_plane = self.input_height * self.input_width
-        op = str(self.torch_name)
         self.is_max = "max_pool" in op
         self.is_adaptive = "adaptive_avg_pool" in op
 

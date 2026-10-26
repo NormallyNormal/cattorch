@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import operator
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -12,7 +13,7 @@ import torch
 
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
-from cattorch.frontend import CapturedGraph, Frontend, capture_model
+from cattorch.frontend import FALLBACK_META, CapturedGraph, Frontend, capture_model
 from cattorch.results import _tensor_spec
 from cattorch.operator_registry import (
     ELEMENTWISE_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
@@ -296,6 +297,23 @@ class _GraphInfo:
     def output_name(self) -> str:
         return self.outputs[0][0]
 
+    def fallbacks(self) -> tuple[tuple[str, int], ...]:
+        """Operations lowered through PyTorch's generic decomposition.
+
+        Each entry is an operation and how many of its calls still run in
+        Scratch. Calls folded into constants at export, and decompositions
+        that only rename the operation (``expand_as`` to ``expand``), aren't
+        counted.
+        """
+        sizes = Counter(
+            node.meta[FALLBACK_META] for node in self.nodes
+            if node.op == "call_function" and FALLBACK_META in node.meta
+            and node.name not in self.generated_weights
+        )
+        return tuple(sorted(Counter(
+            name for (name, _), size in sizes.items() if size > 1
+        ).items()))
+
     @property
     def output_shape(self) -> torch.Size:
         return self.outputs[0][1]
@@ -563,6 +581,17 @@ def _prepare_graph(
         runtime_state = (
             _generation_state_names(nodes, state_inputs) if generation is not None else set()
         )
+        # A zero-element tensor's value is known from its shape alone, so
+        # it and everything computed only from such tensors (an empty sum,
+        # ``mm`` over an empty dimension) fold too.
+        for node in nodes:
+            value = node.meta.get("val")
+            if (
+                node.op in {"placeholder", "call_function", "get_attr"}
+                and isinstance(value, torch.Tensor) and value.numel() == 0
+                and node.name not in generated_weights
+            ):
+                generated_weights[node.name] = torch.zeros(value.shape, dtype=value.dtype)
         generated_weights.update(fold_static_values(
             nodes,
             {
@@ -644,10 +673,11 @@ def _prepare_graph(
 
         elif aten_op == "aten.transpose.int" and hasattr(node.args[0], "name"):
             input_shape = _get_shape(node.args[0])
-            dim0 = node.args[1] % len(input_shape)
-            dim1 = node.args[2] % len(input_shape)
+            # A 0-d tensor accepts dimension 0 or -1, like a 1-d one.
+            dim0 = node.args[1] % max(len(input_shape), 1)
+            dim1 = node.args[2] % max(len(input_shape), 1)
             low, high = sorted((dim0, dim1))
-            singleton_move_is_flat = (
+            singleton_move_is_flat = not input_shape or (
                 (input_shape[dim0] == 1 or input_shape[dim1] == 1)
                 and all(size == 1 for size in input_shape[low + 1:high])
             )

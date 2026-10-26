@@ -26,7 +26,9 @@ import torch.fx
 import torch.nn as nn
 
 from cattorch.errors import UnsupportedModelError
-from cattorch.frontend import CapturedGraph, capture_model, tensor_output_leaves
+from cattorch.frontend import (
+    FALLBACK_META, CapturedGraph, capture_model, tensor_output_leaves,
+)
 from cattorch.graph import _unsupported_operation, fold_static_values
 from cattorch.program_runtime import MethodModule
 
@@ -1613,7 +1615,7 @@ class GenerationStepModule(nn.Module):
                 yield buffer
 
     def restore_module_stacks(self, graph: torch.fx.Graph) -> int:
-        """Copy ``nn_module_stack`` metadata from the step graph onto a traced graph.
+        """Copy module stacks and fallback tags from the step graph onto a traced graph.
 
         Tracing a ``GraphModule`` records no module calls, so the traced graph
         has lost which layer each operation came from. The step graph kept it
@@ -1633,6 +1635,9 @@ class GenerationStepModule(nn.Module):
                     if stack:
                         node.meta["nn_module_stack"] = dict(stack)
                         restored += 1
+                    # Which operations ran as decompositions, for reporting.
+                    if FALLBACK_META in source[candidate].meta:
+                        node.meta[FALLBACK_META] = source[candidate].meta[FALLBACK_META]
                     cursor = candidate + 1
                     break
         return restored
