@@ -10,7 +10,9 @@ from typing import Callable, Iterable, Literal
 import torch
 
 from cattorch.fast import FastConfig
-from cattorch.huggingface import prepare_huggingface_models
+from cattorch.huggingface import (
+    convert_huggingface_experts, is_huggingface_experts, prepare_huggingface_models,
+)
 from cattorch.builtin_kernels import BUILTIN_KERNELS
 from cattorch.kernel_api import Kernel
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
@@ -236,6 +238,13 @@ class OperatorRegistry:
                 # ``routed_experts`` reads the handle from the export copy.
                 module._cattorch_handle = self._register_expert_family(module)
                 return module
+            if is_huggingface_experts(module):
+                experts = convert_huggingface_experts(module, path)
+                experts.experts._cattorch_handle = self._register_expert_family(
+                    experts.experts,
+                )
+                replacements[identity] = experts
+                return experts
             if isinstance(module, SparseMoE):
                 specialized = _specialize_sparse_swiglu(module)
                 if specialized is not None:

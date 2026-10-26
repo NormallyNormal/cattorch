@@ -66,6 +66,18 @@
   variations export without rebuilding the block as a `SparseMoE`. Only the
   selected experts run in Scratch. See
   [routing with your own router code](docs/programs-and-moe.md#routing-with-your-own-router-code).
+- Hugging Face mixture-of-experts models, such as Mixtral, Qwen2-MoE, Qwen3-MoE,
+  and OLMoE, export directly, with `transpile` or `GenerationProgram`. Experts
+  classes marked with transformers' `@use_experts_implementation` run through
+  `routed_experts` on the export copy, whatever their weight layout, biases,
+  gating, or post-expert norm. Experts with their own gate function, such as
+  GPT-OSS, are rejected with a message naming the class.
+- In-place updates of computed tensors, such as `x /= x.sum()` or `x.mul_(2)`,
+  export as ordinary operations. Updates seen through a view taken before the
+  update are still rejected.
+- `ExpertFamily` experts can use `torch.pow` with the same exponents as
+  elsewhere, so ReLU² experts work. `SparseMoE` and `ExpertFamily` also work
+  with automatic `GenerationProgram` export.
 
 ## Fixes
 

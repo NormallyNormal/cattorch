@@ -175,8 +175,9 @@ The first dimension of each stacked tensor is the number of experts.
 
 An expert must process each token independently and keep no state. It can use
 linear layers (with or without bias), elementwise arithmetic, residual
-connections, ReLU, GELU, SiLU, sigmoid, and tanh, LayerNorm and RMSNorm, and
-low-rank linear layers written as two matrix products. Convolution, attention,
+connections, ReLU, GELU, SiLU, sigmoid, and tanh, powers with integer exponents
+from -4 to 4 or ±0.5, LayerNorm and RMSNorm, and low-rank linear layers written
+as two matrix products. Convolution, attention,
 in-place modification, and data-dependent control flow are rejected.
 
 For SwiGLU experts without biases, `StackedSwiGLUMoE` is a faster

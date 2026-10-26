@@ -70,6 +70,16 @@ against the model's own `forward` during export. GPT-2, Llama, and Qwen2
 causal language models work this way; BERT doesn't, because its attention isn't
 causal.
 
+Mixture-of-experts models from transformers, such as Mixtral, Qwen2-MoE,
+Qwen3-MoE, and OLMoE, export the same way, with or without a
+`GenerationProgram`. Their experts classes, marked with transformers'
+`@use_experts_implementation`, are replaced on the export copy by banked experts
+that take their routes from the model's own router, and only the selected experts
+run in Scratch. Two kinds of experts can't export yet: those with their own gate
+function, such as GPT-OSS, and those using operations that
+[experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
+hand-written normalization.
+
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
 requires an even final dimension.

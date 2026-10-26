@@ -576,6 +576,32 @@ class ExpertFamilyMoEInstruction(Instruction):
                 ))
                 continue
 
+            if target == "aten.pow.Tensor_Scalar":
+                # The elementwise kernel's exponents: integers up to 4 and ±0.5.
+                exponent = node.args[1]
+                magnitude = abs(exponent)
+                if magnitude not in {0.5, 1, 2, 3, 4}:
+                    raise ValueError(
+                        "unsupported operation inside generic ExpertFamily: "
+                        f"pow exponent {exponent} (integers from -4 to 4 and ±0.5 work)"
+                    )
+                source_name = tensor_name(node.args[0])
+                element_value = item(source_name, var("expert index"))
+                if magnitude == 0.5:
+                    power = mathop("sqrt", element_value)
+                else:
+                    power = element_value
+                    for _ in range(int(magnitude) - 1):
+                        power = mul(power, element_value)
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(math.prod(output_shape), (
+                        append(output_name, div(1, power) if exponent < 0 else power),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
+
             if target in {
                 "aten.relu.default", "aten.sigmoid.default", "aten.silu.default",
                 "aten.tanh.default", "aten.gelu.default", "aten.neg.default",

@@ -525,6 +525,69 @@ def _erase_mode_switches(graph: Graph) -> None:
             graph.erase_node(node)
 
 
+def _returns_alias(node: Node) -> bool:
+    """Whether ``node``'s result may share storage with one of its inputs."""
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return True
+    return any(value.alias_info is not None for value in schema.returns)
+
+
+def _replace_intermediate_copies(graph: Graph) -> None:
+    """Rewrite in-place updates of intermediate tensors as ordinary dataflow.
+
+    The capture records ``x /= y`` on a computed tensor as ``div`` followed by
+    ``copy_(x, quotient)``. When ``x`` is a fresh tensor rather than a view,
+    and no view of it taken before the copy is read afterwards, every later
+    read of ``x`` can take the copied value instead. Copies into inputs,
+    state, or views are left for the compiler to reject.
+    """
+    def read_after(node: Node, position: int) -> bool:
+        return any(
+            order[user] > position or (_returns_alias(user) and read_after(user, position))
+            for user in node.users
+        )
+
+    for copy in [node for node in graph.nodes if node.target is torch.ops.aten.copy_.default]:
+        order = {node: index for index, node in enumerate(graph.nodes)}
+        target, source = copy.args[:2]
+        if (
+            not isinstance(target, Node) or not isinstance(source, Node)
+            or target.op != "call_function" or _returns_alias(target)
+            or copy.kwargs.get("non_blocking", False)
+        ):
+            continue
+        position = order[copy]
+        if any(
+            user is not copy and order[user] < position and _returns_alias(user)
+            and read_after(user, position)
+            for user in target.users
+        ):
+            continue
+        expected, actual = target.meta.get("val"), source.meta.get("val")
+        if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
+            continue
+        # ``copy_`` casts and broadcasts its source to the target.
+        steps = []
+        if actual.dtype != expected.dtype:
+            steps.append((
+                torch.ops.aten.to.dtype, (expected.dtype,), {}, actual.to(expected.dtype),
+            ))
+        if tuple(actual.shape) != tuple(expected.shape):
+            steps.append((torch.ops.aten.expand.default, (list(expected.shape),), {}, expected))
+        value = source
+        with graph.inserting_before(copy):
+            for operation, args, kwargs, meta_value in steps:
+                value = graph.call_function(operation, (value, *args), kwargs)
+                value.meta.update(copy.meta)
+                value.meta["val"] = meta_value
+        for user in list(target.users):
+            if user is not copy and order[user] > position:
+                user.replace_input_with(target, value)
+        copy.replace_all_uses_with(value)
+        graph.erase_node(copy)
+
+
 def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     example_kwargs = dict(example_kwargs or {})
     tensor_names = [
@@ -580,6 +643,7 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
         restore(graph_module.graph)
 
     _erase_mode_switches(graph_module.graph)
+    _replace_intermediate_copies(graph_module.graph)
     graph_module.recompile()
 
     nodes = list(graph_module.graph.nodes)

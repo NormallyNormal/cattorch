@@ -1967,7 +1967,7 @@ def _transpile_automatic_generation(
             _registry=registry,
         )
     step = GenerationStepModule(build_generation_step(
-        prepared, max_context, prepared=True,
+        prepared, max_context, prepared=True, registry=registry,
     ))
     spec = _GenerationSpec(
         max_context, program.hidden_prefill, program.top_k, automatic=True,

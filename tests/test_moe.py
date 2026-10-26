@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import zipfile
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -394,6 +395,47 @@ def test_generic_exact_tanh_activations_stay_finite_at_extremes(tmp_path):
     result = transpile(model, value, tmp_path / "extreme-tanh-expert")
     comparison = verify(model, value, result, atol=1e-4)
     assert comparison.passed, comparison
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("exponent", [2, 3, -2, 0.5, -0.5])
+def test_generic_expert_power(tmp_path, exponent):
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up = nn.Linear(3, 4)
+            self.down = nn.Linear(4, 3)
+
+        def forward(self, value):
+            # Keep the base positive so fractional and negative powers are finite.
+            return self.down((torch.sigmoid(self.up(value)) + 0.5) ** exponent)
+
+    torch.manual_seed(15)
+    model = SparseMoE(
+        nn.Linear(3, 2),
+        ExpertFamily.from_modules([Expert(), Expert()], example_input=torch.ones(1, 3)),
+    ).eval()
+    value = torch.randn(3, 3)
+    result = transpile(model, value, tmp_path / "power-expert")
+    comparison = verify(model, value, result, atol=1e-5)
+    assert comparison.passed, comparison
+
+
+def test_generic_expert_rejects_unsupported_power(tmp_path):
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2)
+
+        def forward(self, value):
+            return self.linear(value) ** 5
+
+    model = SparseMoE(
+        nn.Linear(2, 2),
+        ExpertFamily.from_modules([Expert(), Expert()], example_input=torch.ones(1, 2)),
+    ).eval()
+    with pytest.raises(ValueError, match="pow exponent 5"):
+        transpile(model, torch.ones(1, 2), tmp_path / "power-five")
 
 
 @torch.no_grad()

@@ -229,3 +229,50 @@ def test_positive_strided_slice_lowers_without_an_index_map(tmp_path):
 def test_frontend_argument_is_validated(tmp_path):
     with pytest.raises(ValueError, match="frontend must be"):
         transpile(nn.Identity(), torch.ones(1), tmp_path / "bad", frontend="other")
+
+
+class RouterUpdate(nn.Module):
+    """Mixtral's router: normalize the top-k values in place."""
+
+    def forward(self, value):
+        weights, ids = torch.topk(torch.softmax(value, dim=-1), 2, dim=-1)
+        weights /= weights.sum(dim=-1, keepdim=True)
+        return weights, ids
+
+
+class ReadBeforeUpdate(nn.Module):
+    def forward(self, value):
+        result = value.exp()
+        before = result * 3
+        result.mul_(0.5)
+        result.add_(torch.ones(1))
+        return before + result
+
+
+class CastUpdate(nn.Module):
+    def forward(self, value):
+        result = torch.zeros(value.shape, dtype=torch.float64)
+        result.copy_(value * 2)
+        return result.float() + 1
+
+
+@pytest.mark.parametrize("model", [RouterUpdate(), ReadBeforeUpdate(), CastUpdate()])
+def test_in_place_updates_of_intermediates_become_dataflow(tmp_path, model):
+    captured = capture_model(model.eval(), (torch.randn(3, 4),))
+    targets = [str(node.target) for node in captured.graph.nodes]
+    assert "aten.copy_.default" not in targets
+    value = torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "in-place")
+    assert verify(model, value, result).passed
+
+
+def test_in_place_update_seen_through_an_earlier_view_stays_unsupported(tmp_path):
+    class ViewThenUpdate(nn.Module):
+        def forward(self, value):
+            result = value * 2
+            row = result[:, 0]
+            result += 1
+            return row * 1
+
+    with pytest.raises(UnsupportedOperationError, match="copy_"):
+        transpile(ViewThenUpdate().eval(), torch.randn(3, 4), tmp_path / "aliased")

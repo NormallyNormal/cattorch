@@ -263,21 +263,27 @@ def analyze_sequence(
     )
 
 
-def prepare_sequence_model(model: torch.nn.Module) -> torch.nn.Module:
-    """The export copy :func:`analyze_sequence` expects, from the default registry."""
+def prepare_sequence_model(model: torch.nn.Module, registry=None) -> torch.nn.Module:
+    """The export copy :func:`analyze_sequence` expects.
+
+    Pass the export's registry; without one, a clone of the default registry
+    holds the copy's expert families, so they never leak into the default.
+    """
     from cattorch.operator_registry import default_registry
 
-    return default_registry().adapt_model(model)
+    return (registry or default_registry().clone()).adapt_model(model)
 
 
 # ── Tracing and pairing ──────────────────────────────────────────────────────
 
 def _capture(model, length: int, example_kwargs) -> CapturedGraph:
-    from cattorch.moe import _expert_family_context
+    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
     from cattorch.operator_registry import default_registry
 
     tokens = torch.zeros(1, length, dtype=torch.long)
-    with _expert_family_context(default_registry().expert_families):
+    # ``build_generation_step`` activates the export's expert families.
+    families = _ACTIVE_EXPERT_FAMILIES.get() or default_registry().expert_families
+    with _expert_family_context(families):
         return capture_model(model, (tokens,), example_kwargs=example_kwargs)
 
 
@@ -674,6 +680,11 @@ def _check_node(node, info, inputs, infos) -> None:
     if name == "embedding":
         if first is not None and first.sequence_axes:
             raise _mixing(node, "the embedding table has a sequence axis")
+        return
+    if name in {"routed_experts", "expert_family_moe", "stacked_swiglu_moe"}:
+        # Experts and their routes act on each token's last-axis features.
+        if ndim - 1 in axes:
+            raise _mixing(node, "experts mix the sequence as features")
         return
     raise _unsupported_operation(
         node,
@@ -1369,18 +1380,25 @@ def check_step_equivalence(
 
 def build_generation_step(
     model: nn.Module, max_context: int, *, example_kwargs: dict | None = None,
-    prepared: bool = False,
+    prepared: bool = False, registry=None,
 ) -> SequenceStepModule:
     """Prepare, analyse, rewrite and verify a stateless ``forward(tokens)`` model.
 
     ``model`` should be in evaluation mode. ``prepared`` says it is already the
-    export copy (adapters applied), as when ``transpile`` has also quantized it.
-    Returns the verified, reset step module.
+    export copy (adapters applied), as when ``transpile`` has also quantized it;
+    ``registry`` is the one that made that copy. Returns the verified, reset
+    step module.
     """
-    adapted = model if prepared else prepare_sequence_model(model)
-    plan = analyze_sequence(adapted, max_context, example_kwargs=example_kwargs)
-    step = build_step_module(adapted, plan)
-    check_step_equivalence(adapted, step, plan)
+    from cattorch.moe import _expert_family_context
+    from cattorch.operator_registry import default_registry
+
+    registry = registry or default_registry().clone()
+    adapted = model if prepared else prepare_sequence_model(model, registry)
+    # Tracing and the equivalence check both run the copy's expert families.
+    with _expert_family_context(registry.expert_families):
+        plan = analyze_sequence(adapted, max_context, example_kwargs=example_kwargs)
+        step = build_step_module(adapted, plan)
+        check_step_equivalence(adapted, step, plan)
     return step
 
 
