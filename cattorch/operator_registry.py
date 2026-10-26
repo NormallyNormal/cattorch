@@ -15,6 +15,7 @@ from cattorch.huggingface import (
 )
 from cattorch.builtin_kernels import BUILTIN_KERNELS
 from cattorch.kernel_api import Kernel
+from cattorch.moe_detection import detect_custom_moe
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized import (
@@ -245,13 +246,14 @@ class OperatorRegistry:
                 )
                 replacements[identity] = experts
                 return experts
-            if isinstance(module, SparseMoE):
-                specialized = _specialize_sparse_swiglu(module)
+            sparse = module if isinstance(module, SparseMoE) else detect_custom_moe(module, path)
+            if sparse is not None:
+                specialized = _specialize_sparse_swiglu(sparse)
                 if specialized is not None:
                     replacements[identity] = specialized
                     return specialized
-                handle = self._register_expert_family(module.expert_family)
-                result = _BankedSparseMoE(module, handle)
+                handle = self._register_expert_family(sparse.expert_family)
+                result = _BankedSparseMoE(sparse, handle)
                 replacements[identity] = result
                 return result
             return module

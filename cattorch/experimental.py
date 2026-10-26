@@ -6,6 +6,7 @@ from cattorch.moe import (
     ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, routed_experts,
     select_routes, stacked_swiglu_moe_adapter,
 )
+from cattorch.moe_detection import CustomMoEWarning
 from cattorch.program import (
     EntryPoint,
     ExportProgram,
@@ -19,7 +20,7 @@ from cattorch.program import (
 )
 
 __all__ = [
-    "AdapterContext", "AnalysisReport", "EntryPoint", "EntryPointAnalysis",
+    "AdapterContext", "AnalysisReport", "CustomMoEWarning", "EntryPoint", "EntryPointAnalysis",
     "ExpertFamily", "ExportProgram", "GenerationProgram", "Input", "ModuleAdapter", "Output",
     "ProgramCall", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE", "State", "StateInput",
     "StateUpdate", "analyze", "routed_experts", "select_routes",

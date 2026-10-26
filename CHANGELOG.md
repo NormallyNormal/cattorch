@@ -9,6 +9,11 @@
   single-KV-head attention work, and so do unwrapped Hugging Face GPT-2,
   Llama, and Qwen2. cattorch checks the cached step against `forward` during
   export. See [KV-cached generation](docs/generation.md).
+- Hand-written mixture-of-experts blocks, with a `ModuleList` of identical
+  experts, a linear router, `topk`, and a loop over the experts, export
+  without changes. cattorch finds the `SparseMoE` routing configuration that
+  reproduces the block on probe inputs and warns with a `CustomMoEWarning`
+  naming it. See [hand-written MoE blocks](docs/programs-and-moe.md#hand-written-moe-blocks).
 - Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
   a wrapper. On the export copy, the cache and extra outputs are turned off
   and an attention implementation that traces is selected, so no

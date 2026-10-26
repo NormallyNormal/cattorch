@@ -185,6 +185,25 @@ implementation. If your MoE module has `router.weight`, `gate.weight`,
 `up.weight`, and `down.weight` attributes, `stacked_swiglu_moe_adapter(YourMoEClass)`
 converts it.
 
+### Hand-written MoE blocks
+
+A block that holds a `ModuleList` of identical experts and a linear router
+with one output per expert, and loops over the experts the usual way, usually
+exports without changes. cattorch runs the block on probe inputs next to
+`SparseMoE` with each routing configuration it knows: every `top_k`, softmax,
+sigmoid or raw router scores, and selected weights renormalized or not. The
+first one that gives the same output replaces the block, and a
+`CustomMoEWarning` names it, for example `top_k=2, softmax scores,
+renormalized weights`. Softmax over the top-k logits, as in Mixtral, is the
+same as softmax scores with renormalized weights. Run `verify` on real inputs
+afterwards.
+
+Anything else in the block, such as a shared expert, a routed scaling factor,
+or router bias added only for selection, doesn't match. Such a block is kept
+as it is if it traces; otherwise export stops with an error pointing here.
+Rebuild it with `ExpertFamily` and `SparseMoE`, or keep its router and call
+`routed_experts` as described next.
+
 ### Routing with your own router code
 
 A typical MoE block picks experts with `torch.topk` and then loops over the

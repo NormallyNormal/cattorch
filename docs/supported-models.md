@@ -84,9 +84,10 @@ Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
 requires an even final dimension.
 
-Mixture-of-experts layers are supported through the experimental
-`ExpertFamily` and `SparseMoE` classes, or `routed_experts` with your own
-router code; see
+Hand-written mixture-of-experts blocks with a `ModuleList` of experts and a
+linear router are usually recognized automatically. Others are supported
+through the experimental `ExpertFamily` and `SparseMoE` classes, or
+`routed_experts` with your own router code; see
 [experimental programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
 Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
