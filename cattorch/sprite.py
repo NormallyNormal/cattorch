@@ -410,6 +410,11 @@ def _share_repeated_transformer_layers(
         bank_roles.append((role, names, sizes[0]))
     if not bank_roles:
         return reject("no layer-varying static weights were found")
+    banked = [name for _, names, _ in bank_roles for name in names]
+    if len(set(banked)) != len(banked):
+        # A deduplicated tensor read by only some layers, or in a different
+        # role per layer, can't become one row of a bank.
+        return reject("a static tensor would fill more than one bank slot")
     log.info("Repeated layer bank roles: %s", bank_roles)
 
     layer_zero_owned = owned_groups[0]
