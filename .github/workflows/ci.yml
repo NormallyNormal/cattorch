@@ -48,7 +48,7 @@ jobs:
         run: pytest tests/test_docs.py -q
 
       - name: Run tests
-        run: pytest tests/ -v --ignore=tests/test_docs.py
+        run: pytest tests/ -v -n auto --ignore=tests/test_docs.py
 
       - name: Check Python sources
         run: |

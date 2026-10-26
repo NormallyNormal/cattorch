@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
+import torch
 
 import cattorch  # noqa: F401 - loads every module that holds the list limit
+
+if os.environ.get("PYTEST_XDIST_WORKER"):
+    # Parallel workers already use every core; PyTorch's own threads on top
+    # of them oversubscribe the machine and make the run slower.
+    torch.set_num_threads(1)
 
 
 @pytest.fixture

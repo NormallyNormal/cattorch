@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tokenizers = ["tokenizers", "transformers", "sentencepiece"]
-dev = ["pytest", "ruff", "mypy", "transformers", "tokenizers", "sentencepiece", "twine"]
+dev = ["pytest", "pytest-xdist", "ruff", "mypy", "transformers", "tokenizers", "sentencepiece", "twine"]
 
 [project.urls]
 Repository = "https://github.com/NormallyNormal/cattorch"

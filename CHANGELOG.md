@@ -95,6 +95,13 @@
 
 ## Fixes
 
+- `verify` ran a Hugging Face model with its own config, so a model with
+  `output_hidden_states` or `use_cache` on failed with an output-count
+  mismatch. It now compares against a copy with the same export defaults as
+  `transpile`.
+- Exports with many operations were slow: each operation copied everything
+  generated so far. Export of a small two-layer MoE model is about 3 times
+  faster.
 - When `forward` fails at `max_context` tokens with an `IndexError`, the
   export error now says that `max_context` is probably larger than a position
   table.

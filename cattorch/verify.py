@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import re
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from cattorch.errors import UnsupportedModelError
 from cattorch.adapters import ModuleAdapter
 from cattorch.export_options import validate_export_options
 from cattorch.frontend import flat_example_inputs, tensor_output_leaves
+from cattorch.huggingface import prepare_huggingface_models
 from cattorch.operator_registry import default_registry, eval_mode_copy_warning
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
@@ -290,9 +292,20 @@ def verify(
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
     emulator.run_procedure("cattorch forward")
 
-    if any(module.training for module in model.modules()):
-        model = copy.deepcopy(model).eval()
-        eval_mode_copy_warning()
+    training = any(module.training for module in model.modules())
+    transformers = sys.modules.get("transformers")
+    huggingface = transformers is not None and any(
+        isinstance(module, transformers.PreTrainedModel) for module in model.modules()
+    )
+    if training or huggingface:
+        # Compare against the model transpile exported: an evaluation-mode
+        # copy, with the same Hugging Face defaults (no cache or extra outputs).
+        model = copy.deepcopy(model)
+        if training:
+            model.eval()
+            eval_mode_copy_warning()
+        if huggingface:
+            prepare_huggingface_models(model)
     with torch.no_grad():
         expected = model(*inputs, **(example_kwargs or {}))
     leaves = tensor_output_leaves(expected, warn=False)

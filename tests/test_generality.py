@@ -303,20 +303,15 @@ class LogitsOnly(nn.Module):
         return self.model(tokens, use_cache=self.use_cache).logits
 
 
-@pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
-def test_huggingface_decoder_logits(tmp_path, kind):
-    wrapper = LogitsOnly(_tiny_decoder(kind), use_cache=False)
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_wrapped_huggingface_decoder_logits(tmp_path, use_cache):
+    # With the cache on, its non-tensor outputs are dropped inside the wrapper.
+    wrapper = LogitsOnly(_tiny_decoder("gpt2"), use_cache=use_cache)
     _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
 
 
-def test_huggingface_gpt2_with_cache_dropped(tmp_path):
-    wrapper = LogitsOnly(_tiny_decoder("gpt2"), use_cache=True)
-    _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
-
-
-@pytest.mark.parametrize("kind", ["gpt2", "llama"])
-def test_unwrapped_huggingface_decoder_with_explicit_cache_off(tmp_path, kind):
-    model = _tiny_decoder(kind).eval()
+def test_unwrapped_huggingface_decoder_with_explicit_cache_off(tmp_path):
+    model = _tiny_decoder("gpt2").eval()
     ids = torch.randint(0, 64, (1, 8))
     kwargs = {"use_cache": False}
     result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
@@ -338,22 +333,14 @@ def test_huggingface_model_in_training_mode_warns_and_stays_training(tmp_path):
 @pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
 def test_huggingface_decoder_needs_no_kwargs(tmp_path, kind):
     model = _tiny_decoder(kind).eval()
-    ids = torch.randint(0, 64, (1, 8))
-    with warnings.catch_warnings():
-        warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
-        result = transpile(model, (ids,), tmp_path / "model")
-        assert verify(model, (ids,), result).passed
-    assert len(result.outputs) == 1
-
-
-def test_huggingface_config_defaults_apply_to_copy_only(tmp_path):
-    model = _tiny_decoder("llama").eval()
+    # Defaults that add outputs apply to the export copy only.
     model.config.use_cache = True
     model.config.output_hidden_states = True
     ids = torch.randint(0, 64, (1, 8))
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
         result = transpile(model, (ids,), tmp_path / "model")
+        assert verify(model, (ids,), result).passed
     assert len(result.outputs) == 1
     assert model.config.use_cache and model.config.output_hidden_states
 

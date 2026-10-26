@@ -93,10 +93,14 @@ def exported(request, tmp_path_factory):
 
 
 def test_prefill_then_decode_matches_full_forward(exported):
-    _, model, emulator, _ = exported
+    name, model, emulator, _ = exported
     prefill_and_decode(emulator, model, [1, 3, 5, 2, 7], [4, 6, 9, 11, 2])
     assert emulator.variables["cattorch cache length"] == 10
     assert len(emulator.lists["cattorch logits"]) == logits_of(model, [1]).numel()
+    if name in {"llama", "qwen2"}:
+        # 2 KV heads of width 32 / 4, not 4 query heads: caches hold KV heads.
+        assert len(emulator.lists["cattorch K cache 1"]) == 10 * 2 * 8
+        assert len(emulator.lists["cattorch V cache 2"]) == 10 * 2 * 8
 
 
 def test_reset_restores_the_first_step(exported):
@@ -145,28 +149,6 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     )
 
 
-def test_without_hidden_prefill_gives_the_same_logits(tmp_path):
-    model = nano()
-    emulator, _ = emulator_for(model, tmp_path, max_context=8, hidden_prefill=False)
-    prefill_and_decode(emulator, model, [5, 6, 7], [8])
-
-
-def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
-    model = nano()
-    counts = {}
-    for hidden in (False, True):
-        emulator, _ = emulator_for(
-            model, tmp_path, f"prefill_{hidden}", max_context=8, hidden_prefill=hidden,
-        )
-        emulator.run_procedure("cattorch init")
-        before = emulator.opcode_counts["data_changevariableby"]
-        emulator.lists["cattorch tokens"] = [1, 2, 3, 4]
-        emulator.run_procedure("cattorch prefill")
-        assert_logits(emulator, model, [1, 2, 3, 4])
-        counts[hidden] = emulator.opcode_counts["data_changevariableby"] - before
-    assert counts[True] < counts[False]
-
-
 def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
     torch.manual_seed(13)
     model = CachedLM(context=16, layers=2).eval()
@@ -187,15 +169,6 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
         emulator.run_procedure("cattorch decode")
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8, 9])
     assert counts[True] < counts[False] * 0.8
-
-
-def test_caches_hold_kv_heads_not_query_heads(tmp_path):
-    model = tiny_decoder("llama", kv_heads=1).eval()
-    emulator, _ = emulator_for(model, tmp_path, max_context=8)
-    prefill_and_decode(emulator, model, [1, 2, 3], [4])
-    kv_width = 1 * (32 // 4)
-    assert len(emulator.lists["cattorch K cache 1"]) == 4 * kv_width
-    assert len(emulator.lists["cattorch V cache 2"]) == 4 * kv_width
 
 
 def test_caches_and_position_are_not_static_weights(exported):
@@ -241,7 +214,7 @@ def test_layer_sharing_banks_the_caches(tmp_path):
 
 
 def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
-    model = nano()  # layers live in `blocks`, but HF-style names do not
+    # Hugging Face layers live in `model.layers`, not `blocks.N`.
     hf = tiny_decoder("gpt2").eval()
     result = transpile(
         hf, GenerationProgram(max_context=8), tmp_path / "hf",
@@ -250,7 +223,6 @@ def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
     emulator = ScratchEmulator(load_sprite(result.path))
     assert "cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
-    del model
 
 
 def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):

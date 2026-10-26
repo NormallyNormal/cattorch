@@ -7,6 +7,7 @@ through the emulator, and compares the output against PyTorch.
 
 import json
 import os
+import tempfile
 import zipfile
 
 import pytest
@@ -19,6 +20,8 @@ from cattorch.transpiler import transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 TOLERANCE = 1e-4
+# One directory per process, so parallel test workers never share the file.
+_OUTPUT_DIRECTORY = tempfile.mkdtemp(prefix="cattorch-transpile-")
 
 
 def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
@@ -27,7 +30,7 @@ def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[fl
     with torch.no_grad():
         expected = model(x).flatten().tolist()
 
-    path = os.path.join(os.path.dirname(__file__), "_test_output")
+    path = os.path.join(_OUTPUT_DIRECTORY, "output")
     transpile(model, x, path)
 
     sprite_path = path + ".sprite3"

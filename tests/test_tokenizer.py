@@ -7,6 +7,7 @@ and compares against the HuggingFace tokenizer output.
 
 import json
 import os
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -23,7 +24,8 @@ from cattorch.tokenizer import (
 from cattorch.results import TokenizerResult
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-SPRITE_PATH = os.path.join(os.path.dirname(__file__), "_test_tokenizer")
+# One directory per process, so parallel test workers never share the file.
+SPRITE_PATH = os.path.join(tempfile.mkdtemp(prefix="cattorch-tokenizer-"), "tokenizer")
 
 
 def _make_char_tokenizer(chars: str) -> PreTrainedTokenizerFast:
