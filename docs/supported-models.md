@@ -79,8 +79,8 @@ that take their routes from the model's own router, and only the selected expert
 run in Scratch. Experts with their own gate function, such as GPT-OSS's
 clamped GLU, run that function in Scratch. Experts using operations that
 [experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
-hand-written normalization, can't export yet. GPT-OSS exports with `transpile`;
-its attention sinks aren't supported by `GenerationProgram` yet.
+hand-written normalization, can't export yet. GPT-OSS, with its attention
+sinks and sliding-window layers, exports with or without a `GenerationProgram`.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and

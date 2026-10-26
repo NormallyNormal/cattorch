@@ -233,8 +233,11 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
     head scores it against every cached key (``cache_tokens`` of them),
     softmaxes and applies the cached values. Grouped-query heads share the key
     and value head ``head // kv_groups``. The exact kernel subtracts the row
-    maximum; the fast kernel (``softmax`` flag) skips it, like the legacy
-    cached softmax.
+    maximum; the fast kernel (``softmax`` flag) skips it.
+
+    A positive ``window`` attends only to the last ``window`` cached tokens.
+    ``slopes`` adds ``slope * (key - query)`` per head (ALiBi), and ``sinks``
+    adds a per-head logit to the softmax denominator only (GPT-OSS).
     """
     q, k, v = ctx.inputs["q"], ctx.inputs["k"], ctx.inputs["v"]
     k_cache, v_cache = ctx.inputs["k_cache"], ctx.inputs["v_cache"]
@@ -243,6 +246,8 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
     )
     groups = int(ctx.scalars["kv_groups"])
     scale = float(ctx.scalars["scale"])
+    window = int(ctx.scalars.get("window") or 0)
+    slopes, sinks = ctx.inputs.get("slopes"), ctx.inputs.get("sinks")
     key_row = kv_heads * width
     value_row = kv_heads * value_width
     stride = int(ctx.options.get("cache_stride", 0))
@@ -257,6 +262,9 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
         "copy_index", "cache_tokens", "query_start", "left_index", "key_offset",
         "key_head", "value_head", "heads_on_key", "feature", "value_index",
         "score_index", "sum", "denominator", "score", *(() if fast else ("maximum",)),
+        *(("attend_tokens", "first_token") if window else ()),
+        *(("head_number",) if slopes is not None or sinks is not None else ()),
+        *(("key_distance",) if slopes is not None else ()),
     ):
         ctx.temp_var(name)
     scores = ctx.temp_list("attention scores", capacity)
@@ -274,34 +282,58 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
     dot = _unrolled_offset_dot_statements(
         width, left_list=q.list, right_list=k_cache.list, right_offset="key_offset",
     )
+    logit = mul(var("sum"), scale)
+    if slopes is not None:
+        logit = add(logit, mul(item(slopes.list, var("head_number")), var("key_distance")))
+    sink = None if sinks is None else item(sinks.list, var("head_number"))
+    # Without a window every cached token is attended, from the first.
+    tokens = var("attend_tokens") if window else var("cache_tokens")
+
+    def from_first(start, stride):
+        return add(start, mul(var("first_token"), stride)) if window else start
+
     if fast:
         score_step = (
-            set_var("score", mathop("e ^", mul(var("sum"), scale))),
+            set_var("score", mathop("e ^", logit)),
             append(scores, var("score")),
             change_var("denominator", var("score")),
         )
     else:
         score_step = (
-            set_var("score", mul(var("sum"), scale)),
+            set_var("score", logit),
             append(scores, var("score")),
             if_(gt(var("score"), var("maximum")), (set_var("maximum", var("score")),)),
         )
-    normalize = () if fast else (
+    if slopes is not None:
+        score_step += (change_var("key_distance", 1),)
+    sink_term = () if sink is None else (
+        change_var("denominator", mathop("e ^", sink if fast else sub(sink, var("maximum")))),
+    )
+    normalize = sink_term if fast else (
         set_var("denominator", 0),
         set_var("score_index", 1),
-        repeat(var("cache_tokens"), (
+        repeat(tokens, (
             set_var("score", mathop("e ^", sub(item(scores, var("score_index")), var("maximum")))),
             replace(scores, var("score_index"), var("score")),
             change_var("denominator", var("score")),
             change_var("score_index", 1),
         )),
+        *sink_term,
     )
     head = (
         clear(scores),
-        *(() if fast else (set_var("maximum", -1e300),)),
+        # A sink takes part in the maximum, so the shifted exponents stay small.
+        *(() if fast else (set_var("maximum", -1e300 if sink is None else sink),)),
         set_var("denominator", 0),
-        set_var("key_offset", sub(var("key_head"), var("query_start"))),
-        repeat(var("cache_tokens"), (
+        set_var("key_offset", from_first(
+            sub(var("key_head"), var("query_start")), key_stride,
+        )),
+        *(() if slopes is None else (
+            set_var("key_distance", sub(
+                var("first_token") if window else 0, var(position),
+            )),
+        )),
+        repeat(tokens, (
             set_var("sum", 0),
             set_var("left_index", var("query_start")),
             *dot,
@@ -313,8 +345,10 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
         repeat(value_width, (
             set_var("sum", 0),
             set_var("score_index", 1),
-            set_var("value_index", add(var("value_head"), var("feature"))),
-            repeat(var("cache_tokens"), (
+            set_var("value_index", from_first(
+                add(var("value_head"), var("feature")), value_stride,
+            )),
+            repeat(tokens, (
                 change_var("sum", mul(
                     item(scores, var("score_index")),
                     item(v_cache.list, var("value_index")),
@@ -326,6 +360,7 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
             change_var("feature", 1),
         )),
         change_var("query_start", width),
+        *(() if slopes is None and sinks is None else (change_var("head_number", 1),)),
         change_var("heads_on_key", 1),
         if_(gt(var("heads_on_key"), groups - 1), (
             set_var("heads_on_key", 0),
@@ -336,6 +371,14 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
     attend = (
         clear(out),
         set_var("cache_tokens", add(var(position), 1)),
+        *(() if not window else (
+            set_var("first_token", 0),
+            if_(gt(var("cache_tokens"), window), (
+                set_var("first_token", sub(var("cache_tokens"), window)),
+            )),
+            set_var("attend_tokens", sub(var("cache_tokens"), var("first_token"))),
+        )),
+        *(() if slopes is None and sinks is None else (set_var("head_number", 1),)),
         set_var("query_start", 1),
         set_var("key_head", add(base, 1)),
         set_var("value_head", add(base, 1)),

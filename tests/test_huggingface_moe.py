@@ -251,7 +251,7 @@ def test_tiny_huggingface_moe_models_export_unwrapped(tmp_path, kind):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("kind", ["mixtral", "qwen2_moe", "deepseek_v3"])
+@pytest.mark.parametrize("kind", ["mixtral", "qwen2_moe", "deepseek_v3", "gpt_oss"])
 def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
     import json
     import zipfile

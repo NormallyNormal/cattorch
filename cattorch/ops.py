@@ -120,14 +120,21 @@ def _cached_attention(
     position: torch.Tensor,
     scale: float,
     kv_groups: int,
+    window: int = 0,
+    slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One causal attention step over a key/value cache.
 
     ``q`` is ``[B, H, 1, D]`` and ``k``/``v`` are ``[B, H_kv, 1, D]`` with
     ``H = H_kv * kv_groups``. The caches are ``[B, H_kv, max_context, D]``. The
     new key and value are written to row ``position``, then the query attends
-    to rows ``0..position``. Rank-3 tensors (``[B, 1, D]`` with caches
-    ``[B, max_context, D]``) are attention without a head axis.
+    to rows ``0..position``, or the last ``window`` of them when ``window`` is
+    positive. ``slopes`` (``[H]``) adds ``slope * (key - position)`` to each
+    score, as ALiBi does. ``sinks`` (``[H]``) adds one extra logit per head to
+    the softmax that no value is attached to, as GPT-OSS does. Rank-3 tensors
+    (``[B, 1, D]`` with caches ``[B, max_context, D]``) are attention without a
+    head axis.
     """
     headless = q.ndim == 3
     if headless:
@@ -137,18 +144,29 @@ def _cached_attention(
     index = _step_index(position, cache_k.shape[-2], "the key/value cache")
     cache_k.narrow(-2, index, 1).copy_(k)
     cache_v.narrow(-2, index, 1).copy_(v)
-    keys = cache_k.narrow(-2, 0, index + 1)
-    values = cache_v.narrow(-2, 0, index + 1)
+    first = max(0, index + 1 - window) if window > 0 else 0
+    keys = cache_k.narrow(-2, first, index + 1 - first)
+    values = cache_v.narrow(-2, first, index + 1 - first)
     if kv_groups > 1:
         keys = keys.repeat_interleave(kv_groups, dim=-3)
         values = values.repeat_interleave(kv_groups, dim=-3)
     scores = torch.matmul(q, keys.transpose(-2, -1)) * scale
-    out = torch.matmul(torch.softmax(scores, dim=-1), values)
+    if slopes is not None:
+        distance = torch.arange(first - index, 1, dtype=scores.dtype)
+        scores = scores + slopes.to(scores.dtype).view(1, -1, 1, 1) * distance
+    if sinks is not None:
+        sink = sinks.to(scores.dtype).view(1, -1, 1, 1).expand(*scores.shape[:-1], 1)
+        probabilities = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
+    else:
+        probabilities = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probabilities, values)
     return out.squeeze(1) if headless else out
 
 
 @_cached_attention.register_fake
-def _cached_attention_fake(q, k, v, k_cache, v_cache, position, scale, kv_groups):
+def _cached_attention_fake(
+    q, k, v, k_cache, v_cache, position, scale, kv_groups, window=0, slopes=None, sinks=None,
+):
     return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
 

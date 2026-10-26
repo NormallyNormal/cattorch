@@ -170,7 +170,7 @@ def test_nanogpt_plan():
         assert (block.n_heads, block.n_kv_heads, block.kv_groups) == (2, 2, 1)
         assert (block.head_dim, block.value_dim) == (8, 8)
         assert block.head_axis == 1
-        assert block.mask_kind == "masked_fill"
+        assert block.mask_nodes and block.window == 0 and block.slopes is None
         assert block.scale == pytest.approx(1 / math.sqrt(8))
         assert {block.scores, block.softmax, block.output} <= block.internal
         # Separate projections: each of q, k and v is its own sequence tensor.
@@ -218,7 +218,7 @@ def test_rope_plan_with_grouped_query_attention():
     for block in plan.attention:
         assert (block.n_heads, block.n_kv_heads, block.kv_groups) == (4, 1, 4)
         assert block.key_source != block.key and block.value_source != block.value
-        assert block.mask_kind == "masked_fill"
+        assert block.mask_nodes and block.window == 0 and block.slopes is None
     cos_sin = [t for t in plan.tables if t.kind == "multiplicative"]
     assert cos_sin and len(cos_sin) == len(plan.tables)
     for table in plan.tables:
@@ -257,7 +257,7 @@ def test_huggingface_decoder_plan(kind):
         for i in range(2)
     ]
     for block in plan.attention:
-        assert block.mask_kind == "masked_fill"  # SDPA bool mask -> masked_fill(-inf)
+        assert block.mask_nodes and block.window == 0  # SDPA bool mask -> masked_fill(-inf)
         assert block.head_dim == 8
         if kind == "gpt2":
             assert (block.n_heads, block.n_kv_heads, block.kv_groups) == (4, 4, 1)
@@ -326,19 +326,28 @@ def test_attention_without_a_mask_is_rejected():
         analyze(RopeLM(layers=1, is_causal=False))
 
 
-def test_sliding_window_mask_is_rejected():
+def _windowed(window, offset=0):
     class Windowed(RopeLM):
         def forward(self, tokens):
             return super().forward(tokens)
 
     model = Windowed(layers=1, is_causal=False)
     for layer in model.layers:
-        layer.forward = _windowed_forward(layer)
-    with pytest.raises(UnsupportedModelError, match="isn't causal.*cannot attend to token 0"):
-        analyze(model, 12)
+        layer.forward = _windowed_forward(layer, window, offset)
+    return model
 
 
-def _windowed_forward(layer, window=3):
+def test_sliding_window_mask_becomes_a_window():
+    (block,) = analyze(_windowed(3), 12).attention
+    assert block.window == 3 and block.slopes is None and block.sinks is None
+
+
+def test_window_without_the_current_token_is_rejected():
+    with pytest.raises(UnsupportedModelError, match="isn't causal.*cannot attend to token 1"):
+        analyze(_windowed(3, offset=1), 12)
+
+
+def _windowed_forward(layer, window=3, offset=0):
     def forward(x, cos, sin):
         batch, length, _ = x.shape
         q = layer.q(x).view(batch, length, layer.heads, layer.dim).transpose(1, 2)
@@ -346,7 +355,8 @@ def _windowed_forward(layer, window=3):
         v = layer.v(x).view(batch, length, layer.kv_heads, layer.dim).transpose(1, 2)
         rows = torch.arange(length)[:, None]
         columns = torch.arange(length)[None]
-        allowed = (columns <= rows) & (columns > rows - window)
+        allowed = (columns <= rows - offset) & (columns > rows - window)
+        allowed[0, 0] = True  # every row needs one key
         out = F.scaled_dot_product_attention(
             q, layer.repeat(k), layer.repeat(v), attn_mask=allowed,
         )
@@ -510,10 +520,10 @@ def test_broken_cache_op_trips_the_equivalence_check(monkeypatch):
     adapted, plan, step = step_for(NanoGPT(layers=1), CONTEXT)
     original = torch.ops.cattorch.cached_attention.default
 
-    def forgetful(q, k, v, k_cache, v_cache, position, scale, groups):
+    def forgetful(q, k, v, k_cache, v_cache, position, scale, groups, *rest):
         # Attends over the new row only, as if the cache were never read.
         return original(q, k, v, torch.zeros_like(k_cache), torch.zeros_like(v_cache),
-                        position, scale, groups)
+                        position, scale, groups, *rest)
     for node in step.graph.nodes:
         if node.target is original:
             node.target = forgetful

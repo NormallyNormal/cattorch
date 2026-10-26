@@ -39,6 +39,7 @@ from cattorch.sprite import (
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
     _guard_generation_output,
+    _guard_generation_range,
     _guard_generation_suffix,
     _logical_list_sizes,
     _merge_duplicate_lists,
@@ -112,6 +113,23 @@ def _bank_generation_caches(graph: _GraphInfo) -> bool:
     generation.cache_layers = layers
     generation.cache_layer_width = layer_width
     return True
+
+
+def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
+    """Nodes whose values reach nothing but ``attention``'s query argument."""
+    nodes = {node.name: node for node in graph.nodes}
+    target = nodes[attention]
+    query_only: set[str] = set()
+    for node in reversed(graph.nodes):
+        if node.op != "call_function" or node is target or not node.users:
+            continue
+        if all(
+            user.name in query_only
+            or (user is target and node is target.args[0] and node not in target.args[1:])
+            for user in node.users
+        ):
+            query_only.add(node.name)
+    return query_only
 
 
 def _wrap_transactional_generation_step(
@@ -1988,9 +2006,22 @@ def _transpile(
                 for entry in sprite.get("variables", {}).values():
                     if entry[0] == "cattorch project output":
                         entry[1] = 1
-                _guard_generation_suffix(
-                    sprite, root_entries[root_names.index(hidden_attention) + 1][1],
-                )
+                attention_position = root_names.index(hidden_attention)
+                _guard_generation_suffix(sprite, root_entries[attention_position + 1][1])
+                # The final layer's query only feeds that attention output.
+                query_only = _query_only_nodes(graph, hidden_attention)
+                position = 0
+                while position < attention_position:
+                    if root_names[position] not in query_only:
+                        position += 1
+                        continue
+                    end = position
+                    while end < attention_position and root_names[end] in query_only:
+                        end += 1
+                    _guard_generation_range(
+                        sprite, root_entries[position][1], root_entries[end][1],
+                    )
+                    position = end
             else:
                 if not compiler.emitted_roots:
                     raise ValueError(

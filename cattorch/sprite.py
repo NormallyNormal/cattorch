@@ -1640,6 +1640,25 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     blocks[suffix_root]["parent"] = guard
 
 
+def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
+    """Run the chain from ``start`` up to ``stop`` only for projected tokens.
+
+    Hidden prefill tokens never read what this range computes, such as the
+    final layer's query projection.
+    """
+    blocks = sprite["blocks"]
+    last = start
+    while blocks[last].get("next") not in (stop, None):
+        last = blocks[last]["next"]
+    if blocks[last].get("next") != stop:
+        raise ValueError("the guarded range does not end at the next operation")
+    blocks[last]["next"] = None
+    _guard_generation_suffix(sprite, start)
+    guard = blocks[start]["parent"]
+    blocks[guard]["next"] = stop
+    blocks[stop]["parent"] = guard
+
+
 _TOP_K_VALUES = "cattorch top k values"
 _TOP_K_IDS = "cattorch top k ids"
 _TOP_K_PROCEDURE = "cattorch select top k"

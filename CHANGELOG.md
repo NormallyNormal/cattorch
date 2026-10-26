@@ -21,6 +21,11 @@
   `topk` results, along any dimension. This covers DeepSeek-V3's
   group-limited router, and DeepSeek-V3 models now export, with or without a
   `GenerationProgram`.
+- `GenerationProgram` accepts sliding-window masks (Mistral, GPT-OSS), ALiBi
+  biases, and GPT-OSS attention sinks. A windowed decode step reads only the
+  window's cache rows.
+- Hidden prefill also skips the final layer's query projection and RoPE for
+  prompt tokens before the last.
 - Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
   a wrapper. On the export copy, the cache and extra outputs are turned off
   and an attention implementation that traces is selected, so no

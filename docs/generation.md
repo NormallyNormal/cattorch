@@ -58,8 +58,12 @@ that break the requirements below in ways the analysis can't see.
 - The model returns logits for every position, not only the last. Slicing to
   the last position inside `forward` isn't supported.
 - The input is a `[1, length]` tensor of token IDs, looked up in an embedding.
-- Attention masks are plain causal masks. Sliding windows and ALiBi biases are
-  rejected.
+- Attention masks are causal masks, optionally limited to a sliding window of
+  the last N tokens (Mistral, GPT-OSS). The scores may also carry an ALiBi
+  bias, `slope * (key - query)` per head, possibly plus a constant per row, and
+  per-head attention sinks: an extra softmax logit concatenated to the scores
+  and dropped afterwards, as GPT-OSS does. Any other float bias is rejected.
+  With a window, each decode step only reads the window's rows of the cache.
 
 ## Errors
 
@@ -78,8 +82,9 @@ With `hidden_prefill=True` (the default), prefill computes logits only for the
 last prompt token. For the other prompt tokens, the output head is skipped.
 When the layers aren't [shared](code-generation.md#optional-compaction), the
 final layer also keeps only its K/V append for those tokens and skips its
-attention output, MLP, and final norm. The final layer's query projection still
-runs. Set it to `False` only for debugging or measurement.
+attention output, MLP, and final norm, and the operations that only compute
+its query, such as the query projection and its RoPE. Set it to `False` only
+for debugging or measurement.
 
 ## Layer sharing
 

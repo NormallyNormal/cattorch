@@ -145,8 +145,7 @@ class AttentionBlock:
     scores: str
     scale: float
     scale_nodes: tuple[str, ...]
-    mask_kind: str  # "masked_fill" or "add"
-    mask_node: str
+    mask_nodes: tuple[str, ...]
     softmax: str
     output: str
     head_axis: int | None
@@ -156,6 +155,9 @@ class AttentionBlock:
     head_dim: int
     value_dim: int
     internal: frozenset[str]
+    window: int = 0  # keys within the last ``window`` positions; 0 for all
+    slopes: tuple[float, ...] | None = None  # ALiBi: slope * (key - query)
+    sinks: tuple[float, ...] | None = None  # one extra softmax logit per head
 
 
 @dataclass(frozen=True, eq=False)
@@ -820,18 +822,35 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
 
     internal: list[str] = [softmax.name]
     scores_in = _skip_casts(softmax.args[0], internal)
-    mask_kind, mask_node, mask_apply = None, None, None
-    if isinstance(scores_in, torch.fx.Node) and scores_in.op == "call_function":
+    scores_in = _skip_row_shift(scores_in, internal)
+    sink_node = None
+    if (
+        isinstance(scores_in, torch.fx.Node) and scores_in.op == "call_function"
+        and _op_name(scores_in) == "cat"
+    ):
+        # GPT-OSS: cat([scores, sinks], -1), softmax, then drop the sink column.
+        pieces = scores_in.args[0]
+        ndim = len(scores_in.meta["val"].shape)
+        if (
+            len(pieces) == 2
+            and _normalize(int(_argument(scores_in, 1, "dim", 0)), ndim) == ndim - 1
+            and isinstance(pieces[1], torch.fx.Node) and pieces[1].name in values
+            and pieces[1].meta["val"].shape[-1] == 1
+        ):
+            sink_node = pieces[1]
+            internal.append(scores_in.name)
+            scores_in = _skip_casts(pieces[0], internal)
+    # Static masks and biases, applied in any order, become one additive table.
+    masks: list[tuple[str, torch.fx.Node]] = []
+    while isinstance(scores_in, torch.fx.Node) and scores_in.op == "call_function":
         op = _op_name(scores_in)
         if op == "masked_fill":
-            mask_kind, mask_apply = "masked_fill", scores_in
-            mask_node = scores_in.args[1]
-            fill = scores_in.args[2]
+            mask_node, fill = scores_in.args[1], scores_in.args[2]
             if not (isinstance(mask_node, torch.fx.Node) and mask_node.name in values):
                 raise reject("the mask is not a static tensor")
             if not (_scalar(fill) and fill <= _MASKED_BELOW):
                 raise reject(f"masked_fill value {fill!r} is not -inf")
-            scores_in = scores_in.args[0]
+            masks.append(("masked_fill", mask_node))
         elif op == "add":
             operands = [scores_in.args[0], scores_in.args[1]]
             static_operands = [
@@ -839,12 +858,15 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
                 if isinstance(a, torch.fx.Node) and a.name in values
                 and infos[a.name].sequence_axes
             ]
-            if len(static_operands) == 1:
-                mask_kind, mask_apply, mask_node = "add", scores_in, static_operands[0]
-                scores_in = next(a for a in operands if a is not mask_node)
-    if mask_apply is not None:
-        internal.append(mask_apply.name)
-    scores_in = _skip_casts(scores_in, internal)
+            if len(static_operands) != 1:
+                break
+            masks.append(("add", static_operands[0]))
+        else:
+            break
+        internal.append(scores_in.name)
+        scores_in = _skip_casts(
+            next(a for a in scores_in.args[:2] if a is not masks[-1][1]), internal,
+        )
 
     scale = 1.0
     scale_nodes = []
@@ -879,7 +901,12 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
     # softmax -> (casts) -> matmul(p, v)
     p_node = softmax
     users = list(p_node.users)
-    while len(users) == 1 and _op_name(users[0]) in {"to", "_to_copy", "dropout"}:
+    sink_dropped = False
+    while len(users) == 1 and (
+        _op_name(users[0]) in {"to", "_to_copy", "dropout"}
+        or (sink_node is not None and not sink_dropped and _drops_last_column(users[0]))
+    ):
+        sink_dropped = sink_dropped or _op_name(users[0]) == "slice"
         internal.append(users[0].name)
         p_node = users[0]
         users = list(p_node.users)
@@ -915,13 +942,22 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
     if n_heads != n_kv * key_groups:
         raise reject(f"{n_heads} query heads against {n_kv} kv heads x {key_groups}")
 
-    if mask_node is None:
+    if not masks:
         raise UnsupportedModelError(
             f"attention over the sequence isn't causal at {path}: the softmax node "
             f"{softmax.name} has no mask, so every token attends to later "
             "tokens (a bidirectional model such as BERT)"
         )
-    _check_causal(mask_kind, mask_node, infos, values, short_values, pair, path)
+    if sink_node is not None and not sink_dropped:
+        raise reject("the sink column is not dropped before matmul(p, v)")
+    window, slopes = _check_causal(
+        masks, values, short_values, pair, path, int(n_heads),
+    )
+    sinks = None
+    if sink_node is not None:
+        sinks = _per_head(values[sink_node.name][..., 0], int(n_heads), head_axis)
+        if sinks is None:
+            raise reject("the sink logits differ between tokens")
     return AttentionBlock(
         index=index,
         module_path=path,
@@ -933,8 +969,7 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
         scores=scores.name,
         scale=scale,
         scale_nodes=tuple(scale_nodes),
-        mask_kind=mask_kind,
-        mask_node=mask_node.name,
+        mask_nodes=tuple(node.name for _, node in masks),
         softmax=softmax.name,
         output=output.name,
         head_axis=head_axis,
@@ -944,6 +979,9 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
         head_dim=int(q_info.shape[-1]),
         value_dim=int(infos[value.name].shape[-1]),
         internal=frozenset(internal),
+        window=window,
+        slopes=slopes,
+        sinks=sinks,
     )
 
 
@@ -1000,45 +1038,150 @@ def _unwrap_gqa(node, head_axis, infos):
     return node, 1, []
 
 
-def _check_causal(kind, mask_node, infos, values, short_values, pair, path) -> None:
-    for label, table in (
-        ("", values[mask_node.name]),
-        ("one token fewer: ", short_values.get(pair[mask_node.name].name)),
+def _skip_row_shift(node, internal):
+    """Skip ``x - x.max(-1, keepdim=True)``: softmax doesn't change with it."""
+    if not (
+        isinstance(node, torch.fx.Node) and node.op == "call_function"
+        and _op_name(node) == "sub" and isinstance(node.args[1], torch.fx.Node)
     ):
-        if table is None:
-            continue
+        return node
+    source, maximum = node.args[0], node.args[1]
+    chain = [maximum]
+    if maximum.target is operator.getitem and maximum.args[1] == 0:
+        maximum = maximum.args[0]
+        chain.append(maximum)
+    ndim = len(source.meta["val"].shape)
+    if (
+        _op_name(maximum) in {"amax", "max"} and maximum.args[0] is source
+        and _dims(maximum, ndim, _DIM_ARGUMENT[_op_name(maximum)]) == {ndim - 1}
+    ):
+        internal.extend([node.name, *(item.name for item in chain)])
+        return _skip_casts(source, internal)
+    return node
+
+
+def _drops_last_column(node) -> bool:
+    """``p[..., :-1]``: the slice that removes an attention sink's column."""
+    if _op_name(node) != "slice":
+        return False
+    ndim = len(node.meta["val"].shape)
+    size = node.args[0].meta["val"].shape[-1]
+    start = _argument(node, 2, "start", 0) or 0
+    end = _argument(node, 3, "end", None)
+    end = size if end is None else (end + size if end < 0 else min(end, size))
+    return (
+        _normalize(int(_argument(node, 1, "dim", 0)), ndim) == ndim - 1
+        and start == 0 and end == size - 1 and (_argument(node, 4, "step", 1) or 1) == 1
+    )
+
+
+def _per_head(table: torch.Tensor, heads: int, head_axis) -> tuple[float, ...] | None:
+    """Values that vary only by head (``[..., heads, tokens]``), one per head."""
+    table = table.reshape(-1, *table.shape[-2:]) if table.ndim >= 2 else table.reshape(1, 1, -1)
+    if table.shape[-2] not in (1, heads) or head_axis is None and table.shape[-2] != 1:
+        return None
+    if not bool((table == table[:1, :, :1]).all()):
+        return None
+    return tuple(float(v) for v in table[0, :, 0].expand(heads))
+
+
+def _combined_bias(masks, tables) -> torch.Tensor:
+    total = None
+    for (kind, _), table in zip(masks, tables):
         if kind == "masked_fill":
-            allowed = ~table.to(torch.bool)
-        else:
-            blocked = table <= _MASKED_BELOW
-            if not bool(((table == 0) | blocked).all()):
-                raise UnsupportedModelError(
-                    f"attention at {path} adds a float mask with values other "
-                    "than 0 and -inf (a bias such as ALiBi is not supported)"
-                )
-            allowed = ~blocked
-        if allowed.ndim < 2:
+            table = torch.zeros(table.shape).masked_fill(table.to(torch.bool), float("-inf"))
+        table = table.to(torch.float64)
+        total = table if total is None else total + table
+    return total
+
+
+def _check_causal(masks, values, short_values, pair, path, heads) -> tuple[int, tuple | None]:
+    """The window and ALiBi slopes of an attention block's masks and biases.
+
+    The combined table must block every later token, may block tokens more
+    than ``window`` back, and may add ``slope * (key - query)`` per head plus
+    any per-row constant (a softmax ignores it). Returns ``(window, slopes)``.
+    """
+    results = []
+    for label, lookup in (("", values), ("one token fewer: ", short_values)):
+        tables = []
+        for _, node in masks:
+            name = node.name if lookup is values else pair[node.name].name
+            tables.append(lookup.get(name))
+        if any(table is None for table in tables):
+            continue
+        bias = _combined_bias(masks, tables)
+        if bias.ndim < 2:
             raise UnsupportedModelError(
                 f"attention over the sequence isn't causal at {path}: the "
-                f"mask has shape {tuple(table.shape)}, not [tokens, tokens]"
+                f"mask has shape {tuple(bias.shape)}, not [tokens, tokens]"
             )
-        flat = allowed.reshape(-1, *allowed.shape[-2:])
-        if not bool((flat == flat[:1]).all()):
+        flat = bias.reshape(-1, *bias.shape[-2:])
+        blocked = flat <= _MASKED_BELOW
+        if not bool((blocked == blocked[:1]).all()):
             raise UnsupportedModelError(
                 f"attention at {path} uses a mask that differs between "
                 "batch rows or heads"
             )
-        rows, columns = flat.shape[-2:]
-        expected = torch.ones(rows, columns, dtype=torch.bool).tril()
-        wrong = (flat[0] != expected).nonzero()
+        rows, columns = blocked.shape[-2:]
+        allowed = ~blocked[0]
+        reach = int(allowed[-1].sum())
+        window = 0 if reach >= rows else reach
+        row = torch.arange(rows)[:, None]
+        column = torch.arange(columns)[None, :]
+        expected = column <= row
+        if window:
+            expected &= row - column < window
+        wrong = (allowed != expected).nonzero()
         if len(wrong):
-            row, column = (int(v) for v in wrong[0])
-            what = "attends to" if bool(flat[0, row, column]) else "cannot attend to"
+            r, c = (int(v) for v in wrong[0])
+            what = "attends to" if bool(allowed[r, c]) else "cannot attend to"
             raise UnsupportedModelError(
                 f"attention over the sequence isn't causal at {path}: {label}"
-                f"token {row} {what} token {column} (a causal mask lets "
-                "each token attend to itself and earlier tokens only)"
+                f"token {r} {what} token {c} (each token may attend to itself and "
+                "earlier tokens only, optionally within a fixed window)"
             )
+        slopes = _fit_slopes(flat, allowed, heads, path)
+        results.append((window, slopes))
+    if not results:
+        raise UnsupportedModelError(f"attention at {path}: the mask could not be evaluated")
+    window, slopes = results[0]
+    for other_window, other_slopes in results[1:]:
+        # A window as long as the shorter trace looks unlimited there.
+        if other_window not in (window, 0) or (other_slopes is None) != (slopes is None):
+            raise UnsupportedModelError(
+                f"attention at {path} uses a mask whose pattern changes with the "
+                "sequence length"
+            )
+    return window, slopes
+
+
+def _fit_slopes(flat, allowed, heads, path) -> tuple[float, ...] | None:
+    """Per-head ALiBi slopes of a bias, or ``None`` when it is only a mask."""
+    finite = torch.where(allowed, flat, torch.zeros_like(flat))
+    # Softmax ignores a constant per row: measure every entry from the diagonal.
+    diagonal = torch.diagonal(finite, dim1=-2, dim2=-1)[..., :, None]
+    relative = torch.where(allowed, finite - diagonal, torch.zeros_like(finite))
+    if not bool((relative.abs() > 1e-9).any()):
+        return None
+    rows = flat.shape[-2]
+    if rows < 2 or flat.shape[0] not in (1, heads):
+        raise UnsupportedModelError(
+            f"attention at {path} adds a bias that is not one ALiBi slope per head"
+        )
+    slopes = -relative[:, 1, 0]
+    distance = (
+        torch.arange(flat.shape[-1], dtype=flat.dtype)[None, :]
+        - torch.arange(rows, dtype=flat.dtype)[:, None]
+    )
+    fitted = slopes[:, None, None] * distance
+    error = torch.where(allowed, relative - fitted, torch.zeros_like(relative)).abs()
+    if bool((error > 1e-5 * (1 + relative.abs())).any()):
+        raise UnsupportedModelError(
+            f"attention at {path} adds a float bias that isn't a causal mask or "
+            "an ALiBi bias (slope * (key - query) per head)"
+        )
+    return tuple(float(v) for v in slopes.expand(heads))
 
 
 # ── Static tables ────────────────────────────────────────────────────────────
@@ -1251,6 +1394,15 @@ def build_step_module(
                     f"{kind}_cache_{block.index}",
                     torch.zeros(shape, dtype=source.dtype),
                 )
+            per_head = []
+            for kind, numbers in (("slopes", block.slopes), ("sinks", block.sinks)):
+                if numbers is None:
+                    per_head.append(None)
+                    continue
+                root.register_buffer(
+                    f"{kind}_{block.index}", torch.tensor(numbers, dtype=torch.float32),
+                )
+                per_head.append(graph.get_attr(f"{kind}_{block.index}"))
             new = graph.call_function(
                 torch.ops.cattorch.cached_attention.default,
                 (
@@ -1262,6 +1414,8 @@ def build_step_module(
                     position_node,
                     float(block.scale),
                     int(block.kv_groups),
+                    int(block.window),
+                    *per_head,
                 ),
             )
             env[node.name] = copy_meta(new, node)
