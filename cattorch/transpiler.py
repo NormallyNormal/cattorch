@@ -433,11 +433,23 @@ class _Compiler:
               and hasattr(node.args[0], 'name')
               and node.args[0].name in self.graph.split_meta):
             self._compile_getitem(node, target_list)
-        elif aten_op in INDEX_MAP_OPS:
+        elif aten_op in INDEX_MAP_OPS and not self._runtime_gather(node):
             self._compile_index_map(node, target_list)
         else:
             self._compile_instruction(node, target_list, aten_op)
         self.scope.release_dependencies(node)
+
+    def _runtime_gather(self, node) -> bool:
+        """A ``gather`` whose indices are computed at run time."""
+        if str(node.target) != "aten.gather.default":
+            return False
+        index = node.args[2] if len(node.args) > 2 else node.kwargs.get("index")
+        name = getattr(index, "name", None)
+        while name in self.graph.aliases:
+            name = self.graph.aliases[name]
+        return name is not None and not isinstance(
+            self.graph.resolve_weight(name), torch.Tensor,
+        )
 
     def _compile_index_map(self, node, target_list):
         """Lower a data-movement operation through a static index table."""

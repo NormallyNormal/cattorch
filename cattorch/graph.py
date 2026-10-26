@@ -745,6 +745,8 @@ def _prepare_graph(
                         not hasattr(other, "name")
                         or _get_shape(other) != _get_shape(user)
                         or node_order.get(other.name, -1) >= node_order[node.name]
+                        # The linear kernel reads one residual list.
+                        or any(operation == "tensor_add" for operation, _ in epilogue)
                     ):
                         break
                     epilogue.append(("tensor_add", other))

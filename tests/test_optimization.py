@@ -612,6 +612,23 @@ def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
     assert "weight_offset" in variables
 
 
+def test_linear_epilogue_keeps_two_residuals_apart(tmp_path):
+    class TwoResiduals(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(16, 16)
+            self.second = nn.Linear(16, 16)
+
+        def forward(self, value):
+            return value + (self.first(value) + self.second(value * 2))
+
+    torch.manual_seed(5)
+    model = TwoResiduals().eval()
+    value = torch.randn(1, 4, 16)
+    result = transpile(model, value, str(tmp_path / "two_residuals"))
+    assert verify(model, value, result, atol=1e-5).passed
+
+
 def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
     torch.manual_seed(27)
     model = ArithmeticChain().eval()

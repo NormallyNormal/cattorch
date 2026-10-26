@@ -14,6 +14,13 @@
   without changes. cattorch finds the `SparseMoE` routing configuration that
   reproduces the block on probe inputs and warns with a `CustomMoEWarning`
   naming it. See [hand-written MoE blocks](docs/programs-and-moe.md#hand-written-moe-blocks).
+- Slice and index assignment into a tensor the model created, such as
+  `x[..., :4] = y` or `x[1] = y` into a `torch.empty` or `torch.zeros`
+  buffer, exports as ordinary dataflow. Uninitialized buffers become zeros.
+- `gather` and `scatter` accept indices computed at run time, such as
+  `topk` results, along any dimension. This covers DeepSeek-V3's
+  group-limited router, and DeepSeek-V3 models now export, with or without a
+  `GenerationProgram`.
 - Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
   a wrapper. On the export copy, the cache and extra outputs are turned off
   and an attention implementation that traces is selected, so no
@@ -86,6 +93,9 @@
 - When `forward` fails at `max_context` tokens with an `IndexError`, the
   export error now says that `max_context` is probably larger than a position
   table.
+- A linear layer followed by two residual additions, as in
+  `x + (shared(x) + routed)`, added the first residual twice and gave wrong
+  output.
 - Layer sharing could fail with a `KeyError` when one stored tensor would
   fill more than one slot of a layer bank. Sharing is now skipped instead.
 - A 0-dimensional parameter, buffer, or constant failed during export.

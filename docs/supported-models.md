@@ -26,7 +26,8 @@ For persistent state and bounded variable-length tensors, use an experimental
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
-| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling, and `gather`, `index_select`, or indexing with indices that don't depend on the input |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling, `index_select` or indexing with indices that don't depend on the input, and `gather` and `scatter` (without `reduce`) with any indices |
+| In-place updates | `x /= y`, `x.copy_(y)`, and slice or index assignment such as `x[..., :4] = y` on a tensor the model created, with step-one slices; updates of inputs, parameters, or a tensor read through an earlier view are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs
 once during export, whatever operations it uses. Masks such as
@@ -71,7 +72,7 @@ causal language models work this way; BERT doesn't, because its attention isn't
 causal.
 
 Mixture-of-experts models from transformers, such as Mixtral, Qwen2-MoE,
-Qwen3-MoE, and OLMoE, export the same way, with or without a
+Qwen3-MoE, OLMoE, and DeepSeek-V3, export the same way, with or without a
 `GenerationProgram`. Their experts classes, marked with transformers'
 `@use_experts_implementation`, are replaced on the export copy by banked experts
 that take their routes from the model's own router, and only the selected experts

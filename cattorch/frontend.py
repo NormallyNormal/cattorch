@@ -533,14 +533,72 @@ def _returns_alias(node: Node) -> bool:
     return any(value.alias_info is not None for value in schema.returns)
 
 
+_VIEW_SLICE = torch.ops.aten.slice.Tensor
+_VIEW_SELECT = torch.ops.aten.select.int
+# Views that keep every element and only change the shape. Assigning through
+# one assigns the whole parent, viewed back to the parent's shape.
+_SHAPE_VIEWS = {
+    torch.ops.aten.view.default, torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.unsqueeze.default, torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.dims, torch.ops.aten.squeeze.default,
+}
+# Uninitialized buffers that a model fills by slice assignment. They become
+# zeros, so no unspecified values are stored in the sprite.
+_EMPTY_AS_ZEROS = {
+    torch.ops.aten.empty.memory_format: torch.ops.aten.zeros.default,
+    torch.ops.aten.new_empty.default: torch.ops.aten.new_zeros.default,
+    torch.ops.aten.empty_like.default: torch.ops.aten.zeros_like.default,
+}
+
+
+def _region_view(node: Node) -> tuple[int, int, int] | None:
+    """``(dim, start, end)`` written through a step-one slice or a select.
+
+    A shape-only view writes all of its parent and gives ``(-1, 0, 0)``.
+    """
+    parent = node.args[0]
+    shape = parent.meta.get("val").shape if isinstance(parent, Node) else None
+    if shape is None:
+        return None
+    if node.target in _SHAPE_VIEWS:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and value.numel() == math.prod(shape):
+            return -1, 0, 0
+        return None
+    if node.target is _VIEW_SLICE:
+        given = tuple(node.args[1:])
+        dim, start, end, step = given + (0, None, None, 1)[len(given):]
+        dim = node.kwargs.get("dim", dim)
+        start = node.kwargs.get("start", start)
+        end = node.kwargs.get("end", end)
+        if node.kwargs.get("step", step) != 1:
+            return None
+        dim %= len(shape)
+        size = shape[dim]
+        start = 0 if start is None else start
+        end = size if end is None else end
+        start = max(0, min(size, start + size if start < 0 else start))
+        end = max(start, min(size, end + size if end < 0 else end))
+        return dim, start, end
+    if node.target is _VIEW_SELECT:
+        dim, index = node.args[1:3]
+        dim %= len(shape)
+        index = index + shape[dim] if index < 0 else index
+        return dim, index, index + 1
+    return None
+
+
 def _replace_intermediate_copies(graph: Graph) -> None:
     """Rewrite in-place updates of intermediate tensors as ordinary dataflow.
 
     The capture records ``x /= y`` on a computed tensor as ``div`` followed by
-    ``copy_(x, quotient)``. When ``x`` is a fresh tensor rather than a view,
-    and no view of it taken before the copy is read afterwards, every later
-    read of ``x`` can take the copied value instead. Copies into inputs,
-    state, or views are left for the compiler to reject.
+    ``copy_(x, quotient)``, and ``x[..., :4] = y`` as ``copy_`` into a slice
+    view of ``x``. When ``x`` is a fresh tensor rather than a view, and no
+    other view of it taken before the copy is read afterwards, the copy
+    becomes a new tensor: the source itself, or ``x`` with the sliced region
+    replaced (a ``cat`` of the untouched parts and the source). Later reads of
+    ``x`` take that tensor. Copies into inputs, state, strided slices, or other
+    views are left for the compiler to reject.
     """
     def read_after(node: Node, position: int) -> bool:
         return any(
@@ -553,39 +611,82 @@ def _replace_intermediate_copies(graph: Graph) -> None:
         target, source = copy.args[:2]
         if (
             not isinstance(target, Node) or not isinstance(source, Node)
-            or target.op != "call_function" or _returns_alias(target)
-            or copy.kwargs.get("non_blocking", False)
+            or target.op != "call_function" or copy.kwargs.get("non_blocking", False)
         ):
             continue
+        # Walk slice and select views up to the tensor that owns the storage.
+        chain: list[tuple[Node, tuple[int, int, int], bool]] = []
+        base = target
+        while _returns_alias(base):
+            region = _region_view(base) if base.op == "call_function" else None
+            if region is None:
+                break
+            chain.append((base, region, base.target is _VIEW_SELECT))
+            base = base.args[0]
+        if base.op != "call_function" or _returns_alias(base):
+            continue
+        if chain and copy.users:
+            continue
         position = order[copy]
+        chain_nodes = {node for node, _, _ in chain}
         if any(
-            user is not copy and order[user] < position and _returns_alias(user)
-            and read_after(user, position)
-            for user in target.users
+            user is not copy and user not in chain_nodes and order[user] < position
+            and _returns_alias(user) and read_after(user, position)
+            for user in base.users
         ):
             continue
         expected, actual = target.meta.get("val"), source.meta.get("val")
         if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
             continue
-        # ``copy_`` casts and broadcasts its source to the target.
-        steps: list[tuple[Any, tuple, dict, torch.Tensor]] = []
-        if actual.dtype != expected.dtype:
-            steps.append((
-                torch.ops.aten.to.dtype, (expected.dtype,), {}, actual.to(expected.dtype),
-            ))
-        if tuple(actual.shape) != tuple(expected.shape):
-            steps.append((torch.ops.aten.expand.default, (list(expected.shape),), {}, expected))
-        value = source
+
+        def call(operation, args, meta_value):
+            node = graph.call_function(operation, args)
+            node.meta.update(copy.meta)
+            node.meta["val"] = meta_value
+            return node
+
         with graph.inserting_before(copy):
-            for operation, args, kwargs, meta_value in steps:
-                value = graph.call_function(operation, (value, *args), kwargs)
-                value.meta.update(copy.meta)
-                value.meta["val"] = meta_value
-        for user in list(target.users):
-            if user is not copy and order[user] > position:
-                user.replace_input_with(target, value)
+            # ``copy_`` casts and broadcasts its source to the target.
+            value = source
+            if actual.dtype != expected.dtype:
+                value = call(torch.ops.aten.to.dtype, (value, expected.dtype),
+                             actual.to(expected.dtype))
+            if tuple(actual.shape) != tuple(expected.shape):
+                value = call(torch.ops.aten.expand.default, (value, list(expected.shape)),
+                             expected)
+            for view, (dim, start, end), selected in chain:
+                parent = view.args[0]
+                whole = parent.meta["val"]
+                if dim < 0:
+                    value = call(torch.ops.aten.view.default, (value, list(whole.shape)),
+                                 whole)
+                    continue
+                if selected:
+                    value = call(torch.ops.aten.unsqueeze.default, (value, dim),
+                                 whole.narrow(dim, start, 1))
+                pieces = []
+                if start > 0:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, 0, start),
+                                       whole.narrow(dim, 0, start)))
+                pieces.append(value)
+                if end < whole.shape[dim]:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, end, whole.shape[dim]),
+                                       whole.narrow(dim, end, whole.shape[dim] - end)))
+                if len(pieces) > 1:
+                    value = call(torch.ops.aten.cat.default, (pieces, dim), whole)
+        if chain and base.target in _EMPTY_AS_ZEROS:
+            base.target = _EMPTY_AS_ZEROS[base.target]
+            base.kwargs = {
+                key: item for key, item in base.kwargs.items() if key != "memory_format"
+            }
+        for user in list(base.users):
+            if user is not copy and user not in chain_nodes and order.get(user, -1) > position:
+                user.replace_input_with(base, value)
         copy.replace_all_uses_with(value)
         graph.erase_node(copy)
+        for view, _, _ in chain:
+            if not view.users:
+                graph.erase_node(view)
 
 
 def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:

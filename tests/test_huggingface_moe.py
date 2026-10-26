@@ -160,6 +160,14 @@ MODELS = {
         num_experts=4, num_experts_per_tok=2, moe_intermediate_size=12, head_dim=8,
     )),
     "olmoe": ("OlmoeConfig", dict(num_experts=4, num_experts_per_tok=2)),
+    # Multi-head latent attention fills its keys by slice assignment, and the
+    # router picks expert groups with scatter and gather.
+    "deepseek_v3": ("DeepseekV3Config", dict(
+        n_routed_experts=4, num_experts_per_tok=2, n_group=2, topk_group=1,
+        moe_intermediate_size=12, first_k_dense_replace=0, n_shared_experts=1,
+        num_key_value_heads=2, q_lora_rank=8, kv_lora_rank=8,
+        qk_rope_head_dim=4, qk_nope_head_dim=4, v_head_dim=8,
+    )),
 }
 
 
@@ -171,7 +179,7 @@ def test_tiny_huggingface_moe_models_export_unwrapped(tmp_path, kind):
     if config_class is None:
         pytest.skip(f"transformers has no {config_name}")
     torch.manual_seed(2)
-    model = transformers.AutoModelForCausalLM.from_config(config_class(**TINY, **extra)).eval()
+    model = transformers.AutoModelForCausalLM.from_config(config_class(**{**TINY, **extra})).eval()
     tokens = torch.tensor([[3, 17, 5, 40]])
     result = transpile(model, tokens, tmp_path / kind)
     comparison = verify(model, tokens, result, atol=1e-4)
@@ -179,7 +187,7 @@ def test_tiny_huggingface_moe_models_export_unwrapped(tmp_path, kind):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("kind", ["mixtral", "qwen2_moe"])
+@pytest.mark.parametrize("kind", ["mixtral", "qwen2_moe", "deepseek_v3"])
 def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
     import json
     import zipfile
@@ -193,7 +201,7 @@ def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
         pytest.skip(f"transformers has no {config_name}")
     torch.manual_seed(3)
     model = transformers.AutoModelForCausalLM.from_config(
-        config_class(**{**TINY, "num_hidden_layers": 2}, **extra),
+        config_class(**{**TINY, "num_hidden_layers": 2, **extra}),
     ).eval()
     before = dict(default_registry().expert_families)
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / kind)

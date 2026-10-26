@@ -684,7 +684,7 @@ def _check_node(node, info, inputs, infos) -> None:
         if dim in {a.axis for a in info.sequence_axes}:
             raise _mixing(node, "`cat` along the sequence")
         return
-    if name in {"slice", "narrow", "select", "index_select", "gather", "unfold"}:
+    if name in {"slice", "narrow", "select", "index_select", "gather", "scatter", "unfold"}:
         dim = _normalize(int(_argument(node, 1, "dim", 0)), ndim)
         if dim not in axes:
             return

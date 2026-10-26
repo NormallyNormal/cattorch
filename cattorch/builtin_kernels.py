@@ -388,7 +388,110 @@ def _emit_sequence_row(ctx: KernelContext):
     )
 
 
+def _index_bases(index_shape, target_shape, dim: int) -> list[int]:
+    """One-based flat positions in ``target_shape`` of each index entry, with
+    the ``dim`` coordinate set to zero."""
+    strides = [math.prod(target_shape[axis + 1:]) for axis in range(len(target_shape))]
+    bases = []
+    for position in range(math.prod(index_shape)):
+        offset, remainder = 0, position
+        for axis in reversed(range(len(index_shape))):
+            coordinate = remainder % index_shape[axis]
+            remainder //= index_shape[axis]
+            if axis != dim:
+                offset += coordinate * strides[axis]
+        bases.append(offset + 1)
+    return bases
+
+
+def _validate_runtime_index(ctx: KernelContext) -> str | None:
+    source, index = ctx.inputs["self"], ctx.inputs["index"]
+    if len(index.shape) != len(source.shape):
+        return "index must have as many dimensions as the input"
+    dim = int(ctx.scalars["dim"]) % max(len(source.shape), 1)
+    if any(
+        index.shape[axis] > source.shape[axis]
+        for axis in range(len(source.shape)) if axis != dim
+    ):
+        return "index may not be larger than the input outside dim"
+    src = ctx.inputs.get("src")
+    if src is not None and any(
+        index.shape[axis] > src.shape[axis] for axis in range(len(src.shape))
+    ):
+        return "index may not be larger than src"
+    if ctx.scalars.get("reduce") not in (None, "none"):
+        return "scatter reductions are not supported"
+    return None
+
+
+def _emit_gather(ctx: KernelContext):
+    """``gather`` whose indices are computed at run time: one read per output."""
+    source, index = ctx.inputs["self"], ctx.inputs["index"]
+    dim = int(ctx.scalars["dim"]) % len(source.shape)
+    stride = math.prod(source.shape[dim + 1:])
+    bases = ctx.static_list("gather_bases", _index_bases(index.shape, source.shape, dim))
+    position = ctx.temp_var("index")
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(position, 1),
+        repeat(index.numel, (
+            append(out, item(source.list, add(
+                item(bases, var(position)), mul(item(index.list, var(position)), stride),
+            ))),
+            change_var(position, 1),
+        )),
+    )
+
+
+def _emit_scatter(ctx: KernelContext, *, scalar: bool):
+    """``scatter`` whose indices are computed at run time: copy, then write."""
+    source, index = ctx.inputs["self"], ctx.inputs["index"]
+    dim = int(ctx.scalars["dim"]) % len(source.shape)
+    stride = math.prod(source.shape[dim + 1:])
+    targets = ctx.static_list("scatter_targets", _index_bases(index.shape, source.shape, dim))
+    position = ctx.temp_var("index")
+    if scalar:
+        written = ctx.scalars["value"]
+    else:
+        src = ctx.inputs["src"]
+        # Each index entry reads ``src`` at its own coordinates; no axis is
+        # replaced, so pass a ``dim`` past the last axis.
+        sources = ctx.static_list(
+            "scatter_sources", _index_bases(index.shape, src.shape, len(src.shape)),
+        )
+        written = item(src.list, item(sources, var(position)))
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(position, 1),
+        repeat(source.numel, (
+            append(out, item(source.list, var(position))),
+            change_var(position, 1),
+        )),
+        set_var(position, 1),
+        repeat(index.numel, (
+            replace(out, add(
+                item(targets, var(position)), mul(item(index.list, var(position)), stride),
+            ), written),
+            change_var(position, 1),
+        )),
+    )
+
+
 BUILTIN_KERNELS = (
+    Kernel(
+        "aten.gather.default", _emit_gather, name="gather_runtime",
+        validator=_validate_runtime_index,
+    ),
+    Kernel(
+        "aten.scatter.src", partial(_emit_scatter, scalar=False), name="scatter_runtime",
+        validator=_validate_runtime_index,
+    ),
+    Kernel(
+        "aten.scatter.value", partial(_emit_scatter, scalar=True), name="scatter_runtime",
+        validator=_validate_runtime_index,
+    ),
     Kernel(
         "cattorch.rotary_embedding.default",
         _emit_rotary_embedding,
