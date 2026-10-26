@@ -19,7 +19,6 @@ from cattorch import (
     UnsupportedOperationError,
     verify,
 )
-from cattorch.graph import _GenerationSpec
 from cattorch.transpiler import _prepare_graph
 from cattorch.fast import prepare_fast_matmul_weights, prepare_fast_model
 from cattorch.benchmark import (
@@ -231,27 +230,6 @@ class CachedMQALM(CachedLM):
         super().__init__(context=context, layers=layers)
         for block in self.blocks:
             block.attention = CachedMQAAttention(context=context)
-
-
-class LayerPositionCachedMQABlock(CachedBlock):
-    def __init__(self, context=6):
-        super().__init__(context=context)
-        self.attention = CachedMQAAttention(context=context)
-        self.position = nn.Embedding(context, 8)
-        self.register_buffer("position_index", torch.zeros(1, dtype=torch.long))
-
-    def forward(self, x):
-        position = self.position(self.position_index).view(1, 1, 8)
-        x = x + self.attention(self.norm1(x) + position)
-        return x + self.mlp(self.norm2(x))
-
-
-class LayerPositionCachedMQALM(CachedLM):
-    def __init__(self, context=6, layers=2):
-        super().__init__(context=context, layers=layers)
-        self.blocks = nn.Sequential(*(
-            LayerPositionCachedMQABlock(context=context) for _ in range(layers)
-        ))
 
 
 def _load_sprite(path):
@@ -1182,7 +1160,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     path = tmp_path / "cached_generation"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         str(path),
     )
     sprite = _load_sprite(path.with_suffix(".sprite3"))
@@ -1239,131 +1217,12 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     assert emulator.lists["cattorch V cache 2"] == []
 
 
-def test_legacy_generation_retries_unshared_when_banked_sharing_is_rejected(tmp_path):
-    from cattorch.codegen import CodegenConfig
-
-    torch.manual_seed(3)
-    model = CachedLM(context=6, layers=2)
-    # A structurally different second layer makes sharing fail after banking.
-    model.blocks[1].mlp = nn.Sequential(
-        nn.Linear(8, 16), nn.GELU(approximate="tanh"), nn.Linear(16, 8),
-    )
-    model.eval()
-    path = tmp_path / "unshareable"
-    transpile(
-        model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=6),
-        str(path),
-        codegen=CodegenConfig(layer_sharing="auto"),
-    )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    emulator.run_procedure("cattorch init")
-    prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = list(prompt)
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
-    for token in (2, 4):
-        prompt.append(token)
-        emulator.lists["cattorch tokens"] = [token]
-        emulator._exec_chain(emulator._procedures["cattorch decode"])
-        torch.testing.assert_close(
-            torch.tensor(emulator.lists["cattorch logits"]),
-            model(torch.tensor([prompt]))[0, -1], atol=1e-4, rtol=0,
-        )
-
-
-class RopeCachedMQAAttention(CachedMQAAttention):
-    """MQA attention with RoPE tables read through a zero position buffer.
-
-    ``cached=True`` is the one-token legacy export contract: the lowerer
-    replaces the zero index with the cache length. ``cached=False`` reads the
-    same tables by sequence position, which is the eager reference.
-    """
-
-    def __init__(self, width=8, heads=2, context=6, cached=True):
-        super().__init__(width=width, heads=heads, context=context)
-        self.cached = cached
-        angles = (
-            torch.arange(context)[:, None]
-            * (0.9 / (1 + torch.arange(self.head_width // 2)))[None]
-        ).repeat_interleave(2, dim=-1)
-        self.cos = nn.Embedding.from_pretrained(angles.cos(), freeze=True)
-        self.sin = nn.Embedding.from_pretrained(angles.sin(), freeze=True)
-        self.register_buffer("position", torch.zeros(1, dtype=torch.long))
-        with torch.no_grad():
-            self.qkv.weight.mul_(4)
-
-    def forward(self, x):
-        from cattorch import rotary_embedding
-
-        batch, length, width = x.shape
-        q, k, v = self.qkv(x).split(
-            (width, self.head_width, self.head_width), dim=-1,
-        )
-        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        k = k.view(batch, length, 1, self.head_width).transpose(1, 2)
-        v = v.view(batch, length, 1, self.head_width).transpose(1, 2)
-        if self.cached:
-            cos = self.cos(self.position).view(1, 1, 1, self.head_width)
-            sin = self.sin(self.position).view(1, 1, 1, self.head_width)
-        else:
-            cos = self.cos.weight[:length][None, None]
-            sin = self.sin.weight[:length][None, None]
-        q, k = rotary_embedding(q, cos, sin), rotary_embedding(k, cos, sin)
-        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
-        weights = F.softmax(
-            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
-        )
-        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
-        return self.projection(joined)
-
-
-@pytest.mark.parametrize(
-    ("layers", "sharing"), [(1, "off"), (3, "off"), (3, "auto")],
-)
-def test_legacy_generation_reads_rope_position_from_cache_length(
-    tmp_path, layers, sharing,
-):
-    from cattorch.codegen import CodegenConfig
-
-    torch.manual_seed(5)
-    cached = CachedMQALM(context=6, layers=layers)
-    reference = CachedMQALM(context=6, layers=layers)
-    for model, flag in ((cached, True), (reference, False)):
-        for block in model.blocks:
-            block.attention = RopeCachedMQAAttention(context=6, cached=flag)
-    cached.eval()
-    reference.load_state_dict(cached.state_dict())
-    reference.eval()
-    path = tmp_path / "rope_generation"
-    transpile(
-        cached,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=6),
-        str(path),
-        codegen=CodegenConfig(layer_sharing=sharing),
-    )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    emulator.run_procedure("cattorch init")
-    if sharing == "auto":
-        assert "cattorch shared transformer layer" in emulator._procedures
-    prompt = []
-    for index, token in enumerate((1, 3, 5, 2, 4, 6)):
-        prompt.append(token)
-        emulator.lists["cattorch tokens"] = [token]
-        emulator._exec_chain(
-            emulator._procedures["cattorch prefill" if index == 0 else "cattorch decode"]
-        )
-        torch.testing.assert_close(
-            torch.tensor(emulator.lists["cattorch logits"]),
-            reference(torch.tensor([prompt]))[0, -1].detach(), atol=1e-4, rtol=0,
-        )
-
-
 def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_path):
     model = CachedLM(context=5, layers=1).eval()
     path = tmp_path / "cached_generation_guards"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=3),
+        GenerationProgram(max_context=5, top_k=3),
         path,
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
@@ -1394,7 +1253,7 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     path = tmp_path / "cached_mqa_generation"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         str(path),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
@@ -1423,13 +1282,13 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     path = tmp_path / "cached_shared_layers"
     result = transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         path,
         codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
     )
     baseline = transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         tmp_path / "cached_unshared_layers",
         codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
     )
@@ -1470,7 +1329,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     path = tmp_path / "cached_top_k"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=5),
+        GenerationProgram(max_context=5, top_k=5),
         str(path),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
@@ -1522,109 +1381,6 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     assert emulator.lists["cattorch top k ids"] == []
 
 
-def test_generation_layer_positions_use_their_own_attention_cache():
-    model = LayerPositionCachedMQALM(context=5, layers=2).eval()
-    graph = _prepare_graph(
-        model,
-        (torch.tensor([[1]]),),
-        optimization="exact",
-        generation=_GenerationSpec(max_context=5),
-    )
-    caches = [
-        graph.generation.position_embeddings[node.name][0]
-        for node in graph.nodes
-        if node.name in graph.generation.position_embeddings
-    ]
-    assert caches == [
-        "cattorch K cache 1",
-        "cattorch K cache 1",
-        "cattorch K cache 2",
-    ]
-
-
-def test_long_generation_fuses_attention_and_emits_qkv_caches_directly(tmp_path):
-    torch.manual_seed(51)
-    model = CachedMQALM(context=64, layers=1).eval()
-    token = torch.tensor([[1]])
-    graph = _prepare_graph(
-        model,
-        (token,),
-        optimization="exact",
-        generation=_GenerationSpec(max_context=64),
-    )
-    assert len(graph.generation.qkv_caches) == 1
-    assert len(graph.generation.prepopulated_scores) == 1
-    assert len(graph.generation.prepopulated_values) == 1
-    assert len(graph.generation.attention_fusions) == 1
-    assert graph.generation.hidden_prefill_qkv in graph.generation.qkv_caches
-
-    prompt = [1, 3, 5, 2]
-    path = tmp_path / "long_cached_attention"
-    transpile(
-        model,
-        GenerationProgram("forward", token, max_context=64),
-        str(path),
-        storage=StorageConfig(compression=False),
-    )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    emulator.lists["cattorch tokens"] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
-
-    torch.testing.assert_close(
-        torch.tensor(emulator.lists["cattorch logits"]),
-        model(torch.tensor([prompt]))[0, -1],
-        atol=1e-4,
-        rtol=0,
-    )
-    assert len(emulator.lists["cattorch K cache 1"]) == len(prompt) * 4
-    assert len(emulator.lists["cattorch V cache 1"]) == len(prompt) * 4
-
-
-def test_transformer_sized_cached_qkv_uses_interleaved_destination_weights(tmp_path):
-    class WideCachedLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embedding = nn.Embedding(11, 128)
-            self.attention = CachedAttention(width=128, heads=4, context=5)
-            self.head = nn.Linear(128, 11, bias=False)
-
-        def forward(self, tokens):
-            return self.head(self.attention(self.embedding(tokens)))
-
-    torch.manual_seed(52)
-    model = WideCachedLM().eval()
-    token = torch.tensor([[2]])
-    path = tmp_path / "grouped_cached_qkv"
-    transpile(
-        model,
-        GenerationProgram("forward", token, max_context=5, hidden_prefill=False),
-        str(path),
-        storage=StorageConfig(compression=False),
-    )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    qkv_weights = [
-        entry
-        for entry in sprite["lists"].values()
-        if entry[0].startswith("W_qkv_")
-    ]
-    assert [len(entry[1]) for entry in qkv_weights] == [16_384] * 3
-    mutations = {
-        block.get("fields", {}).get("VARIABLE", [None])[0]
-        for block in sprite["blocks"].values()
-    }
-    assert {"sum a", "sum b", "sum c", "sum d", "weight_index"} <= mutations
-
-    emulator = ScratchEmulator(sprite)
-    emulator.lists["cattorch tokens"] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
-    torch.testing.assert_close(
-        torch.tensor(emulator.lists["cattorch logits"]),
-        model(token).flatten(),
-        atol=1e-4,
-        rtol=0,
-    )
-
-
 def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
     torch.manual_seed(46)
     model = CachedLM(context=5, layers=1).eval()
@@ -1634,10 +1390,7 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
         path = tmp_path / f"prefill_{hidden_prefill}"
         transpile(
             model,
-            GenerationProgram(
-                "forward", torch.tensor([[1]]), max_context=5,
-                hidden_prefill=hidden_prefill,
-            ),
+            GenerationProgram(max_context=5, hidden_prefill=hidden_prefill),
             str(path),
         )
         emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
@@ -1659,19 +1412,19 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
 
 def test_generation_config_validates_hidden_prefill():
     with pytest.raises(TypeError, match="hidden_prefill must be a boolean"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, hidden_prefill=1)
+        GenerationProgram(max_context=5, hidden_prefill=1)
 
 
 @pytest.mark.parametrize("top_k", [True, 1.5, "5"])
 def test_generation_config_validates_top_k_type(top_k):
     with pytest.raises(TypeError, match="top_k must be an integer or None"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
+        GenerationProgram(max_context=5, top_k=top_k)
 
 
 @pytest.mark.parametrize("top_k", [0, 65])
 def test_generation_config_validates_top_k_range(top_k):
     with pytest.raises(ValueError, match="top_k must be between 1 and 64"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
+        GenerationProgram(max_context=5, top_k=top_k)
 
 
 def test_generation_top_k_cannot_exceed_output_size(tmp_path):
@@ -1679,42 +1432,15 @@ def test_generation_top_k_cannot_exceed_output_size(tmp_path):
     with pytest.raises(ValueError, match=r"top_k \(14\) exceeds output size \(13\)"):
         transpile(
             model,
-            GenerationProgram("forward", torch.tensor([[1]]), max_context=4, top_k=14),
+            GenerationProgram(max_context=4, top_k=14),
             str(tmp_path / "top_k_too_large"),
         )
 
 
-def test_generation_validates_input_shape_and_shards_oversized_cache(tmp_path):
+def test_generation_names_max_context_beyond_the_position_table(tmp_path):
     model = CachedLM(context=4, layers=1).eval()
-    with pytest.raises(ValueError, match="must contain one token"):
-        transpile(
-            model, GenerationProgram("forward", torch.tensor([[1, 2]]), 4),
-            str(tmp_path / "bad_generation"),
-        )
-
-    with pytest.raises(ValueError, match="position table capacity"):
-        transpile(
-            model, GenerationProgram("forward", torch.tensor([[1]]), 5),
-            str(tmp_path / "position_overflow"),
-        )
-
-    class PositionlessCachedLM(CachedLM):
-        def forward(self, tokens):
-            hidden = self.token(tokens)
-            return self.head(self.norm(self.blocks(hidden)))
-
-    model = PositionlessCachedLM(context=4, layers=1).eval()
-    path = tmp_path / "oversized_cache"
-    transpile(
-        model, GenerationProgram("forward", torch.tensor([[1]]), 25_001), str(path),
-    )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    names = {entry[0] for entry in sprite["lists"].values()}
-    assert "cattorch K cache 1 shard 2" in names
-    assert "cattorch V cache 1 shard 2" in names
-    variables = {entry[0]: entry[1] for entry in sprite["variables"].values()}
-    assert variables["cattorch K cache 1 shard count"] == 2
-    assert variables["cattorch K cache 1 logical length"] == 25_001 * 8
+    with pytest.raises(UnsupportedModelError, match=r"max_context \(5\) is probably larger"):
+        transpile(model, GenerationProgram(max_context=5), str(tmp_path / "overflow"))
 
 
 def test_eval_conv_batchnorm_is_folded_without_mutating_model(tmp_path):

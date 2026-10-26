@@ -93,8 +93,6 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
     processor = transpile(
         processor_model,
         GenerationProgram(
-            method="forward",
-            example_token=torch.tensor([[1]]),
             max_context=context,
         ),
         processor_path,
@@ -145,7 +143,7 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
         },
         "export": {
             "optimization": "exact",
-            "generation_wrapper": "cached dynamic RoPE",
+            "generation_wrapper": "automatic cached step",
             "weight_precision": "int8",
             "scale_precision": "float16",
             "compression": "costume-base92-huffman-int4",

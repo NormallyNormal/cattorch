@@ -8,7 +8,7 @@ writing an artifact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 import re
 from typing import Literal
 
@@ -212,34 +212,23 @@ class GenerationProgram:
     against the original model, and creates init, reset, prefill, and decode
     blocks. ``method`` names the method to export. A Hugging Face model's
     first tensor output (the logits) is the interface.
-
-    With ``example_token`` (a ``[1, 1]`` token tensor) the model is instead a
-    hand-written cached decoder: cattorch recognizes its combined-QKV causal
-    attention and constant-zero position lookup (legacy path).
-
-    ``max_context`` is required; it has a placeholder default only so the
-    positional field order stays ``(method, example_token, max_context)``.
     """
 
+    max_context: int
+    _: KW_ONLY
     method: str = "forward"
-    example_token: torch.Tensor | None = None
-    max_context: int = None  # type: ignore[assignment]
     hidden_prefill: bool = True
     top_k: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "method", _name(self.method, "generation method"))
-        if self.example_token is not None:
-            if not isinstance(self.example_token, torch.Tensor):
-                raise TypeError("GenerationProgram.example_token must be a torch.Tensor")
-            if self.example_token.numel() != 1:
-                raise ValueError("GenerationProgram.example_token must contain one token")
-        if self.max_context is None:
-            raise TypeError("GenerationProgram requires max_context")
         if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
-            raise TypeError("GenerationProgram.max_context must be an integer")
+            raise TypeError(
+                "GenerationProgram.max_context must be an integer; the other "
+                "fields are keyword-only, as in GenerationProgram(64, method=...)"
+            )
         if self.max_context < 1:
             raise ValueError("GenerationProgram.max_context must be positive")
+        object.__setattr__(self, "method", _name(self.method, "generation method"))
         if not isinstance(self.hidden_prefill, bool):
             raise TypeError("GenerationProgram.hidden_prefill must be a boolean")
         if self.top_k is not None:

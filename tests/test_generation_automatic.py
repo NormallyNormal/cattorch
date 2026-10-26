@@ -76,7 +76,7 @@ MODELS = {
     "nanogpt": nano,
     "mqa_broadcast": lambda: (torch.manual_seed(8), NanoMQA(layers=2, heads=4, context=16).eval())[1],
     "rope_gqa": lambda: (torch.manual_seed(6), RopeLM(layers=2).eval())[1],
-    "legacy_cached_lm": lambda: (torch.manual_seed(7), CachedLM(context=16, layers=2).eval())[1],
+    "cached_lm": lambda: (torch.manual_seed(7), CachedLM(context=16, layers=2).eval())[1],
     "gpt2": lambda: tiny_decoder("gpt2").eval(),
     "llama": lambda: tiny_decoder("llama").eval(),
     "qwen2": lambda: tiny_decoder("qwen2").eval(),
@@ -289,26 +289,6 @@ def test_int8_storage_and_quantization_cover_buffer_weights(tmp_path):
     assert storage["cattorch storage precision"] == "int8"
 
 
-def test_quantized_legacy_and_automatic_exports_agree(tmp_path):
-    torch.manual_seed(12)
-    model = CachedLM(context=8, layers=2).eval()
-    quantization = QuantizationConfig(bits=8, min_quantized_values=64)
-    rows = {}
-    for label, program in (
-        ("legacy", GenerationProgram("forward", torch.tensor([[1]]), 8)),
-        ("auto", GenerationProgram(max_context=8)),
-    ):
-        result = transpile(
-            model, program, tmp_path / label, quantization=quantization,
-        )
-        emulator = ScratchEmulator(load_sprite(result.path))
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = [1, 3, 5]
-        emulator.run_procedure("cattorch prefill")
-        rows[label] = torch.tensor(emulator.lists["cattorch logits"])
-    torch.testing.assert_close(rows["auto"], rows["legacy"], atol=TOLERANCE, rtol=0)
-
-
 def test_module_paths_survive_into_the_traced_step():
     from cattorch.autoregressive import GenerationStepModule, build_generation_step
     from cattorch.frontend import capture_model
@@ -341,33 +321,6 @@ def test_exports_a_named_method(tmp_path):
     emulator, _ = emulator_for(model, tmp_path, max_context=8, method="decode")
     expected = model.inner
     prefill_and_decode(emulator, expected, [1, 2], [3])
-
-
-def test_legacy_and_automatic_exports_agree(tmp_path):
-    torch.manual_seed(10)
-    model = CachedLM(context=8, layers=2).eval()
-    legacy = ScratchEmulator(load_sprite(transpile(
-        model, GenerationProgram("forward", torch.tensor([[1]]), 8), tmp_path / "legacy",
-    ).path))
-    auto = ScratchEmulator(load_sprite(transpile(
-        model, GenerationProgram(max_context=8), tmp_path / "auto",
-    ).path))
-    for emulator in (legacy, auto):
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = [1, 3, 5]
-        emulator.run_procedure("cattorch prefill")
-    torch.testing.assert_close(
-        torch.tensor(auto.lists["cattorch logits"]),
-        torch.tensor(legacy.lists["cattorch logits"]), atol=TOLERANCE, rtol=0,
-    )
-    for token in (2, 4):
-        for emulator in (legacy, auto):
-            emulator.lists["cattorch tokens"] = [token]
-            emulator.run_procedure("cattorch decode")
-        torch.testing.assert_close(
-            torch.tensor(auto.lists["cattorch logits"]),
-            torch.tensor(legacy.lists["cattorch logits"]), atol=TOLERANCE, rtol=0,
-        )
 
 
 class LongContextLM(torch.nn.Module):
@@ -403,13 +356,15 @@ def test_long_context_shards_the_caches_and_tables(tmp_path):
 
 
 def test_generation_program_signature_and_validation():
-    token = torch.tensor([[1]])
-    legacy = GenerationProgram("forward", token, 64)
-    assert (legacy.method, legacy.max_context) == ("forward", 64)
-    auto = GenerationProgram(max_context=32)
-    assert auto.example_token is None and auto.method == "forward"
-    with pytest.raises(TypeError, match="requires max_context"):
+    program = GenerationProgram(64)
+    assert (program.method, program.max_context) == ("forward", 64)
+    assert GenerationProgram(max_context=32, method="decode").method == "decode"
+    with pytest.raises(TypeError):
         GenerationProgram()
+    with pytest.raises(TypeError):
+        GenerationProgram("forward", torch.tensor([[1]]), 64)
+    with pytest.raises(TypeError, match="keyword-only"):
+        GenerationProgram("forward")
     with pytest.raises(ValueError, match="positive"):
         GenerationProgram(max_context=0)
 

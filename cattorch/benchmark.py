@@ -648,11 +648,7 @@ def build_generation_benchmark_suite(
             cached_base = temp / f"generation_{index}_cached"
             transpile(
                 model,
-                GenerationProgram(
-                    method="forward",
-                    example_token=prompt_inputs[0][:, :1],
-                    max_context=prompt_inputs[0].shape[1] + iterations,
-                ),
+                GenerationProgram(max_context=prompt_inputs[0].shape[1] + iterations),
                 str(cached_base),
                 sig_figs,
                 optimization="exact",

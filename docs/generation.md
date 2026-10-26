@@ -190,36 +190,6 @@ shrink the sprite, see layer sharing in
 Generation sprites don't have `cattorch prepare for save`; see
 [save after running](storage.md#save-after-running).
 
-## Legacy: hand-written cached decoders
-
-Passing `example_token` selects the older recognizer, which doesn't derive the
-cache and instead looks for one graph shape. Use it only for a decoder already
-written that way:
-
-```python
-GenerationProgram(
-    method="next_token_logits",
-    example_token=torch.tensor([[0]]),
-    max_context=64,
-)
-```
-
-`example_token` must be a single integer token with shape `[1, 1]`. The
-method must take that one token and:
-
-- use a combined QKV projection with causal attention in a form cattorch
-  recognizes;
-- look up positions from a table, either learned position embeddings or
-  precomputed RoPE sine and cosine tables, so cattorch can index the table with
-  the current cache length;
-- return one tensor, and otherwise use [supported operations](supported-models.md).
-
-Watch out for stateless wrappers that slice the position or RoPE table by
-sequence length (`table[:length]`). Traced with a `[1, 1]` example, that slice
-only contains position zero, so every later token gets the wrong position.
-Instead, index the full table with an explicit position tensor. The automatic
-path above doesn't have this problem, and is the better choice for new work.
-
 Related: [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
 [supported models](supported-models.md), and
 [generation benchmarking](verification-and-benchmarking.md#scratch-benchmark-projects).

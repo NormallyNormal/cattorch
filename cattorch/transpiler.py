@@ -108,22 +108,9 @@ def _bank_generation_caches(graph: _GraphInfo) -> bool:
     generation.value_caches = {name: value_bank for name, _ in value_entries}
     generation.cache_widths = {key_bank: bank_width, value_bank: bank_width}
     generation.first_cache = (key_bank, bank_width)
-    generation.position_embeddings = {
-        name: (key_bank, bank_width)
-        for name in generation.position_embeddings
-    }
-    generation.qkv_caches = {
-        name: (key_bank, value_bank)
-        for name in generation.qkv_caches
-    }
     generation.banked_caches = True
     generation.cache_layers = layers
     generation.cache_layer_width = layer_width
-
-    # The old hidden-prefill shortcut specialized only the last layer's QKV
-    # projection. A shared body must be identical for every layer, so retain
-    # the still-important output-head guard and compile uniform QKV work.
-    generation.hidden_prefill_qkv = None
     return True
 
 
@@ -292,8 +279,6 @@ class _Compiler:
     def _automatic_bindings(self, node) -> dict[int, str]:
         """Argument positions of an automatic-generation op bound to named lists."""
         generation = self.graph.generation
-        if not generation.automatic:
-            return {}
         target = str(node.target)
         if target == "cattorch.cached_attention.default":
             return {
@@ -308,10 +293,7 @@ class _Compiler:
     def _lowering_options(self, node) -> dict[str, object]:
         """Compile-time facts for a context kernel (``KernelContext.options``)."""
         generation = self.graph.generation
-        if not (
-            generation.automatic
-            and str(node.target) == "cattorch.cached_attention.default"
-        ):
+        if str(node.target) != "cattorch.cached_attention.default":
             return {}
         if generation.banked_caches:
             return {
@@ -413,9 +395,6 @@ class _Compiler:
             return
         if node.name in self.graph.qkv_linear_fusions:
             self._compile_qkv_linear(node)
-            return
-        if node.name in self.graph.generation.attention_fusions:
-            self._compile_cached_attention(node)
             return
         if node.name in self.graph.embedding_add_fusions:
             self._compile_embedding_add(node)
@@ -521,32 +500,8 @@ class _Compiler:
                 value=self.graph.qkv_offsets.get(k.name, 0),
             ),
         ]
-        if node.name in self.graph.generation.score_caches:
-            cache_name = self.graph.generation.score_caches[node.name]
-            input_lists = [input_lists[0], input_lists[1], cache_name]
-            args = [
-                args[0],
-                args[1],
-                Argument(cache_name, torch.Size([])),
-                args[2],
-                args[3],
-                args[4],
-            ]
-            from cattorch.util.instruction.optimized import CachedCausalScoreInstruction
-            instruction = CachedCausalScoreInstruction(
-                node.target,
-                target_list,
-                *args,
-                cache_prepopulated=(
-                    node.name in self.graph.generation.prepopulated_scores
-                ),
-            )
-            if self.graph.generation.banked_caches:
-                instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-                instruction.cache_base_variable = _LAYER_CACHE_BASE
-        else:
-            from cattorch.util.instruction.optimized import CausalScoreInstruction
-            instruction = CausalScoreInstruction(node.target, target_list, *args)
+        from cattorch.util.instruction.optimized import CausalScoreInstruction
+        instruction = CausalScoreInstruction(node.target, target_list, *args)
         self._emit(instruction, input_lists, target_list)
 
         # Mirror the dependency releases of the materialized chain that this
@@ -576,62 +531,10 @@ class _Compiler:
             Argument("C_query_heads", torch.Size([]), value=query_heads),
             Argument("C_kv_heads", torch.Size([]), value=kv_heads),
         ))
-        direct_caches = node.name in self.graph.generation.qkv_caches
-        if direct_caches:
-            input_lists, weight_shard_specs = self._prepare_cached_qkv_weights(
-                node, input_lists, query_heads, kv_heads,
-            )
-            args[1] = Argument(
-                input_lists[1], args[1].shape,
-                dtype=args[1].dtype, static=input_lists[1].startswith("W_"),
-            )
-            k_cache, v_cache = self.graph.generation.qkv_caches[node.name]
-            input_lists.extend((k_cache, v_cache))
-        else:
-            weight_shard_specs = ()
         from cattorch.util.instruction.optimized import QKVLinearInstruction
-        instruction = QKVLinearInstruction(
-            node.target,
-            target_list,
-            *args,
-            direct_caches=direct_caches,
-            hidden_prefill=(
-                node.name == self.graph.generation.hidden_prefill_qkv
-            ),
-            weight_shard_specs=weight_shard_specs,
-        )
+        instruction = QKVLinearInstruction(node.target, target_list, *args)
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(node)
-
-    def _compile_cached_attention(self, node):
-        value_node = self.graph.generation.attention_fusions[node.name]
-        target_list = self.scope.get_list_for_node(value_node)
-        self.last_target_list = target_list
-        score = node.args[0]
-        value = value_node.args[1]
-        cache_name = self.graph.generation.value_caches[value_node.name]
-        value_shape = _get_shape(value)
-        heads = self.graph.generation.softmax_heads[node.name]
-        kv_heads = value_shape[-3]
-        width = value_shape[-1]
-        input_lists = [self._resolve_name(score.name), cache_name]
-        args = (
-            Argument(input_lists[0], _get_shape(score)),
-            Argument(cache_name, torch.Size([])),
-            Argument("C_heads", torch.Size([]), value=heads),
-            Argument("C_kv_heads", torch.Size([]), value=kv_heads),
-            Argument("C_width", torch.Size([]), value=width),
-        )
-        from cattorch.util.instruction.optimized import CachedSoftmaxValueInstruction
-        instruction = CachedSoftmaxValueInstruction(
-            node.target, target_list, *args,
-        )
-        if self.graph.generation.banked_caches:
-            instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-            instruction.cache_base_variable = _LAYER_CACHE_BASE
-        self._emit(instruction, input_lists, target_list)
-        self.scope.release_dependencies(node)
-        self.scope.release_dependencies(value_node)
 
     def _compile_embedding_add(self, node):
         first, second = self.graph.embedding_add_fusions[node.name]
@@ -643,31 +546,8 @@ class _Compiler:
             self._argument(name, value)
             for name, value in zip(input_lists, tensor_nodes)
         ]
-        cached_position_side = None
-        if self.graph.generation.first_cache is not None:
-            for side, embedding in enumerate((first, second)):
-                indices = self.graph.resolve_weight(embedding.args[1].name)
-                if (
-                    isinstance(indices, torch.Tensor)
-                    and indices.numel() == 1 and float(indices.flatten()[0]) == 0
-                ):
-                    cached_position_side = side
-                    break
-        if cached_position_side is not None:
-            cache_name, cache_width = self.graph.generation.first_cache
-            input_lists.append(cache_name)
-            args.extend((
-                Argument(cache_name, torch.Size([])),
-                Argument("C_position_side", torch.Size([]), value=cached_position_side),
-                Argument("C_cache_width", torch.Size([]), value=cache_width),
-            ))
-            from cattorch.util.instruction.optimized import CachedPositionEmbeddingAddInstruction
-            instruction = CachedPositionEmbeddingAddInstruction(
-                node.target, target_list, *args,
-            )
-        else:
-            from cattorch.util.instruction.optimized import EmbeddingAddInstruction
-            instruction = EmbeddingAddInstruction(node.target, target_list, *args)
+        from cattorch.util.instruction.optimized import EmbeddingAddInstruction
+        instruction = EmbeddingAddInstruction(node.target, target_list, *args)
         instruction.interleaved_sides = (
             self._uses_grouped_tied_weight(first),
             self._uses_grouped_tied_weight(second),
@@ -1023,17 +903,6 @@ class _Compiler:
                 node.target, target_list, *args,
                 weight=factors[0],
             )
-        elif node.name in self.graph.generation.softmax_heads:
-            args.append(Argument(
-                "C_heads", torch.Size([]),
-                value=self.graph.generation.softmax_heads[node.name],
-            ))
-            if self.graph.fast and self.graph.fast_config.softmax:
-                from cattorch.util.instruction.optimized import FastCachedSoftmaxInstruction
-                instruction = FastCachedSoftmaxInstruction(node.target, target_list, *args)
-            else:
-                from cattorch.util.instruction.optimized import CachedSoftmaxInstruction
-                instruction = CachedSoftmaxInstruction(node.target, target_list, *args)
         elif node.name in self.graph.causal_softmaxes:
             if self.graph.fast and self.graph.fast_config.softmax:
                 from cattorch.util.instruction.optimized import FastCausalSoftmaxInstruction
@@ -1042,51 +911,22 @@ class _Compiler:
                 from cattorch.util.instruction.optimized import CausalSoftmaxInstruction
                 instruction = CausalSoftmaxInstruction(node.target, target_list, *args)
         elif aten_op == "aten.embedding.default":
-            if node.name in self.graph.generation.position_embeddings:
-                cache_name, cache_width = self.graph.generation.position_embeddings[node.name]
-                input_lists.append(cache_name)
-                args.extend((
-                    Argument(cache_name, torch.Size([])),
-                    Argument("C_cache_width", torch.Size([]), value=cache_width),
-                ))
-                from cattorch.util.instruction.optimized import CachedPositionEmbeddingInstruction
-                instruction = CachedPositionEmbeddingInstruction(node.target, target_list, *args)
-            else:
-                kernel = self.graph.registry.kernel(
-                    aten_op,
-                    fast=self.graph.fast,
-                    config=self.graph.fast_config,
-                )
-                instruction = self._instantiate(
-                    kernel, lowering_target, node, target_list, args,
-                )
+            kernel = self.graph.registry.kernel(
+                aten_op,
+                fast=self.graph.fast,
+                config=self.graph.fast_config,
+            )
+            instruction = self._instantiate(
+                kernel, lowering_target, node, target_list, args,
+            )
             instruction.interleaved_weight = self._uses_grouped_tied_weight(node)
         elif node.name in self.graph.causal_value_matmuls:
-            if node.name in self.graph.generation.value_caches:
-                from cattorch.util.instruction.optimized import CachedValueMatMulInstruction
-                cache_name = self.graph.generation.value_caches[node.name]
-                input_lists.append(cache_name)
-                instruction = CachedValueMatMulInstruction(
-                    node.target, target_list, *args,
-                    Argument(cache_name, torch.Size([])),
-                    Argument(
-                        "C_value_offset", torch.Size([]),
-                        value=self.graph.qkv_offsets.get(node.args[1].name, 0),
-                    ),
-                    cache_prepopulated=(
-                        node.name in self.graph.generation.prepopulated_values
-                    ),
-                )
-                if self.graph.generation.banked_caches:
-                    instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-                    instruction.cache_base_variable = _LAYER_CACHE_BASE
-            else:
-                from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
-                value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
-                instruction = CausalValueMatMulInstruction(
-                    node.target, target_list, *args,
-                    Argument("C_value_offset", torch.Size([]), value=value_offset),
-                )
+            from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
+            value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
+            instruction = CausalValueMatMulInstruction(
+                node.target, target_list, *args,
+                Argument("C_value_offset", torch.Size([]), value=value_offset),
+            )
         else:
             kernel = self.graph.registry.kernel(
                 aten_op,
@@ -1438,65 +1278,6 @@ class _Compiler:
             row_counts.append(end - start)
         return [input_lists[0], *names, input_lists[2], input_lists[4]], tuple(row_counts)
 
-    def _prepare_cached_qkv_weights(
-        self, node, input_lists, query_heads, kv_heads,
-    ):
-        from cattorch.util.instruction.optimized import LinearInstruction
-
-        weight = self.graph.resolve_weight(node.args[1].name)
-        if (
-            not isinstance(weight, torch.Tensor)
-            or weight.ndim != 2
-        ):
-            return input_lists, ()
-        rows, embed = weight.shape
-        head_width = embed // query_heads
-        segments = (
-            ("query", query_heads * head_width),
-            ("key", kv_heads * head_width),
-            ("value", kv_heads * head_width),
-        )
-        if sum(size for _, size in segments) != rows:
-            return input_lists, ()
-        grouped = (
-            weight.numel() >= LinearInstruction.grouped_min_macs
-            and all(size % 4 == 0 for _, size in segments)
-        )
-        if weight.numel() <= SCRATCH_LIST_LIMIT and not grouped:
-            return input_lists, ()
-        rows_per_shard = SCRATCH_LIST_LIMIT // embed
-        if grouped:
-            rows_per_shard -= rows_per_shard % 4
-        if rows_per_shard < 1:
-            return input_lists, ()
-
-        names = []
-        specs = []
-        start = 0
-        shard_index = 0
-        for destination, segment_rows in segments:
-            remaining = segment_rows
-            while remaining:
-                count = min(rows_per_shard, remaining)
-                shard_index += 1
-                key = f"qkv_{node.name}_{destination}_weight_{shard_index}"
-                shard = weight[start:start + count].detach().clone()
-                if grouped:
-                    shard = (
-                        shard.reshape(-1, 4, embed)
-                        .permute(0, 2, 1)
-                        .contiguous()
-                        .reshape(shard.shape)
-                    )
-                self.static_lists[key] = shard
-                if grouped and self.row_aligned_weights:
-                    self.interleaved_static_layouts[key] = ((0, count, embed),)
-                names.append(f"W_{key}")
-                specs.append((destination, count, grouped))
-                start += count
-                remaining -= count
-        return [input_lists[0], *names, input_lists[2]], tuple(specs)
-
     def _large_static_matmul(self, node, target_list, left_arg, rhs):
         """Use row-aligned output-major weights only when sharding dominates."""
         from cattorch.util.instruction.optimized import LinearInstruction
@@ -1847,52 +1628,13 @@ def transpile(
         registry = default_registry().clone()
         for adapter in adapters:
             registry.register_adapter(adapter)
-        if generation_program.example_token is None:
-            return _transpile_automatic_generation(
-                model, generation_program, output_path, sig_figs,
-                name=name, optimization=optimization, fast_config=fast_config,
-                storage=storage, quantization=quantization,
-                calibration_sequences=calibration_sequences,
-                codegen=codegen, registry=registry,
-            )
-        if calibration_sequences is not None:
-            # A retry without layer sharing must see the same one-pass data.
-            calibration_sequences = list(calibration_sequences)
-
-        def export_legacy(config):
-            return _transpile(
-                MethodModule(model, generation_program.method),
-                (generation_program.example_token,),
-                output_path,
-                sig_figs,
-                name=name,
-                optimization=optimization,
-                fast_config=fast_config,
-                generation=_GenerationSpec(
-                    generation_program.max_context,
-                    generation_program.hidden_prefill,
-                    generation_program.top_k,
-                ),
-                storage=storage,
-                quantization=quantization,
-                calibration_inputs=calibration_sequences,
-                codegen=config,
-                frontend="fx",
-                _generation_public_interface=True,
-                _registry=registry,
-            )
-
-        try:
-            return export_legacy(codegen)
-        except _LayerSharingUnavailable:
-            log.warning(
-                "layer_sharing='auto' could not factor this model's layers; "
-                "exporting without layer sharing"
-            )
-            return export_legacy(replace(
-                codegen if codegen is not None else CodegenConfig(),
-                layer_sharing="off",
-            ))
+        return _transpile_automatic_generation(
+            model, generation_program, output_path, sig_figs,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_sequences=calibration_sequences,
+            codegen=codegen, registry=registry,
+        )
     if adapters:
         raise ValueError("adapters require an ExportProgram or GenerationProgram")
     if calibration_calls is not None:
@@ -1970,7 +1712,7 @@ def _transpile_automatic_generation(
         prepared, max_context, prepared=True, registry=registry,
     ))
     spec = _GenerationSpec(
-        max_context, program.hidden_prefill, program.top_k, automatic=True,
+        max_context, program.hidden_prefill, program.top_k,
     )
     options = dict(
         name=name, optimization=optimization, fast_config=fast_config,
@@ -2098,7 +1840,7 @@ def _transpile(
         example_kwargs=example_kwargs,
     )
     if generation is not None and codegen.layer_sharing == "auto":
-        if generation.automatic and not _layers_can_share_caches(graph):
+        if not _layers_can_share_caches(graph):
             log.info(
                 "Banked generation caches skipped: attention blocks are not in "
                 "consecutive `blocks.N` layers"
@@ -2205,7 +1947,9 @@ def _transpile(
             capacity, logical_sizes.get(public_name, 0), logical_sizes.pop(old_name, 0),
         )
     if generation is not None and generation.top_k is not None:
-        output_size = logical_sizes.get("output", 0)
+        # The output list may be a reused, larger scratch list; the logits
+        # row is the output's own shape.
+        output_size = math.prod(graph.outputs[0][1])
         if generation.top_k > output_size:
             raise ValueError(
                 f"top_k ({generation.top_k}) exceeds output size ({output_size})"
@@ -2219,12 +1963,11 @@ def _transpile(
     _wrap_optimized_lifecycle(sprite)
     if generation is not None:
         if generation.hidden_prefill:
-            hidden_qkv = graph.generation.hidden_prefill_qkv
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
             hidden_attention = graph.generation.hidden_prefill_attention
             if (
-                graph.generation.automatic and not graph.generation.banked_caches
+                not graph.generation.banked_caches
                 and hidden_attention in root_names
                 and root_names.index(hidden_attention) + 1 < len(root_entries)
             ):
@@ -2236,11 +1979,6 @@ def _transpile(
                 _guard_generation_suffix(
                     sprite, root_entries[root_names.index(hidden_attention) + 1][1],
                 )
-            elif hidden_qkv is not None and hidden_qkv in root_names:
-                position = root_names.index(hidden_qkv)
-                if position + 1 >= len(root_entries):
-                    raise ValueError("final cached QKV projection has no suffix")
-                _guard_generation_suffix(sprite, root_entries[position + 1][1])
             else:
                 if not compiler.emitted_roots:
                     raise ValueError(

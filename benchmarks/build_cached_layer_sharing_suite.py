@@ -51,8 +51,6 @@ def _compile_variant(model, directory: Path, label: str, sharing: str, namespace
     result = transpile(
         model,
         GenerationProgram(
-            method="next_token_logits",
-            example_token=torch.tensor([[1]]),
             max_context=1 + DECODE_ITERATIONS,
             top_k=20,
         ),

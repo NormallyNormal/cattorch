@@ -491,9 +491,7 @@ def test_example_kwargs_rejections(tmp_path):
     ))
     with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
         transpile(model, program, tmp_path / "a", example_kwargs={"mask": mask})
-    generation = GenerationProgram(
-        "forward", torch.zeros(1, 1, dtype=torch.long), max_context=4,
-    )
+    generation = GenerationProgram(max_context=4)
     with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
         transpile(model, generation, tmp_path / "b", example_kwargs={"mask": mask})
     with pytest.raises(TypeError, match="dict with string keys"):

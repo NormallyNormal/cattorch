@@ -532,7 +532,7 @@ def test_export_options_are_validated_before_interface_dispatch(tmp_path, kind, 
                 EntryPoint("run", arguments=(Input("x", example),), returns=(Output("y"),)),
             )
         ),
-        "generation": GenerationProgram("forward", torch.tensor([[0]]), max_context=4),
+        "generation": GenerationProgram(max_context=4),
     }[kind]
     with pytest.raises(error):
         transpile(nn.Identity().eval(), interface, tmp_path / "invalid", **options)

@@ -34,7 +34,6 @@ class _GenerationSpec:
     max_context: int
     hidden_prefill: bool = True
     top_k: int | None = None
-    automatic: bool = False
 
 # ── Op classification ────────────────────────────────────────────────────────
 
@@ -133,22 +132,6 @@ def _is_foldable(node) -> bool:
     return torch.Tag.nondeterministic_seeded not in tags
 
 
-def _is_legacy_position_lookup(node, args) -> bool:
-    """A single constant-index-0 embedding row in a legacy generation export.
-
-    The legacy lowerer treats the zero index as a placeholder for the current
-    position and reads the row from the cache length at run time, so folding it
-    to row zero would freeze every position at the first token.
-    """
-    if str(node.target) != "aten.embedding.default" or len(args) < 2:
-        return False
-    indices = args[1]
-    return (
-        isinstance(indices, torch.Tensor) and indices.numel() == 1
-        and float(indices.flatten()[0]) == 0
-    )
-
-
 def fold_static_values(
     nodes,
     state: dict[str, torch.Tensor],
@@ -156,7 +139,6 @@ def fold_static_values(
     seed: dict[str, torch.Tensor] | None = None,
     element_limit: int | None = _FOLD_ELEMENT_LIMIT,
     passthrough: frozenset[str] = frozenset(),
-    keep_runtime=None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate every foldable node whose tensor inputs are all static.
 
@@ -166,8 +148,6 @@ def fold_static_values(
     (``None`` folds them all). A node whose target is in ``passthrough``
     takes its first argument's value without being called, for aliasing
     operations such as ``detach_`` that are not otherwise foldable.
-    ``keep_runtime(node, args)`` returning true leaves a node unfolded because
-    its value changes at run time even though its inputs are static.
     """
     folded: dict[str, torch.Tensor] = {}
     known = dict(seed or {})
@@ -203,8 +183,6 @@ def fold_static_values(
             args = static_value(node.args)
             kwargs = static_value(node.kwargs)
             if args is missing or kwargs is missing:
-                continue
-            if keep_runtime is not None and keep_runtime(node, args):
                 continue
             try:
                 result = node.target(*args, **kwargs)
@@ -279,17 +257,9 @@ class _GenerationInfo:
     score_caches: dict[str, str] = field(default_factory=dict)
     value_caches: dict[str, str] = field(default_factory=dict)
     cache_widths: dict[str, int] = field(default_factory=dict)
-    softmax_heads: dict[str, int] = field(default_factory=dict)
     first_cache: tuple[str, int] | None = None
-    position_embeddings: dict[str, tuple[str, int]] = field(default_factory=dict)
-    qkv_caches: dict[str, tuple[str, str]] = field(default_factory=dict)
-    prepopulated_scores: set[str] = field(default_factory=set)
-    prepopulated_values: set[str] = field(default_factory=set)
-    hidden_prefill_qkv: str | None = None
     hidden_prefill_attention: str | None = None
-    attention_fusions: dict[str, object] = field(default_factory=dict)
     banked_caches: bool = False
-    automatic: bool = False
     cache_layers: int = 1
     cache_layer_width: int = 0
 
@@ -392,8 +362,7 @@ def _prepare_graph(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
     _drop_empty_cat_inputs(captured.graph)
-    automatic = generation is not None and generation.automatic
-    if automatic:
+    if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
         for node in list(captured.graph.nodes):
@@ -591,7 +560,9 @@ def _prepare_graph(
     if use_fusions:
         # Position and cache buffers change at run time: nothing derived from
         # them is a constant.
-        runtime_state = _generation_state_names(nodes, state_inputs) if automatic else set()
+        runtime_state = (
+            _generation_state_names(nodes, state_inputs) if generation is not None else set()
+        )
         generated_weights.update(fold_static_values(
             nodes,
             {
@@ -599,10 +570,6 @@ def _prepare_graph(
                 if name not in runtime_state
             },
             seed=generated_weights,
-            keep_runtime=(
-                _is_legacy_position_lookup
-                if generation is not None and not automatic else None
-            ),
         ))
 
     def resolve_weight(arg_name):
@@ -1089,7 +1056,7 @@ def _prepare_graph(
             # Reordered QKV emission adds outer-loop dispatch.  Official-VM
             # A/B runs show the removed copies pay for that only once the
             # sequence is moderately long.
-            if _get_shape(q)[-2] < 16 and generation is None:
+            if _get_shape(q)[-2] < 16:
                 continue
             q_item = alias_source(q.args[0]) if str(q.target) == "aten.transpose.int" else None
             k_item = alias_source(k.args[0]) if str(k.target) == "aten.transpose.int" else None
@@ -1158,16 +1125,9 @@ def _prepare_graph(
     generation_score_caches = {}
     generation_value_caches = {}
     generation_cache_widths = {}
-    generation_softmax_heads = {}
     generation_first_cache = None
-    generation_position_embeddings = {}
-    generation_qkv_caches = {}
-    generation_prepopulated_scores = set()
-    generation_prepopulated_values = set()
-    generation_hidden_prefill_qkv = None
     generation_hidden_prefill_attention = None
-    generation_attention_fusions = {}
-    if automatic:
+    if generation is not None:
         if len(example_inputs) != 1 or tuple(example_inputs[0].shape) != (1, 1):
             raise ValueError("generation export example input must have shape [1, 1]")
         for node in nodes:
@@ -1190,110 +1150,6 @@ def _prepare_graph(
             )
         if generation.hidden_prefill:
             generation_hidden_prefill_attention = next(reversed(generation_score_caches))
-    elif generation is not None:
-        if len(example_inputs) != 1 or example_inputs[0].ndim != 2:
-            raise ValueError("generation export requires one [1, 1] token tensor input")
-        if tuple(example_inputs[0].shape) != (1, 1):
-            raise ValueError("generation export example input must have shape [1, 1]")
-        layer = 0
-        for qk_name, fusion in causal_score_fusions.items():
-            mask_node, q, k, _, _, _ = fusion
-            softmax = next(
-                (candidate for candidate in mask_node.users if candidate.name in causal_softmaxes),
-                None,
-            )
-            value_matmul = next(
-                (
-                    candidate for candidate in nodes
-                    if candidate.name in causal_value_matmuls
-                    and softmax is not None and candidate.args[0] is softmax
-                ),
-                None,
-            )
-            if softmax is None or value_matmul is None:
-                continue
-            layer += 1
-            embed = _get_shape(k)[-3] * _get_shape(k)[-1]
-            k_cache = f"cattorch K cache {layer}"
-            v_cache = f"cattorch V cache {layer}"
-            generation_score_caches[qk_name] = k_cache
-            generation_value_caches[value_matmul.name] = v_cache
-            generation_cache_widths[k_cache] = embed
-            generation_cache_widths[v_cache] = embed
-            generation_softmax_heads[softmax.name] = _get_shape(q)[-3]
-            current_v = value_matmul.args[1]
-            for linear_name, qkv_fusion in qkv_linear_fusions.items():
-                _, _, fused_q, fused_k, fused_v, *_ = qkv_fusion
-                if fused_q is q and fused_k is k and fused_v is current_v:
-                    generation_qkv_caches[linear_name] = (k_cache, v_cache)
-                    generation_prepopulated_scores.add(qk_name)
-                    generation_prepopulated_values.add(value_matmul.name)
-                    break
-            if generation_first_cache is None:
-                generation_first_cache = (k_cache, embed)
-        if not generation_score_caches:
-            raise ValueError(
-                "generation export requires a recognized causal attention block"
-            )
-        node_positions = {node.name: index for index, node in enumerate(nodes)}
-        if generation.hidden_prefill and generation_qkv_caches:
-            generation_hidden_prefill_qkv = max(
-                generation_qkv_caches,
-                key=lambda name: node_positions.get(name, -1),
-            )
-        if not fast and generation.max_context >= 64:
-            for value_name in generation_prepopulated_values:
-                value_node = next(node for node in nodes if node.name == value_name)
-                softmax = value_node.args[0]
-                if (
-                    hasattr(softmax, "name")
-                    and softmax.name in generation_softmax_heads
-                    and len(softmax.users) == 1
-                ):
-                    generation_attention_fusions[softmax.name] = value_node
-                    fused_nodes.add(value_node.name)
-        first_cache_name, first_cache_width = generation_first_cache
-        score_positions = sorted(
-            (
-                node_positions[name], cache_name,
-                generation_cache_widths[cache_name],
-            )
-            for name, cache_name in generation_score_caches.items()
-        )
-        for node in nodes:
-            if node.op != "call_function" or str(node.target) != "aten.embedding.default":
-                continue
-            indices = resolve_weight(node.args[1].name) if hasattr(node.args[1], "name") else None
-            if (
-                isinstance(indices, torch.Tensor) and indices.numel() == 1
-                and float(indices.flatten()[0]) == 0
-            ):
-                table = (
-                    resolve_weight(node.args[0].name)
-                    if hasattr(node.args[0], "name") else None
-                )
-                if (
-                    isinstance(table, torch.Tensor)
-                    and table.ndim >= 1
-                    and generation.max_context > table.shape[0]
-                ):
-                    raise ValueError(
-                        f"generation max_context ({generation.max_context}) exceeds "
-                        f"recognized position table capacity ({table.shape[0]}) at "
-                        f"exported node {node.name!r}"
-                    )
-                # RoPE tables live inside attention blocks. Use the next
-                # causal score's own K cache so later layers do not observe
-                # layer 1 after it has already appended the current token.
-                next_score = next(
-                    (
-                        (cache_name, cache_width)
-                        for position, cache_name, cache_width in score_positions
-                        if position > node_positions[node.name]
-                    ),
-                    (first_cache_name, first_cache_width),
-                )
-                generation_position_embeddings[node.name] = next_score
 
     graph = _GraphInfo(
         nodes=nodes,
@@ -1309,16 +1165,8 @@ def _prepare_graph(
             score_caches=generation_score_caches,
             value_caches=generation_value_caches,
             cache_widths=generation_cache_widths,
-            softmax_heads=generation_softmax_heads,
             first_cache=generation_first_cache,
-            position_embeddings=generation_position_embeddings,
-            qkv_caches=generation_qkv_caches,
-            prepopulated_scores=generation_prepopulated_scores,
-            prepopulated_values=generation_prepopulated_values,
-            hidden_prefill_qkv=generation_hidden_prefill_qkv,
             hidden_prefill_attention=generation_hidden_prefill_attention,
-            attention_fusions=generation_attention_fusions,
-            automatic=automatic,
         ),
         linear_fusions=linear_fusions,
         paired_swiglu_fusions=paired_swiglu_fusions,
@@ -1344,7 +1192,7 @@ def _validate_lowering_operations(graph: _GraphInfo) -> None:
     skipped = set(graph.aliases) | set(graph.generated_weights) | graph.fused_nodes
     for roots in (
         graph.causal_score_fusions, graph.qkv_linear_fusions,
-        graph.generation.attention_fusions, graph.embedding_add_fusions,
+        graph.embedding_add_fusions,
         graph.elementwise_fusions, graph.linear_fusions,
         graph.paired_swiglu_fusions, graph.silu_mul_fusions,
     ):

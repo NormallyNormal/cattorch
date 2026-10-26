@@ -51,8 +51,6 @@ def _compile_variant(source, name: str, threshold: float):
             transpile(
                 model,
                 GenerationProgram(
-                    method="forward",
-                    example_token=prompt[:, :1],
                     max_context=CONTEXT + DECODE_ITERATIONS,
                     hidden_prefill=True,
                 ),

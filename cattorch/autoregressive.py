@@ -209,7 +209,11 @@ def analyze_sequence(
             f"automatic generation needs max_context >= 3, got {max_context}"
         )
     length, short_length = max_context, max_context - 1
-    long = _capture(model, length, example_kwargs)
+    try:
+        long = _capture(model, length, example_kwargs)
+    except UnsupportedModelError as error:
+        _explain_context_failure(model, length, example_kwargs, error)
+        raise
     short = _capture(model, short_length, example_kwargs)
     long_nodes = list(long.graph.nodes)
     short_nodes = list(short.graph.nodes)
@@ -285,6 +289,24 @@ def _capture(model, length: int, example_kwargs) -> CapturedGraph:
     families = _ACTIVE_EXPERT_FAMILIES.get() or default_registry().expert_families
     with _expert_family_context(families):
         return capture_model(model, (tokens,), example_kwargs=example_kwargs)
+
+
+def _explain_context_failure(model, length: int, example_kwargs, error) -> None:
+    """Name ``max_context`` when ``forward`` itself fails at that length."""
+    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
+    from cattorch.operator_registry import default_registry
+
+    families = _ACTIVE_EXPERT_FAMILIES.get() or default_registry().expert_families
+    try:
+        with torch.no_grad(), _expert_family_context(families):
+            model(torch.zeros(1, length, dtype=torch.long), **(example_kwargs or {}))
+    except IndexError as eager:
+        raise UnsupportedModelError(
+            f"the model's forward fails on {length} tokens ({eager}); "
+            f"max_context ({length}) is probably larger than a position table"
+        ) from error
+    except Exception:  # noqa: BLE001 - the trace error is the better report
+        return
 
 
 def _module_path(node) -> str | None:

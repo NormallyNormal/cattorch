@@ -126,8 +126,6 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
     processor = transpile(
         source,
         GenerationProgram(
-            method="next_token_logits",
-            example_token=torch.tensor([[1]]),
             max_context=config.block_size,
         ),
         processor_path,
@@ -182,7 +180,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
         },
         "export": {
             "optimization": "exact",
-            "generation_method": "next_token_logits",
+            "generation_method": "forward",
             "generation_wrapper": "cached MQA with fused semantic RoPE",
             "quantization": "symmetric q4",
             "group_size": 256,

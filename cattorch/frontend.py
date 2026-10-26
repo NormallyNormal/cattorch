@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import RLock
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import contextlib
 import functools
@@ -568,7 +568,7 @@ def _replace_intermediate_copies(graph: Graph) -> None:
         if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
             continue
         # ``copy_`` casts and broadcasts its source to the target.
-        steps = []
+        steps: list[tuple[Any, tuple, dict, torch.Tensor]] = []
         if actual.dtype != expected.dtype:
             steps.append((
                 torch.ops.aten.to.dtype, (expected.dtype,), {}, actual.to(expected.dtype),

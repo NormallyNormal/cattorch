@@ -8,10 +8,7 @@
   q/k/v projections, `arange` positions, RoPE, grouped-query and
   single-KV-head attention work, and so do unwrapped Hugging Face GPT-2,
   Llama, and Qwen2. cattorch checks the cached step against `forward` during
-  export. `example_token` still selects the old recognizer. See
-  [KV-cached generation](docs/generation.md).
-- `GenerationProgram` fields `method` and `example_token` now have defaults
-  (`"forward"` and `None`); `max_context` is still required.
+  export. See [KV-cached generation](docs/generation.md).
 - Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
   a wrapper. On the export copy, the cache and extra outputs are turned off
   and an attention implementation that traces is selected, so no
@@ -81,15 +78,11 @@
 
 ## Fixes
 
-- A legacy `GenerationProgram(method, example_token, ...)` export with
-  `layer_sharing="auto"` failed with an internal error, or read layer zero's
-  cache rows in every layer, when the layers could not be factored after their
-  caches were banked. The export now retries without layer sharing.
-- A legacy cached-generation export gave wrong logits for every token after the
-  first when a position table, such as RoPE `cos`/`sin` embeddings, was indexed
-  by a zero buffer. The lookup was folded to row zero at export time instead of
-  reading the cache length, and with layer sharing it also read a fractional
-  position partway through a layer's cache row.
+- When `forward` fails at `max_context` tokens with an `IndexError`, the
+  export error now says that `max_context` is probably larger than a position
+  table.
+- Layer sharing could fail with a `KeyError` when one stored tensor would
+  fill more than one slot of a layer bank. Sharing is now skipped instead.
 - A 0-dimensional parameter, buffer, or constant failed during export.
   Hugging Face models with `eager` attention hit this.
 - Concatenating with an empty tensor, as Hugging Face caches do on their
@@ -99,6 +92,17 @@
   later were affected the same way.
 - `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
   failed during export.
+
+## Breaking changes
+
+- The legacy cached-generation recognizer is removed, along with
+  `GenerationProgram.example_token`. Export the model's stateless
+  `forward(tokens) -> logits` with `GenerationProgram(max_context=...)`
+  instead: replace a one-token decoder that reads its position from a zero
+  buffer with a forward over the whole sequence. In Scratch timings on a
+  TinyStories-sized model, the automatic path matched or beat the legacy one.
+- `max_context` is now the first field of `GenerationProgram` and the only
+  positional one; `method`, `hidden_prefill`, and `top_k` are keyword-only.
 
 # 0.5.0 - 2026-09-14
 
