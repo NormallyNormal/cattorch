@@ -82,4 +82,85 @@ def _topk_indices_fake(value, k, dim, largest):
     return value.new_empty(shape, dtype=torch.int64)
 
 
+# ── Private ops for the automatic generation step module ────────────────────
+# These are not exported: ``cattorch.autoregressive.build_step_module`` inserts
+# them, and the generation lowering gives them dedicated Scratch kernels.
+
+def _step_index(position: torch.Tensor, limit: int, what: str) -> int:
+    index = int(position)
+    if not 0 <= index < limit:
+        raise RuntimeError(
+            f"the generation step module is full: position {index} is outside "
+            f"the {limit} rows of {what}; call reset() or raise max_context"
+        )
+    return index
+
+
+@torch.library.custom_op("cattorch::sequence_row", mutates_args=())
+def _sequence_row(table: torch.Tensor, position: torch.Tensor, axis: int) -> torch.Tensor:
+    """Row ``position`` of ``table`` along ``axis``, keeping the axis with size 1."""
+    index = _step_index(position, table.shape[axis], "a position table")
+    return table.narrow(axis, index, 1).clone()
+
+
+@_sequence_row.register_fake
+def _sequence_row_fake(table, position, axis):
+    shape = list(table.shape)
+    shape[axis] = 1
+    return table.new_empty(shape)
+
+
+@torch.library.custom_op("cattorch::cached_attention", mutates_args=("k_cache", "v_cache"))
+def _cached_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    position: torch.Tensor,
+    scale: float,
+    kv_groups: int,
+) -> torch.Tensor:
+    """One causal attention step over a key/value cache.
+
+    ``q`` is ``[B, H, 1, D]`` and ``k``/``v`` are ``[B, H_kv, 1, D]`` with
+    ``H = H_kv * kv_groups``. The caches are ``[B, H_kv, max_context, D]``. The
+    new key and value are written to row ``position``, then the query attends
+    to rows ``0..position``. Rank-3 tensors (``[B, 1, D]`` with caches
+    ``[B, max_context, D]``) are attention without a head axis.
+    """
+    headless = q.ndim == 3
+    if headless:
+        q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+    cache_k = k_cache.unsqueeze(1) if headless else k_cache
+    cache_v = v_cache.unsqueeze(1) if headless else v_cache
+    index = _step_index(position, cache_k.shape[-2], "the key/value cache")
+    cache_k.narrow(-2, index, 1).copy_(k)
+    cache_v.narrow(-2, index, 1).copy_(v)
+    keys = cache_k.narrow(-2, 0, index + 1)
+    values = cache_v.narrow(-2, 0, index + 1)
+    if kv_groups > 1:
+        keys = keys.repeat_interleave(kv_groups, dim=-3)
+        values = values.repeat_interleave(kv_groups, dim=-3)
+    scores = torch.matmul(q, keys.transpose(-2, -1)) * scale
+    out = torch.matmul(torch.softmax(scores, dim=-1), values)
+    return out.squeeze(1) if headless else out
+
+
+@_cached_attention.register_fake
+def _cached_attention_fake(q, k, v, k_cache, v_cache, position, scale, kv_groups):
+    return q.new_empty((*q.shape[:-1], v.shape[-1]))
+
+
+@torch.library.custom_op("cattorch::advance_position", mutates_args=("position",))
+def _advance_position(position: torch.Tensor) -> None:
+    """Move the step module on by one token."""
+    position.add_(1)
+
+
+@_advance_position.register_fake
+def _advance_position_fake(position):
+    return None
+
+
 __all__ = ["rotary_embedding"]

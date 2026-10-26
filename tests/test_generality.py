@@ -9,6 +9,8 @@ supported list and the matrix can only improve.
 from __future__ import annotations
 
 import math
+import sys
+import warnings
 
 import pytest
 import torch
@@ -313,16 +315,11 @@ def test_huggingface_gpt2_with_cache_dropped(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["gpt2", "llama"])
-@pytest.mark.parametrize("cache", ["off", "left on"])
-def test_unwrapped_huggingface_decoder(tmp_path, kind, cache):
+def test_unwrapped_huggingface_decoder_with_explicit_cache_off(tmp_path, kind):
     model = _tiny_decoder(kind).eval()
     ids = torch.randint(0, 64, (1, 8))
-    kwargs = {"use_cache": False} if cache == "off" else None
-    if kwargs is None:
-        with pytest.warns(UserWarning, match="past_key_values"):
-            result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
-    else:
-        result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
+    kwargs = {"use_cache": False}
+    result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
     assert verify(model, (ids,), result, example_kwargs=kwargs).passed
 
 
@@ -336,6 +333,70 @@ def test_huggingface_model_in_training_mode_warns_and_stays_training(tmp_path):
     with pytest.warns(UserWarning, match="training mode"):
         assert verify(model, (ids,), result, example_kwargs=kwargs).passed
     assert model.training
+
+
+@pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
+def test_huggingface_decoder_needs_no_kwargs(tmp_path, kind):
+    model = _tiny_decoder(kind).eval()
+    ids = torch.randint(0, 64, (1, 8))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
+        result = transpile(model, (ids,), tmp_path / "model")
+        assert verify(model, (ids,), result).passed
+    assert len(result.outputs) == 1
+
+
+def test_huggingface_config_defaults_apply_to_copy_only(tmp_path):
+    model = _tiny_decoder("llama").eval()
+    model.config.use_cache = True
+    model.config.output_hidden_states = True
+    ids = torch.randint(0, 64, (1, 8))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
+        result = transpile(model, (ids,), tmp_path / "model")
+    assert len(result.outputs) == 1
+    assert model.config.use_cache and model.config.output_hidden_states
+
+
+def test_huggingface_attention_switches_to_sdpa(tmp_path):
+    from cattorch.huggingface import prepare_huggingface_models
+
+    model = _tiny_decoder("llama").eval()
+    for current in ("eager", "flex_attention"):
+        model.config._attn_implementation = current
+        prepare_huggingface_models(model)
+        assert model.config._attn_implementation == "sdpa"
+    assert not model.config.use_cache
+
+
+class ZeroDimBuffer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("scale", torch.tensor(-3.0))
+
+    def forward(self, x):
+        return torch.where(x > 0, x, self.scale)
+
+
+def test_zero_dim_static_tensor(tmp_path):
+    _export_and_verify(tmp_path, ZeroDimBuffer().eval(), (torch.randn(2, 4),))
+
+
+def test_huggingface_defaults_are_noop_without_transformers(tmp_path, monkeypatch):
+    from cattorch.huggingface import prepare_huggingface_models
+
+    monkeypatch.delitem(sys.modules, "transformers", raising=False)
+    assert not prepare_huggingface_models(nn.Linear(4, 4))
+    _export_and_verify(tmp_path, nn.Linear(4, 4), (torch.randn(2, 4),))
+
+
+def test_huggingface_explicit_use_cache_overrides_default(tmp_path):
+    model = _tiny_decoder("gpt2").eval()
+    ids = torch.randint(0, 64, (1, 8))
+    kwargs = {"use_cache": True}
+    with pytest.warns(UserWarning, match="past_key_values"):
+        result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
+    assert verify(model, (ids,), result, example_kwargs=kwargs).passed
 
 
 class KeywordMask(nn.Module):

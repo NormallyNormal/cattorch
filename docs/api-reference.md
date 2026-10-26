@@ -210,10 +210,10 @@ multiplications. See [optimization modes](optimization.md#weight-transforms).
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `method` | required | Name of the model method that takes token IDs and returns next-token logits. |
-| `example_token` | required | A `[1, 1]` integer tensor used to trace the method. |
-| `max_context` | required | Maximum number of tokens the cache holds. |
-| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. |
+| `method` | `"forward"` | Name of the model method that takes token IDs and returns next-token logits for every position. |
+| `example_token` | `None` | Leave unset to derive the cached step automatically from a stateless method. A `[1, 1]` integer tensor selects the [legacy recognizer](generation.md#legacy-hand-written-cached-decoders) for a hand-written cached decoder. |
+| `max_context` | required | Maximum number of tokens the cache holds. Keyword-only in practice, since `method` and `example_token` come first. |
+| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. Without layer sharing, the final layer's attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 
 See [KV-cached generation](generation.md) for model requirements and the

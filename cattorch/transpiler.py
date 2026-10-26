@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 import operator
 import warnings
 from dataclasses import replace
@@ -16,6 +17,7 @@ from cattorch.frontend import Frontend, flat_example_inputs
 from cattorch.graph import (
     _GenerationSpec,
     _GraphInfo,
+    _get_dtype,
     _get_shape,
     _prepare_graph,
     _unsupported_operation,
@@ -40,7 +42,9 @@ from cattorch.sprite import (
     _guard_generation_suffix,
     _logical_list_sizes,
     _merge_duplicate_lists,
+    _graph_layer,
     _merge_lists_by_name,
+    _merge_variables_by_name,
     _remove_unused,
     _rename_list,
     _share_repeated_transformer_layers,
@@ -183,6 +187,19 @@ def _wrap_transactional_generation_step(
 
 # ── Compiler ─────────────────────────────────────────────────────────────────
 
+class _LayerSharingUnavailable(Exception):
+    """Banked caches were requested but the layers could not be factored."""
+
+
+def _layers_can_share_caches(graph: _GraphInfo) -> bool:
+    """Whether each automatic attention block sits in its own ``blocks.N`` layer."""
+    by_name = {node.name: node for node in graph.nodes}
+    layers = [
+        _graph_layer(by_name[name]) for name in graph.generation.score_caches
+    ]
+    return None not in layers and layers == list(range(len(layers)))
+
+
 class _Compiler:
     """Walk the graph, dispatch each node to the right handler, and produce
     a single Scratch sprite dict with all blocks chained together."""
@@ -256,7 +273,54 @@ class _Compiler:
             name,
             _get_shape(node),
             dynamic_axis=self.graph.dynamic_axes.get(node.name),
+            dtype=_get_dtype(node),
+            # Parameters, buffers and folded constants live in W_ lists.
+            static=name.startswith("W_"),
         )
+
+    def _instantiate(self, kernel, lowering_target, node, target_list, args):
+        """Create a kernel instruction; context kernels also get output info."""
+        output = target_list
+        if getattr(kernel, "wants_output_info", False):
+            output = Argument(target_list, _get_shape(node), dtype=_get_dtype(node))
+        instruction = kernel(lowering_target, output, *args)
+        options = self._lowering_options(node)
+        if options:
+            instruction.options = options
+        return instruction
+
+    def _automatic_bindings(self, node) -> dict[int, str]:
+        """Argument positions of an automatic-generation op bound to named lists."""
+        generation = self.graph.generation
+        if not generation.automatic:
+            return {}
+        target = str(node.target)
+        if target == "cattorch.cached_attention.default":
+            return {
+                3: generation.score_caches[node.name],
+                4: generation.value_caches[node.name],
+                5: "_none",
+            }
+        if target == "cattorch.sequence_row.default":
+            return {1: "_none"}
+        return {}
+
+    def _lowering_options(self, node) -> dict[str, object]:
+        """Compile-time facts for a context kernel (``KernelContext.options``)."""
+        generation = self.graph.generation
+        if not (
+            generation.automatic
+            and str(node.target) == "cattorch.cached_attention.default"
+        ):
+            return {}
+        if generation.banked_caches:
+            return {
+                "cache_stride": generation.cache_widths[generation.score_caches[node.name]],
+                "cache_base_variable": _LAYER_CACHE_BASE,
+            }
+        if node.name == generation.hidden_prefill_attention:
+            return {"hidden_prefill_last": True}
+        return {}
 
     # ── public ───────────────────────────────────────────────────────────
 
@@ -517,7 +581,10 @@ class _Compiler:
             input_lists, weight_shard_specs = self._prepare_cached_qkv_weights(
                 node, input_lists, query_heads, kv_heads,
             )
-            args[1] = Argument(input_lists[1], args[1].shape)
+            args[1] = Argument(
+                input_lists[1], args[1].shape,
+                dtype=args[1].dtype, static=input_lists[1].startswith("W_"),
+            )
             k_cache, v_cache = self.graph.generation.qkv_caches[node.name]
             input_lists.extend((k_cache, v_cache))
         else:
@@ -829,6 +896,11 @@ class _Compiler:
             else rule.lowering_target
         )
         input_lists = self._resolve_args(node)
+        # Automatic generation binds a step module's cache buffers to the
+        # persistent K/V lists and drops its position input (the kernels read
+        # `cattorch cache length`), so none of them becomes a static weight.
+        for position, bound in self._automatic_bindings(node).items():
+            input_lists[position] = bound
         node_args = list(node.args)
         # Capture frontends omit the optional bias for bias-free linear.
         # Keep the production kernel's tensor slots stable with an empty list.
@@ -975,7 +1047,9 @@ class _Compiler:
                     fast=self.graph.fast,
                     config=self.graph.fast_config,
                 )
-                instruction = kernel(lowering_target, target_list, *args)
+                instruction = self._instantiate(
+                    kernel, lowering_target, node, target_list, args,
+                )
             instruction.interleaved_weight = self._uses_grouped_tied_weight(node)
         elif node.name in self.graph.causal_value_matmuls:
             if node.name in self.graph.generation.value_caches:
@@ -1021,9 +1095,17 @@ class _Compiler:
                     interleaved=interleaved,
                 )
             else:
-                instruction = kernel(lowering_target, target_list, *args)
+                instruction = self._instantiate(
+                    kernel, lowering_target, node, target_list, args,
+                )
         instruction.transform_weights(self.static_lists)
         self._emit(instruction, input_lists, target_list)
+        # Context kernels report the scratch lists they allocated, so the
+        # sharding pass can size them like any other tensor list.
+        for list_name, size in getattr(instruction, "temporary_sizes", {}).items():
+            self.logical_sizes[list_name] = max(
+                self.logical_sizes.get(list_name, 0), size,
+            )
 
     # ── cat (pairwise chaining) ──────────────────────────────────────────
 
@@ -1533,6 +1615,19 @@ class _Compiler:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
+def _size_numbered_private_lists(sprite: dict, sizes: dict[str, int]) -> None:
+    """Give ``_name_2``-style copies of a private list its recorded capacity.
+
+    The block combiner keeps every instruction's private list separate by
+    numbering later duplicates, so a size recorded for ``_name`` applies to
+    all of them.
+    """
+    for name, _ in sprite.get("lists", {}).values():
+        base = re.sub(r"_\d+$", "", name)
+        if base != name and base.startswith("_") and base in sizes:
+            sizes[name] = max(sizes.get(name, 0), sizes[base])
+
+
 def _select_unroll_factor(
     model: torch.nn.Module,
     storage: StorageConfig,
@@ -1554,7 +1649,13 @@ def _select_unroll_factor(
         # Conservatively budget fixed q4. Huffman coding can only improve it.
         "int4": 8 / 13,
     }
-    for tensor in (*model.parameters(), *model.buffers()):
+    # An automatic generation step module also holds caches and a position
+    # counter, which are never stored; it names the tensors that are.
+    static_tensors = getattr(model, "static_tensors", None)
+    for tensor in (
+        static_tensors() if static_tensors is not None
+        else (*model.parameters(), *model.buffers())
+    ):
         identity = (
             tensor.untyped_storage().data_ptr(), tensor.storage_offset(),
             tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype,
@@ -1736,27 +1837,52 @@ def transpile(
         registry = default_registry().clone()
         for adapter in adapters:
             registry.register_adapter(adapter)
-        return _transpile(
-            MethodModule(model, generation_program.method),
-            (generation_program.example_token,),
-            output_path,
-            sig_figs,
-            name=name,
-            optimization=optimization,
-            fast_config=fast_config,
-            generation=_GenerationSpec(
-                generation_program.max_context,
-                generation_program.hidden_prefill,
-                generation_program.top_k,
-            ),
-            storage=storage,
-            quantization=quantization,
-            calibration_inputs=calibration_sequences,
-            codegen=codegen,
-            frontend="fx",
-            _generation_public_interface=True,
-            _registry=registry,
-        )
+        if generation_program.example_token is None:
+            return _transpile_automatic_generation(
+                model, generation_program, output_path, sig_figs,
+                name=name, optimization=optimization, fast_config=fast_config,
+                storage=storage, quantization=quantization,
+                calibration_sequences=calibration_sequences,
+                codegen=codegen, registry=registry,
+            )
+        if calibration_sequences is not None:
+            # A retry without layer sharing must see the same one-pass data.
+            calibration_sequences = list(calibration_sequences)
+
+        def export_legacy(config):
+            return _transpile(
+                MethodModule(model, generation_program.method),
+                (generation_program.example_token,),
+                output_path,
+                sig_figs,
+                name=name,
+                optimization=optimization,
+                fast_config=fast_config,
+                generation=_GenerationSpec(
+                    generation_program.max_context,
+                    generation_program.hidden_prefill,
+                    generation_program.top_k,
+                ),
+                storage=storage,
+                quantization=quantization,
+                calibration_inputs=calibration_sequences,
+                codegen=config,
+                frontend="fx",
+                _generation_public_interface=True,
+                _registry=registry,
+            )
+
+        try:
+            return export_legacy(codegen)
+        except _LayerSharingUnavailable:
+            log.warning(
+                "layer_sharing='auto' could not factor this model's layers; "
+                "exporting without layer sharing"
+            )
+            return export_legacy(replace(
+                codegen if codegen is not None else CodegenConfig(),
+                layer_sharing="off",
+            ))
     if adapters:
         raise ValueError("adapters require an ExportProgram or GenerationProgram")
     if calibration_calls is not None:
@@ -1773,6 +1899,91 @@ def transpile(
         frontend=frontend,
         example_kwargs=example_kwargs,
     )
+
+
+def _transpile_automatic_generation(
+    model: torch.nn.Module,
+    program: GenerationProgram,
+    output_path: str | Path,
+    sig_figs: int | None,
+    *,
+    name: str | None,
+    optimization: Literal["exact", "fast"],
+    fast_config: FastConfig | None,
+    storage: StorageConfig | None,
+    quantization: QuantizationConfig | None,
+    calibration_sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None,
+    codegen: CodegenConfig | None,
+    registry: OperatorRegistry,
+) -> TranspileResult:
+    """Export a stateless ``forward(tokens)`` model as a cached decoder.
+
+    The model is prepared exactly like an ordinary export (adapters, fast
+    transforms, batch-norm folding, quantization), so quantization still sees
+    the parameters. ``build_generation_step`` then derives the one-token step
+    module whose attention reads and writes per-layer K/V caches, and the
+    step is lowered through the generation machinery.
+    """
+    import copy
+    from cattorch.autoregressive import (
+        GenerationStepModule, MethodLeaves, build_generation_step,
+    )
+
+    config = fast_config or FastConfig()
+    storage = storage or StorageConfig()
+    codegen = codegen or CodegenConfig()
+    if quantization is not None and storage.precision in {"int8", "int6", "int4"}:
+        raise ValueError(
+            "quantization cannot be combined with legacy integer "
+            "StorageConfig.precision"
+        )
+    if calibration_sequences is not None and (
+        quantization is None or quantization.method != "gptq"
+    ):
+        raise ValueError("calibration_inputs can only be used with GPTQ quantization")
+    max_context = program.max_context
+    module = model if program.method == "forward" else MethodLeaves(model, program.method)
+    prepared = registry.adapt_model(module)
+    if optimization == "fast":
+        prepared = prepare_fast_model(prepared, config)
+    prepared = fold_eval_batch_norms(prepared)
+    report = None
+    if quantization is not None:
+        report = quantize_model(
+            prepared,
+            quantization,
+            calibration_sequences,
+            orientation_inputs=[(torch.zeros(1, max_context, dtype=torch.long),)],
+            _registry=registry,
+        )
+    step = GenerationStepModule(build_generation_step(
+        prepared, max_context, prepared=True,
+    ))
+    spec = _GenerationSpec(
+        max_context, program.hidden_prefill, program.top_k, automatic=True,
+    )
+    options = dict(
+        name=name, optimization=optimization, fast_config=fast_config,
+        generation=spec, storage=storage, quantization=quantization,
+        frontend="fx", _generation_public_interface=True, _registry=registry,
+        _prepared_model=True, _prepared_quantization_report=report,
+    )
+    example = torch.zeros(1, 1, dtype=torch.long)
+    try:
+        # Tracing runs the step, so every attempt gets its own copy.
+        return _transpile(
+            copy.deepcopy(step), (example,), output_path, sig_figs,
+            codegen=codegen, **options,
+        )
+    except _LayerSharingUnavailable:
+        log.warning(
+            "layer_sharing='auto' could not factor this model's layers; "
+            "exporting without layer sharing"
+        )
+        return _transpile(
+            copy.deepcopy(step), (example,), output_path, sig_figs,
+            codegen=replace(codegen, layer_sharing="off"), **options,
+        )
 
 
 def _transpile(
@@ -1877,7 +2088,12 @@ def _transpile(
         example_kwargs=example_kwargs,
     )
     if generation is not None and codegen.layer_sharing == "auto":
-        if _bank_generation_caches(graph):
+        if generation.automatic and not _layers_can_share_caches(graph):
+            log.info(
+                "Banked generation caches skipped: attention blocks are not in "
+                "consecutive `blocks.N` layers"
+            )
+        elif _bank_generation_caches(graph):
             log.info(
                 "Banked %s generation cache layers for structural sharing",
                 graph.generation.cache_layers,
@@ -1926,6 +2142,10 @@ def _transpile(
         shared = _share_repeated_transformer_layers(sprite, compiler, storage)
         if shared:
             log.info("Factored repeated transformer layers into one shared procedure")
+        elif generation is not None and graph.generation.banked_caches:
+            # Banked caches are addressed through the shared procedure's base
+            # variable; without it every layer would read layer zero's rows.
+            raise _LayerSharingUnavailable()
 
     # 4. Name the output list and clean up
     output_lists = compiler.output_lists
@@ -1940,6 +2160,7 @@ def _transpile(
     logical_sizes = _logical_list_sizes(
         compiler, graph, generation, output,
     )
+    _size_numbered_private_lists(sprite, logical_sizes)
     for node in graph.nodes:
         if node.name not in graph.dynamic_axes:
             continue
@@ -1991,7 +2212,21 @@ def _transpile(
             hidden_qkv = graph.generation.hidden_prefill_qkv
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
-            if hidden_qkv is not None and hidden_qkv in root_names:
+            hidden_attention = graph.generation.hidden_prefill_attention
+            if (
+                graph.generation.automatic and not graph.generation.banked_caches
+                and hidden_attention in root_names
+                and root_names.index(hidden_attention) + 1 < len(root_entries)
+            ):
+                # Keep the final layer's K/V append, skip its attention output
+                # and everything after it for hidden prompt tokens.
+                for entry in sprite.get("variables", {}).values():
+                    if entry[0] == "cattorch project output":
+                        entry[1] = 1
+                _guard_generation_suffix(
+                    sprite, root_entries[root_names.index(hidden_attention) + 1][1],
+                )
+            elif hidden_qkv is not None and hidden_qkv in root_names:
                 position = root_names.index(hidden_qkv)
                 if position + 1 >= len(root_entries):
                     raise ValueError("final cached QKV projection has no suffix")
@@ -2013,6 +2248,9 @@ def _transpile(
             top_k=generation.top_k,
             compact_top_k=codegen.unrolling != "speed",
         )
+        # Kernels declare `cattorch cache length` themselves; unify them with
+        # the lifecycle's variable.
+        _merge_variables_by_name(sprite, {"cattorch cache length"})
         sprite = _wrap_transactional_generation_step(
             sprite,
             {

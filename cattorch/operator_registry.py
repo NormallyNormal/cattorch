@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import copy
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Literal
 
 import torch
 
 from cattorch.fast import FastConfig
+from cattorch.huggingface import prepare_huggingface_models
+from cattorch.builtin_kernels import BUILTIN_KERNELS
+from cattorch.kernel_api import Kernel
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized import (
@@ -28,7 +31,6 @@ from cattorch.util.instruction.optimized import (
     OptimizedMeanInstruction,
     OptimizedPoolingInstruction,
     OptimizedRMSNormInstruction,
-    RotaryEmbeddingInstruction,
     OptimizedSoftmaxInstruction,
     OptimizedTransposeInstruction,
 )
@@ -36,7 +38,7 @@ from cattorch.util.instruction.optimized_moe import (
     ExpertFamilyMoEInstruction, StackedSwiGLUMoEInstruction,
 )
 from cattorch.util.instruction.generic import (
-    IndexMapInstruction, REDUCTIONS, ReductionInstruction, TopKInstruction,
+    IndexMapInstruction, REDUCTIONS, ReductionInstruction,
 )
 
 
@@ -116,6 +118,26 @@ class OperatorRegistry:
             raise ValueError("operation target must be non-empty")
         self._operations[rule.target] = rule
 
+    def register_kernel(self, kernel: Kernel) -> None:
+        """Register a context ``Kernel``, merging into any existing rule.
+
+        An exact kernel replaces the rule's exact lowering; a kernel with a
+        ``fast_flag`` replaces its fast lowering and flag. The observer,
+        ``lowering_target``, registry validator and the other variant are
+        kept, unlike ``register_operation`` which replaces the whole rule.
+        """
+        rule = self._operations.get(kernel.target_name)
+        if rule is None:
+            rule = OperationRule(target=kernel.target_name)
+        instruction = kernel.instruction_class()
+        if kernel.fast_flag is None:
+            rule = replace(rule, exact_kernel=instruction)
+        else:
+            rule = replace(
+                rule, fast_kernel=instruction, fast_flag=kernel.fast_flag,
+            )
+        self._operations[kernel.target_name] = rule
+
     def operation(self, target: str) -> OperationRule | None:
         return self._operations.get(target)
 
@@ -127,9 +149,15 @@ class OperatorRegistry:
 
     def validate(self, node: torch.fx.Node, *, fast: bool, config: FastConfig) -> str | None:
         rule = self.operation(str(node.target))
-        if rule is None or rule.validator is None:
+        if rule is None:
             return None
-        return rule.validator(node, config, fast)
+        detail = None if rule.validator is None else rule.validator(node, config, fast)
+        if detail is not None:
+            return detail
+        # A context kernel validates only when it is the one that will run.
+        selected = rule.kernel(fast=fast, config=config)
+        validate_node = getattr(selected, "validate_node", None)
+        return None if validate_node is None else validate_node(node)
 
     def observe(
         self, target: str, func: object, args: tuple, kwargs: dict, result: object,
@@ -162,6 +190,7 @@ class OperatorRegistry:
         if any(module.training for module in model.modules()):
             model.eval()
             eval_mode_copy_warning()
+        prepare_huggingface_models(model)
         replacements: dict[int, torch.nn.Module] = {}
 
         def adapt(module: torch.nn.Module, path: str) -> torch.nn.Module:
@@ -356,19 +385,6 @@ def _validate_matmul(node, _config, _fast) -> str | None:
     )
 
 
-def _validate_rotary_embedding(node, _config, _fast) -> str | None:
-    value_shape = _shape(node.args[0])
-    if not value_shape or value_shape[-1] % 2:
-        return "Rotary embedding requires an even final dimension"
-    try:
-        output_shape = torch.broadcast_shapes(*(_shape(arg) for arg in node.args[:3]))
-    except RuntimeError:
-        return "Rotary cosine and sine must broadcast with the input"
-    if tuple(output_shape) != tuple(value_shape):
-        return "Rotary cosine and sine may not expand the input shape"
-    return None
-
-
 def _observe_linear(_func, args, _kwargs, _result):
     if len(args) < 2:
         return ()
@@ -498,7 +514,6 @@ def _observe_expert_family(_func, args, _kwargs, _result):
 def _build_default_registry() -> OperatorRegistry:
     registry = OperatorRegistry()
     exact: dict[str, type[Instruction]] = {
-        "cattorch.rotary_embedding.default": RotaryEmbeddingInstruction,
         "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
         "aten.linear.default": LinearInstruction,
@@ -511,8 +526,6 @@ def _build_default_registry() -> OperatorRegistry:
             for operation in REDUCTIONS if operation != "aten.mean.dim"
         },
         **{operation: IndexMapInstruction for operation in INDEX_MAP_OPS},
-        "cattorch.topk_values.default": TopKInstruction,
-        "cattorch.topk_indices.default": TopKInstruction,
         "aten.layer_norm.default": OptimizedLayerNormInstruction,
         "aten.rms_norm.default": OptimizedRMSNormInstruction,
         "aten.batch_norm.default": OptimizedBatchNormInstruction,
@@ -532,7 +545,6 @@ def _build_default_registry() -> OperatorRegistry:
         **{operation: OptimizedMatMulInstruction for operation in MATMUL_OPS},
     }
     validators = {
-        "cattorch.rotary_embedding.default": _validate_rotary_embedding,
         "aten.add.Tensor": _validate_add_sub,
         "aten.sub.Tensor": _validate_add_sub,
         "aten.clamp.default": _validate_clamp,
@@ -575,6 +587,8 @@ def _build_default_registry() -> OperatorRegistry:
             validator=validators.get(target),
             observer=observers.get(target),
         ))
+    for kernel in BUILTIN_KERNELS:
+        registry.register_kernel(kernel)
     return registry
 
 

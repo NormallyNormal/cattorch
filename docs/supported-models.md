@@ -46,13 +46,29 @@ Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without a
 wrapper. Their `ModelOutput` is unwrapped, and the cache is skipped:
 
 ```python
-cattorch.transpile(model, (input_ids,), "model.sprite3",
-                   example_kwargs={"use_cache": False})
+cattorch.transpile(model, (input_ids,), "model.sprite3")
 ```
 
+On the export copy, cattorch sets `use_cache`, `output_attentions`, and
+`output_hidden_states` to `False`, so only the model's real outputs remain
+(`logits` first for `*ForCausalLM`). It also switches attention to `sdpa`,
+which gives smaller sprites than `eager`, or to `eager` when the model has no
+SDPA support. Your model and its config aren't modified, and an explicit
+`use_cache=` in `example_kwargs` still wins.
+
 This exports a stateless forward pass over the example's sequence length. It
-doesn't add a KV cache; cached generation still uses
-[`GenerationProgram`](generation.md).
+doesn't add a KV cache. For cached generation, pass the same unwrapped model to
+a [`GenerationProgram`](generation.md):
+
+```python
+cattorch.transpile(model, cattorch.GenerationProgram(max_context=64),
+                   "model.sprite3")
+```
+
+cattorch derives the one-token step and its per-layer caches, and checks it
+against the model's own `forward` during export. GPT-2, Llama, and Qwen2
+causal language models work this way; BERT doesn't, because its attention isn't
+causal.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and

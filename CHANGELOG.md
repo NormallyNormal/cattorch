@@ -2,9 +2,20 @@
 
 ## New features
 
+- `GenerationProgram(max_context=64)` exports an ordinary stateless
+  `forward(tokens) -> logits` model as a KV-cached generator, with no
+  `example_token`, combined QKV projection, or position wrapper. Separate
+  q/k/v projections, `arange` positions, RoPE, grouped-query and
+  single-KV-head attention work, and so do unwrapped Hugging Face GPT-2,
+  Llama, and Qwen2. cattorch checks the cached step against `forward` during
+  export. `example_token` still selects the old recognizer. See
+  [KV-cached generation](docs/generation.md).
+- `GenerationProgram` fields `method` and `example_token` now have defaults
+  (`"forward"` and `None`); `max_context` is still required.
 - Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
-  a wrapper. Pass `example_kwargs={"use_cache": False}` to skip building the
-  cache for decoders.
+  a wrapper. On the export copy, the cache and extra outputs are turned off
+  and an attention implementation that traces is selected, so no
+  `example_kwargs` are needed. Your model isn't modified.
 - `transpile` and `verify` take `example_kwargs`. Tensor values become input
   lists after the positional inputs; other values are fixed for the export.
 - Non-tensor outputs, such as `None` or a `DynamicCache`, are skipped with a
@@ -50,6 +61,17 @@
 
 ## Fixes
 
+- A legacy `GenerationProgram(method, example_token, ...)` export with
+  `layer_sharing="auto"` failed with an internal error, or read layer zero's
+  cache rows in every layer, when the layers could not be factored after their
+  caches were banked. The export now retries without layer sharing.
+- A legacy cached-generation export gave wrong logits for every token after the
+  first when a position table, such as RoPE `cos`/`sin` embeddings, was indexed
+  by a zero buffer. The lookup was folded to row zero at export time instead of
+  reading the cache length, and with layer sharing it also read a fractional
+  position partway through a layer's cache row.
+- A 0-dimensional parameter, buffer, or constant failed during export.
+  Hugging Face models with `eager` attention hit this.
 - Concatenating with an empty tensor, as Hugging Face caches do on their
   first step, failed during code generation.
 - A tensor read through a view after its last direct use could be overwritten

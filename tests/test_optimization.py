@@ -1239,6 +1239,125 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     assert emulator.lists["cattorch V cache 2"] == []
 
 
+def test_legacy_generation_retries_unshared_when_banked_sharing_is_rejected(tmp_path):
+    from cattorch.codegen import CodegenConfig
+
+    torch.manual_seed(3)
+    model = CachedLM(context=6, layers=2)
+    # A structurally different second layer makes sharing fail after banking.
+    model.blocks[1].mlp = nn.Sequential(
+        nn.Linear(8, 16), nn.GELU(approximate="tanh"), nn.Linear(16, 8),
+    )
+    model.eval()
+    path = tmp_path / "unshareable"
+    transpile(
+        model,
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=6),
+        str(path),
+        codegen=CodegenConfig(layer_sharing="auto"),
+    )
+    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator.run_procedure("cattorch init")
+    prompt = [1, 3, 5]
+    emulator.lists["cattorch tokens"] = list(prompt)
+    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    for token in (2, 4):
+        prompt.append(token)
+        emulator.lists["cattorch tokens"] = [token]
+        emulator._exec_chain(emulator._procedures["cattorch decode"])
+        torch.testing.assert_close(
+            torch.tensor(emulator.lists["cattorch logits"]),
+            model(torch.tensor([prompt]))[0, -1], atol=1e-4, rtol=0,
+        )
+
+
+class RopeCachedMQAAttention(CachedMQAAttention):
+    """MQA attention with RoPE tables read through a zero position buffer.
+
+    ``cached=True`` is the one-token legacy export contract: the lowerer
+    replaces the zero index with the cache length. ``cached=False`` reads the
+    same tables by sequence position, which is the eager reference.
+    """
+
+    def __init__(self, width=8, heads=2, context=6, cached=True):
+        super().__init__(width=width, heads=heads, context=context)
+        self.cached = cached
+        angles = (
+            torch.arange(context)[:, None]
+            * (0.9 / (1 + torch.arange(self.head_width // 2)))[None]
+        ).repeat_interleave(2, dim=-1)
+        self.cos = nn.Embedding.from_pretrained(angles.cos(), freeze=True)
+        self.sin = nn.Embedding.from_pretrained(angles.sin(), freeze=True)
+        self.register_buffer("position", torch.zeros(1, dtype=torch.long))
+        with torch.no_grad():
+            self.qkv.weight.mul_(4)
+
+    def forward(self, x):
+        from cattorch import rotary_embedding
+
+        batch, length, width = x.shape
+        q, k, v = self.qkv(x).split(
+            (width, self.head_width, self.head_width), dim=-1,
+        )
+        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
+        k = k.view(batch, length, 1, self.head_width).transpose(1, 2)
+        v = v.view(batch, length, 1, self.head_width).transpose(1, 2)
+        if self.cached:
+            cos = self.cos(self.position).view(1, 1, 1, self.head_width)
+            sin = self.sin(self.position).view(1, 1, 1, self.head_width)
+        else:
+            cos = self.cos.weight[:length][None, None]
+            sin = self.sin.weight[:length][None, None]
+        q, k = rotary_embedding(q, cos, sin), rotary_embedding(k, cos, sin)
+        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
+        weights = F.softmax(
+            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
+        )
+        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
+        return self.projection(joined)
+
+
+@pytest.mark.parametrize(
+    ("layers", "sharing"), [(1, "off"), (3, "off"), (3, "auto")],
+)
+def test_legacy_generation_reads_rope_position_from_cache_length(
+    tmp_path, layers, sharing,
+):
+    from cattorch.codegen import CodegenConfig
+
+    torch.manual_seed(5)
+    cached = CachedMQALM(context=6, layers=layers)
+    reference = CachedMQALM(context=6, layers=layers)
+    for model, flag in ((cached, True), (reference, False)):
+        for block in model.blocks:
+            block.attention = RopeCachedMQAAttention(context=6, cached=flag)
+    cached.eval()
+    reference.load_state_dict(cached.state_dict())
+    reference.eval()
+    path = tmp_path / "rope_generation"
+    transpile(
+        cached,
+        GenerationProgram("forward", torch.tensor([[1]]), max_context=6),
+        str(path),
+        codegen=CodegenConfig(layer_sharing=sharing),
+    )
+    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator.run_procedure("cattorch init")
+    if sharing == "auto":
+        assert "cattorch shared transformer layer" in emulator._procedures
+    prompt = []
+    for index, token in enumerate((1, 3, 5, 2, 4, 6)):
+        prompt.append(token)
+        emulator.lists["cattorch tokens"] = [token]
+        emulator._exec_chain(
+            emulator._procedures["cattorch prefill" if index == 0 else "cattorch decode"]
+        )
+        torch.testing.assert_close(
+            torch.tensor(emulator.lists["cattorch logits"]),
+            reference(torch.tensor([prompt]))[0, -1].detach(), atol=1e-4, rtol=0,
+        )
+
+
 def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_path):
     model = CachedLM(context=5, layers=1).eval()
     path = tmp_path / "cached_generation_guards"

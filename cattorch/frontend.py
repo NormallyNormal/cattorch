@@ -573,6 +573,12 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
             "troubleshooting.md#keep-one-inference-return-path"
         ) from exc
 
+    # A wrapper around an already-traced graph (automatic generation) knows
+    # which modules its operations came from; the tracer saw only the graph.
+    restore = getattr(model, "restore_module_stacks", None)
+    if callable(restore):
+        restore(graph_module.graph)
+
     _erase_mode_switches(graph_module.graph)
     graph_module.recompile()
 

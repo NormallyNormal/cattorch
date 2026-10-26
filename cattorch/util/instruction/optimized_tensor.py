@@ -24,7 +24,6 @@ from cattorch.util.scratch.dsl import (
     mod,
     mul,
     repeat,
-    static_unrolled_repeat,
     replace,
     set_var,
     sub,
@@ -83,62 +82,6 @@ class OptimizedEmbeddingInstruction(Instruction):
         ).compile()
 
 
-class RotaryEmbeddingInstruction(Instruction):
-    """Fused exact pairwise rotary embedding application."""
-
-    def prepare(self):
-        self.output_shape = tuple(self.args[0].shape)
-        self.size = math.prod(self.output_shape)
-        if not self.output_shape or self.output_shape[-1] % 2:
-            raise ValueError("rotary embedding requires an even final dimension")
-
-    def finalize(self):
-        even = var("index")
-        odd = add(var("index"), 1)
-        cos_even, cos_even_map = _broadcast_index(
-            self.args[1].shape, self.output_shape, "_rope cos map", even,
-        )
-        cos_odd, cos_odd_map = _broadcast_index(
-            self.args[1].shape, self.output_shape, "_rope cos map", odd,
-        )
-        sin_even, sin_even_map = _broadcast_index(
-            self.args[2].shape, self.output_shape, "_rope sin map", even,
-        )
-        sin_odd, sin_odd_map = _broadcast_index(
-            self.args[2].shape, self.output_shape, "_rope sin map", odd,
-        )
-        list_values = {}
-        if cos_even_map is not None or cos_odd_map is not None:
-            list_values["_rope cos map"] = cos_even_map or cos_odd_map
-        if sin_even_map is not None or sin_odd_map is not None:
-            list_values["_rope sin map"] = sin_even_map or sin_odd_map
-        lists = ["T1", "T2", "T3", "T4", *list_values]
-        pair = (
-            append("T4", add(
-                mul(item("T1", even), item("T2", cos_even)),
-                mul(mul(-1, item("T1", odd)), item("T3", sin_even)),
-            )),
-            append("T4", add(
-                mul(item("T1", odd), item("T2", cos_odd)),
-                mul(item("T1", even), item("T3", sin_odd)),
-            )),
-            change_var("index", 2),
-        )
-        return Program(
-            "rotary_embedding_fused",
-            variables=("index",),
-            lists=tuple(lists),
-            list_values=list_values,
-            body=(
-                clear("T4"),
-                set_var("index", 1),
-                static_unrolled_repeat(
-                    self.size // 2, pair, max_factor=4, priority=3,
-                ),
-            ),
-        ).compile()
-
-
 class CachedPositionEmbeddingInstruction(Instruction):
     """Look up the current autoregressive position from a persistent K cache."""
 
@@ -156,7 +99,7 @@ class CachedPositionEmbeddingInstruction(Instruction):
                 set_var(
                     "weight_index",
                     add(
-                        mul(div(length("T3"), self.cache_token_width), self.width),
+                        mul(mathop("floor", div(length("T3"), self.cache_token_width)), self.width),
                         1,
                     ),
                 ),
@@ -232,7 +175,8 @@ class CachedPositionEmbeddingAddInstruction(EmbeddingAddInstruction):
         self.cache_token_width = self.args[6].value
 
     def finalize(self):
-        position = div(length("T5"), self.cache_token_width)
+        # Banked caches hold a partial token row mid-layer, so truncate.
+        position = mathop("floor", div(length("T5"), self.cache_token_width))
         first_token = position if self.position_side == 0 else item("T2", var("token"))
         second_token = position if self.position_side == 1 else item("T4", var("token"))
         interleaved = getattr(self, "interleaved_sides", (False, False))

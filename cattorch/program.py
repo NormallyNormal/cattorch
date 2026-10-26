@@ -205,24 +205,37 @@ class ExportProgram:
 class GenerationProgram:
     """A complete autoregressive decoder interface for one Scratch sprite.
 
-    The named model method must accept ``example_token`` and return next-token
-    logits. cattorch recognizes its causal attention, adds a KV cache of
-    ``max_context`` tokens, and creates init, reset, prefill, and decode
-    blocks.
+    ``GenerationProgram(max_context=64)`` exports an ordinary stateless
+    ``forward(tokens) -> logits`` model (including an unwrapped Hugging Face
+    causal language model). cattorch traces it at ``max_context`` tokens,
+    derives the one-token step with a K/V cache per attention layer, checks it
+    against the original model, and creates init, reset, prefill, and decode
+    blocks. ``method`` names the method to export. A Hugging Face model's
+    first tensor output (the logits) is the interface.
+
+    With ``example_token`` (a ``[1, 1]`` token tensor) the model is instead a
+    hand-written cached decoder: cattorch recognizes its combined-QKV causal
+    attention and constant-zero position lookup (legacy path).
+
+    ``max_context`` is required; it has a placeholder default only so the
+    positional field order stays ``(method, example_token, max_context)``.
     """
 
-    method: str
-    example_token: torch.Tensor
-    max_context: int
+    method: str = "forward"
+    example_token: torch.Tensor | None = None
+    max_context: int = None  # type: ignore[assignment]
     hidden_prefill: bool = True
     top_k: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", _name(self.method, "generation method"))
-        if not isinstance(self.example_token, torch.Tensor):
-            raise TypeError("GenerationProgram.example_token must be a torch.Tensor")
-        if self.example_token.numel() != 1:
-            raise ValueError("GenerationProgram.example_token must contain one token")
+        if self.example_token is not None:
+            if not isinstance(self.example_token, torch.Tensor):
+                raise TypeError("GenerationProgram.example_token must be a torch.Tensor")
+            if self.example_token.numel() != 1:
+                raise ValueError("GenerationProgram.example_token must contain one token")
+        if self.max_context is None:
+            raise TypeError("GenerationProgram requires max_context")
         if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
             raise TypeError("GenerationProgram.max_context must be an integer")
         if self.max_context < 1:

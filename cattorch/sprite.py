@@ -116,7 +116,7 @@ def _deduplicate_static_tensors(
             kept[key] = tensor
             continue
         contiguous = tensor.detach().cpu().contiguous()
-        raw = contiguous.view(torch.uint8).numpy().tobytes()
+        raw = contiguous.reshape(-1).view(torch.uint8).numpy().tobytes()
         identity = (
             str(contiguous.dtype), contiguous.numel(),
             (effective_ndims or {}).get(key, tensor.ndim),

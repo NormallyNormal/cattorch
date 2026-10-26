@@ -57,8 +57,8 @@ x = block(x)[0]
 Several returned tensors, even in nested tuples, lists, or dictionaries,
 become `output`, `output_1`, and so on. Anything that isn't a tensor, such as
 `None` or a Hugging Face `DynamicCache`, is skipped with a warning naming it.
-For Hugging Face decoders, pass `example_kwargs={"use_cache": False}` to skip
-building the cache.
+Hugging Face models have their cache turned off on the export copy, so this
+warning only appears if you pass `example_kwargs={"use_cache": True}`.
 
 ## Treat example inputs as the interface
 

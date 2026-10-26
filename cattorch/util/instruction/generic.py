@@ -28,7 +28,6 @@ from cattorch.util.scratch.dsl import (
     mul,
     not_,
     repeat,
-    replace,
     set_var,
     sub,
     var,
@@ -294,101 +293,7 @@ class IndexMapInstruction(Instruction):
         ).compile()
 
 
-class TopKInstruction(Instruction):
-    """Select the ``k`` largest or smallest entries along one dimension.
-
-    Each group is scanned ``k`` times, marking chosen positions in a scratch
-    list, so the cost is ``k`` passes over the dimension. That suits the small
-    ``k`` of MoE routers and sampling. Ties keep the lower position. The
-    ``cattorch.topk_values`` target writes values and ``cattorch.topk_indices``
-    writes zero-based positions.
-    """
-
-    def prepare(self):
-        shape = tuple(self.args[0].shape)
-        self.k = int(self.args[1].value)
-        dim = int(self.args[2].value) % len(shape)
-        self.largest = bool(self.args[3].value)
-        self.values = str(self.torch_name).startswith("cattorch.topk_values")
-        self.extent = shape[dim]
-        self.stride = math.prod(shape[dim + 1:])
-        self.groups = math.prod(shape) // self.extent
-        _, _, bases, _ = _reduction_layout(shape, (dim,))
-        self.bases = [base + 1 for base in bases]
-
-    def finalize(self):
-        compare = gt if self.largest else lt
-        candidate = item("T1", var("index"))
-        scan = (
-            set_var("best", 0),
-            set_var("index", var("base")),
-            set_var("position", 1),
-            repeat(self.extent, (
-                if_(eq(item("_topk_taken", var("position")), 0), (
-                    if_(
-                        # The first untaken position always becomes the best.
-                        eq(var("best"), 0),
-                        (set_var("best", var("position")), set_var("acc", candidate)),
-                    ),
-                    if_(compare(candidate, var("acc")), (
-                        set_var("best", var("position")), set_var("acc", candidate),
-                    )),
-                )),
-                change_var("index", self.stride),
-                change_var("position", 1),
-            )),
-            replace("_topk_taken", var("best"), 1),
-            append("T2", var("acc") if self.values else sub(var("best"), 1)),
-        )
-        # Output groups are laid out like the input, with k along ``dim``.
-        # Build contiguous per-group results, then reorder when stride > 1.
-        body = (
-            clear("_topk_taken"),
-            repeat(self.extent, (append("_topk_taken", 0),)),
-            set_var("base", item("_topk_bases", var("group"))),
-            repeat(self.k, scan),
-            change_var("group", 1),
-        )
-        program_body = [clear("T2"), set_var("group", 1), repeat(self.groups, body)]
-        list_values = {"_topk_bases": self.bases}
-        lists = ["T1", "_topk_bases", "_topk_taken", "T2"]
-        if self.stride != 1:
-            # Results are group-major; permute them into PyTorch's layout.
-            order = []
-            outer = self.groups // self.stride
-            for block in range(outer):
-                for rank in range(self.k):
-                    for offset in range(self.stride):
-                        group = block * self.stride + offset
-                        order.append(group * self.k + rank + 1)
-            list_values["_topk_order"] = order
-            lists.insert(3, "_topk_order")
-            lists.insert(4, "_topk_scratch")
-            program_body = [
-                *program_body,
-                clear("_topk_scratch"),
-                set_var("index", 1),
-                repeat(len(order), (
-                    append("_topk_scratch", item("T2", item("_topk_order", var("index")))),
-                    change_var("index", 1),
-                )),
-                clear("T2"),
-                set_var("index", 1),
-                repeat(len(order), (
-                    append("T2", item("_topk_scratch", var("index"))),
-                    change_var("index", 1),
-                )),
-            ]
-        return Program(
-            "topk_generic",
-            variables=("group", "base", "index", "position", "best", "acc"),
-            lists=tuple(lists),
-            list_values=list_values,
-            body=tuple(program_body),
-        ).compile()
-
-
 __all__ = [
-    "IndexMapInstruction", "REDUCTIONS", "ReductionInstruction", "TopKInstruction",
+    "IndexMapInstruction", "REDUCTIONS", "ReductionInstruction",
     "index_map",
 ]

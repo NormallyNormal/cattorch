@@ -34,6 +34,7 @@ class _GenerationSpec:
     max_context: int
     hidden_prefill: bool = True
     top_k: int | None = None
+    automatic: bool = False
 
 # ── Op classification ────────────────────────────────────────────────────────
 
@@ -91,6 +92,36 @@ def _graph_handled_operations() -> frozenset[str]:
 _FOLD_ELEMENT_LIMIT = 1 << 20
 
 
+_CACHED_ATTENTION = "cattorch.cached_attention.default"
+_SEQUENCE_ROW = "cattorch.sequence_row.default"
+_ADVANCE_POSITION = "cattorch.advance_position.default"
+
+
+def _generation_state_names(nodes, state: dict[str, torch.Tensor]) -> set[str]:
+    """Names of the state tensors a step module changes while it runs.
+
+    These are the caches and position scalar passed to the step module's
+    custom ops. make_fx gives every use its own ``get_attr`` name, so the
+    tensors are matched by identity.
+    """
+    runtime: set[int] = set()
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        target = str(node.target)
+        if target == _CACHED_ATTENTION:
+            roles = node.args[3:6]
+        elif target == _SEQUENCE_ROW:
+            roles = node.args[1:2]
+        else:
+            continue
+        for argument in roles:
+            value = state.get(getattr(argument, "name", None))
+            if value is not None:
+                runtime.add(id(value))
+    return {name for name, value in state.items() if id(value) in runtime}
+
+
 def _is_foldable(node) -> bool:
     """Whether ``node`` may be evaluated at export time on static inputs."""
     if node.target is operator.getitem:
@@ -100,6 +131,97 @@ def _is_foldable(node) -> bool:
         return False
     tags = getattr(node.target, "tags", ())
     return torch.Tag.nondeterministic_seeded not in tags
+
+
+def _is_legacy_position_lookup(node, args) -> bool:
+    """A single constant-index-0 embedding row in a legacy generation export.
+
+    The legacy lowerer treats the zero index as a placeholder for the current
+    position and reads the row from the cache length at run time, so folding it
+    to row zero would freeze every position at the first token.
+    """
+    if str(node.target) != "aten.embedding.default" or len(args) < 2:
+        return False
+    indices = args[1]
+    return (
+        isinstance(indices, torch.Tensor) and indices.numel() == 1
+        and float(indices.flatten()[0]) == 0
+    )
+
+
+def fold_static_values(
+    nodes,
+    state: dict[str, torch.Tensor],
+    *,
+    seed: dict[str, torch.Tensor] | None = None,
+    element_limit: int | None = _FOLD_ELEMENT_LIMIT,
+    passthrough: frozenset[str] = frozenset(),
+    keep_runtime=None,
+) -> dict[str, torch.Tensor]:
+    """Evaluate every foldable node whose tensor inputs are all static.
+
+    ``state`` maps get_attr names to tensors and ``seed`` holds values already
+    generated for other nodes. Returns the newly folded tensors by node name,
+    without ``seed``. Results above ``element_limit`` elements are skipped
+    (``None`` folds them all). A node whose target is in ``passthrough``
+    takes its first argument's value without being called, for aliasing
+    operations such as ``detach_`` that are not otherwise foldable.
+    ``keep_runtime(node, args)`` returning true leaves a node unfolded because
+    its value changes at run time even though its inputs are static.
+    """
+    folded: dict[str, torch.Tensor] = {}
+    known = dict(seed or {})
+    missing = object()
+    static_results: dict[str, object] = {}
+
+    def static_value(arg):
+        if hasattr(arg, "name"):
+            if arg.name in known:
+                return known[arg.name]
+            if arg.name in static_results:
+                return static_results[arg.name]
+            found = state.get(arg.name)
+            return found if found is not None else missing
+        if isinstance(arg, (list, tuple)):
+            values = [static_value(item) for item in arg]
+            if any(item is missing for item in values):
+                return missing
+            return type(arg)(values)
+        return arg
+
+    with torch.no_grad():
+        for node in nodes:
+            if node.op != "call_function":
+                continue
+            if str(node.target) in passthrough:
+                value = static_value(node.args[0])
+                if isinstance(value, torch.Tensor):
+                    folded[node.name] = known[node.name] = value
+                continue
+            if not _is_foldable(node):
+                continue
+            args = static_value(node.args)
+            kwargs = static_value(node.kwargs)
+            if args is missing or kwargs is missing:
+                continue
+            if keep_runtime is not None and keep_runtime(node, args):
+                continue
+            try:
+                result = node.target(*args, **kwargs)
+            except (RuntimeError, TypeError, ValueError, IndexError):
+                continue
+            if isinstance(result, torch.Tensor):
+                if element_limit is not None and result.numel() > element_limit:
+                    continue
+                folded[node.name] = known[node.name] = result.detach().contiguous()
+                log.info("Constant-folded %s as static weight %s", node.target, node.name)
+            elif isinstance(result, (tuple, list)) and all(
+                isinstance(value, torch.Tensor) for value in result
+            ):
+                # Keep multi-output results (split, max.dim) only as
+                # intermediates; their getitem users become the weights.
+                static_results[node.name] = result
+    return folded
 
 
 def _is_value_preserving_cast(source: torch.dtype, target: torch.dtype) -> bool:
@@ -130,6 +252,12 @@ def _get_shape(arg) -> torch.Size:
     return torch.Size([])
 
 
+def _get_dtype(arg) -> torch.dtype | None:
+    if hasattr(arg, 'meta') and 'val' in arg.meta:
+        return getattr(arg.meta['val'], 'dtype', None)
+    return None
+
+
 def _unsupported_operation(node, detail: str | None = None) -> UnsupportedOperationError:
     module_stack = node.meta.get("nn_module_stack", {})
     module_path = next(
@@ -158,8 +286,10 @@ class _GenerationInfo:
     prepopulated_scores: set[str] = field(default_factory=set)
     prepopulated_values: set[str] = field(default_factory=set)
     hidden_prefill_qkv: str | None = None
+    hidden_prefill_attention: str | None = None
     attention_fusions: dict[str, object] = field(default_factory=dict)
     banked_caches: bool = False
+    automatic: bool = False
     cache_layers: int = 1
     cache_layer_width: int = 0
 
@@ -262,6 +392,16 @@ def _prepare_graph(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
     _drop_empty_cat_inputs(captured.graph)
+    automatic = generation is not None and generation.automatic
+    if automatic:
+        # The wrapper tracks the length, so the step module's position
+        # increment has nothing to lower.
+        for node in list(captured.graph.nodes):
+            if (
+                node.op == "call_function"
+                and str(node.target) == _ADVANCE_POSITION
+            ):
+                captured.graph.erase_node(node)
     nodes = list(captured.graph.nodes)
     dynamic_inputs = dynamic_inputs or {}
     placeholders = [
@@ -449,47 +589,21 @@ def _prepare_graph(
     # RoPE tables (`torch.outer(arange, inv_freq)`), and similar setup code
     # then never reach Scratch, whatever operations they happen to use.
     if use_fusions:
-        missing = object()
-        static_results: dict[str, object] = {}
-
-        def static_value(arg):
-            if hasattr(arg, "name"):
-                if arg.name in generated_weights:
-                    return generated_weights[arg.name]
-                if arg.name in static_results:
-                    return static_results[arg.name]
-                found = resolve_state(arg.name)
-                return found if found is not None else missing
-            if isinstance(arg, (list, tuple)):
-                values = [static_value(item) for item in arg]
-                if any(item is missing for item in values):
-                    return missing
-                return type(arg)(values)
-            return arg
-
-        with torch.no_grad():
-            for node in nodes:
-                if node.op != "call_function" or not _is_foldable(node):
-                    continue
-                args = static_value(node.args)
-                kwargs = static_value(node.kwargs)
-                if args is missing or kwargs is missing:
-                    continue
-                try:
-                    result = node.target(*args, **kwargs)
-                except (RuntimeError, TypeError, ValueError, IndexError):
-                    continue
-                if isinstance(result, torch.Tensor):
-                    if result.numel() > _FOLD_ELEMENT_LIMIT:
-                        continue
-                    generated_weights[node.name] = result.detach().contiguous()
-                    log.info("Constant-folded %s as static weight %s", node.target, node.name)
-                elif isinstance(result, (tuple, list)) and all(
-                    isinstance(value, torch.Tensor) for value in result
-                ):
-                    # Keep multi-output results (split, max.dim) only as
-                    # intermediates; their getitem users become the weights.
-                    static_results[node.name] = result
+        # Position and cache buffers change at run time: nothing derived from
+        # them is a constant.
+        runtime_state = _generation_state_names(nodes, state_inputs) if automatic else set()
+        generated_weights.update(fold_static_values(
+            nodes,
+            {
+                name: value for name, value in state_inputs.items()
+                if name not in runtime_state
+            },
+            seed=generated_weights,
+            keep_runtime=(
+                _is_legacy_position_lookup
+                if generation is not None and not automatic else None
+            ),
+        ))
 
     def resolve_weight(arg_name):
         if arg_name in generated_weights:
@@ -1051,8 +1165,32 @@ def _prepare_graph(
     generation_prepopulated_scores = set()
     generation_prepopulated_values = set()
     generation_hidden_prefill_qkv = None
+    generation_hidden_prefill_attention = None
     generation_attention_fusions = {}
-    if generation is not None:
+    if automatic:
+        if len(example_inputs) != 1 or tuple(example_inputs[0].shape) != (1, 1):
+            raise ValueError("generation export example input must have shape [1, 1]")
+        for node in nodes:
+            if node.op != "call_function" or str(node.target) != _CACHED_ATTENTION:
+                continue
+            layer = len(generation_score_caches) + 1
+            k_cache = f"cattorch K cache {layer}"
+            v_cache = f"cattorch V cache {layer}"
+            q_shape, k_shape, v_shape = (_get_shape(node.args[i]) for i in range(3))
+            kv_heads = 1 if len(q_shape) == 3 else k_shape[-3]
+            generation_score_caches[node.name] = k_cache
+            generation_value_caches[node.name] = v_cache
+            generation_cache_widths[k_cache] = kv_heads * k_shape[-1]
+            generation_cache_widths[v_cache] = kv_heads * v_shape[-1]
+            if generation_first_cache is None:
+                generation_first_cache = (k_cache, generation_cache_widths[k_cache])
+        if not generation_score_caches:
+            raise UnsupportedModelError(
+                "automatic generation found no causal attention block to cache"
+            )
+        if generation.hidden_prefill:
+            generation_hidden_prefill_attention = next(reversed(generation_score_caches))
+    elif generation is not None:
         if len(example_inputs) != 1 or example_inputs[0].ndim != 2:
             raise ValueError("generation export requires one [1, 1] token tensor input")
         if tuple(example_inputs[0].shape) != (1, 1):
@@ -1178,7 +1316,9 @@ def _prepare_graph(
             prepopulated_scores=generation_prepopulated_scores,
             prepopulated_values=generation_prepopulated_values,
             hidden_prefill_qkv=generation_hidden_prefill_qkv,
+            hidden_prefill_attention=generation_hidden_prefill_attention,
             attention_fusions=generation_attention_fusions,
+            automatic=automatic,
         ),
         linear_fusions=linear_fusions,
         paired_swiglu_fusions=paired_swiglu_fusions,
