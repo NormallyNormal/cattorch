@@ -83,7 +83,11 @@ def test_batchnorm_folding_respects_all_program_methods(tmp_path):
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_program_shards_inputs_and_outputs_after_binding_names(tmp_path, compact):
+def test_program_shards_inputs_and_outputs_after_binding_names(
+    tmp_path, compact, small_list_limit,
+):
+    limit = small_list_limit(2_000)
+
     class Model(nn.Module):
         def first(self, x):
             return x + 1
@@ -91,7 +95,7 @@ def test_program_shards_inputs_and_outputs_after_binding_names(tmp_path, compact
         def second(self, x):
             return -x
 
-    x = torch.zeros(200_001)
+    x = torch.zeros(limit + 1)
     x[-1] = 7
     model = Model().eval()
     program = ExportProgram(
@@ -114,15 +118,17 @@ def test_program_shards_inputs_and_outputs_after_binding_names(tmp_path, compact
     assert "input" not in artifact.sharded_lists
 
 
-def test_program_shards_dynamic_alias_outputs_and_state(tmp_path):
+def test_program_shards_dynamic_alias_outputs_and_state(tmp_path, small_list_limit):
+    rows = small_list_limit(2_000) // 2 + 1
+
     class Model(nn.Module):
         def forward(self, state):
             return state
 
-    initial = torch.zeros(100_001, 2)
+    initial = torch.zeros(rows, 2)
     initial[-1] = torch.tensor([3.0, 7.0])
     program = ExportProgram(
-        states=(State("rows", initial, mode="append", capacity=100_001),),
+        states=(State("rows", initial, mode="append", capacity=rows),),
         entrypoints=(
             EntryPoint("read", arguments=(StateInput("rows"),), returns=(Output("values"),)),
         ),

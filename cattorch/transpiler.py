@@ -1417,7 +1417,7 @@ class _Compiler:
         if self.sprite is None:
             self.sprite = data
         else:
-            self.sprite = combine(self.sprite, data)
+            self.sprite = combine(self.sprite, data, in_place=True)
 
     @staticmethod
     def _is_full_slice(node) -> bool:

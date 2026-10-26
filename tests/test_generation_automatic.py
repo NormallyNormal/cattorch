@@ -343,9 +343,10 @@ class LongContextLM(torch.nn.Module):
         return self.head(x)
 
 
-def test_long_context_shards_the_caches_and_tables(tmp_path):
+def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     torch.manual_seed(11)
-    context = 4096  # 4096 rows x 64 = 262,144 items, above Scratch's list limit
+    small_list_limit(2_000)
+    context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
     assert "cattorch K cache 1" in result.sharded_lists

@@ -532,8 +532,13 @@ def test_fast_neuron_pruning_reduces_stacked_swiglu_work():
 
 
 @torch.no_grad()
-def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(tmp_path):
-    width, experts, hidden = 48, 8, 300
+def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
+    tmp_path, small_list_limit,
+):
+    # Each bank holds 2,048 values over both layers, just over the lowered
+    # limit; one layer's 1,024 fit in a list.
+    small_list_limit(2_000)
+    width, experts, hidden = 8, 4, 32
 
     class Block(nn.Module):
         def __init__(self):
@@ -582,5 +587,8 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(tmp_path):
         outputs[mode] = torch.tensor(emulator.lists["output"])
         if mode == "auto":
             assert "cattorch shared transformer layer" in emulator._procedures
+            assert {
+                f"W__param_constant{index} shard 2" for index in (1, 2, 3)
+            } <= set(emulator._list_name_to_ids)
 
     torch.testing.assert_close(outputs["auto"], outputs["off"], atol=1e-6, rtol=0)
