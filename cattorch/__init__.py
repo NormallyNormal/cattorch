@@ -20,10 +20,11 @@ from cattorch.program import GenerationProgram
 from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
 from cattorch.results import (
     ArtifactResult, BoundedDimension, EntryPointResult, ProgramCallVerifyResult, ProgramResult,
-    ProgramVerifyResult, StateResult, TensorSpec, TokenizerResult,
+    ProgramVerifyResult, ProjectResult, StateResult, TensorSpec, TokenizerResult,
     TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
 from cattorch.verify import verify
+from cattorch.project import build_project
 
 
 _BENCHMARK_EXPORTS = {
@@ -53,7 +54,7 @@ __all__ = [
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",
     "TensorSpec", "TokenizerResult", "TranspileResult",
-    "VerifyResult", "MultiOutputVerifyResult", "verify",
+    "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project", "ProjectResult",
     "build_paired_benchmark", "build_benchmark_suite", "analyze_benchmark",
     "build_generation_benchmark_suite",
     "build_storage_benchmark_suite",

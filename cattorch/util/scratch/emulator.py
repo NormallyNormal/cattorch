@@ -109,7 +109,16 @@ class _NameView:
 
 
 class ScratchEmulator:
-    def __init__(self, sprite: dict):
+    """Run one sprite's blocks.
+
+    With ``stage``, the sprite also sees the stage's variables and lists, as
+    in a Scratch project; :class:`ProjectEmulator` builds those for a whole
+    ``.sb3``. ``on_broadcast`` is called with each broadcast message after it
+    is recorded, ``on_ask`` with each ``ask and wait`` question to return the
+    answer, and ``said`` records what ``say`` blocks showed.
+    """
+
+    def __init__(self, sprite: dict, *, stage: "ScratchEmulator | None" = None):
         self.blocks = sprite["blocks"]
         self._procedures = self._find_procedures()
         self.opcode_counts = Counter()
@@ -118,23 +127,33 @@ class ScratchEmulator:
         ]
         self._current_costume = int(sprite.get("currentCostume", 0))
         self.broadcasts = []
+        self.on_broadcast = None
+        self.on_ask = None
+        self.said: list = []
+        self._answer = stage._answer if stage is not None else [""]
         self._chains: dict = {}
 
-        # Variables stored by ID
-        self._vars = {}
+        # Variables stored by ID; a sprite shares the stage's dictionaries,
+        # since data IDs are unique across a project.
+        self._vars = stage._vars if stage is not None else {}
         self._var_name_to_ids = {}
         for sid, entry in sprite.get("variables", {}).items():
             name, value = entry[0], entry[1]
             self._vars[sid] = value
             self._var_name_to_ids.setdefault(name, []).append(sid)
+        # The sprite's own data shadows stage data with the same name.
+        for name, ids in (stage._var_name_to_ids if stage else {}).items():
+            self._var_name_to_ids.setdefault(name, []).extend(ids)
 
         # Lists stored by ID
-        self._lists = {}
+        self._lists = stage._lists if stage is not None else {}
         self._list_name_to_ids = {}
         for sid, entry in sprite.get("lists", {}).items():
             name, data = entry[0], list(entry[1])
             self._lists[sid] = data
             self._list_name_to_ids.setdefault(name, []).append(sid)
+        for name, ids in (stage._list_name_to_ids if stage else {}).items():
+            self._list_name_to_ids.setdefault(name, []).extend(ids)
 
         # Public name-based views for test convenience
         self.variables = _NameView(self._vars, self._var_name_to_ids)
@@ -382,9 +401,36 @@ class ScratchEmulator:
 
             def run():
                 counts[opcode] += 1
-                broadcasts.append(message())
+                sent = message()
+                broadcasts.append(sent)
+                # Receivers run to completion, as ``broadcast and wait`` does.
+                if self.on_broadcast is not None:
+                    self.on_broadcast(str(sent))
 
-        elif opcode in {"procedures_definition", "procedures_prototype"}:
+        elif opcode == "sensing_askandwait":
+            question = value_of(inputs["QUESTION"])
+            answer = self._answer
+
+            def run():
+                counts[opcode] += 1
+                asked = question()
+                if self.on_ask is None:
+                    raise RuntimeError(f"ask and wait without an answer: {asked}")
+                answer[0] = self.on_ask(asked)
+
+        elif opcode in {"looks_say", "looks_think"}:
+            message = value_of(inputs["MESSAGE"])
+            said = self.said
+
+            def run():
+                counts[opcode] += 1
+                said.append(message())
+
+        elif opcode in {
+            "procedures_definition", "procedures_prototype", "event_whenflagclicked",
+            "event_whenbroadcastreceived", "event_whenkeypressed", "event_whenthisspriteclicked",
+            "event_whenstageclicked",
+        }:
             # Definitions are metadata/entry points rather than executable
             # commands when encountered outside a procedure call.
             def run():
@@ -542,6 +588,10 @@ class ScratchEmulator:
                 return math.floor(value() + 0.5)
             round_half_up.numeric = True
             return round_half_up
+
+        if opcode == "sensing_answer":
+            answer = self._answer
+            return lambda: answer[0]
 
         if opcode == "operator_random":
             low_of = number_of(inputs["FROM"])
@@ -813,3 +863,66 @@ class ScratchEmulator:
     def _scratch_numeric(cls, value):
         converted = cls._scratch_number(value)
         return 0 if converted is None else converted
+
+
+class ProjectEmulator:
+    """Run a whole Scratch project: the stage and its sprites, sharing stage data.
+
+    Scripts run to completion one after another, so ``broadcast`` and
+    ``broadcast and wait`` both behave like ``broadcast and wait``. ``answers``
+    are returned in order to ``ask and wait`` blocks, whose questions collect
+    in ``questions``.
+    """
+
+    def __init__(self, project, *, answers=()):
+        if not isinstance(project, dict):
+            import json
+            import zipfile
+
+            with zipfile.ZipFile(project) as archive:
+                project = json.loads(archive.read("project.json"))
+        targets = project["targets"]
+        self.stage = ScratchEmulator(next(target for target in targets if target.get("isStage")))
+        self.sprites = {
+            target["name"]: ScratchEmulator(target, stage=self.stage)
+            for target in targets if not target.get("isStage")
+        }
+        self.answers = list(answers)
+        self.questions: list = []
+        for emulator in self.targets:
+            emulator.on_broadcast = self.broadcast
+            emulator.on_ask = self._ask
+
+    @property
+    def targets(self) -> tuple[ScratchEmulator, ...]:
+        return (self.stage, *self.sprites.values())
+
+    def _run_hats(self, opcode, matches=lambda block: True) -> None:
+        for emulator in self.targets:
+            hats = [
+                block for block in emulator.blocks.values()
+                if block.get("opcode") == opcode and block.get("topLevel") and matches(block)
+            ]
+            for hat in hats:
+                emulator._exec_chain(hat.get("next"))
+
+    def green_flag(self) -> None:
+        self._run_hats("event_whenflagclicked")
+
+    def broadcast(self, message: str) -> None:
+        self._run_hats(
+            "event_whenbroadcastreceived",
+            lambda block: str(block["fields"]["BROADCAST_OPTION"][0]).lower() == message.lower(),
+        )
+
+    def press(self, key: str) -> None:
+        self._run_hats(
+            "event_whenkeypressed",
+            lambda block: block["fields"]["KEY_OPTION"][0] in {key, "any"},
+        )
+
+    def _ask(self, question):
+        self.questions.append(question)
+        if not self.answers:
+            raise RuntimeError(f"no answer left for {question!r}")
+        return self.answers.pop(0)

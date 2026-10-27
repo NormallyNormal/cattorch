@@ -21,6 +21,8 @@ connecting it to the rest of a project.
   text one token at a time.
 - [Tokenizers](tokenizers.md): export character, BPE, or SentencePiece
   tokenizers.
+- [Projects and the command line](projects-and-cli.md): build a runnable
+  Scratch project around exported sprites, and export from the terminal.
 - [Verification and benchmarking](verification-and-benchmarking.md): check
   output against PyTorch and measure speed in Scratch.
 - [Troubleshooting](troubleshooting.md): fix export failures and report

@@ -173,6 +173,23 @@ class TokenizerResult(ArtifactResult):
 
 
 @dataclass(frozen=True)
+class ProjectResult:
+    """A project written by :func:`build_project`.
+
+    ``messages`` are the broadcasts that run each bridged operation, and
+    ``lists`` and ``variables`` the global data they read and write, all by
+    Scratch name.
+    """
+
+    path: Path
+    sprites: tuple[str, ...]
+    messages: tuple[str, ...]
+    lists: tuple[str, ...]
+    variables: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class VerifyResult:
     """Numerical comparison between PyTorch and a generated Scratch sprite.
 

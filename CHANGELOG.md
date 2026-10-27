@@ -33,6 +33,19 @@
   `ModuleAdapter` from a function. `transpile(model, None, path)` and
   `verify(model, None, result)` take the interface from the markers. See
   [markers](docs/markers.md).
+- `build_project` writes a runnable Scratch project around exported sprites.
+  Each operation is bridged to global lists, so other sprites can run it with
+  `broadcast and wait`. A plain model gets list monitors and runs on the green
+  flag, with an optional label for a classifier's prediction. A text generator
+  gets its tokenizer and a Demo sprite that asks for a prompt and continues
+  it, sampling at an adjustable temperature. See
+  [projects and the command line](docs/projects-and-cli.md).
+- A `cattorch` command: `cattorch export MODEL` exports and verifies a model
+  from a Python file, module, or saved `.pt`, with inputs from its markers or
+  `--shape`; `cattorch generate` exports a text generator, from a file or
+  `--hf REPO`, with its tokenizer. `--project` also builds the project.
+- An `examples/` directory: an MLP, a CNN, and a character-level text
+  generator, each trained in seconds and exported with its project.
 - Recurrent layers (`nn.GRU`, `nn.LSTM`, `nn.RNN`) run as one Scratch loop
   over time instead of unrolling every step, so the sprite no longer grows
   with the sequence length. With `dynamic=` the sequence length can vary at

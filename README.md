@@ -34,6 +34,12 @@ Import the file using Scratch's **Upload Sprite** option. On the imported
 sprite, fill the `input` list, click `cattorch forward`, and read `output`.
 The first call initializes the model automatically.
 
+For a complete project instead, with the inputs and outputs on the stage and
+scripts other sprites can call, pass the result to `cattorch.build_project`,
+or export from the terminal with `cattorch export my_models.py:Net --project`.
+See [projects and the command line](https://github.com/NormallyNormal/cattorch/blob/main/docs/projects-and-cli.md)
+and the [examples](https://github.com/NormallyNormal/cattorch/tree/main/examples).
+
 cattorch exports inference only; train your model in PyTorch and call
 `model.eval()` before exporting. The [getting-started guide](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md)
 covers input layout, connecting other sprites, and saving after a run.
@@ -47,6 +53,8 @@ covers input layout, connecting other sprites, and saving after a run.
 - Cached text generation and character, BPE, or SentencePiece tokenizer sprites.
 - Experimental multi-method models, persistent state, and sparse
   mixture-of-experts models.
+- Runnable demo projects, including a prompt-and-continue text generator,
+  and a `cattorch` command.
 - Numerical verification and benchmark projects that measure speed in Scratch.
 
 ## Documentation

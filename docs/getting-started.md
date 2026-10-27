@@ -97,7 +97,10 @@ My Blocks and sprite-local lists belong to one Scratch sprite. A controller
 sprite cannot call `cattorch forward` or directly read the generated local
 `input` and `output` lists.
 
-To drive it from another sprite, bridge through global lists:
+[`build_project`](projects-and-cli.md) writes a project with these bridges
+already in place: `broadcast [NAME run] and wait` after filling the global
+`NAME input` list, then read `NAME output`. To build a bridge by hand, go
+through global lists:
 
 1. Create global input and output lists with your own names.
 2. On the generated processor sprite, add a `when I receive` script.

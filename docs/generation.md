@@ -135,7 +135,9 @@ tokens into text are up to your Scratch project.
 
 These blocks and lists belong to the generated sprite. To drive generation from
 another sprite, use the
-[global-list bridge](getting-started.md#connect-another-sprite).
+[global-list bridge](getting-started.md#connect-another-sprite), or let
+[`build_project`](projects-and-cli.md) write a project with the model, its
+tokenizer, bridges, and a generation loop already wired together.
 
 ## Lifecycle notifications
 

@@ -203,6 +203,39 @@ The remaining arguments apply only to an `ExportProgram`:
   quantized weights, so the comparison shows conversion error separately from
   quantization error. GPTQ isn't supported here.
 
+## Projects
+
+### `build_project`
+
+```text
+build_project(
+    output_path,
+    model,
+    *,
+    tokenizer=None,
+    example_inputs=(),
+    labels=None,
+    max_new_tokens=40,
+    temperature=0.8,
+    eos_token_id=None,
+    prompt=None,
+) -> ProjectResult
+```
+
+Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
+missing. Every operation gets a bridge to global lists that other sprites can
+run with `broadcast and wait`. A plain model gets list monitors starting from
+`example_inputs` (or zeros) and runs on the green flag or space key; `labels`
+names a classifier's outputs. A `GenerationProgram` export needs `tokenizer`, a
+`TokenizerResult`, and gets a Demo sprite that continues typed prompts. A model
+with entry points gets bridges only. See
+[projects and the command line](projects-and-cli.md).
+
+### `ProjectResult`
+
+`path`, the `sprites` in the project, and the bridges' `messages`, global
+`lists`, and global `variables`, all by Scratch name, plus `warnings`.
+
 ## Configuration objects
 
 Configuration classes are immutable dataclasses. Invalid values raise an
