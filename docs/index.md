@@ -34,6 +34,8 @@ connecting it to the rest of a project.
   speed.
 - [Experimental programs and sparse MoE](programs-and-moe.md): multiple
   methods, persistent state, and mixture-of-experts models.
+- [Markers](markers.md): declare entry points, state, MoE routing, and
+  export-only methods with decorators on your own classes (experimental).
 - [Custom kernels and operations](custom-kernels.md): write Scratch kernels
   and declare new operations (experimental).
 - [Glossary](glossary.md): cattorch and Scratch terms used in these guides.

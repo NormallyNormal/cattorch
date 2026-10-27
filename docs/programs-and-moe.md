@@ -7,6 +7,11 @@ calls, into one sprite. Everything in this guide is experimental and may
 change. For a model with just a `forward` method and no state, use the
 [ordinary export](getting-started.md) instead.
 
+[Markers](markers.md) declare the same things with decorators on your own
+model: `@entrypoint` methods and the buffers they update instead of
+`ExportProgram`, and `@moe` instead of rebuilding a block with `ExpertFamily`
+and `SparseMoE`. The classes here remain for code you can't decorate.
+
 ## Named entrypoints and state
 
 Import the interface types from `cattorch.experimental`:

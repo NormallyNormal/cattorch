@@ -789,6 +789,46 @@ def _replace_intermediate_copies(graph: Graph) -> None:
                 graph.erase_node(view)
 
 
+def _slice_cat_pieces(graph: Graph) -> None:
+    """Replace a slice of a ``cat`` that starts at a piece boundary by the pieces.
+
+    ``torch.cat([history, row])[len(history):]`` is ``row`` whatever
+    ``history``'s length, which is how append state commits its new rows.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.slice.Tensor":
+            continue
+        source = node.args[0]
+        if not isinstance(source, Node) or str(source.target) != "aten.cat.default":
+            continue
+        pieces = list(source.args[0])
+        rank = len(source.meta["val"].shape)
+        cat_dim = (source.args[1] if len(source.args) > 1 else 0) % rank
+        dim = (node.args[1] if len(node.args) > 1 else 0) % rank
+        start = node.args[2] if len(node.args) > 2 else 0
+        end = node.args[3] if len(node.args) > 3 else None
+        step = node.args[4] if len(node.args) > 4 else 1
+        total = source.meta["val"].shape[cat_dim]
+        if dim != cat_dim or step != 1 or not isinstance(start, int) or (
+            end is not None and end < total
+        ):
+            continue
+        offset = 0
+        for index, piece in enumerate(pieces):
+            if offset == start and 0 < index:
+                kept = pieces[index:]
+                with graph.inserting_before(node):
+                    replacement = kept[0] if len(kept) == 1 else graph.call_function(
+                        source.target, (kept, cat_dim),
+                    )
+                if replacement is not kept[0]:
+                    replacement.meta = dict(node.meta)
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+                break
+            offset += piece.meta["val"].shape[cat_dim]
+
+
 def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     example_kwargs = dict(example_kwargs or {})
     tensor_names = [
@@ -845,6 +885,7 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
 
     _erase_mode_switches(graph_module.graph)
     _replace_intermediate_copies(graph_module.graph)
+    _slice_cat_pieces(graph_module.graph)
     # Unused results, such as pooling indices nobody reads, would otherwise
     # still run in Scratch. Mutations are kept.
     graph_module.graph.eliminate_dead_code()

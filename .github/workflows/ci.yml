@@ -62,7 +62,7 @@ jobs:
           ruff check cattorch tests benchmarks
 
       - name: Check typed public modules
-        run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/codegen.py cattorch/storage.py cattorch/quantization.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py cattorch/frontend.py cattorch/operator_registry.py cattorch/kernel_api.py cattorch/custom_ops.py cattorch/scratch.py cattorch/kernel_testing.py
+        run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/codegen.py cattorch/storage.py cattorch/quantization.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py cattorch/frontend.py cattorch/operator_registry.py cattorch/kernel_api.py cattorch/custom_ops.py cattorch/scratch.py cattorch/kernel_testing.py cattorch/markers.py
 
   package:
     runs-on: ubuntu-latest

@@ -232,9 +232,28 @@ class OperatorRegistry:
             # than a user adapter. Register their canonical program only on
             # this export-owned registry so concurrent exports cannot leak
             # template handles into one another.
+            from cattorch.markers import apply_export_forward, marked_moe
             from cattorch.moe import (
                 ExpertFamily, SparseMoE, _BankedSparseMoE, _specialize_sparse_swiglu,
             )
+
+            def banked(sparse):
+                specialized = _specialize_sparse_swiglu(sparse)
+                if specialized is not None:
+                    return specialized
+                return _BankedSparseMoE(sparse, self._register_expert_family(sparse.expert_family))
+
+            apply_export_forward(module)
+            marked = marked_moe(module, path)
+            if marked is not None:
+                sparse, wrapper = marked
+                if wrapper is not None:
+                    wrapper.routed = banked(sparse)
+                    result = wrapper
+                else:
+                    result = banked(sparse)
+                replacements[identity] = result
+                return result
             if isinstance(module, ExpertFamily):
                 # ``routed_experts`` reads the handle from the export copy.
                 module._cattorch_handle = self._register_expert_family(module)
@@ -248,12 +267,7 @@ class OperatorRegistry:
                 return experts
             sparse = module if isinstance(module, SparseMoE) else detect_custom_moe(module, path)
             if sparse is not None:
-                specialized = _specialize_sparse_swiglu(sparse)
-                if specialized is not None:
-                    replacements[identity] = specialized
-                    return specialized
-                handle = self._register_expert_family(sparse.expert_family)
-                result = _BankedSparseMoE(sparse, handle)
+                result = banked(sparse)
                 replacements[identity] = result
                 return result
             return module

@@ -14,6 +14,16 @@
 - Experimental `op` declares a new operation from an annotated function. It
   exports whole, with a kernel attached through `@operation.kernel`, or
   through its function when it has none.
+- Experimental markers, decorators that describe a model's export interface
+  without changing how it runs in PyTorch. `@entrypoint` exports methods as
+  Scratch blocks and turns the buffers they update into persistent state,
+  with `capacity=` for a buffer that grows. `@example` gives `forward` example
+  inputs, `@export_forward` swaps in an export-only method for a class,
+  `@moe` declares a block's routing (including shared experts and scaled
+  outputs), `@generate` picks a generation method, and `@adapter` builds a
+  `ModuleAdapter` from a function. `transpile(model, None, path)` and
+  `verify(model, None, result)` take the interface from the markers. See
+  [markers](docs/markers.md).
 - `TranspileResult.approximate_operations` lists the operations that used an
   approximate kernel in fast mode, and `verify` repeats it in its result.
 - `GenerationProgram(max_context=64)` exports an ordinary stateless

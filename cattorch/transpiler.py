@@ -2,6 +2,7 @@ import logging
 import math
 import re
 import operator
+import dataclasses
 import warnings
 from collections import Counter
 from dataclasses import replace
@@ -1541,7 +1542,7 @@ def _select_unroll_factor(
 
 def transpile(
     model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram | None,
     output_path: str | Path,
     sig_figs: int | None = None,
     *,
@@ -1574,7 +1575,9 @@ def transpile(
     example_inputs:
         One tensor or a tuple defining a fixed interface, an ``ExportProgram``
         defining named methods and state, or a ``GenerationProgram`` defining
-        the cached decoder interface.
+        the cached decoder interface. ``None`` takes the interface from the
+        model's experimental markers: its ``@entrypoint`` methods, or the
+        ``@example`` inputs of ``forward``.
     output_path:
         Destination path. ``.sprite3`` is appended when absent and missing
         parent directories are created.
@@ -1669,6 +1672,23 @@ def _transpile_any(
     fast_config, storage, quantization, calibration_inputs, codegen, frontend,
     adapters, calibration_calls, calibration_sequences, example_kwargs, kernels,
 ):
+    if example_inputs is None:
+        # The model describes its own interface with markers.
+        from cattorch.markers import example_inputs as marked_example, has_entrypoints, marked_program
+        if has_entrypoints(model):
+            model, example_inputs = marked_program(model)
+        else:
+            example_inputs = marked_example(model)
+            if example_inputs is None:
+                raise ValueError(
+                    "example_inputs is None, but the model has no @example or "
+                    "@entrypoint marker to take them from"
+                )
+    if isinstance(example_inputs, GenerationProgram) and example_inputs.method == "forward":
+        from cattorch.markers import generation_method
+        method = generation_method(model)
+        if method is not None:
+            example_inputs = dataclasses.replace(example_inputs, method=method)
     if example_kwargs is not None and isinstance(
         example_inputs, (ExportProgram, GenerationProgram),
     ):

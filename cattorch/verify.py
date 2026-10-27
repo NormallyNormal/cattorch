@@ -231,7 +231,7 @@ def _verify_program(
 
 def verify(
     model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | None,
     sprite: str | Path | TranspileResult | ProgramResult,
     *,
     atol: float = 1e-4,
@@ -265,6 +265,15 @@ def verify(
     """
     if atol < 0 or rtol < 0:
         raise ValueError("atol and rtol must be non-negative")
+    if example_inputs is None:
+        # As in ``transpile``: the interface comes from the model's markers.
+        from cattorch.markers import example_inputs as marked_example, has_entrypoints, marked_program
+        if has_entrypoints(model):
+            model, example_inputs = marked_program(model)
+        else:
+            example_inputs = marked_example(model)
+            if example_inputs is None:
+                raise ValueError("example_inputs is None, but the model has no marker for them")
     validate_export_options(example_kwargs=example_kwargs)
     if example_kwargs is not None and isinstance(example_inputs, ExportProgram):
         raise ValueError("example_kwargs cannot be used with an ExportProgram")
