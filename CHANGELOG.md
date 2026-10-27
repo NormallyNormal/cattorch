@@ -11,10 +11,10 @@
   `check_kernel` compares a kernel with PyTorch in the emulator, and
   `build_kernel_benchmark` times it in Scratch. See
   [custom kernels and operations](docs/custom-kernels.md).
-- Experimental `op` declares a new operation from an annotated function. It
+- `cattorch.op` declares a new operation from an annotated function. It
   exports whole, with a kernel attached through `@operation.kernel`, or
   through its function when it has none.
-- Experimental markers, decorators that describe a model's export interface
+- Markers (`cattorch.entrypoint` and others), decorators that describe a model's export interface
   without changing how it runs in PyTorch. `@entrypoint` exports methods as
   Scratch blocks and turns the buffers they update into persistent state,
   with `capacity=` for a buffer that grows. `@example` gives `forward` example

@@ -97,6 +97,25 @@ Apply rotary position embeddings (RoPE) to adjacent pairs of features. The
 last dimension of `value` must be even. `cosine` and `sine` must broadcast to
 `value`'s shape without making it larger.
 
+## Markers and new operations
+
+Decorators on your own classes and methods. They only attach metadata, so the
+model runs unchanged in PyTorch; see [markers](markers.md) and
+[custom kernels and operations](custom-kernels.md).
+
+| Name | Use |
+|---|---|
+| `entrypoint` | On a method: export it as a Scratch block. Buffers it updates become state; `capacity=` for a buffer that grows; `name=`, `inputs=`, `outputs=`, `example=`. |
+| `example` | On a class: example inputs for `forward`, so `transpile(model, None, path)` needs none. |
+| `export_forward` | On a method: trace it instead of `forward` for every instance of the class. |
+| `moe` | On a class: export it as a sparse mixture of experts with the given `router`, `experts`, `top_k`, `scoring`, `normalize`, `shared`, and `scale`, checked against `forward`. |
+| `generate` | On a method: the method a `GenerationProgram` exports. |
+| `adapter` | On a function: build a `ModuleAdapter` for a class you don't own. |
+| `op` | On an annotated function: declare a new operation, exported whole and lowered by a kernel attached with `@operation.kernel`, or through the function itself. |
+
+Pass `None` as `example_inputs` to `transpile` and `verify` to take the
+interface from `entrypoint` or `example` markers.
+
 ## Tokenizer export
 
 ### `transpile_tokenizer`

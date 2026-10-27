@@ -9,8 +9,8 @@ module should look like during export. They replace building
 [programs and MoE classes](programs-and-moe.md) by hand.
 
 A marker only attaches metadata. Your model runs, trains, and saves exactly
-as before, and an unmarked model exports as it always has. Markers are
-experimental and come from `cattorch.experimental`.
+as before, and an unmarked model exports as it always has. Import them from
+`cattorch`, as in `@cattorch.entrypoint`.
 
 ## Entry points and state
 
@@ -20,8 +20,8 @@ becomes persistent state:
 ```python
 import torch
 from torch import nn
-from cattorch import transpile, verify
-from cattorch.experimental import ProgramCall, entrypoint
+from cattorch import entrypoint, transpile, verify
+from cattorch.experimental import ProgramCall
 
 class Tally(nn.Module):
     def __init__(self):
@@ -83,7 +83,7 @@ describe, if you want to inspect or extend it.
 command line can export it without being told its shapes:
 
 ```python
-from cattorch.experimental import example
+from cattorch import example
 
 @example(lambda: (torch.zeros(1, 1, 28, 28),))
 class Digits(nn.Module):
@@ -100,7 +100,7 @@ whose `forward` has training branches or control flow that depends on tensor
 values:
 
 ```python
-from cattorch.experimental import export_forward
+from cattorch import export_forward
 
 class Gate(nn.Module):
     def forward(self, value):
@@ -123,7 +123,7 @@ for example with a shared expert or a scaled routed output, `@moe` states the
 routing:
 
 ```python
-from cattorch.experimental import moe
+from cattorch import moe
 
 @moe(router="gate", experts="experts", top_k=2, normalize=True, shared="shared")
 class Block(nn.Module):
@@ -153,7 +153,7 @@ match on probe inputs, so wrong options fail the export.
 
 ```python
 from cattorch import GenerationProgram
-from cattorch.experimental import generate
+from cattorch import generate
 
 class Chat(nn.Module):
     @generate
@@ -169,7 +169,7 @@ A marker needs your own source. For a third-party class, `@adapter` turns a
 function into a [`ModuleAdapter`](programs-and-moe.md) to pass to one export:
 
 ```python
-from cattorch.experimental import adapter
+from cattorch import adapter
 
 @adapter(ThirdPartyBlock)
 def export_block(module, context):

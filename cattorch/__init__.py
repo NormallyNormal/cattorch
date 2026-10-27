@@ -14,6 +14,8 @@ from cattorch.quantization import (
 )
 from cattorch.codegen import CodegenConfig
 from cattorch.ops import rotary_embedding
+from cattorch.custom_ops import op
+from cattorch.markers import adapter, entrypoint, example, export_forward, generate, moe
 from cattorch.program import GenerationProgram
 from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
 from cattorch.results import (
@@ -45,7 +47,8 @@ __all__ = [
     "FastConfig", "FastLayerConfig", "GenerationProgram", "BoundedDimension",
     "StorageConfig", "QuantizationConfig", "QuantizationReport",
     "TensorQuantizationReport",
-    "CodegenConfig", "rotary_embedding",
+    "CodegenConfig", "rotary_embedding", "op",
+    "adapter", "entrypoint", "example", "export_forward", "generate", "moe",
     "CattorchError", "UnsupportedModelError", "UnsupportedOperationError",
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",
