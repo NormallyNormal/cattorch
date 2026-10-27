@@ -12,7 +12,9 @@ from torch import nn
 from cattorch.adapters import ModuleAdapter
 from cattorch.export_options import validate_export_options
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
-from cattorch.frontend import capture_model
+from cattorch.fast import FastConfig
+from cattorch.frontend import capture_model, keep_operations
+from cattorch.kernel_api import active_kernel_targets, validate_kernels
 from cattorch.graph import _prepare_graph
 from cattorch.moe import (
     ExpertFamily, SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
@@ -95,14 +97,28 @@ def analyze(
     adapters: tuple[ModuleAdapter, ...] = (),
     storage: StorageConfig | None = None,
     optimization: str = "exact",
+    kernels=(),
 ) -> AnalysisReport:
-    """Capture every entrypoint and report compatibility and approximate size."""
+    """Capture every entrypoint and report compatibility and approximate size.
+
+    ``kernels`` are the experimental ``Kernel`` lowerings the export would use.
+    """
     if not isinstance(program, ExportProgram):
         raise TypeError("program must be an ExportProgram")
     validate_export_options(optimization=optimization, storage=storage, adapters=adapters)
+    kernels = validate_kernels(kernels)
+    with keep_operations(active_kernel_targets(
+        kernels, fast=optimization == "fast", config=FastConfig(),
+    )):
+        return _analyze(model, program, adapters, storage, optimization, kernels)
+
+
+def _analyze(model, program, adapters, storage, optimization, kernels) -> AnalysisReport:
     registry = default_registry().clone()
     for adapter in adapters:
         registry.register_adapter(adapter)
+    for kernel in kernels:
+        registry.register_kernel(kernel)
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )

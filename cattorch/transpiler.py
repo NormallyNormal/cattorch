@@ -3,6 +3,7 @@ import math
 import re
 import operator
 import warnings
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -13,7 +14,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
-from cattorch.frontend import Frontend, flat_example_inputs
+from cattorch.frontend import Frontend, flat_example_inputs, keep_operations
 from cattorch.graph import (
     _GenerationSpec,
     _GraphInfo,
@@ -28,6 +29,7 @@ from cattorch.results import (
 )
 from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
 from cattorch.adapters import ModuleAdapter
+from cattorch.kernel_api import Kernel, active_kernel_targets, validate_kernels
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
@@ -213,6 +215,8 @@ class _Compiler:
 
     def __init__(self, graph: _GraphInfo, *, row_aligned_weights: bool = False):
         self.graph = graph
+        # Operations lowered by an approximate kernel, for the result.
+        self.approximate: Counter[str] = Counter(graph.approximate_fusions)
         self.scope = ScopeManager()
         self.block_manager = BlockManager()
         self.dynamic_lists: set[str] = set()
@@ -957,6 +961,7 @@ class _Compiler:
             if self.graph.fast and self.graph.fast_config.softmax:
                 from cattorch.util.instruction.optimized import FastCausalSoftmaxInstruction
                 instruction = FastCausalSoftmaxInstruction(node.target, target_list, *args)
+                self.approximate[aten_op] += 1
             else:
                 from cattorch.util.instruction.optimized import CausalSoftmaxInstruction
                 instruction = CausalSoftmaxInstruction(node.target, target_list, *args)
@@ -985,6 +990,8 @@ class _Compiler:
             )
             if kernel is None:
                 raise _unsupported_operation(node)
+            if self.graph.fast and rule is not None and kernel is rule.fast_kernel:
+                self.approximate[aten_op] += 1
             if aten_op == "aten.linear.default" and linear_layout is not None:
                 weight_shard_rows, interleaved = linear_layout
                 instruction = kernel(
@@ -1554,6 +1561,7 @@ def transpile(
         torch.Tensor | tuple[torch.Tensor, ...]
     ] | None = None,
     example_kwargs: dict[str, Any] | None = None,
+    kernels: tuple[Kernel, ...] = (),
 ):
     """Export a PyTorch module as a Scratch ``.sprite3`` file.
 
@@ -1607,6 +1615,10 @@ def transpile(
         (``input_k`` in order); other values, such as ``use_cache=False``, are
         constants of the trace. Not valid for programs, and tensor values
         cannot be combined with GPTQ ``calibration_inputs``.
+    kernels:
+        Experimental ``cattorch.experimental.Kernel`` lowerings for this
+        export. A kernel for an operation cattorch already lowers replaces the
+        built-in one; an approximate kernel applies only in fast mode.
 
     Returns
     -------
@@ -1626,6 +1638,37 @@ def transpile(
         sig_figs=sig_figs, frontend=frontend, adapters=adapters,
         example_kwargs=example_kwargs,
     )
+    kernels = validate_kernels(kernels)
+    kept = active_kernel_targets(
+        kernels, fast=optimization == "fast", config=fast_config or FastConfig(),
+    )
+    with keep_operations(kept):
+        return _transpile_any(
+            model, example_inputs, output_path, sig_figs,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_inputs=calibration_inputs, codegen=codegen,
+            frontend=frontend, adapters=adapters,
+            calibration_calls=calibration_calls,
+            calibration_sequences=calibration_sequences,
+            example_kwargs=example_kwargs, kernels=kernels,
+        )
+
+
+def _registry_with(kernels, adapters=()) -> OperatorRegistry:
+    registry = default_registry().clone()
+    for adapter in adapters:
+        registry.register_adapter(adapter)
+    for kernel in kernels:
+        registry.register_kernel(kernel)
+    return registry
+
+
+def _transpile_any(
+    model, example_inputs, output_path, sig_figs, *, name, optimization,
+    fast_config, storage, quantization, calibration_inputs, codegen, frontend,
+    adapters, calibration_calls, calibration_sequences, example_kwargs, kernels,
+):
     if example_kwargs is not None and isinstance(
         example_inputs, (ExportProgram, GenerationProgram),
     ):
@@ -1655,6 +1698,7 @@ def transpile(
             calibration_calls=calibration_calls,
             codegen=codegen,
             adapters=adapters,
+            kernels=kernels,
         )
     if isinstance(example_inputs, GenerationProgram):
         if frontend != "fx":
@@ -1675,9 +1719,7 @@ def transpile(
             )
         from cattorch.program_runtime import MethodModule
         generation_program = example_inputs
-        registry = default_registry().clone()
-        for adapter in adapters:
-            registry.register_adapter(adapter)
+        registry = _registry_with(kernels, adapters)
         return _transpile_automatic_generation(
             model, generation_program, output_path, sig_figs,
             name=name, optimization=optimization, fast_config=fast_config,
@@ -1700,6 +1742,7 @@ def transpile(
         codegen=codegen,
         frontend=frontend,
         example_kwargs=example_kwargs,
+        _registry=_registry_with(kernels) if kernels else None,
     )
 
 
@@ -2270,4 +2313,5 @@ def _transpile(
         ) + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
         quantization=quantization_report,
         fallback_operations=graph.fallbacks(),
+        approximate_operations=tuple(sorted(compiler.approximate.items())),
     )

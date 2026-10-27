@@ -292,6 +292,9 @@ class _GraphInfo:
     registry: OperatorRegistry
     dynamic_axes: dict[str, int]
     dynamic_bounds: dict[str, tuple[str, int, int]]
+    # Operations a fusion approximates in fast mode, such as exact GELU in a
+    # linear epilogue.
+    approximate_fusions: tuple[str, ...] = ()
 
     @property
     def output_name(self) -> str:
@@ -735,6 +738,7 @@ def _prepare_graph(
             raise _unsupported_operation(node, detail)
 
     linear_fusions = {}
+    approximate_fusions: list[str] = []
     fused_nodes = set()
     if use_fusions:
         scalar_ops = {
@@ -785,9 +789,10 @@ def _prepare_graph(
                         break
                     # The fused linear epilogue only implements tanh GELU;
                     # exact GELU runs as its own elementwise kernel.
-                    if target == "aten.gelu.default" and _gelu_approximation(user) != "tanh" and not (
-                        fast and fast_config.activations
-                    ):
+                    exact_gelu = (
+                        target == "aten.gelu.default" and _gelu_approximation(user) != "tanh"
+                    )
+                    if exact_gelu and not (fast and fast_config.activations):
                         break
                     # Leave SiLU materialization to the broader SiLU-times-
                     # tensor fusion below when it feeds a single multiply.
@@ -796,6 +801,8 @@ def _prepare_graph(
                         if str(next_user.target) == "aten.mul.Tensor":
                             break
                     epilogue.append((activation_ops[target], None))
+                    if exact_gelu:
+                        approximate_fusions.append(target)
                     chain.append(user)
                     current = user
                     break  # Activations terminate the simple expression epilogue.
@@ -1201,6 +1208,7 @@ def _prepare_graph(
             hidden_prefill_attention=generation_hidden_prefill_attention,
         ),
         linear_fusions=linear_fusions,
+        approximate_fusions=tuple(approximate_fusions),
         paired_swiglu_fusions=paired_swiglu_fusions,
         silu_mul_fusions=silu_mul_fusions,
         embedding_add_fusions=embedding_add_fusions,

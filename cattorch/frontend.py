@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Callable, Literal
@@ -388,6 +389,22 @@ class _CallView:
         self.kwargs = kwargs
 
 
+# Operations an export's own kernels lower, so tracing keeps them whole.
+_KEPT_OPERATIONS: ContextVar[frozenset[str]] = ContextVar(
+    "cattorch_kept_operations", default=frozenset(),
+)
+
+
+@contextlib.contextmanager
+def keep_operations(names):
+    """Don't decompose ``names`` in captures made inside this block."""
+    token = _KEPT_OPERATIONS.set(_KEPT_OPERATIONS.get() | frozenset(names))
+    try:
+        yield
+    finally:
+        _KEPT_OPERATIONS.reset(token)
+
+
 # ``node.meta`` key naming the operation whose generic PyTorch decomposition
 # produced the node, and which call of it, as ``(operation, call)``.
 FALLBACK_META = "cattorch_fallback"
@@ -486,9 +503,11 @@ def _fx_decompositions() -> dict:
         table[operator] = _static_scalar_decomposition(operator)
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
+    kept_by_export = _KEPT_OPERATIONS.get()
     return {
         operator: _without_cycles(operator, decomposition)
         for operator, decomposition in table.items()
+        if str(operator) not in kept_by_export
     }
 
 

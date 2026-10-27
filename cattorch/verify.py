@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import re
@@ -328,9 +329,11 @@ def verify(
         )
         for value, name in zip(leaves, output_names)
     )
+    approximate = sprite.approximate_operations if isinstance(sprite, TranspileResult) else ()
     if len(comparisons) == 1:
-        return comparisons[0]
+        return dataclasses.replace(comparisons[0], approximate_operations=approximate)
     return MultiOutputVerifyResult(
         passed=all(result.passed for result in comparisons),
         outputs=comparisons,
+        approximate_operations=approximate,
     )

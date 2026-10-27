@@ -363,6 +363,7 @@ def transpile_program(
     calibration_calls: tuple[ProgramCall, ...] | None = None,
     codegen: CodegenConfig | None = None,
     adapters: tuple[ModuleAdapter, ...] = (),
+    kernels=(),
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact."""
     if not isinstance(program, ExportProgram):
@@ -380,6 +381,8 @@ def transpile_program(
     registry: OperatorRegistry = default_registry().clone()
     for adapter in adapters:
         registry.register_adapter(adapter)
+    for kernel in kernels:
+        registry.register_kernel(kernel)
 
     states = {state.name: state for state in program.states}
     calls = tuple(calibration_calls or ())

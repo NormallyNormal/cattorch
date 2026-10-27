@@ -97,7 +97,8 @@ class TranspileResult(ArtifactResult):
     whether each parameter used GPTQ, symmetric quantization, or float16.
     ``fallback_operations`` lists operations without a kernel of their own,
     which run as PyTorch's decomposition into simpler operations, with how
-    many calls of each the sprite runs.
+    many calls of each the sprite runs. ``approximate_operations`` lists the
+    operations that use an approximate (fast-mode) kernel, the same way.
     """
 
     inputs: tuple[TensorSpec, ...]
@@ -106,6 +107,7 @@ class TranspileResult(ArtifactResult):
     quantization: QuantizationReport | None = None
     additional_outputs: tuple[TensorSpec, ...] = ()
     fallback_operations: tuple[tuple[str, int], ...] = ()
+    approximate_operations: tuple[tuple[str, int], ...] = ()
 
     @property
     def outputs(self) -> tuple[TensorSpec, ...]:
@@ -176,7 +178,9 @@ class VerifyResult:
 
     Error fields compare flattened values. ``worst_index`` is zero-based and
     is ``None`` for an empty result. Output-length mismatches return a failed
-    result with infinite aggregate errors.
+    result with infinite aggregate errors. ``approximate_operations`` repeats
+    the export's approximate kernels when ``verify`` was given its
+    ``TranspileResult``, since they explain small differences.
     """
 
     passed: bool
@@ -187,6 +191,7 @@ class VerifyResult:
     max_rel_error: float
     mean_abs_error: float
     worst_index: int | None
+    approximate_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,10 +199,12 @@ class MultiOutputVerifyResult:
     """Per-tensor comparisons in the exported pytree leaf order.
 
     ``passed`` is true only when every output comparison passes.
+    ``approximate_operations`` is as for ``VerifyResult``.
     """
 
     passed: bool
     outputs: tuple[VerifyResult, ...]
+    approximate_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)

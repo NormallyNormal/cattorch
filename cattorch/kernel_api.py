@@ -1,13 +1,13 @@
-"""Private draft of a context-style kernel interface.
+"""Context-style kernel interface (experimental).
 
-This module is internal while the extension API settles. It is not exported
-from ``cattorch`` or ``cattorch.experimental`` and has no public
-documentation; real kernels (generation, mixture-of-experts) are meant to
-shape it before it is made public.
+Public through ``cattorch.experimental``: ``Kernel``, ``KernelContext``, and
+``TensorInfo``, with the statements in ``cattorch.scratch``. Built-in kernels
+in ``cattorch/builtin_kernels.py`` use the same interface. It may change
+before 1.0.
 
 A ``Kernel`` pairs an operator with an ``emit`` function. ``emit`` receives a
 ``KernelContext`` describing the operation by name (shapes, dtypes, static
-flags, scalar arguments) and returns a body of ``cattorch.util.scratch.dsl``
+flags, scalar arguments) and returns a body of ``cattorch.scratch``
 statements. The context also allocates the lists and variables the body uses.
 ``_ContextInstruction`` adapts that to the positional ``Instruction`` protocol,
 so tensor rebinding, sharding and compaction work unchanged.
@@ -235,12 +235,20 @@ class KernelContext:
 
 @dataclass(frozen=True)
 class Kernel:
-    """A lowering for one operator, written against ``KernelContext``.
+    """A Scratch lowering for one operation.
+
+    ``target`` is the operation: an ``OpOverload`` such as
+    ``torch.ops.aten.gelu.default`` (a bare ``torch.ops.aten.gelu`` means its
+    ``default`` overload), its name ``"aten.gelu.default"``, or an operation
+    declared with ``cattorch.op``. ``emit`` receives a ``KernelContext`` and
+    returns the body, a tuple of ``cattorch.scratch`` statements.
 
     ``name`` titles the generated program; it must not include per-layer data.
-    ``fast_flag`` is ``None`` for an exact kernel. A ``FastConfig`` flag name
-    marks an approximate kernel used only when fast optimization is on and
-    that flag is enabled.
+    ``validator`` receives the same context and returns ``None`` to accept
+    the call or a reason, which is raised as ``UnsupportedOperationError``.
+    An ``approximate`` kernel is used only with ``optimization="fast"``; an
+    exact one replaces the exact kernel. ``fast_flag`` (internal) also ties an
+    approximate kernel to a ``FastConfig`` flag.
     """
 
     target: object
@@ -248,12 +256,23 @@ class Kernel:
     name: str | None = None
     validator: Callable[[KernelContext], str | None] | None = None
     fast_flag: str | None = None
+    approximate: bool = False
 
     def __post_init__(self) -> None:
+        target = getattr(self.target, "operator", self.target)
+        if isinstance(target, torch._ops.OpOverloadPacket):
+            target = target.default
+        object.__setattr__(self, "target", target)
+        if not callable(self.emit):
+            raise TypeError("kernel emit must be callable")
+        if self.validator is not None and not callable(self.validator):
+            raise TypeError("kernel validator must be callable or None")
         if not self.target_name:
             raise ValueError("kernel target must be non-empty")
         if self.fast_flag is not None and not hasattr(FastConfig(), self.fast_flag):
             raise ValueError(f"unknown FastConfig flag {self.fast_flag!r}")
+        if self.fast_flag is not None:
+            object.__setattr__(self, "approximate", True)
 
     @property
     def target_name(self) -> str:
@@ -308,3 +327,21 @@ class _ContextInstruction(Instruction):
         if cls.kernel.validator is None:
             return None
         return cls.kernel.validator(KernelContext.from_node(node, cls._operator()))
+
+
+def active_kernel_targets(kernels, *, fast: bool, config: FastConfig) -> frozenset[str]:
+    """The operations ``kernels`` lower in this mode, which tracing keeps."""
+    return frozenset(
+        kernel.target_name for kernel in kernels
+        if not kernel.approximate or (
+            fast and (kernel.fast_flag is None or bool(getattr(config, kernel.fast_flag)))
+        )
+    )
+
+
+def validate_kernels(kernels) -> tuple[Kernel, ...]:
+    kernels = tuple(kernels)
+    if any(not isinstance(kernel, Kernel) for kernel in kernels):
+        raise TypeError("kernels must contain cattorch.experimental.Kernel values")
+    return kernels
+

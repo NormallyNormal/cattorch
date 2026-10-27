@@ -19,7 +19,7 @@ from cattorch.util.instruction.optimized_common import (
     _static_unrolled_repeat,
     _unrolled_offset_dot_statements,
 )
-from cattorch.util.scratch.dsl import (
+from cattorch.scratch import (
     add,
     append,
     change_var,

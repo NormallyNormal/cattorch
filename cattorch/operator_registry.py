@@ -129,8 +129,8 @@ class OperatorRegistry:
     def register_kernel(self, kernel: Kernel) -> None:
         """Register a context ``Kernel``, merging into any existing rule.
 
-        An exact kernel replaces the rule's exact lowering; a kernel with a
-        ``fast_flag`` replaces its fast lowering and flag. The observer,
+        An exact kernel replaces the rule's exact lowering; an approximate
+        one replaces its fast lowering and flag. The observer,
         ``lowering_target``, registry validator and the other variant are
         kept, unlike ``register_operation`` which replaces the whole rule.
         """
@@ -138,7 +138,7 @@ class OperatorRegistry:
         if rule is None:
             rule = OperationRule(target=kernel.target_name)
         instruction = kernel.instruction_class()
-        if kernel.fast_flag is None:
+        if not kernel.approximate:
             rule = replace(rule, exact_kernel=instruction)
         else:
             rule = replace(
