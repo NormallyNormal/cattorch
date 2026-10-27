@@ -551,6 +551,11 @@ DECOMPOSED = {
     ),
     "lstm": (nn.LSTM(4, 4, batch_first=True), (torch.randn(1, 3, 4),)),
     "gru": (nn.GRU(4, 4, batch_first=True), (torch.randn(1, 3, 4),)),
+    "depthwise convolution": (nn.Conv2d(4, 4, 3, groups=4), (IMAGE,)),
+    "dilated convolution": (nn.Conv2d(4, 4, 3, dilation=2), (IMAGE,)),
+    "transposed convolution": (nn.ConvTranspose2d(4, 4, 2, stride=2), (IMAGE,)),
+    "3d convolution": (nn.Conv3d(4, 4, 3), (torch.randn(1, 4, 4, 4, 4),)),
+    "same padding": (nn.Conv1d(4, 2, 4, padding="same"), (torch.randn(1, 4, 6),)),
 }
 
 
@@ -562,10 +567,6 @@ def test_decomposed_operation(tmp_path, name):
 
 
 KNOWN_UNSUPPORTED = {
-    "depthwise convolution": (nn.Conv2d(4, 4, 3, groups=4), (IMAGE,)),
-    "dilated convolution": (nn.Conv2d(4, 4, 3, dilation=2), (IMAGE,)),
-    "transposed convolution": (nn.ConvTranspose2d(4, 4, 2, stride=2), (IMAGE,)),
-    "3d convolution": (nn.Conv3d(4, 4, 3), (torch.randn(1, 4, 4, 4, 4),)),
     "log gamma": (Lambda(torch.lgamma), (POSITIVE,)),
 }
 

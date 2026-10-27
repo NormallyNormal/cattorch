@@ -692,6 +692,29 @@ class ScratchEmulator:
                     return math.nan
                 return math.floor(function(math.pi * number / 180) * 1e10 + 0.5) / 1e10
             return trigonometry
+        if op == "tan":
+            def tangent():
+                # scratch-vm's MathUtil.tan: exact infinities at ±90 degrees,
+                # otherwise rounded like sin and cos.
+                number = value()
+                if not math.isfinite(number):
+                    return math.nan
+                angle = math.fmod(number, 360)
+                if angle in {90, -270}:
+                    return math.inf
+                if angle in {-90, 270}:
+                    return -math.inf
+                return math.floor(math.tan(math.pi * angle / 180) * 1e10 + 0.5) / 1e10
+            return tangent
+        if op in {"asin", "acos", "atan"}:
+            function = {"asin": math.asin, "acos": math.acos, "atan": math.atan}[op]
+
+            def inverse_trigonometry():
+                number = value()
+                if op != "atan" and not -1 <= number <= 1:
+                    return math.nan
+                return function(number) * 180 / math.pi
+            return inverse_trigonometry
         if op == "10 ^":
             def power():
                 try:

@@ -12,40 +12,52 @@ an argument a model rarely uses, so a partial or failing operator may
 still work in your model; see [supported models](supported-models.md)
 for what cattorch is designed to handle.
 
-Of 1551 samples tried with PyTorch 2.14, 1116 pass.
+Of 1551 samples tried with PyTorch 2.14, 1266 pass.
 Samples were skipped when their output is random, complex, or not a tensor.
 
-## Every sample passes (311)
+## Every sample passes (366)
 
 `H`, `T`, `__getitem__`, `__radd__`, `__rdiv__`, `__rmatmul__`, `__rmod__`,
-`__rmul__`, `__rsub__`, `_chunk_cat`, `_softmax_backward_data`, `abs`, `add`,
-`addcdiv`, `addcmul`, `addmm`, `addmm.decomposed`, `addmv`, `addr`,
-`alias_copy`, `all`, `amax`, `amin`, `aminmax`, `any`, `argmax`, `argmin`,
-`as_strided`, `as_strided.partial_views`, `as_strided_copy`, `atleast_1d`,
-`atleast_2d`, `atleast_3d`, `baddbmm`, `block_diag`, `bmm`,
-`bmm.triton_optimized`, `broadcast_tensors`, `broadcast_to`, `cartesian_prod`,
-`cat`, `ceil`, `chunk`, `clamp`, `clamp_max`, `clamp_min`, `clone`,
-`column_stack`, `combinations`, `conj`, `constant_pad_nd`, `contiguous`, `cos`,
-`count_nonzero`, `cross`, `cumsum`, `cumulative_trapezoid`, `deg2rad`, `diag`,
-`diag_embed`, `diagflat`, `diagonal`, `diagonal_copy`, `diff`,
-`div.floor_rounding`, `div.no_rounding_mode`, `div.trunc_rounding`, `dot`,
-`dsplit`, `dstack`, `einsum`, `eq`, `erf`, `exp`, `expand`, `expand_as`,
-`expand_copy`, `expm1`, `flatten`, `flip`, `fliplr`, `flipud`, `floor`,
-`floor_divide`, `fmod`, `frac`, `full_like`, `gather`, `ge`, `gradient`, `gt`,
-`heaviside`, `hsplit`, `hstack`, `inner`, `isinf`, `isnan`, `isneginf`,
-`isposinf`, `isreal`, `kron`, `le`, `lerp`, `log`, `log10`, `log1p`,
-`log_softmax`, `log_softmax.with_dtype`, `logical_and`, `logical_not`,
-`logical_or`, `logical_xor`, `logit`, `lt`, `mH`, `mT`, `masked_fill`,
-`matmul`, `max.binary`, `max.reduction_no_dim`, `max.reduction_with_dim`,
-`maximum`, `mean`, `meshgrid.list_of_tensors`, `meshgrid.variadic_tensors`,
-`min.binary`, `min.reduction_no_dim`, `min.reduction_with_dim`, `minimum`,
-`mm`, `movedim`, `mul`, `mv`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
+`__rmul__`, `__rpow__`, `__rsub__`, `_chunk_cat`, `_softmax_backward_data`,
+`abs`, `acos`, `acosh`, `add`, `addbmm`, `addcdiv`, `addcmul`, `addmm`,
+`addmm.decomposed`, `addmv`, `addr`, `alias_copy`, `all`, `amax`, `amin`,
+`aminmax`, `angle`, `any`, `argmax`, `argmin`, `as_strided`,
+`as_strided.partial_views`, `as_strided_copy`, `asin`, `asinh`, `atan`,
+`atan2`, `atanh`, `atleast_1d`, `atleast_2d`, `atleast_3d`, `baddbmm`,
+`block_diag`, `bmm`, `bmm.triton_optimized`, `broadcast_tensors`,
+`broadcast_to`, `cartesian_prod`, `cat`, `cdist`, `ceil`, `chunk`, `clamp`,
+`clamp_max`, `clamp_min`, `clone`, `column_stack`, `combinations`, `conj`,
+`conj_physical`, `constant_pad_nd`, `contiguous`, `copysign`, `cos`, `cosh`,
+`count_nonzero`, `cross`, `cumprod`, `cumsum`, `cumulative_trapezoid`,
+`deg2rad`, `diag`, `diag_embed`, `diagflat`, `diagonal`, `diagonal_copy`,
+`diff`, `dist`, `div.floor_rounding`, `div.no_rounding_mode`,
+`div.trunc_rounding`, `dot`, `dsplit`, `dstack`, `einsum`, `eq`, `erf`, `erfc`,
+`exp`, `exp2`, `expand`, `expand_as`, `expand_copy`, `expm1`, `fill`,
+`flatten`, `flip`, `fliplr`, `flipud`, `float_power`, `floor`, `floor_divide`,
+`fmax`, `fmin`, `fmod`, `frac`, `full_like`, `gather`, `ge`, `gradient`, `gt`,
+`heaviside`, `hsplit`, `hstack`, `hypot`, `inner`, `isfinite`, `isinf`,
+`isnan`, `isneginf`, `isposinf`, `isreal`, `kron`, `ldexp`, `le`, `lerp`,
+`log`, `log10`, `log1p`, `log2`, `log_softmax`, `log_softmax.with_dtype`,
+`logaddexp`, `logaddexp2`, `logcumsumexp`, `logical_and`, `logical_not`,
+`logical_or`, `logical_xor`, `logit`, `logspace.tensor_overload`, `logsumexp`,
+`lt`, `mH`, `mT`, `masked_fill`, `matmul`, `max.binary`,
+`max.reduction_no_dim`, `max.reduction_with_dim`, `maximum`, `mean`,
+`meshgrid.list_of_tensors`, `meshgrid.variadic_tensors`, `min.binary`,
+`min.reduction_no_dim`, `min.reduction_with_dim`, `minimum`, `mm`, `movedim`,
+`mul`, `mv`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
 `native_dropout_backward`, `native_group_norm`, `native_layer_norm`, `ne`,
 `neg`, `new_full`, `new_ones`, `new_zeros`,
 `nn.functional.adaptive_avg_pool1d`, `nn.functional.adaptive_avg_pool2d`,
-`nn.functional.adaptive_max_pool3d`, `nn.functional.binary_cross_entropy`,
+`nn.functional.adaptive_avg_pool3d`, `nn.functional.adaptive_max_pool1d`,
+`nn.functional.adaptive_max_pool2d`, `nn.functional.adaptive_max_pool3d`,
+`nn.functional.avg_pool1d`, `nn.functional.avg_pool2d`,
+`nn.functional.avg_pool3d`, `nn.functional.bilinear`,
+`nn.functional.binary_cross_entropy`,
 `nn.functional.binary_cross_entropy_with_logits`, `nn.functional.celu`,
-`nn.functional.channel_shuffle`, `nn.functional.cosine_embedding_loss`,
+`nn.functional.channel_shuffle`, `nn.functional.conv1d`,
+`nn.functional.conv2d`, `nn.functional.conv3d`,
+`nn.functional.conv_transpose1d`, `nn.functional.conv_transpose2d`,
+`nn.functional.conv_transpose3d`, `nn.functional.cosine_embedding_loss`,
 `nn.functional.cosine_similarity`, `nn.functional.cross_entropy`,
 `nn.functional.elu`, `nn.functional.embedding`, `nn.functional.gelu`,
 `nn.functional.glu`, `nn.functional.group_norm`, `nn.functional.hardshrink`,
@@ -58,35 +70,38 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `nn.functional.interpolate.trilinear`, `nn.functional.kl_div`,
 `nn.functional.l1_loss`, `nn.functional.layer_norm`,
 `nn.functional.leaky_relu`, `nn.functional.linear`,
-`nn.functional.linear_cross_entropy`, `nn.functional.logsigmoid`,
-`nn.functional.margin_ranking_loss`, `nn.functional.max_pool3d`,
-`nn.functional.mish`, `nn.functional.mse_loss`,
+`nn.functional.linear_cross_entropy`, `nn.functional.local_response_norm`,
+`nn.functional.logsigmoid`, `nn.functional.margin_ranking_loss`,
+`nn.functional.max_pool1d`, `nn.functional.max_pool2d`,
+`nn.functional.max_pool3d`, `nn.functional.mish`, `nn.functional.mse_loss`,
 `nn.functional.multi_margin_loss`, `nn.functional.multilabel_margin_loss`,
 `nn.functional.multilabel_soft_margin_loss`, `nn.functional.nll_loss`,
 `nn.functional.normalize`, `nn.functional.pad.circular`,
 `nn.functional.pad.constant`, `nn.functional.pad.reflect`,
 `nn.functional.pad.replicate`, `nn.functional.pad.replicate_negative`,
-`nn.functional.pairwise_distance`, `nn.functional.pixel_shuffle`,
-`nn.functional.pixel_unshuffle`, `nn.functional.poisson_nll_loss`,
-`nn.functional.prelu`, `nn.functional.relu`, `nn.functional.relu6`,
-`nn.functional.rms_norm`, `nn.functional.selu`, `nn.functional.silu`,
-`nn.functional.smooth_l1_loss`, `nn.functional.soft_margin_loss`,
-`nn.functional.softmin`, `nn.functional.softmin.with_dtype`,
-`nn.functional.softplus`, `nn.functional.softshrink`, `nn.functional.softsign`,
+`nn.functional.pairwise_distance`, `nn.functional.pdist`,
+`nn.functional.pixel_shuffle`, `nn.functional.pixel_unshuffle`,
+`nn.functional.poisson_nll_loss`, `nn.functional.prelu`, `nn.functional.relu`,
+`nn.functional.relu6`, `nn.functional.rms_norm`, `nn.functional.selu`,
+`nn.functional.silu`, `nn.functional.smooth_l1_loss`,
+`nn.functional.soft_margin_loss`, `nn.functional.softmin`,
+`nn.functional.softmin.with_dtype`, `nn.functional.softplus`,
+`nn.functional.softshrink`, `nn.functional.softsign`,
 `nn.functional.tanhshrink`, `nn.functional.threshold`,
 `nn.functional.triplet_margin_loss`,
 `nn.functional.triplet_margin_with_distance_loss`, `nn.functional.unfold`,
 `nn.functional.upsample_bilinear`, `nn.functional.upsample_nearest`, `norm`,
 `norm.fro`, `norm.inf`, `ones_like`, `outer`, `permute`, `permute_copy`,
-`positive`, `prod`, `rad2deg`, `ravel`, `reciprocal`, `remainder`, `renorm`,
-`repeat`, `reshape`, `reshape_as`, `resolve_conj`, `resolve_neg`, `roll`,
-`rot90`, `round`, `rsqrt`, `rsub`, `searchsorted`, `select`, `select_scatter`,
-`sgn`, `sigmoid`, `sign`, `signbit`, `sin`, `sinc`, `slice`, `softmax`,
-`softmax.with_dtype`, `split`, `split.list_args`, `split_with_sizes`,
-`split_with_sizes_copy`, `sqrt`, `square`, `squeeze`, `squeeze.multiple`,
-`squeeze_copy`, `stack`, `std`, `std.unbiased`, `std_mean`,
+`positive`, `pow`, `prod`, `rad2deg`, `ravel`, `real`, `reciprocal`,
+`remainder`, `renorm`, `repeat`, `reshape`, `reshape_as`, `resolve_conj`,
+`resolve_neg`, `roll`, `rot90`, `round`, `round.decimals_0`,
+`round.decimals_3`, `round.decimals_neg_3`, `rsqrt`, `rsub`, `searchsorted`,
+`select`, `select_scatter`, `sgn`, `sigmoid`, `sign`, `signbit`, `sin`, `sinc`,
+`sinh`, `slice`, `softmax`, `softmax.with_dtype`, `split`, `split.list_args`,
+`split_with_sizes`, `split_with_sizes_copy`, `sqrt`, `square`, `squeeze`,
+`squeeze.multiple`, `squeeze_copy`, `stack`, `std`, `std.unbiased`, `std_mean`,
 `std_mean.unbiased`, `sub`, `sum`, `sum_to_size`, `t`, `t_copy`,
-`take_along_dim`, `tanh`, `tensordot`, `tile`, `topk`,
+`take_along_dim`, `tan`, `tanh`, `tensordot`, `tile`, `topk`,
 `torch.ops.aten._safe_softmax.default`, `trace`, `transpose`, `transpose_copy`,
 `trapezoid`, `trapz`, `tril`, `triu`, `true_divide`, `trunc`, `unbind`,
 `unbind_copy`, `unflatten`, `unfold`, `unfold_copy`, `unsafe_chunk`,
@@ -94,84 +109,45 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `var_mean`, `var_mean.unbiased`, `vdot`, `view`, `view_as`, `view_copy`,
 `vsplit`, `vstack`, `where`, `xlogy`, `zero_`, `zeros_like`
 
-## Some samples pass (35)
+## Some samples pass (12)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
-| `acos` | 1/3 | no kernel for `aten.acos.default` |
-| `acosh` | 1/3 | no kernel for `aten.acosh.default` |
-| `cosh` | 1/3 | no kernel for `aten.cosh.default` |
 | `digamma` | 1/3 | no kernel for `aten.digamma.default` |
-| `dist` | 2/4 | `aten.pow.Tensor_Scalar`: Only integer exponents from -4 to 4 and exponents of 0.5 and -0.5 are exact for arbitrary Scratch inputs |
-| `erfc` | 1/3 | no kernel for `aten.erfc.default` |
-| `exp2` | 1/3 | no kernel for `aten.exp2.default` |
-| `fill` | 1/3 | no kernel for `aten.fill.Scalar` |
-| `isfinite` | 1/3 | no kernel for `aten.isfinite.default` |
 | `isin` | 1/2 | no kernel for `aten.sort.default` |
 | `lgamma` | 1/3 | no kernel for `aten.lgamma.default` |
 | `linspace.tensor_overload` | 2/3 | no kernel for `aten.copy.default` |
-| `log2` | 1/3 | no kernel for `aten.log2.default` |
-| `logspace.tensor_overload` | 1/3 | tracing failed (RuntimeError: aten::pow() Expected a value of type 'Tensor' for argument 'self' but instead found type 'float'. |
 | `narrow` | 2/4 | passes only with constant integer arguments |
 | `native_batch_norm` | 1/4 | no kernel for `aten.copy_.default` |
-| `nn.functional.adaptive_avg_pool3d` | 1/4 | no kernel for `aten._adaptive_avg_pool3d.default` |
-| `nn.functional.avg_pool1d` | 2/4 | `aten.avg_pool1d.default`: Average pooling requires ceil_mode=False, count_include_pad=True, and no divisor_override |
 | `nn.functional.batch_norm` | 2/4 | no kernel for `aten.copy_.default` |
-| `nn.functional.bilinear` | 1/4 | no kernel for `aten._trilinear.default` |
-| `nn.functional.conv1d` | 1/4 | `aten.conv1d.default`: Unbatched convolution is not supported |
-| `nn.functional.conv2d` | 1/4 | `aten.conv2d.default`: Unbatched convolution is not supported |
 | `nn.functional.linear_cross_entropy.chunked` | 1/4 | no kernel for `torch_nn._linear_cross_entropy_batch_chunked.default` |
 | `nn.functional.linear_cross_entropy.chunked_none` | 1/4 | no kernel for `torch_nn._linear_cross_entropy_batch_chunked_no_reduction.default` |
-| `nn.functional.local_response_norm` | 3/4 | `aten.pow.Tensor_Scalar`: Only integer exponents from -4 to 4 and exponents of 0.5 and -0.5 are exact for arbitrary Scratch inputs |
-| `nn.functional.max_pool1d` | 2/4 | `aten.max_pool1d.default`: Max pooling dilation must be 1 and ceil_mode must be False |
-| `nn.functional.max_pool2d` | 2/4 | `aten.max_pool2d.default`: Max pooling dilation must be 1 and ceil_mode must be False |
-| `nn.functional.pdist` | 2/4 | no kernel for `aten._pdist_forward.default` |
 | `nn.functional.scaled_dot_product_attention` | 2/4 | tracing failed (RuntimeError: cattorch SDPA decomposition requires dropout_p=0) |
-| `real` | 1/3 | no kernel for `aten.real.default` |
 | `repeat_interleave` | 3/4 | passes only with constant integer arguments |
-| `round.decimals_0` | 1/3 | no kernel for `aten.round.decimals` |
-| `round.decimals_3` | 1/3 | no kernel for `aten.round.decimals` |
-| `round.decimals_neg_3` | 1/3 | no kernel for `aten.round.decimals` |
 | `scatter` | 2/4 | no kernel for `aten.scatter.reduce` |
 
-## No sample passes (104)
+## No sample passes (72)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
-| `__rpow__` | 0/4 | no kernel for `aten.pow.Tensor_Tensor` |
 | `_batch_norm_with_update` | 0/4 | no kernel for `aten.copy_.default` |
 | `_upsample_bilinear2d_aa` | 0/4 | no kernel for `aten._upsample_bilinear2d_aa.default` |
-| `addbmm` | 0/4 | no kernel for `aten.addbmm.default` |
-| `angle` | 0/1 | no kernel for `aten.angle.default` |
 | `argsort` | 0/3 | no kernel for `aten.sort.default` |
 | `as_strided_scatter` | 0/4 | no kernel for `aten.as_strided_scatter.default` |
-| `asin` | 0/1 | no kernel for `aten.asin.default` |
-| `asinh` | 0/1 | no kernel for `aten.asinh.default` |
-| `atan` | 0/1 | no kernel for `aten.atan.default` |
-| `atan2` | 0/4 | no kernel for `aten.atan2.default` |
-| `atanh` | 0/1 | no kernel for `aten.atanh.default` |
 | `bucketize` | 0/4 | needs an input's value at export (`aten.item.default`) |
 | `cauchy` | 0/3 | no kernel for `aten.rand_like.default` |
-| `cdist` | 0/4 | no kernel for `aten._cdist_forward.default` |
-| `conj_physical` | 0/1 | no kernel for `aten.conj_physical.default` |
-| `copysign` | 0/4 | no kernel for `prims.signbit.default` |
 | `corrcoef` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `cov` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `cummax` | 0/3 | no kernel for `aten.cummax.default` |
 | `cummin` | 0/3 | no kernel for `aten.cummin.default` |
-| `cumprod` | 0/4 | no kernel for `prims.prod.default` |
 | `diagonal_scatter` | 0/4 | no kernel for `prims.copy_to.default` |
 | `erfinv` | 0/1 | no kernel for `prims.erf_inv.default` |
 | `exponential` | 0/3 | no kernel for `aten.rand_like.default` |
-| `float_power` | 0/4 | no kernel for `aten.pow.Tensor_Tensor` |
-| `fmax` | 0/4 | no kernel for `aten.fmax.default` |
-| `fmin` | 0/4 | no kernel for `aten.fmin.default` |
 | `frexp` | 0/3 | no kernel for `aten.frexp.Tensor` |
 | `geometric` | 0/3 | no kernel for `aten.rand_like.default` |
 | `grid_sampler_2d` | 0/4 | `aten.index.Tensor`: only the first argument can vary at runtime |
 | `grid_sampler_3d` | 0/1 | no kernel for `aten.grid_sampler_3d.default` |
 | `hash_tensor` | 0/4 | no kernel for `aten.hash_tensor.default` |
-| `hypot` | 0/4 | no kernel for `aten.hypot.default` |
 | `i0` | 0/2 | no kernel for `prims.bessel_i0.default` |
 | `igamma` | 0/4 | no kernel for `aten.igamma.default` |
 | `igammac` | 0/4 | no kernel for `aten.igammac.default` |
@@ -185,12 +161,7 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `index_reduce.prod` | 0/4 | no kernel for `aten.index_reduce.default` |
 | `index_select` | 0/3 | passes only with constant integer arguments |
 | `kthvalue` | 0/4 | no kernel for `aten.kthvalue.default` |
-| `ldexp` | 0/4 | no kernel for `aten.pow.Tensor_Tensor` |
 | `log_normal` | 0/3 | no kernel for `aten.randn_like.default` |
-| `logaddexp` | 0/4 | no kernel for `aten.real.default` |
-| `logaddexp2` | 0/1 | no kernel for `aten.exp2.default` |
-| `logcumsumexp` | 0/4 | no kernel for `aten.logcumsumexp.default` |
-| `logsumexp` | 0/4 | no kernel for `aten.real.default` |
 | `masked_scatter` | 0/4 | no kernel for `aten.masked_scatter.default` |
 | `max_pool2d_with_indices_backward` | 0/4 | no kernel for `aten.scatter_add.default` |
 | `median` | 0/4 | no kernel for `aten.median.default` |
@@ -202,14 +173,6 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `nanmedian` | 0/4 | no kernel for `aten.nanmedian.default` |
 | `nanquantile` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `nextafter` | 0/4 | no kernel for `aten.nextafter.default` |
-| `nn.functional.adaptive_max_pool1d` | 0/4 | no kernel for `aten.adaptive_max_pool2d.default` |
-| `nn.functional.adaptive_max_pool2d` | 0/4 | no kernel for `aten.adaptive_max_pool2d.default` |
-| `nn.functional.avg_pool2d` | 0/4 | `aten.avg_pool2d.default`: Average pooling requires ceil_mode=False, count_include_pad=True, and no divisor_override |
-| `nn.functional.avg_pool3d` | 0/4 | no kernel for `aten.avg_pool3d.default` |
-| `nn.functional.conv3d` | 0/4 | no kernel for `aten.convolution.default` |
-| `nn.functional.conv_transpose1d` | 0/4 | no kernel for `aten.convolution.default` |
-| `nn.functional.conv_transpose2d` | 0/4 | no kernel for `aten.convolution.default` |
-| `nn.functional.conv_transpose3d` | 0/4 | no kernel for `aten.convolution.default` |
 | `nn.functional.fractional_max_pool2d` | 0/4 | no kernel for `aten.rand.default` |
 | `nn.functional.fractional_max_pool3d` | 0/4 | no kernel for `aten.rand.default` |
 | `nn.functional.gaussian_nll_loss` | 0/4 | needs an input's value at export (`aten.item.default`) |
@@ -227,7 +190,6 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `polygamma.polygamma_n_2` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_3` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_4` | 0/4 | no kernel for `aten.polygamma.default` |
-| `pow` | 0/4 | no kernel for `aten.pow.Tensor_Tensor` |
 | `put` | 0/4 | no kernel for `aten.put.default` |
 | `quantile` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `scatter_add` | 0/4 | no kernel for `aten.scatter_add.default` |
@@ -236,9 +198,7 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `scatter_reduce.mean` | 0/4 | no kernel for `aten.scatter_reduce.two` |
 | `scatter_reduce.prod` | 0/4 | no kernel for `aten.scatter_reduce.two` |
 | `scatter_reduce.sum` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `sinh` | 0/1 | no kernel for `aten.sinh.default` |
 | `sort` | 0/3 | no kernel for `aten.sort.default` |
 | `stft` | 0/1 | no kernel for `aten._fft_r2c.default` |
 | `take` | 0/4 | passes only with constant integer arguments |
-| `tan` | 0/1 | no kernel for `aten.tan.default` |
 | `tensor_split` | 0/4 | passes only with constant integer arguments |

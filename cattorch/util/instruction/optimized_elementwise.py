@@ -274,14 +274,44 @@ class OptimizedElementwiseInstruction(Instruction):
                     result = mul(result, cached)
                 if exponent < 0:
                     result = div(1, result)
+            elif float(exponent).is_integer():
+                # |x| ^ n, negated for a negative base and an odd exponent.
+                setup = (set_var("value", direct),)
+                magnitude = mathop("e ^", mul(exponent, mathop("ln", mathop("abs", cached))))
+                if int(exponent) % 2:
+                    output = if_else(
+                        lt(cached, 0),
+                        (append(self.output_list, mul(-1, magnitude)),),
+                        (append(self.output_list, magnitude),),
+                    )
+                    result = None
+                else:
+                    result = magnitude
             else:
+                # A negative base gives NaN through ln, as in PyTorch.
                 result = mathop("e ^", mul(exponent, mathop("ln", direct)))
         elif self.op in self._MATHOP:
             result = mathop(self._MATHOP[self.op], direct)
-        elif self.op in {"aten.sin.default", "aten.cos.default"}:
+        elif self.op in {"aten.sin.default", "aten.cos.default", "aten.tan.default"}:
             # Scratch's trigonometry takes degrees.
-            name = "sin" if self.op == "aten.sin.default" else "cos"
+            name = self.op.split(".")[1]
             result = mathop(name, mul(direct, 57.29577951308232))
+        elif self.op in {"aten.asin.default", "aten.acos.default", "aten.atan.default"}:
+            # ... and returns them.
+            name = self.op.split(".")[1]
+            result = mul(mathop(name, direct), 0.017453292519943295)
+        elif self.op == "aten.exp2.default":
+            result = mathop("e ^", mul(direct, 0.6931471805599453))
+        elif self.op == "aten.log2.default":
+            result = mul(mathop("ln", direct), 1.4426950408889634)
+        elif self.op == "aten.erfc.default":
+            setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
+            output = if_else(
+                lt(cached, 0),
+                (append(self.output_list, sub(2, var("inner"))),),
+                (append(self.output_list, var("inner")),),
+            )
+            result = None
         elif self.op == "aten.reciprocal.default":
             result = div(1, direct)
         elif self.op == "aten.erf.default":

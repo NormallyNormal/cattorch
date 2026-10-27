@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch import UnsupportedOperationError, transpile, verify
+from cattorch import transpile, verify
 from cattorch.analysis import analyze
 from cattorch.program import EntryPoint, ExportProgram, Input, Output
 
@@ -80,8 +80,26 @@ def test_pointwise_decompositions_match(tmp_path, operation):
     assert verify(model, inputs, transpile(model, inputs, tmp_path / "pointwise")).passed
 
 
-def test_a_decomposition_cycle_names_the_operation(tmp_path):
-    """``aten.pow.Tensor_Tensor`` decomposes to a primitive mapped back to it."""
+def test_a_decomposition_cycle_keeps_the_operation():
+    """``aten.sign`` decomposed to ``prims.sign``, which mapped back to it.
+
+    The guard makes the inner call keep the operation, so lowering can name
+    it instead of the trace recursing.
+    """
+    from cattorch.frontend import _without_cycles
+
+    calls = []
+
+    def decomposition(value):
+        calls.append(value)
+        return guarded(value)
+
+    guarded = _without_cycles(torch.ops.aten.sign.default, decomposition)
+    assert guarded(1) is NotImplemented
+    assert calls == [1]
+
+
+def test_tensor_exponents_match(tmp_path):
     model = type("Model", (nn.Module,), {"forward": lambda self, x, y: x ** y})().eval()
-    with pytest.raises(UnsupportedOperationError, match="aten.pow.Tensor_Tensor"):
-        transpile(model, (torch.rand(3) + 1, torch.rand(3)), tmp_path / "pow")
+    inputs = (torch.tensor([-2.0, -2.0, 0.0, 0.0, 3.0, -1.5]), torch.tensor([3.0, 2.0, 0.0, 2.0, 0.5, 0.5]))
+    assert verify(model, inputs, transpile(model, inputs, tmp_path / "pow")).passed

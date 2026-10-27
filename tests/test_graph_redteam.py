@@ -153,11 +153,6 @@ def test_linear_division_by_zero_falls_back_from_epilogue(tmp_path):
             (torch.randn(2, 3), torch.randn(2, 3)),
             "alpha=2",
         ),
-        (
-            FunctionModel(lambda value: torch.pow(value, 1.5)),
-            (torch.randn(2, 3),),
-            "integer exponents",
-        ),
     ],
 )
 def test_unsupported_semantic_variants_are_rejected(
@@ -178,12 +173,18 @@ def test_unsupported_semantic_variants_are_rejected(
         nn.AvgPool2d(2, divisor_override=7).eval(),
     ],
 )
-def test_unimplemented_convolution_and_pooling_options_are_rejected(
-    tmp_path, model,
-):
+def test_convolution_and_pooling_options_match(tmp_path, model):
     channels = 4 if isinstance(model, nn.Conv2d) and model.groups == 2 else 2
-    with pytest.raises(UnsupportedOperationError):
-        transpile(model, torch.randn(1, channels, 8, 8), tmp_path / "options")
+    value = torch.randn(1, channels, 8, 8)
+    result = transpile(model, value, tmp_path / "options")
+    assert verify(model, value, result, atol=1e-5).passed
+
+
+def test_fractional_powers_match(tmp_path):
+    """Negative bases give NaN, as in PyTorch."""
+    model = FunctionModel(lambda value: torch.pow(value, 1.5) + value ** 7)
+    value = torch.randn(2, 3)
+    assert verify(model, value, transpile(model, value, tmp_path / "power")).passed
 
 
 def test_batchnorm_without_running_statistics_uses_batch_statistics(tmp_path):

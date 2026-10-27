@@ -279,6 +279,8 @@ ELEMENTWISE_OPS = frozenset({
     "aten.maximum.default", "aten.minimum.default",
     "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
     "aten.where.Scalar", "aten.sin.default", "aten.cos.default",
+    "aten.tan.default", "aten.asin.default", "aten.acos.default", "aten.atan.default",
+    "aten.exp2.default", "aten.log2.default", "aten.erfc.default",
 })
 
 # Pure data-movement operations. The transpiler describes each call as a
@@ -325,18 +327,6 @@ def _mean_kernel(torch_name, output, *args):
     return ReductionInstruction(torch_name, output, *args)
 
 
-def _validate_power(node, _config, _fast) -> str | None:
-    exponent = node.args[1]
-    if exponent in {0.5, -0.5} or (
-        float(exponent).is_integer() and abs(exponent) <= 4
-    ):
-        return None
-    return (
-        "Only integer exponents from -4 to 4 and exponents of 0.5 and -0.5 "
-        "are exact for arbitrary Scratch inputs"
-    )
-
-
 def _validate_bitwise_not(node, _config, _fast) -> str | None:
     value = node.args[0].meta.get("val") if hasattr(node.args[0], "meta") else None
     if value is not None and value.dtype == torch.bool:
@@ -352,12 +342,12 @@ def _validate_clamp(node, _config, _fast) -> str | None:
 
 def _validate_convolution(node, _config, _fast) -> str | None:
     dimensions = 1 if str(node.target) == "aten.conv1d.default" else 2
-    if len(_shape(node.args[0])) != dimensions + 2:
-        return "Unbatched convolution is not supported"
-    dilation = node.args[5] if len(node.args) > 5 else [1] * dimensions
-    groups = node.args[6] if len(node.args) > 6 else 1
-    if any(value != 1 for value in dilation) or groups != 1:
-        return "Convolution dilation must be 1 and groups must be 1"
+    # Unbatched inputs have the same layout as a batch of one.
+    if len(_shape(node.args[0])) not in {dimensions + 1, dimensions + 2}:
+        return f"Convolution needs a {dimensions + 1}D or {dimensions + 2}D input"
+    padding = node.args[4] if len(node.args) > 4 else [0]
+    if isinstance(padding, str):
+        return f"padding={padding!r} should have been made explicit"
     return None
 
 
@@ -370,13 +360,7 @@ def _validate_pool_rank(node, dimensions) -> str | None:
 
 def _validate_max_pool(node, _config, _fast) -> str | None:
     dimensions = 1 if str(node.target) == "aten.max_pool1d.default" else 2
-    if (error := _validate_pool_rank(node, dimensions)) is not None:
-        return error
-    dilation = node.args[4] if len(node.args) > 4 else [1] * dimensions
-    ceil_mode = node.args[5] if len(node.args) > 5 else False
-    if any(value != 1 for value in dilation) or ceil_mode:
-        return "Max pooling dilation must be 1 and ceil_mode must be False"
-    return None
+    return _validate_pool_rank(node, dimensions)
 
 
 def _validate_adaptive_pool(node, _config, _fast) -> str | None:
@@ -385,17 +369,7 @@ def _validate_adaptive_pool(node, _config, _fast) -> str | None:
 
 def _validate_avg_pool(node, _config, _fast) -> str | None:
     dimensions = 1 if str(node.target) == "aten.avg_pool1d.default" else 2
-    if (error := _validate_pool_rank(node, dimensions)) is not None:
-        return error
-    ceil_mode = node.args[4] if len(node.args) > 4 else False
-    count_include_pad = node.args[5] if len(node.args) > 5 else True
-    divisor_override = node.args[6] if len(node.args) > 6 else None
-    if ceil_mode or not count_include_pad or divisor_override is not None:
-        return (
-            "Average pooling requires ceil_mode=False, count_include_pad=True, "
-            "and no divisor_override"
-        )
-    return None
+    return _validate_pool_rank(node, dimensions)
 
 
 def _validate_batch_norm(node, _config, _fast) -> str | None:
@@ -597,7 +571,6 @@ def _build_default_registry() -> OperatorRegistry:
         "aten.sub.Tensor": _validate_add_sub,
         "aten.clamp.default": _validate_clamp,
         "aten.bitwise_not.default": _validate_bitwise_not,
-        "aten.pow.Tensor_Scalar": _validate_power,
         "aten.conv1d.default": _validate_convolution,
         "aten.conv2d.default": _validate_convolution,
         "aten.max_pool1d.default": _validate_max_pool,

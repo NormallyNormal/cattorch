@@ -23,6 +23,7 @@ from torch.export import export
 from torch.utils._pytree import tree_flatten
 from torch._decomp import core_aten_decompositions, get_decompositions
 
+from cattorch.decompositions import POINTWISE_DECOMPOSITIONS
 from cattorch.errors import UnsupportedModelError
 
 
@@ -260,6 +261,12 @@ def _prims_broadcast_in_dim(value, shape, broadcast_dimensions):
     )
 
 
+def _prims_prod(value, dims, *, output_dtype=None):
+    for dim in sorted((dim % value.ndim for dim in dims), reverse=True):
+        value = torch.ops.aten.prod.dim_int(value, dim)
+    return value
+
+
 # Some PyTorch decompositions are written against primitives. Map the ones
 # that reach models back to ATen operations cattorch lowers.
 _PRIMITIVE_DECOMPOSITIONS = {
@@ -274,111 +281,12 @@ _PRIMITIVE_DECOMPOSITIONS = {
     "expm1": lambda value: torch.ops.aten.sub.Tensor(
         torch.ops.aten.exp.default(value), 1,
     ),
+    "signbit": lambda value: torch.ops.aten.lt.Scalar(value, 0),
+    "prod": _prims_prod,
 }
 
 
 _aten = torch.ops.aten
-
-
-def _sign(value):
-    positive = _aten.gt.Scalar(value, 0)
-    negative = _aten.lt.Scalar(value, 0)
-    result = _aten.where.ScalarSelf(positive, 1, _aten.where.ScalarSelf(
-        negative, -1, _aten.zeros_like.default(value),
-    ))
-    return _aten.to.dtype(result, value.dtype)
-
-
-def _trunc(value):
-    if not value.is_floating_point():
-        return value
-    return _aten.where.self(
-        _aten.lt.Scalar(value, 0), _aten.ceil.default(value), _aten.floor.default(value),
-    )
-
-
-def _round(value):
-    """Round half to even, as PyTorch does; Scratch's round goes half up."""
-    if not value.is_floating_point():
-        return value
-    floor = _aten.floor.default(value)
-    fraction = _aten.sub.Tensor(value, floor)
-    # 1 when ``floor`` is odd, so ``floor + odd`` is the even neighbour.
-    odd = _aten.sub.Tensor(floor, _aten.mul.Tensor(
-        _aten.floor.default(_aten.mul.Tensor(floor, 0.5)), 2,
-    ))
-    up = _aten.add.Tensor(floor, 1)
-    return _aten.where.self(
-        _aten.gt.Scalar(fraction, 0.5), up,
-        _aten.where.self(
-            _aten.lt.Scalar(fraction, 0.5), floor, _aten.add.Tensor(floor, odd),
-        ),
-    )
-
-
-def _divide(left, right, rounding_mode=None):
-    quotient = _aten.div.Tensor(left, right)
-    if rounding_mode == "floor":
-        quotient = _aten.floor.default(quotient)
-    elif rounding_mode == "trunc":
-        quotient = _trunc(quotient)
-    elif rounding_mode is not None:
-        return NotImplemented
-    dtype = torch.result_type(left, right)
-    if rounding_mode is not None and not dtype.is_floating_point:
-        quotient = _aten.to.dtype(quotient, dtype)
-    return quotient
-
-
-def _remainder(left, right):
-    """Python's ``%``: the result takes the divisor's sign."""
-    quotient = _divide(left, right, "floor")
-    return _aten.sub.Tensor(left, _aten.mul.Tensor(quotient, right))
-
-
-def _fmod(left, right):
-    """C's ``fmod``: the result takes the dividend's sign."""
-    quotient = _divide(left, right, "trunc")
-    return _aten.sub.Tensor(left, _aten.mul.Tensor(quotient, right))
-
-
-def _boolean(operation):
-    """``&``, ``|`` and ``^`` on boolean masks; integer bitwise stays unsupported."""
-    def decomposition(left, right):
-        boolean = (
-            isinstance(left, torch.Tensor) and left.dtype == torch.bool
-            and (not isinstance(right, torch.Tensor) or right.dtype == torch.bool)
-            and (isinstance(right, torch.Tensor) or isinstance(right, bool))
-        )
-        if not boolean:
-            return NotImplemented
-        if not isinstance(right, torch.Tensor):
-            right = _aten.full_like.default(left, right)
-        if operation == "and":
-            return _aten.logical_and.default(left, right)
-        if operation == "or":
-            return _aten.logical_or.default(left, right)
-        return _aten.ne.Tensor(left, right)
-    return decomposition
-
-
-def _logical(operation):
-    def decomposition(left, right):
-        left = _aten.ne.Scalar(left, 0)
-        right = _aten.ne.Scalar(right, 0)
-        if operation == "and":
-            return _aten.where.self(left, right, _aten.zeros_like.default(left))
-        if operation == "or":
-            return _aten.where.self(left, _aten.ones_like.default(left), right)
-        return _aten.ne.Tensor(left, right)
-    return decomposition
-
-
-def _full_like(value, fill, *, dtype=None, layout=None, device=None,
-               pin_memory=None, memory_format=None):
-    return _aten.full.default(
-        list(value.shape), fill, dtype=dtype or value.dtype, device=value.device,
-    )
 
 
 def _addmm(bias, left, right, *, beta=1, alpha=1):
@@ -397,33 +305,7 @@ def _addmm(bias, left, right, *, beta=1, alpha=1):
 
 # Pointwise operations whose PyTorch decompositions end in primitives
 # cattorch can't lower, written with ones it can.
-_POINTWISE_DECOMPOSITIONS = {
-    _aten.sign.default: _sign,
-    _aten.sgn.default: _sign,
-    _aten.signbit.default: lambda value: _aten.lt.Scalar(value, 0),
-    _aten.trunc.default: _trunc,
-    _aten.fix.default: _trunc,
-    _aten.round.default: _round,
-    _aten.div.Tensor_mode: _divide,
-    _aten.div.Scalar_mode: _divide,
-    _aten.floor_divide.default: lambda left, right: _divide(left, right, "floor"),
-    _aten.floor_divide.Scalar: lambda left, right: _divide(left, right, "floor"),
-    _aten.remainder.Tensor: _remainder,
-    _aten.remainder.Scalar: _remainder,
-    _aten.fmod.Tensor: _fmod,
-    _aten.fmod.Scalar: _fmod,
-    _aten.bitwise_and.Tensor: _boolean("and"),
-    _aten.bitwise_and.Scalar: _boolean("and"),
-    _aten.bitwise_or.Tensor: _boolean("or"),
-    _aten.bitwise_or.Scalar: _boolean("or"),
-    _aten.bitwise_xor.Tensor: _boolean("xor"),
-    _aten.bitwise_xor.Scalar: _boolean("xor"),
-    _aten.logical_and.default: _logical("and"),
-    _aten.logical_or.default: _logical("or"),
-    _aten.logical_xor.default: _logical("xor"),
-    _aten.full_like.default: _full_like,
-    _aten.addmm.default: _addmm,
-}
+_POINTWISE_DECOMPOSITIONS = {**POINTWISE_DECOMPOSITIONS, _aten.addmm.default: _addmm}
 
 
 def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
@@ -951,6 +833,9 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
 
     _erase_mode_switches(graph_module.graph)
     _replace_intermediate_copies(graph_module.graph)
+    # Unused results, such as pooling indices nobody reads, would otherwise
+    # still run in Scratch. Mutations are kept.
+    graph_module.graph.eliminate_dead_code()
     graph_module.recompile()
 
     nodes = list(graph_module.graph.nodes)

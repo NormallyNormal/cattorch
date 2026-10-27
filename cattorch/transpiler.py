@@ -485,7 +485,8 @@ class _Compiler:
                     raise _unsupported_operation(
                         node, "only the first argument can vary at runtime",
                     )
-                return tensor
+                # Aliases are views such as reshapes; keep this value's shape.
+                return tensor.reshape(_get_shape(value))
             if isinstance(value, (list, tuple)):
                 return type(value)(static(entry) for entry in value)
             return value

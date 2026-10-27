@@ -14,13 +14,13 @@ For persistent state and bounded variable-length tensors, use an experimental
 
 | Category | Operations |
 |---|---|
-| Convolution | Batched `nn.Conv1d`, `nn.Conv2d`, with optional bias, stride, and padding; dilation and groups must be 1 |
-| Pooling | Batched `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool1d/2d`, `nn.AdaptiveMaxPool1d/2d`; non-default dilation, ceiling, padding-count, and divisor options are rejected |
+| Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
+| Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
 | Linear algebra | `nn.Linear`, `@`, `torch.matmul`; two batched operands must have identical batch dimensions |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
 | Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
-| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`; unary `-`; `exp`, `log`, `log10`, `sqrt`, `rsqrt`, `abs`, `floor`, `ceil`, `reciprocal`, `erf`, `sin`, `cos`; `clamp`; `torch.pow` with an integer exponent from -4 to 4 or ±0.5 |
+| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
 | Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `cumsum`, over any dimensions; `torch.topk` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
