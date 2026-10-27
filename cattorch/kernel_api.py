@@ -61,6 +61,10 @@ class TensorInfo:
     shape: tuple[int, ...]
     dtype: torch.dtype | None = None
     static: bool = False
+    #: The axis holding a runtime number of items (see ``transpile(dynamic=)``),
+    #: or ``None``. ``shape`` is then the traced shape, and the list's length
+    #: gives the actual one.
+    dynamic_axis: int | None = None
 
     @property
     def numel(self) -> int:
@@ -149,6 +153,7 @@ class KernelContext:
                     tuple(argument.shape),
                     argument.dtype,
                     argument.static,
+                    getattr(argument, "dynamic_axis", None),
                 )
                 scalars.pop(name, None)
             else:

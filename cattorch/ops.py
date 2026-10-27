@@ -80,6 +80,79 @@ def _topk_indices(
     return order.narrow(dim, 0, k)
 
 
+@op(
+    name="cattorch::recurrent_scan",
+    fake=lambda gates, state, weight, bias, projection, kind, reverse: gates.new_empty(
+        (gates.shape[0], *state.shape),
+    ),
+)
+def _recurrent_scan(
+    gates: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    projection: torch.Tensor | None,
+    kind: str,
+    reverse: bool,
+) -> torch.Tensor:
+    """One recurrent layer in one direction, stepped through time.
+
+    ``gates`` is the input projection for every step, ``[T, B, G * H]``, and
+    ``weight`` and ``bias`` are the hidden-to-hidden ``[G * H, P]`` and
+    ``[G * H]``. ``kind`` is ``gru``, ``lstm``, ``rnn_tanh`` or ``rnn_relu``.
+    The state is ``[B, P]``, or ``[B, P + H]`` for an LSTM (hidden, then cell),
+    where ``P`` is the LSTM ``projection``'s row count or ``H``. Returns the
+    state after every step, ``[T, B, width of state]``, in time order even
+    when ``reverse`` steps from the last input to the first. The capture frontend
+    turns ``nn.GRU``, ``nn.LSTM`` and ``nn.RNN`` into this, so Scratch loops
+    over time instead of repeating the cell once per step.
+    """
+    hidden = weight.shape[0] // {"gru": 3, "lstm": 4}.get(kind, 1)
+    width = state.shape[-1] - hidden if kind == "lstm" else state.shape[-1]
+    current = state
+    steps = []
+    for step in (gates.flip(0) if reverse else gates):
+        previous = current[..., :width]
+        recurrent = torch.nn.functional.linear(previous, weight, bias)
+        if kind == "gru":
+            reset, update, new = step.chunk(3, -1)
+            hidden_reset, hidden_update, hidden_new = recurrent.chunk(3, -1)
+            reset = torch.sigmoid(reset + hidden_reset)
+            update = torch.sigmoid(update + hidden_update)
+            new = torch.tanh(new + reset * hidden_new)
+            current = (1 - update) * new + update * previous
+        elif kind == "lstm":
+            input_gate, forget, cell_gate, output = (step + recurrent).chunk(4, -1)
+            cell = (
+                torch.sigmoid(forget) * current[..., width:]
+                + torch.sigmoid(input_gate) * torch.tanh(cell_gate)
+            )
+            hidden_state = torch.sigmoid(output) * torch.tanh(cell)
+            if projection is not None:
+                hidden_state = torch.nn.functional.linear(hidden_state, projection)
+            current = torch.cat((hidden_state, cell), -1)
+        elif kind == "rnn_tanh":
+            current = torch.tanh(step + recurrent)
+        else:
+            current = torch.relu(step + recurrent)
+        steps.append(current)
+    steps = torch.stack(steps)
+    return steps.flip(0) if reverse else steps
+
+
+@op(
+    name="cattorch::recurrent_final",
+    fake=lambda steps, reverse: steps.new_empty(steps.shape[1:]),
+)
+def _recurrent_final(steps: torch.Tensor, reverse: bool) -> torch.Tensor:
+    """The state ``recurrent_scan`` ends on: its last step, or first if ``reverse``.
+
+    Its kernel finds the step from the list's length, so it is right for a
+    sequence of any length.
+    """
+    return (steps[0] if reverse else steps[-1]).clone()
+
+
 # ── Private ops for the automatic generation step module ────────────────────
 # These are not exported: ``cattorch.autoregressive.build_step_module`` inserts
 # them, and the generation lowering gives them dedicated Scratch kernels.

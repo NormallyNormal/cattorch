@@ -29,6 +29,7 @@ from cattorch.scratch import (
     gt,
     if_,
     item,
+    length,
     lt,
     mathop,
     mul,
@@ -619,7 +620,195 @@ def _emit_scatter(ctx: KernelContext, *, scalar: bool):
     )
 
 
+_GATES = {"gru": 3, "lstm": 4, "rnn_tanh": 1, "rnn_relu": 1}
+
+
+def _sigmoid(value):
+    return div(1, add(1, mathop("e ^", mul(-1, value))))
+
+
+def _tanh(value):
+    # Matches the elementwise tanh kernel.
+    return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+
+
+def _emit_recurrent_scan(ctx: KernelContext):
+    """Step a GRU, LSTM or RNN layer through time in one Scratch loop.
+
+    Each step takes the hidden-to-hidden product into a scratch list, applies
+    the gates unit by unit while updating a private copy of the state, then
+    appends the state to the output. The cost is one ``G * H * P`` product per
+    step and batch item, and the generated program does not grow with the
+    sequence length.
+    """
+    gates, state_in, weight = ctx.inputs["gates"], ctx.inputs["state"], ctx.inputs["weight"]
+    bias, projection = ctx.inputs.get("bias"), ctx.inputs.get("projection")
+    kind = str(ctx.scalars["kind"])
+    steps, batch, gate_width = gates.shape
+    width = state_in.shape[-1]
+    hidden = gate_width // _GATES[kind]
+    previous = weight.shape[1]
+    for name in ("scan_gate", "scan_state", "scan_weight", "scan_unit", "scan_index", "scan_acc",
+                 "scan_cell"):
+        ctx.temp_var(name)
+    state = ctx.temp_list("scan_state", batch * width)
+    recurrent = ctx.temp_list("scan_recurrent", gate_width)
+    raw = ctx.temp_list("scan_raw", hidden) if projection is not None else None
+    out = ctx.output.list
+
+    def gate(number):
+        offset = add(var("scan_unit"), number * hidden)
+        return add(item(gates.list, add(var("scan_gate"), offset)), item(recurrent, offset))
+
+    def state_at(offset):
+        return add(var("scan_state"), offset)
+
+    product = (
+        set_var("scan_acc", 0 if bias is None else item(bias.list, var("scan_unit"))),
+        set_var("scan_index", 1),
+        static_unrolled_repeat(previous, (
+            change_var("scan_acc", mul(
+                item(weight.list, add(var("scan_weight"), var("scan_index"))),
+                item(state, state_at(var("scan_index"))),
+            )),
+            change_var("scan_index", 1),
+        ), max_factor=4, priority=3),
+        append(recurrent, var("scan_acc")),
+        change_var("scan_weight", previous),
+        change_var("scan_unit", 1),
+    )
+    unit = var("scan_unit")
+    if kind == "gru":
+        # ``scan_cell`` holds the candidate state n, ``scan_acc`` the update gate z.
+        update = (
+            set_var("scan_acc", _sigmoid(gate(1))),
+            set_var("scan_cell", _tanh(add(
+                item(gates.list, add(var("scan_gate"), add(unit, 2 * hidden))),
+                mul(_sigmoid(gate(0)), item(recurrent, add(unit, 2 * hidden))),
+            ))),
+            replace(state, state_at(unit), add(var("scan_cell"), mul(
+                var("scan_acc"), sub(item(state, state_at(unit)), var("scan_cell")),
+            ))),
+        )
+    elif kind == "lstm":
+        cell = state_at(add(unit, previous))
+        hidden_value = mul(_sigmoid(gate(3)), _tanh(var("scan_cell")))
+        update = (
+            set_var("scan_cell", add(
+                mul(_sigmoid(gate(1)), item(state, cell)),
+                mul(_sigmoid(gate(0)), _tanh(gate(2))),
+            )),
+            replace(state, cell, var("scan_cell")),
+            replace(raw, unit, hidden_value) if raw is not None
+            else replace(state, state_at(unit), hidden_value),
+        )
+    elif kind == "rnn_tanh":
+        update = (replace(state, state_at(unit), _tanh(gate(0))),)
+    else:
+        update = (
+            set_var("scan_acc", gate(0)),
+            replace(state, state_at(unit), mul(var("scan_acc"), gt(var("scan_acc"), 0))),
+        )
+    project = ()
+    if raw is not None:
+        # The projected hidden state replaces the first ``previous`` entries.
+        project = (
+            set_var("scan_weight", 0),
+            set_var("scan_unit", 1),
+            repeat(previous, (
+                set_var("scan_acc", 0),
+                set_var("scan_index", 1),
+                static_unrolled_repeat(hidden, (
+                    change_var("scan_acc", mul(
+                        item(projection.list, add(var("scan_weight"), var("scan_index"))),
+                        item(raw, var("scan_index")),
+                    )),
+                    change_var("scan_index", 1),
+                ), max_factor=4, priority=3),
+                replace(state, state_at(unit), var("scan_acc")),
+                change_var("scan_weight", hidden),
+                change_var("scan_unit", 1),
+            )),
+        )
+    reverse = bool(ctx.scalars["reverse"])
+    if reverse:
+        # Steps run from the last to the first but are written in time order.
+        write = (replace(out, add(var("scan_out"), var("scan_index")),
+                         item(state, state_at(var("scan_index")))),)
+    else:
+        write = (append(out, item(state, state_at(var("scan_index")))),)
+    per_item = (
+        clear(recurrent),
+        set_var("scan_weight", 0),
+        set_var("scan_unit", 1),
+        repeat(gate_width, product),
+        set_var("scan_unit", 1),
+        repeat(hidden, (*update, change_var("scan_unit", 1))),
+        *project,
+        set_var("scan_index", 1),
+        repeat(width, (*write, change_var("scan_index", 1))),
+        change_var("scan_state", width),
+        change_var("scan_gate", gate_width),
+        change_var("scan_out", width),
+    )
+    if raw is not None:
+        per_item = (clear(raw), repeat(hidden, (append(raw, 0),)), *per_item)
+    ctx.temp_var("scan_out")
+    count = (
+        div(length(gates.list), batch * gate_width) if gates.dynamic_axis is not None else steps
+    )
+    step = (set_var("scan_state", 0), repeat(batch, per_item))
+    if reverse:
+        start = (
+            set_var("scan_gate", mul(sub(count, 1), batch * gate_width)),
+            set_var("scan_out", mul(sub(count, 1), batch * width)),
+            repeat(mul(count, batch * width), (append(out, 0),)),
+        )
+        step += (
+            change_var("scan_gate", -2 * batch * gate_width),
+            change_var("scan_out", -2 * batch * width),
+        )
+    else:
+        start = (set_var("scan_gate", 0), set_var("scan_out", 0))
+    return (
+        clear(out),
+        clear(state),
+        set_var("scan_index", 1),
+        repeat(batch * width, (
+            append(state, item(state_in.list, var("scan_index"))),
+            change_var("scan_index", 1),
+        )),
+        *start,
+        repeat(count, step),
+    )
+
+
+def _emit_recurrent_final(ctx: KernelContext):
+    """Copy the first or last step of ``recurrent_scan``'s output."""
+    steps = ctx.inputs["steps"]
+    size = math.prod(steps.shape[1:])
+    position = ctx.temp_var("index")
+    if ctx.scalars["reverse"]:
+        first = 1
+    else:
+        first = sub(length(steps.list), size - 1) if steps.dynamic_axis is not None else (
+            steps.numel - size + 1
+        )
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(position, first),
+        repeat(size, (append(out, item(steps.list, var(position))), change_var(position, 1))),
+    )
+
+
 BUILTIN_KERNELS = (
+    Kernel(
+        "cattorch.recurrent_scan.default", _emit_recurrent_scan, name="recurrent_scan",
+    ),
+    Kernel(
+        "cattorch.recurrent_final.default", _emit_recurrent_final, name="recurrent_final",
+    ),
     Kernel(
         "aten.gather.default", _emit_gather, name="gather_runtime",
         validator=_validate_runtime_index,

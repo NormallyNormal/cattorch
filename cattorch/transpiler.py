@@ -1975,6 +1975,14 @@ def _transpile(
 ) -> TranspileResult:
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
+    for index, value in enumerate(example_inputs):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"example input {index} is a {type(value).__name__}, not a tensor; "
+                "each positional input becomes one Scratch list, so pass nested "
+                "values (such as an LSTM's (hidden, cell) state) through a "
+                "wrapper that takes them as separate tensors"
+            )
     output_path = Path(output_path)
     if output_path.suffix.lower() != ".sprite3":
         output_path = Path(f"{output_path}.sprite3")

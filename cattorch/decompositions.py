@@ -943,7 +943,105 @@ def _isin(elements, test_elements, *, assume_unique=False, invert=False):
     return _aten.logical_not.default(found) if invert else found
 
 
+def _gru_cell(value, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
+    # PyTorch's own decomposition writes into ``chunk`` views, which tracing rejects.
+    reset, update, new = _aten.chunk.default(_aten.linear.default(value, w_ih, b_ih), 3, -1)
+    hidden_reset, hidden_update, hidden_new = _aten.chunk.default(
+        _aten.linear.default(hidden, w_hh, b_hh), 3, -1,
+    )
+    reset = _aten.sigmoid.default(_aten.add.Tensor(reset, hidden_reset))
+    update = _aten.sigmoid.default(_aten.add.Tensor(update, hidden_update))
+    new = _aten.tanh.default(_aten.add.Tensor(new, _aten.mul.Tensor(reset, hidden_new)))
+    return _aten.add.Tensor(new, _aten.mul.Tensor(update, _aten.sub.Tensor(hidden, new)))
+
+
+def _lstm_cell(value, state, w_ih, w_hh, b_ih=None, b_hh=None):
+    hidden, cell = state
+    gates = _aten.add.Tensor(
+        _aten.linear.default(value, w_ih, b_ih), _aten.linear.default(hidden, w_hh, b_hh),
+    )
+    input_gate, forget, cell_gate, output = _aten.chunk.default(gates, 4, -1)
+    cell = _aten.add.Tensor(
+        _aten.mul.Tensor(_aten.sigmoid.default(forget), cell),
+        _aten.mul.Tensor(_aten.sigmoid.default(input_gate), _aten.tanh.default(cell_gate)),
+    )
+    return _aten.mul.Tensor(_aten.sigmoid.default(output), _aten.tanh.default(cell)), cell
+
+
+def _rnn_cell(activation):
+    def decomposition(value, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
+        return activation(_aten.add.Tensor(
+            _aten.linear.default(value, w_ih, b_ih), _aten.linear.default(hidden, w_hh, b_hh),
+        ))
+    return decomposition
+
+
+def _recurrent(kind, fallback):
+    """``nn.GRU``, ``nn.LSTM`` and ``nn.RNN`` as one looped scan per layer and direction.
+
+    The input projection for every step is one matrix product; only the
+    hidden-to-hidden step runs inside ``cattorch::recurrent_scan``, whose
+    Scratch kernel loops over time instead of repeating the cell per step.
+    """
+    def decomposition(value, hx, params, has_biases, num_layers, dropout, train,
+                      bidirectional, batch_first):
+        if train and dropout:
+            return fallback(value, hx, params, has_biases, num_layers, dropout, train,
+                            bidirectional, batch_first)
+        scan = torch.ops.cattorch.recurrent_scan.default
+        directions = 2 if bidirectional else 1
+        hidden, cell = (hx[0], hx[1]) if kind == "lstm" else (hx, None)
+        per_layer = len(params) // (num_layers * directions)
+        if batch_first:
+            value = _aten.transpose.int(value, 0, 1)
+        finals, cells = [], []
+        for layer in range(num_layers):
+            outputs = []
+            for direction in range(directions):
+                index = layer * directions + direction
+                weights = list(params[index * per_layer:(index + 1) * per_layer])
+                w_ih, w_hh = weights[:2]
+                b_ih, b_hh = weights[2:4] if has_biases else (None, None)
+                projection = weights[-1] if per_layer in (3, 5) else None
+                state = _aten.select.int(hidden, 0, index)
+                if kind == "lstm":
+                    state = _aten.cat.default([state, _aten.select.int(cell, 0, index)], -1)
+                gates = _aten.linear.default(value, w_ih, b_ih)
+                reverse = bool(direction)
+                steps = scan(gates, state, w_hh, b_hh, projection, kind, reverse)
+                width = hidden.shape[-1]
+                last = torch.ops.cattorch.recurrent_final.default(steps, reverse)
+                finals.append(_aten.slice.Tensor(last, -1, 0, width))
+                if kind == "lstm":
+                    cells.append(_aten.slice.Tensor(last, -1, width))
+                outputs.append(_aten.slice.Tensor(steps, -1, 0, width))
+            value = outputs[0] if directions == 1 else _aten.cat.default(outputs, -1)
+        if batch_first:
+            value = _aten.transpose.int(value, 0, 1)
+        results = (value, _aten.stack.default(finals))
+        return (*results, _aten.stack.default(cells)) if kind == "lstm" else results
+    return decomposition
+
+
+def _recurrent_decompositions():
+    from torch._decomp import decomposition_table
+
+    table = {
+        _aten.gru_cell.default: _gru_cell,
+        _aten.lstm_cell.default: _lstm_cell,
+        _aten.rnn_tanh_cell.default: _rnn_cell(_aten.tanh.default),
+        _aten.rnn_relu_cell.default: _rnn_cell(_aten.relu.default),
+    }
+    for kind, operator in (
+        ("gru", _aten.gru.input), ("lstm", _aten.lstm.input),
+        ("rnn_tanh", _aten.rnn_tanh.input), ("rnn_relu", _aten.rnn_relu.input),
+    ):
+        table[operator] = _recurrent(kind, decomposition_table[operator])
+    return table
+
+
 POINTWISE_DECOMPOSITIONS = {
+    **_recurrent_decompositions(),
     _aten.sign.default: _sign,
     _aten.sgn.default: _sign,
     _aten.signbit.default: lambda value: _aten.lt.Scalar(value, 0),

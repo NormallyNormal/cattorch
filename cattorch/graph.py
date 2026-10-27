@@ -625,6 +625,14 @@ def _prepare_graph(
         elif target in MATMUL_OPS:
             if parent is not node.args[0] or axis == len(input_shape) - 1:
                 raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+        elif target in {"cattorch.recurrent_scan.default", "cattorch.recurrent_final.default"}:
+            if len(dynamic_parents) != 1 or parent is not node.args[0] or axis != 0 or unit != 1:
+                raise UnsupportedModelError(
+                    "a recurrent layer takes a runtime extent only along its sequence"
+                )
+            if target == "cattorch.recurrent_final.default":
+                # The final state has no runtime extent.
+                continue
         elif target == "aten.slice.Tensor":
             dimension = int(node.args[1]) % len(input_shape)
             start = int(node.args[2]) if len(node.args) > 2 else 0
@@ -887,7 +895,11 @@ def _prepare_graph(
             "aten.gelu.default": "gelu",
         }
         for node in nodes:
-            if node.op != "call_function" or str(node.target) != "aten.linear.default":
+            if (
+                node.op != "call_function" or str(node.target) != "aten.linear.default"
+                # A folded linear is never compiled, so it can't carry an epilogue.
+                or node.name in generated_weights
+            ):
                 continue
             current = node
             epilogue = []

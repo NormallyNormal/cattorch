@@ -59,7 +59,11 @@ already lowers replaces the built-in kernel for that export only.
 - `ctx.inputs` maps the operator's schema argument names to tensors. Each has
   `list` (the Scratch list holding it, flattened in row-major order), `shape`,
   `dtype`, `numel`, `strides`, and `static` (true for a weight stored in the
-  sprite). Find the names in the schema, for example with
+  sprite). `dynamic_axis` is the dimension that varies at run time in a
+  [variable-length export](supported-models.md#variable-length-inputs), or
+  `None`; `shape` is then the traced shape, and `length(info.list)` gives the
+  actual number of items. A kernel that ignores it runs once per item when
+  the operation treats items independently. Find the names in the schema, for example with
   `print(torch.ops.aten.mish.default._schema)`.
 - `ctx.scalars` holds the other arguments, with the schema's defaults filled
   in.

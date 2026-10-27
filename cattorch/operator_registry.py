@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import warnings
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Literal
+from typing import Callable, Iterable, Literal, cast
 
 import torch
 
@@ -142,7 +142,9 @@ class OperatorRegistry:
             rule = replace(rule, exact_kernel=instruction)
         else:
             rule = replace(
-                rule, fast_kernel=instruction, fast_flag=kernel.fast_flag,
+                rule, fast_kernel=instruction,
+                fast_flag=cast(Literal["activations", "layer_norm", "softmax"] | None,
+                               kernel.fast_flag),
             )
         self._operations[kernel.target_name] = rule
 

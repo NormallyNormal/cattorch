@@ -99,10 +99,14 @@ operations. They may run slower than an operation with a dedicated kernel;
 uses. [Operator coverage](operator-coverage.md) shows which operators pass
 PyTorch's own test samples.
 
-`nn.LSTM` and `nn.GRU` export for the fixed sequence length of the example,
-including stacked and bidirectional layers. Every time step is unrolled into
-its own blocks, so sprite size grows with sequence length and layer count.
-Check `expanded_json_bytes` for longer sequences.
+`nn.GRU`, `nn.LSTM` (including `proj_size`) and `nn.RNN` export with stacked
+and bidirectional layers, and so do `nn.GRUCell`, `nn.LSTMCell` and
+`nn.RNNCell`. A recurrent layer runs as one Scratch loop over time, so the
+sprite doesn't grow with the sequence length, and the sequence can vary at
+run time (see [variable-length inputs](#variable-length-inputs)). To process
+one step per call, write a step method around a cell and keep the hidden
+state in a buffer; [`@cattorch.entrypoint`](markers.md) exports it with the
+state kept between calls.
 
 A listed operation can still be rejected for an unsupported shape,
 broadcasting pattern, or option. The error names the operation that failed.
@@ -147,8 +151,10 @@ the output lists grow with it. `TensorSpec.shape` shows the bounded
 dimension as a `BoundedDimension`.
 
 The model must treat the items independently, as most models treat a batch,
-or tokens processed one at a time. Operations that mix items, such as a
-softmax across them or `x - x.mean(0)`, are rejected. When a model's
+or tokens processed one at a time. Recurrent layers are the exception: a
+sequence's length can vary, and the final state (`h_n`) is an output of fixed
+shape. Other operations that mix items, such as a softmax across them or
+`x - x.mean(0)`, are rejected. When a model's
 operations can't follow the length directly, for example attention layers
 that reorder their batch internally, cattorch runs the whole model once per
 item and adds a warning.

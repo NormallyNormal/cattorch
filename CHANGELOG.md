@@ -33,6 +33,12 @@
   `ModuleAdapter` from a function. `transpile(model, None, path)` and
   `verify(model, None, result)` take the interface from the markers. See
   [markers](docs/markers.md).
+- Recurrent layers (`nn.GRU`, `nn.LSTM`, `nn.RNN`) run as one Scratch loop
+  over time instead of unrolling every step, so the sprite no longer grows
+  with the sequence length. With `dynamic=` the sequence length can vary at
+  run time, and the final state is a fixed-shape output. `nn.GRUCell` and
+  `nn.LSTMCell` now export, so a step method with its hidden state in a
+  buffer works as an entry point.
 - `TranspileResult.approximate_operations` lists the operations that used an
   approximate kernel in fast mode, and `verify` repeats it in its result.
 - `GenerationProgram(max_context=64)` exports an ordinary stateless
@@ -171,6 +177,12 @@
 
 ## Fixes
 
+- A linear layer whose result could be computed at export, such as one
+  applied to `torch.zeros`, followed by an addition and an activation made
+  export fail when a view of the result was the output.
+- A tuple or other non-tensor positional example input fails with a
+  `TypeError` that says to pass the tensors separately, instead of an
+  `AttributeError`.
 - `nn.SELU`, `nn.CELU`, and `F.elu` with a `scale` argument ignored the
   scale and gave wrong output.
 - A view of a constant, such as a reshaped index table, passed to a

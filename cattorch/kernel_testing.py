@@ -52,7 +52,8 @@ def check_kernel(
     whose export didn't run the kernel. Returns each sample's ``verify``
     result.
     """
-    from cattorch import transpile, verify
+    from cattorch.transpiler import transpile
+    from cattorch.verify import verify
 
     operator = kernel.target
     if not isinstance(operator, torch._ops.OpOverload):
