@@ -43,7 +43,8 @@ class OptimizedEmbeddingInstruction(Instruction):
     """Embedding lookup that computes the weight-row offset once per token."""
 
     def prepare(self):
-        self.tokens = math.prod(self.args[1].shape)
+        # A runtime-length token list sets the count when the code runs.
+        self.tokens = length("T2") if self.args[1].dynamic else math.prod(self.args[1].shape)
         self.width = self.args[0].shape[1]
 
     def finalize(self):
@@ -86,7 +87,8 @@ class EmbeddingAddInstruction(Instruction):
     """Fuse two equal-width embedding lookups and their elementwise add."""
 
     def prepare(self):
-        self.tokens = math.prod(self.args[1].shape)
+        # A runtime-length token list sets the count when the code runs.
+        self.tokens = length("T2") if self.args[1].dynamic else math.prod(self.args[1].shape)
         self.width = self.args[0].shape[1]
 
     def finalize(self):

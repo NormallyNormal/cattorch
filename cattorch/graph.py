@@ -295,6 +295,8 @@ class _GraphInfo:
     # Operations a fusion approximates in fast mode, such as exact GELU in a
     # linear epilogue.
     approximate_fusions: tuple[str, ...] = ()
+    # Nodes whose one-row kernel runs once per row of a runtime extent.
+    row_loops: frozenset[str] = frozenset()
 
     @property
     def output_name(self) -> str:
@@ -334,6 +336,93 @@ class _GraphInfo:
             )
             for index, (name, shape, dtype) in enumerate(self.outputs)
         )
+
+
+def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | None:
+    """``(output axis, items per unit)`` of a unit-by-unit operation, or ``None``.
+
+    Each runtime-length input holds its units contiguously: only size-1
+    dimensions come before its axis. The operation runs on random inputs with
+    two units and with each unit alone. It treats units independently if the
+    two-unit output is the one-unit outputs joined along an axis that leads
+    the flat layout.
+    """
+    import torch.utils._pytree as pytree
+
+    if not callable(node.target):
+        return None
+    generator = torch.Generator().manual_seed(0)
+
+    def unit_of(name):
+        return dynamic_units.get(name, 1)
+
+    def sample(arg):
+        value = arg.meta.get("val") if hasattr(arg, "meta") else None
+        if not isinstance(value, torch.Tensor):
+            return None
+        shape = list(value.shape)
+        if arg.name in dynamic_axes:
+            shape[dynamic_axes[arg.name]] = 2 * unit_of(arg.name)
+        if value.dtype == torch.bool:
+            return torch.rand(shape, generator=generator) > 0.5
+        if not value.dtype.is_floating_point:
+            return torch.zeros(shape, dtype=value.dtype)
+        return torch.randn(shape, generator=generator, dtype=value.dtype)
+
+    for arg in node.all_input_nodes:
+        if arg.name in dynamic_axes:
+            if math.prod(_get_shape(arg)[:dynamic_axes[arg.name]]) != 1:
+                return None
+    output_shape = list(_get_shape(node))
+    samples = {}
+    for arg in node.all_input_nodes:
+        value = sample(arg)
+        if value is None:
+            return None
+        samples[arg.name] = value
+
+    def call(pick=None, sizes=None):
+        def convert(value):
+            if not isinstance(value, torch.fx.Node):
+                return value
+            tensor = samples[value.name]
+            if pick is not None and value.name in dynamic_axes:
+                unit = unit_of(value.name)
+                tensor = tensor.narrow(dynamic_axes[value.name], pick * unit, unit)
+            return tensor
+
+        def size_argument(value):
+            # A size for the whole output, such as expand's, grows with it.
+            if sizes is not None and isinstance(value, (list, tuple)) and list(value) == output_shape:
+                return type(value)(sizes)
+            return pytree.tree_map(convert, value)
+
+        args = tuple(size_argument(arg) for arg in node.args)
+        kwargs = pytree.tree_map(convert, node.kwargs)
+        return node.target(*args, **kwargs)
+
+    for axis in range(len(output_shape)):
+        if math.prod(output_shape[:axis]) != 1:
+            break
+        sizes = list(output_shape)
+        sizes[axis] *= 2
+        try:
+            with torch.no_grad():
+                both, again = call(sizes=sizes), call(sizes=sizes)
+                first, second = call(0), call(1)
+        except Exception:  # noqa: BLE001 - an operation that can't run per unit isn't separable
+            continue
+        if not all(isinstance(value, torch.Tensor) for value in (both, first, second, again)):
+            continue
+        if not torch.equal(both.nan_to_num(), again.nan_to_num()) or first.shape != second.shape:
+            continue
+        if (
+            both.ndim > axis and list(first.shape) == output_shape
+            and both.shape[axis] == 2 * first.shape[axis]
+            and torch.allclose(both, torch.cat([first, second], axis), equal_nan=True)
+        ):
+            return axis, first.shape[axis]
+    return None
 
 
 def _drop_empty_cat_inputs(graph) -> None:
@@ -400,14 +489,21 @@ def _prepare_graph(
     ]
     dynamic_axes: dict[str, int] = {}
     dynamic_bounds: dict[str, tuple[str, int, int]] = {}
+    row_loops: set[str] = set()
+    # Items along a node's dynamic axis per unit of runtime length: 1, or
+    # more once a view folds the length into a larger dimension.
+    dynamic_units: dict[str, int] = {}
     for index, bound in dynamic_inputs.items():
         if index >= len(placeholders):
             raise UnsupportedModelError("dynamic input index is outside the captured signature")
         node = placeholders[index]
-        if len(_get_shape(node)) < 1:
-            raise UnsupportedModelError("a dynamic input must have a leading dimension")
-        dynamic_axes[node.name] = 0
-        dynamic_bounds[node.name] = bound
+        # ``(name, minimum, maximum)``, with an optional fourth item for the
+        # axis; the leading one by default.
+        axis = bound[3] if len(bound) > 3 else 0
+        if len(_get_shape(node)) <= axis:
+            raise UnsupportedModelError("a dynamic input must have the dynamic dimension")
+        dynamic_axes[node.name] = axis
+        dynamic_bounds[node.name] = tuple(bound[:3])
 
     shape_only = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
     elementwise = {
@@ -434,7 +530,12 @@ def _prepare_graph(
             )
         parent = dynamic_parents[0]
         axis = dynamic_axes[parent.name]
+        unit = dynamic_units.get(parent.name, 1)
         target = str(node.target)
+        if not isinstance(node.meta.get("val"), torch.Tensor):
+            raise UnsupportedModelError(
+                f"{target} returns several tensors from a runtime-length input"
+            )
         input_shape = tuple(_get_shape(parent))
         output_shape = tuple(_get_shape(node))
         if target == "aten.transpose.int":
@@ -453,16 +554,21 @@ def _prepare_graph(
             "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
             "aten.unflatten.int",
         }:
-            suffix = math.prod(input_shape[axis + 1:])
+            # One unit of runtime length is the whole traced tensor; a view
+            # keeps it as a contiguous block, on a dimension of its own when
+            # one fits, or folded into the first dimension that holds it.
+            block = math.prod(output_shape)
             candidates = [
                 position for position, extent in enumerate(output_shape)
-                if extent == 1 and math.prod(output_shape[position + 1:]) == suffix
+                if extent == 1 and math.prod(output_shape[position + 1:]) == block
             ]
-            if len(candidates) != 1:
-                raise UnsupportedModelError(
-                    f"{target} folds or splits the runtime extent; only a movable extent is supported"
+            if candidates:
+                axis, unit = candidates[-1], 1
+            else:
+                axis = next(
+                    (position for position, extent in enumerate(output_shape) if extent != 1), 0,
                 )
-            axis = candidates[0]
+                unit = output_shape[axis] if output_shape else 1
         elif target == "aten.unsqueeze.default":
             inserted = int(node.args[1]) % len(output_shape)
             if inserted <= axis:
@@ -525,12 +631,42 @@ def _prepare_graph(
             end = node.args[3] if len(node.args) > 3 else None
             if dimension == axis and (start != 0 or end not in {None, 9223372036854775807}):
                 raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
+            if output_shape != input_shape:
+                # The slice's offsets describe one row.
+                row_loops.add(node.name)
+        elif target in elementwise and (
+            any(tuple(_get_shape(value)) != output_shape for value in dynamic_parents)
+            # Elementwise kernels size their loop from the first operand.
+            or not (node.args and getattr(node.args[0], "name", None) in dynamic_axes)
+        ):
+            # Broadcasting the runtime-length operand: the kernel's broadcast
+            # tables describe one row.
+            row_loops.add(node.name)
         elif target not in shape_only and target not in elementwise:
+            # Any other operation that treats rows independently runs its
+            # one-row kernel once per row.
+            axis, unit = _row_separable_axis(node, dynamic_axes, dynamic_units) or (None, 1)
+            if axis is None:
+                raise UnsupportedModelError(
+                    f"{target} mixes values across the runtime extent, or doesn't "
+                    "keep it as a dimension of its own, so it can't take a "
+                    "variable-length input"
+                )
+            row_loops.add(node.name)
+        if unit != 1 and math.prod(output_shape[:axis]) != 1:
             raise UnsupportedModelError(
-                f"{target} does not yet define runtime-extent propagation"
+                f"{target} moves a folded runtime extent away from the front"
             )
         dynamic_axes[node.name] = axis
+        if unit != 1:
+            dynamic_units[node.name] = unit
         dynamic_bounds[node.name] = dynamic_bounds[parent.name]
+    for name in captured.user_output_names:
+        if dynamic_units.get(name, 1) != 1:
+            raise UnsupportedModelError(
+                "an output keeps the runtime extent folded into another dimension; "
+                "reshape it back so the extent has a dimension of its own"
+            )
     node_order = {node.name: index for index, node in enumerate(nodes)}
     state_inputs = captured.state_inputs
     user_input_placeholders = captured.user_input_names
@@ -1209,6 +1345,7 @@ def _prepare_graph(
         ),
         linear_fusions=linear_fusions,
         approximate_fusions=tuple(approximate_fusions),
+        row_loops=frozenset(row_loops),
         paired_swiglu_fusions=paired_swiglu_fusions,
         silu_mul_fusions=silu_mul_fusions,
         embedding_add_fusions=embedding_add_fusions,

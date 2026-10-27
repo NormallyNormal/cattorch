@@ -498,7 +498,9 @@ class _Compiler:
 
         if not hasattr(source, "name"):
             raise _unsupported_operation(node, "the first argument must be a tensor")
-        if node.name in self.graph.dynamic_axes or source.name in self.graph.dynamic_axes:
+        if node.name not in self.graph.row_loops and (
+            node.name in self.graph.dynamic_axes or source.name in self.graph.dynamic_axes
+        ):
             raise _unsupported_operation(
                 node, "data movement on a runtime extent is not supported",
             )
@@ -1423,7 +1425,10 @@ class _Compiler:
 
     def _emit(self, instruction, input_lists, target_list):
         """Generate Scratch blocks for an instruction and merge into sprite."""
-        data = instruction.finalize()
+        if self.active_node in self.graph.row_loops:
+            data = self._row_looped(instruction, input_lists, target_list)
+        else:
+            data = instruction.finalize()
 
         self.block_manager.new_context()
         data["blocks"] = self.block_manager.apply_to_blocks(data["blocks"])
@@ -1446,6 +1451,29 @@ class _Compiler:
             self.sprite = data
         else:
             self.sprite = combine(self.sprite, data, in_place=True)
+
+    def _row_looped(self, instruction, input_lists, target_list) -> dict:
+        """Run a one-row kernel once per row of its runtime-length inputs."""
+        from cattorch.util.instruction.row_loop import captured_programs, row_loop
+
+        node = next(node for node in self.graph.nodes if node.name == self.active_node)
+        with captured_programs() as programs:
+            instruction.finalize()
+        if len(programs) != 1:
+            raise _unsupported_operation(
+                node, "its kernel can't run once per row of a variable-length input",
+            )
+        dynamic = {
+            self._resolve_name(arg.name): math.prod(_get_shape(arg))
+            for arg in node.all_input_nodes if arg.name in self.graph.dynamic_axes
+        }
+        tensor_lists = [name for name in input_lists if not name.startswith("C_")]
+        rows = {
+            f"T{position}": dynamic[name]
+            for position, name in enumerate(tensor_lists, 1) if name in dynamic
+        }
+        output = f"T{len(tensor_lists) + 1}"
+        return row_loop(programs[0], rows, output, math.prod(_get_shape(node))).compile()
 
     @staticmethod
     def _is_full_slice(node) -> bool:
@@ -1563,6 +1591,7 @@ def transpile(
     ] | None = None,
     example_kwargs: dict[str, Any] | None = None,
     kernels: tuple[Kernel, ...] = (),
+    dynamic: dict | None = None,
 ):
     """Export a PyTorch module as a Scratch ``.sprite3`` file.
 
@@ -1622,6 +1651,13 @@ def transpile(
         Experimental ``cattorch.experimental.Kernel`` lowerings for this
         export. A kernel for an operation cattorch already lowers replaces the
         built-in one; an approximate kernel applies only in fast mode.
+    dynamic:
+        Bounded variable-length inputs, as ``{input: (minimum, maximum)}`` for
+        an input's first dimension or ``{input: {dimension: (minimum,
+        maximum)}}``; an input is its position or tensor keyword name. The
+        sprite then accepts any length in the bounds. The export is checked
+        against the model at several lengths and fails if the model uses the
+        length in a way the sprite can't follow. Not valid for programs.
 
     Returns
     -------
@@ -1654,8 +1690,60 @@ def transpile(
             frontend=frontend, adapters=adapters,
             calibration_calls=calibration_calls,
             calibration_sequences=calibration_sequences,
-            example_kwargs=example_kwargs, kernels=kernels,
+            example_kwargs=example_kwargs, kernels=kernels, dynamic=dynamic,
         )
+
+
+def _transpile_dynamic(
+    model, example_inputs, output_path, sig_figs, dynamic, *, example_kwargs, kernels,
+    **options,
+):
+    """Trace one row of the dynamic input, export, and check other lengths."""
+    from cattorch.dynamic import (
+        at_length, check_lengths, loop_over_units, normalize_dynamic, unit_output_axes,
+    )
+    from cattorch.verify import verify
+
+    if isinstance(example_inputs, torch.Tensor):
+        example_inputs = (example_inputs,)
+    example_inputs = tuple(example_inputs)
+    kwarg_names = [
+        key for key, value in (example_kwargs or {}).items() if isinstance(value, torch.Tensor)
+    ]
+    flat = flat_example_inputs(example_inputs, example_kwargs)
+    spec = normalize_dynamic(dynamic, flat, kwarg_names)
+    ((index, (_, minimum, maximum, axis)),) = spec.items()
+    representative = list(flat)
+    representative[index] = at_length(flat[index], axis, 1)
+    positional = len(example_inputs)
+    traced_kwargs = dict(example_kwargs or {})
+    traced_kwargs.update(zip(kwarg_names, representative[positional:]))
+    arguments = dict(
+        generation=None, example_kwargs=traced_kwargs or None,
+        _registry=_registry_with(kernels) if kernels else None, **options,
+    )
+    try:
+        result = _transpile(
+            model, tuple(representative[:positional]), output_path, sig_figs,
+            _dynamic_inputs=spec, **arguments,
+        )
+    except UnsupportedModelError as error:
+        # Operations that can't follow the length directly: run the whole
+        # model once per item instead, if items are independent.
+        try:
+            axes = unit_output_axes(model, flat, kwarg_names, spec, example_kwargs)
+        except UnsupportedModelError:
+            raise error from None
+        result = _transpile(
+            model, tuple(representative[:positional]), output_path, sig_figs, **arguments,
+        )
+        result = loop_over_units(
+            result, spec, axes,
+            [tuple(value.shape) for value in representative],
+            [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
+        )
+    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs)
+    return result
 
 
 def _registry_with(kernels, adapters=()) -> OperatorRegistry:
@@ -1671,6 +1759,7 @@ def _transpile_any(
     model, example_inputs, output_path, sig_figs, *, name, optimization,
     fast_config, storage, quantization, calibration_inputs, codegen, frontend,
     adapters, calibration_calls, calibration_sequences, example_kwargs, kernels,
+    dynamic=None,
 ):
     if example_inputs is None:
         # The model describes its own interface with markers.
@@ -1753,6 +1842,14 @@ def _transpile_any(
         raise ValueError("calibration_calls require an ExportProgram")
     if calibration_sequences is not None:
         raise ValueError("calibration_sequences require a GenerationProgram")
+    if dynamic is not None:
+        return _transpile_dynamic(
+            model, example_inputs, output_path, sig_figs, dynamic,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_inputs=calibration_inputs, codegen=codegen,
+            frontend=frontend, example_kwargs=example_kwargs, kernels=kernels,
+        )
     return _transpile(
         model, example_inputs, output_path, sig_figs,
         name=name,
@@ -2030,12 +2127,8 @@ def _transpile(
         if node.name not in graph.dynamic_axes:
             continue
         bound = graph.dynamic_bounds[node.name]
-        axis = graph.dynamic_axes[node.name]
-        shape = tuple(_get_shape(node))
-        maximum = math.prod(
-            bound[2] if index == axis else extent
-            for index, extent in enumerate(shape)
-        )
+        # The traced tensor is one unit of the runtime length.
+        maximum = math.prod(_get_shape(node)) * bound[2]
         if node.name in graph.input_names:
             # Program input/state lists are renamed before their one global
             # interface-sharding pass.
@@ -2273,7 +2366,10 @@ def _transpile(
             tuple(value.shape),
             value.dtype,
             (
-                (0, _dynamic_inputs[index])
+                (
+                    _dynamic_inputs[index][3] if len(_dynamic_inputs[index]) > 3 else 0,
+                    tuple(_dynamic_inputs[index][:3]),
+                )
                 if _dynamic_inputs is not None and index in _dynamic_inputs
                 else None
             ),

@@ -14,6 +14,15 @@
 - `cattorch.op` declares a new operation from an annotated function. It
   exports whole, with a kernel attached through `@operation.kernel`, or
   through its function when it has none.
+- `transpile(..., dynamic={0: (1, 32)})` exports a model whose input length
+  varies at run time within bounds, such as a batch or a sequence of
+  independent tokens. Operations without a runtime-length kernel run once per
+  item, and a model whose operations can't follow the length runs whole once
+  per item. The export is checked against the model at several lengths, so a
+  model that uses the length itself fails instead of exporting wrong numbers.
+  Entry points take `Input(..., dynamic=(1, 32))` or
+  `@entrypoint(dynamic=...)`. See
+  [variable-length inputs](docs/supported-models.md#variable-length-inputs).
 - Markers (`cattorch.entrypoint` and others), decorators that describe a model's export interface
   without changing how it runs in PyTorch. `@entrypoint` exports methods as
   Scratch blocks and turns the buffers they update into persistent state,
@@ -166,6 +175,9 @@
   scale and gave wrong output.
 - A view of a constant, such as a reshaped index table, passed to a
   data-movement operation like `index_select` lost its shape and failed.
+- With a runtime-length input (append state or a dynamic input), embedding
+  lookups and fused arithmetic processed only the traced length.
+- `F.rms_norm` without a weight failed during export.
 - An arithmetic operation with a constant on the left, such as `1 - x`, on a
   0-dimensional tensor gave an empty or wrong output.
 - `F.batch_norm` with running statistics passed as inputs, not buffers, gave

@@ -57,6 +57,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `adapters` | `ModuleAdapter`s for an `ExportProgram` or `GenerationProgram`. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
+| `dynamic` | One variable-length input, as `{input: (minimum, maximum)}` for its first dimension or `{input: {dimension: (minimum, maximum)}}`; see [variable-length inputs](supported-models.md#variable-length-inputs). Not valid with programs. |
 | `kernels` | Experimental `Kernel`s for this export; see [custom kernels](custom-kernels.md). Each replaces the built-in lowering of its operation for this export. |
 | `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
 

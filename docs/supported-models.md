@@ -116,7 +116,8 @@ broadcasting pattern, or option. The error names the operation that failed.
   Hugging Face `ModelOutput` of tensors. Leaves are flattened into `output`,
   `output_1`, and so on in order. Non-tensor leaves are skipped with a
   warning; at least one tensor is required.
-- Input shapes are fixed to the shapes of the example values.
+- Input shapes are fixed to the shapes of the example values, unless one
+  input is [variable-length](#variable-length-inputs).
 - A model with modules in training mode is exported as an evaluation-mode
   copy, with a warning.
 - `torch.no_grad()` and `torch.autocast` blocks inside `forward` are ignored.
@@ -128,6 +129,39 @@ broadcasting pattern, or option. The error names the operation that failed.
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
 return value without any tensors, raise `UnsupportedModelError`.
+
+## Variable-length inputs
+
+`dynamic=` lets one input's length vary at run time, within bounds:
+
+```python
+result = cattorch.transpile(model, torch.randn(4, 16), "model.sprite3",
+                            dynamic={0: (1, 32)})
+```
+
+`{0: (1, 32)}` lets input 0's first dimension hold 1 to 32 items. Use
+`{0: {1: (1, 32)}}` for another dimension, after dimensions of size 1, such
+as the tokens in a `(1, tokens)` input; name a tensor in `example_kwargs` by
+its key. The Scratch input list then takes any whole number of items, and
+the output lists grow with it. `TensorSpec.shape` shows the bounded
+dimension as a `BoundedDimension`.
+
+The model must treat the items independently, as most models treat a batch,
+or tokens processed one at a time. Operations that mix items, such as a
+softmax across them or `x - x.mean(0)`, are rejected. When a model's
+operations can't follow the length directly, for example attention layers
+that reorder their batch internally, cattorch runs the whole model once per
+item and adds a warning.
+
+cattorch traces the model with one item, then checks the sprite against the
+model at several lengths during export. A model that uses the length itself,
+such as `torch.arange(tokens.shape[1])` for positions, fails that check.
+Language models should use a [`GenerationProgram`](generation.md) instead,
+which handles prompts of any length up to `max_context`.
+
+Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
+`@cattorch.entrypoint(dynamic={"rows": (1, 32)})` in [markers](markers.md),
+for an input's first dimension.
 
 Run [`verify`](api-reference.md#verify) whenever you change the model or export
 options. If export fails, see [troubleshooting](troubleshooting.md).

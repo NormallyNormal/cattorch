@@ -63,6 +63,8 @@ interface from the markers. Each entry point becomes a block named
   function returning one. They must be tensors.
 - `name=` names the block, `inputs=` and `outputs=` name its lists. Outputs
   default to `output`, `output_1`, and so on.
+- `dynamic={"rows": (1, 32)}` lets an input's first dimension vary between
+  those bounds at run time.
 - cattorch runs each entry point once on a copy of the model to find the
   buffers it changes. Each one becomes a state list, `cattorch state total`,
   starting from the buffer's value; `cattorch reset` restores it. Every entry

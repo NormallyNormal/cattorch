@@ -23,15 +23,32 @@ def _name(value: str, field: str) -> str:
 
 @dataclass(frozen=True)
 class Input:
-    """One tensor argument supplied through a public Scratch list."""
+    """One tensor argument supplied through a public Scratch list.
+
+    ``dynamic=(minimum, maximum)`` lets the first dimension's length vary
+    between those bounds at run time.
+    """
 
     name: str
     example: torch.Tensor
+    _: KW_ONLY
+    dynamic: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "input name"))
         if not isinstance(self.example, torch.Tensor):
             raise TypeError("Input.example must be a torch.Tensor")
+        if self.dynamic is not None:
+            bounds = tuple(self.dynamic)
+            if (
+                len(bounds) != 2
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds)
+                or not 1 <= bounds[0] <= bounds[1]
+            ):
+                raise ValueError("Input.dynamic must be (minimum, maximum) with 1 <= minimum <= maximum")
+            if self.example.ndim < 1 or self.example.shape[0] < 1:
+                raise ValueError("a dynamic Input needs an example with a first dimension")
+            object.__setattr__(self, "dynamic", bounds)
 
 
 @dataclass(frozen=True)

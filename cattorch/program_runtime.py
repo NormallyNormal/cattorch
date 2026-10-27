@@ -30,7 +30,12 @@ def entry_examples(program, entrypoint):
     dynamic_inputs = {}
     for binding in entrypoint.arguments:
         if isinstance(binding, Input):
-            args.append(binding.example)
+            if binding.dynamic is not None:
+                # Traced with one row, like append state.
+                dynamic_inputs[len(args)] = (binding.name, *binding.dynamic)
+                args.append(binding.example[:1])
+            else:
+                args.append(binding.example)
         else:
             state = states[binding.name]
             if state.mode == "append":
@@ -124,7 +129,16 @@ class ProgramReplay:
         for binding in entry.arguments:
             if isinstance(binding, Input):
                 value = next(public)
-                if value.shape != binding.example.shape or value.dtype != binding.example.dtype:
+                expected = binding.example.shape
+                if binding.dynamic is not None:
+                    minimum, maximum = binding.dynamic
+                    matches = (
+                        value.ndim == len(expected) and value.shape[1:] == expected[1:]
+                        and minimum <= value.shape[0] <= maximum
+                    )
+                else:
+                    matches = value.shape == expected
+                if not matches or value.dtype != binding.example.dtype:
                     raise ValueError(
                         f"input {binding.name!r} does not match its shape/dtype contract"
                     )

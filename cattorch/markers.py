@@ -60,6 +60,7 @@ def entrypoint(
     outputs: tuple[str, ...] | None = None,
     capacity: dict[str, int] | None = None,
     example=None,
+    dynamic: dict[str, tuple[int, int]] | None = None,
 ):
     """Export this method as a Scratch block; usable bare or with options.
 
@@ -75,11 +76,15 @@ def entrypoint(
     buffer that grows along its first dimension, such as
     ``self.history = torch.cat([self.history, row])``, needs its largest
     length in ``capacity={"history": 64}``.
+
+    ``dynamic={"rows": (1, 64)}`` lets an input's first dimension vary
+    between those bounds at run time; keys are input names.
     """
     options = {
         "name": name, "inputs": None if inputs is None else tuple(inputs),
         "outputs": None if outputs is None else tuple(outputs),
         "capacity": dict(capacity or {}), "example": example,
+        "dynamic": dict(dynamic or {}),
     }
 
     def apply(method: Callable) -> Callable:
@@ -411,8 +416,13 @@ def marked_program(model: nn.Module):
                 f"@entrypoint {method_name} names {len(output_names)} outputs, but returns "
                 f"{len(outputs)} tensors"
             )
+        unknown = set(options["dynamic"]) - set(input_names)
+        if unknown:
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} makes unknown inputs dynamic: {sorted(unknown)}"
+            )
         plans.append((method_name, options["name"] or method_name, input_names, arguments,
-                      output_names, set(changed) & set(buffers)))
+                      output_names, set(changed) & set(buffers), options["dynamic"]))
 
     states = tuple(
         State(name, buffers[name].detach().clone(), mode="append", capacity=capacities[name])
@@ -422,13 +432,16 @@ def marked_program(model: nn.Module):
     state_order = [(state.name, state.mode) for state in states]
     generated = {}
     entrypoints = []
-    for method_name, entry_name, input_names, arguments, output_names, changed in plans:
+    for method_name, entry_name, input_names, arguments, output_names, changed, dynamic in plans:
         wrapper_name = f"_cattorch_entry_{method_name}"
         generated[wrapper_name] = _entry_method(method_name, len(arguments), state_order, changed)
         entrypoints.append(EntryPoint(
             entry_name, method=wrapper_name,
             arguments=(
-                *(Input(name, value) for name, value in zip(input_names, arguments)),
+                *(
+                    Input(name, value, dynamic=dynamic.get(name))
+                    for name, value in zip(input_names, arguments)
+                ),
                 *(StateInput(name) for name, _ in state_order),
             ),
             returns=(

@@ -462,7 +462,7 @@ class FusedArithmeticInstruction(Instruction):
         destination = f"T{len(self.args) + 1}"
         lists = tuple(f"T{index}" for index in range(1, len(self.args) + 2))
         traversal = (
-            (repeat(self.size, (
+            (repeat(length("T1"), (
                 append(destination, self.expression),
                 change_var("index", 1),
             )),)
