@@ -4,6 +4,7 @@ from cattorch import scratch
 from cattorch.adapters import AdapterContext, ModuleAdapter
 from cattorch.analysis import AnalysisReport, EntryPointAnalysis, analyze
 from cattorch.benchmark import build_kernel_benchmark
+from cattorch.custom_ops import Operation, op
 from cattorch.kernel_api import Kernel, KernelContext, TensorInfo
 from cattorch.kernel_testing import check_kernel
 from cattorch.moe import (
@@ -26,7 +27,7 @@ from cattorch.program import (
 __all__ = [
     "AdapterContext", "AnalysisReport", "CustomMoEWarning", "EntryPoint", "EntryPointAnalysis",
     "ExpertFamily", "ExportProgram", "GenerationProgram", "Input", "Kernel", "KernelContext",
-    "ModuleAdapter", "Output", "ProgramCall", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE",
+    "ModuleAdapter", "Operation", "Output", "ProgramCall", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE",
     "State", "StateInput", "StateUpdate", "TensorInfo", "analyze", "build_kernel_benchmark",
-    "check_kernel", "routed_experts", "scratch", "select_routes", "stacked_swiglu_moe_adapter",
+    "check_kernel", "op", "routed_experts", "scratch", "select_routes", "stacked_swiglu_moe_adapter",
 ]

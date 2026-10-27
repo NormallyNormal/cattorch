@@ -504,6 +504,11 @@ def _fx_decompositions() -> dict:
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
     kept_by_export = _KEPT_OPERATIONS.get()
+    # Operations declared with ``cattorch.experimental.op`` and no kernel in
+    # this export run as their eager function.
+    from cattorch.custom_ops import declared_without_kernel
+    for operator, operation in declared_without_kernel(kept_by_export):
+        table[operator] = _recorded_fallback(str(operator), operation.eager)
     return {
         operator: _without_cycles(operator, decomposition)
         for operator, decomposition in table.items()

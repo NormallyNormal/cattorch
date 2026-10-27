@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import torch
 
+from cattorch.custom_ops import op
 
-@torch.library.custom_op("cattorch::rotary_embedding", mutates_args=())
+
+# Declared like user operations; their kernels are in ``builtin_kernels``.
+@op(name="cattorch::rotary_embedding", fake=lambda value, cosine, sine: torch.empty_like(value))
 def _rotary_embedding(
     value: torch.Tensor,
     cosine: torch.Tensor,
@@ -16,11 +19,6 @@ def _rotary_embedding(
     even, odd = pairs.unbind(-1)
     rotated = torch.stack((-odd, even), dim=-1).flatten(-2)
     return value * cosine + rotated * sine
-
-
-@_rotary_embedding.register_fake
-def _rotary_embedding_fake(value, cosine, sine):
-    return torch.empty_like(value)
 
 
 def rotary_embedding(
@@ -48,7 +46,16 @@ def rotary_embedding(
     return _rotary_embedding(value, cosine, sine)
 
 
-@torch.library.custom_op("cattorch::topk_values", mutates_args=())
+def _topk_shape(value, k, dim):
+    shape = list(value.shape)
+    shape[dim] = k
+    return shape
+
+
+@op(
+    name="cattorch::topk_values",
+    fake=lambda value, k, dim, largest: value.new_empty(_topk_shape(value, k, dim)),
+)
 def _topk_values(
     value: torch.Tensor, k: int, dim: int, largest: bool,
 ) -> torch.Tensor:
@@ -56,14 +63,12 @@ def _topk_values(
     return torch.topk(value, k, dim, largest, True).values
 
 
-@_topk_values.register_fake
-def _topk_values_fake(value, k, dim, largest):
-    shape = list(value.shape)
-    shape[dim] = k
-    return value.new_empty(shape)
-
-
-@torch.library.custom_op("cattorch::topk_indices", mutates_args=())
+@op(
+    name="cattorch::topk_indices",
+    fake=lambda value, k, dim, largest: value.new_empty(
+        _topk_shape(value, k, dim), dtype=torch.int64,
+    ),
+)
 def _topk_indices(
     value: torch.Tensor, k: int, dim: int, largest: bool,
 ) -> torch.Tensor:
@@ -73,13 +78,6 @@ def _topk_indices(
     """
     order = torch.sort(value, dim=dim, descending=largest, stable=True).indices
     return order.narrow(dim, 0, k)
-
-
-@_topk_indices.register_fake
-def _topk_indices_fake(value, k, dim, largest):
-    shape = list(value.shape)
-    shape[dim] = k
-    return value.new_empty(shape, dtype=torch.int64)
 
 
 # ── Private ops for the automatic generation step module ────────────────────

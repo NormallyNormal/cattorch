@@ -44,57 +44,25 @@ A change to an operation should come with:
 Fast kernels also need tests that measure how far the approximation drifts, and
 that the exact kernel is used when the approximation is turned off.
 
-## Draft context interface (internal)
+## Context kernels
 
-`cattorch.kernel_api` is a private draft of a friendlier way to write a kernel.
-It isn't exported or supported for users, and it may change before the public
-interface in 0.8. Contributors can use it for new kernels; rotary embedding and
-`topk` (`cattorch/builtin_kernels.py`) are written this way.
+New kernels are written against the public, experimental interface described
+in [custom kernels and operations](custom-kernels.md): a `Kernel` with an
+`emit(ctx)` function returning `cattorch.scratch` statements. Rotary
+embedding, `topk`, runtime gather and scatter, and generation's cached
+attention (`cattorch/builtin_kernels.py`) are written this way, and register
+in `_build_default_registry`. New built-in operations are declared with
+`cattorch.custom_ops.op`, as `cattorch/ops.py` does. Notes that only matter
+inside cattorch:
 
-A `Kernel` pairs an operator with an `emit` function. `emit` receives a
-`KernelContext` and returns a body of DSL statements; the context names every
-input instead of numbering `T` slots by hand.
-
-```python
-from cattorch.kernel_api import Kernel
-from cattorch.util.scratch.dsl import add, append, change_var, clear, item, mul, repeat, set_var, var
-
-def emit_scale_shift(ctx):
-    value, weight = ctx.inputs["value"], ctx.inputs["weight"]  # schema argument names
-    index = ctx.temp_var("index")
-    out = ctx.output.list
-    return (
-        clear(out),
-        set_var(index, 1),
-        repeat(value.numel, (
-            append(out, add(
-                mul(item(value.list, var(index)), item(weight.list, var(index))),
-                ctx.scalars["shift"],
-            )),
-            change_var(index, 1),
-        )),
-    )
-
-registry.register_kernel(Kernel("mylib.scale_shift.default", emit_scale_shift))
-```
-
-- `ctx.inputs` maps schema argument names to `TensorInfo` (`list`, `shape`,
-  `dtype`, `static`, `numel`, `strides`). `ctx.scalars` holds the other
-  arguments, with schema defaults filled in. `ctx.output` is the result.
-- `ctx.temp_list(name, length)` returns a private scratch list and records its
-  capacity so it is sharded past 200,000 items. `ctx.static_list(name, values)`
-  returns a private table filled at export time. Private names start with `_`
-  and are never merged across instructions. `ctx.temp_var(name)` declares a
-  variable; variables are shared by name across the sprite.
 - Lists are declared in request order, after the inputs, and the output is
   placed when `ctx.output` is first read. That order shows up in the sprite,
   so keep it stable when porting an existing kernel.
-- Don't put per-layer data (a layer index, say) in a kernel's name or body.
-  Layer sharing relies on identical layers producing identical code.
-- `Kernel(validator=...)` takes the same context and returns a rejection
-  reason or `None`; it surfaces in `UnsupportedOperationError`.
-  `Kernel(fast_flag="activations")` marks an approximate kernel used only in
-  fast mode with that `FastConfig` flag on.
+- `temp_list` and `static_list` names start with `_` and are never merged
+  across instructions; `temp_list` records its capacity so it is sharded past
+  200,000 items.
+- `Kernel(fast_flag="activations")` ties an approximate kernel to a
+  `FastConfig` flag.
 - `ctx.options` holds facts the compiler decides after the operation is
   known, such as the row stride and base variable of banked generation caches,
   or that this is the final layer during hidden prefill. It is empty in
@@ -109,7 +77,8 @@ registry.register_kernel(Kernel("mylib.scale_shift.default", emit_scale_shift))
   variable.
 - `register_kernel` merges into the operation's existing rule, keeping its
   quantization observer and the other (exact or fast) kernel. Register on a
-  cloned registry, never on `default_registry()`.
+  cloned registry, never on `default_registry()`; `transpile(kernels=...)`
+  does this per export.
 
 ## Operator conformance
 

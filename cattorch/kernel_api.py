@@ -330,9 +330,13 @@ class _ContextInstruction(Instruction):
 
 
 def active_kernel_targets(kernels, *, fast: bool, config: FastConfig) -> frozenset[str]:
-    """The operations ``kernels`` lower in this mode, which tracing keeps."""
+    """The operations ``kernels``, or kernels attached to declared operations,
+    lower in this mode; tracing keeps them whole."""
+    from cattorch.custom_ops import DECLARED
+
+    attached = [kernel for operation in DECLARED.values() for kernel in operation.kernels]
     return frozenset(
-        kernel.target_name for kernel in kernels
+        kernel.target_name for kernel in (*kernels, *attached)
         if not kernel.approximate or (
             fast and (kernel.fast_flag is None or bool(getattr(config, kernel.fast_flag)))
         )

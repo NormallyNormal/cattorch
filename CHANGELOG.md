@@ -2,6 +2,20 @@
 
 ## New features
 
+- Experimental custom kernels: `transpile(..., kernels=[Kernel(...)])` lowers
+  an operation with your own Scratch code for that export, replacing a
+  built-in kernel or a PyTorch decomposition. Kernels receive a context
+  naming each input's list, shape, dtype, and whether it is a stored weight,
+  and return statements from the new `cattorch.scratch` module. A validator
+  can reject calls, and `approximate=True` kernels apply only in fast mode.
+  `check_kernel` compares a kernel with PyTorch in the emulator, and
+  `build_kernel_benchmark` times it in Scratch. See
+  [custom kernels and operations](docs/custom-kernels.md).
+- Experimental `op` declares a new operation from an annotated function. It
+  exports whole, with a kernel attached through `@operation.kernel`, or
+  through its function when it has none.
+- `TranspileResult.approximate_operations` lists the operations that used an
+  approximate kernel in fast mode, and `verify` repeats it in its result.
 - `GenerationProgram(max_context=64)` exports an ordinary stateless
   `forward(tokens) -> logits` model as a KV-cached generator, with no
   `example_token`, combined QKV projection, or position wrapper. Separate

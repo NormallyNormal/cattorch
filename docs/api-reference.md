@@ -7,7 +7,10 @@ Functions, configuration classes, and result types are imported from
 
 Experimental programs, state, adapters, analysis, and MoE classes are imported
 from `cattorch.experimental`; see
-[experimental programs and sparse MoE](programs-and-moe.md).
+[experimental programs and sparse MoE](programs-and-moe.md). The experimental
+kernel interface (`Kernel`, `op`, `check_kernel`, `build_kernel_benchmark`,
+and `cattorch.scratch`) is described in
+[custom kernels and operations](custom-kernels.md).
 
 ## Model export
 
@@ -54,6 +57,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `adapters` | `ModuleAdapter`s for an `ExportProgram` or `GenerationProgram`. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
+| `kernels` | Experimental `Kernel`s for this export; see [custom kernels](custom-kernels.md). Each replaces the built-in lowering of its operation for this export. |
 | `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
 
 Tensor-input and generation exports return a `TranspileResult`. An
@@ -318,8 +322,12 @@ Fields shared by model and tokenizer results:
 
 `ArtifactResult` plus `inputs`, `output`, `additional_outputs`, `procedures`
 (the custom block names), `quantization` (a `QuantizationReport`, or
-`None`), and `fallback_operations`. The `outputs` property lists every
+`None`), `fallback_operations`, and `approximate_operations`. The `outputs`
+property lists every
 output's `TensorSpec` in order.
+
+`approximate_operations` lists, the same way, the operations that used an
+approximate kernel in fast mode.
 
 `fallback_operations` lists the operations that have no kernel of their own
 and ran as PyTorch's decomposition into simpler operations, as
@@ -343,6 +351,7 @@ Calls that depend only on weights are computed at export and aren't listed.
 | `max_rel_error` | Largest relative difference. |
 | `mean_abs_error` | Mean absolute difference. |
 | `worst_index` | Zero-based flattened index of the largest absolute error, or `None` for an empty result. |
+| `approximate_operations` | The export's `approximate_operations`, when `verify` was given its `TranspileResult`. Approximate kernels explain small differences. |
 
 If the sprite returns the wrong number of values, `passed` is `False` and the
 error fields are infinite; no exception is raised.
