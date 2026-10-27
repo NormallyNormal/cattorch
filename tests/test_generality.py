@@ -556,6 +556,17 @@ DECOMPOSED = {
     "transposed convolution": (nn.ConvTranspose2d(4, 4, 2, stride=2), (IMAGE,)),
     "3d convolution": (nn.Conv3d(4, 4, 3), (torch.randn(1, 4, 4, 4, 4),)),
     "same padding": (nn.Conv1d(4, 2, 4, padding="same"), (torch.randn(1, 4, 6),)),
+    "sort": (Lambda(lambda x: torch.sort(x, -1, descending=True).values), (VECTOR,)),
+    "argsort": (Lambda(lambda x: x.argsort(0)), (VECTOR,)),
+    "median": (Lambda(lambda x: x.median(-1).values), (VECTOR,)),
+    "kthvalue indices": (Lambda(lambda x: x.kthvalue(3, -1).indices), (VECTOR,)),
+    "cummax": (Lambda(lambda x: torch.cummax(x, -1).values), (VECTOR,)),
+    "isin": (Lambda(lambda x: torch.isin(x.floor(), torch.tensor([-2.0, 1.0])).float()), (VECTOR,)),
+    "atan2": (Lambda(lambda x: torch.atan2(x, x.flip(-1))), (VECTOR,)),
+    "logsumexp": (Lambda(lambda x: x.logsumexp(-1)), (VECTOR,)),
+    "max pool indices": (
+        Lambda(lambda x: F.max_pool2d(x, 2, return_indices=True)[1].float()), (IMAGE,),
+    ),
 }
 
 

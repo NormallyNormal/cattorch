@@ -12,39 +12,43 @@ an argument a model rarely uses, so a partial or failing operator may
 still work in your model; see [supported models](supported-models.md)
 for what cattorch is designed to handle.
 
-Of 1551 samples tried with PyTorch 2.14, 1266 pass.
+Of 1551 samples tried with PyTorch 2.14, 1392 pass.
 Samples were skipped when their output is random, complex, or not a tensor.
 
-## Every sample passes (366)
+## Every sample passes (401)
 
 `H`, `T`, `__getitem__`, `__radd__`, `__rdiv__`, `__rmatmul__`, `__rmod__`,
 `__rmul__`, `__rpow__`, `__rsub__`, `_chunk_cat`, `_softmax_backward_data`,
 `abs`, `acos`, `acosh`, `add`, `addbmm`, `addcdiv`, `addcmul`, `addmm`,
 `addmm.decomposed`, `addmv`, `addr`, `alias_copy`, `all`, `amax`, `amin`,
-`aminmax`, `angle`, `any`, `argmax`, `argmin`, `as_strided`,
+`aminmax`, `angle`, `any`, `argmax`, `argmin`, `argsort`, `as_strided`,
 `as_strided.partial_views`, `as_strided_copy`, `asin`, `asinh`, `atan`,
 `atan2`, `atanh`, `atleast_1d`, `atleast_2d`, `atleast_3d`, `baddbmm`,
 `block_diag`, `bmm`, `bmm.triton_optimized`, `broadcast_tensors`,
 `broadcast_to`, `cartesian_prod`, `cat`, `cdist`, `ceil`, `chunk`, `clamp`,
 `clamp_max`, `clamp_min`, `clone`, `column_stack`, `combinations`, `conj`,
 `conj_physical`, `constant_pad_nd`, `contiguous`, `copysign`, `cos`, `cosh`,
-`count_nonzero`, `cross`, `cumprod`, `cumsum`, `cumulative_trapezoid`,
-`deg2rad`, `diag`, `diag_embed`, `diagflat`, `diagonal`, `diagonal_copy`,
-`diff`, `dist`, `div.floor_rounding`, `div.no_rounding_mode`,
-`div.trunc_rounding`, `dot`, `dsplit`, `dstack`, `einsum`, `eq`, `erf`, `erfc`,
-`exp`, `exp2`, `expand`, `expand_as`, `expand_copy`, `expm1`, `fill`,
-`flatten`, `flip`, `fliplr`, `flipud`, `float_power`, `floor`, `floor_divide`,
-`fmax`, `fmin`, `fmod`, `frac`, `full_like`, `gather`, `ge`, `gradient`, `gt`,
-`heaviside`, `hsplit`, `hstack`, `hypot`, `inner`, `isfinite`, `isinf`,
-`isnan`, `isneginf`, `isposinf`, `isreal`, `kron`, `ldexp`, `le`, `lerp`,
-`log`, `log10`, `log1p`, `log2`, `log_softmax`, `log_softmax.with_dtype`,
-`logaddexp`, `logaddexp2`, `logcumsumexp`, `logical_and`, `logical_not`,
-`logical_or`, `logical_xor`, `logit`, `logspace.tensor_overload`, `logsumexp`,
-`lt`, `mH`, `mT`, `masked_fill`, `matmul`, `max.binary`,
-`max.reduction_no_dim`, `max.reduction_with_dim`, `maximum`, `mean`,
+`count_nonzero`, `cross`, `cummax`, `cummin`, `cumprod`, `cumsum`,
+`cumulative_trapezoid`, `deg2rad`, `diag`, `diag_embed`, `diagflat`,
+`diagonal`, `diagonal_copy`, `diff`, `dist`, `div.floor_rounding`,
+`div.no_rounding_mode`, `div.trunc_rounding`, `dot`, `dsplit`, `dstack`,
+`einsum`, `eq`, `erf`, `erfc`, `exp`, `exp2`, `expand`, `expand_as`,
+`expand_copy`, `expm1`, `fill`, `flatten`, `flip`, `fliplr`, `flipud`,
+`float_power`, `floor`, `floor_divide`, `fmax`, `fmin`, `fmod`, `frac`,
+`full_like`, `gather`, `ge`, `gradient`, `grid_sampler_2d`, `gt`, `heaviside`,
+`hsplit`, `hstack`, `hypot`, `index_add`, `index_copy`, `index_fill`,
+`index_put`, `index_reduce.amax`, `index_reduce.amin`, `index_reduce.mean`,
+`index_reduce.prod`, `index_select`, `inner`, `isfinite`, `isin`, `isinf`,
+`isnan`, `isneginf`, `isposinf`, `isreal`, `kron`, `kthvalue`, `ldexp`, `le`,
+`lerp`, `log`, `log10`, `log1p`, `log2`, `log_softmax`,
+`log_softmax.with_dtype`, `logaddexp`, `logaddexp2`, `logcumsumexp`,
+`logical_and`, `logical_not`, `logical_or`, `logical_xor`, `logit`,
+`logspace.tensor_overload`, `logsumexp`, `lt`, `mH`, `mT`, `masked_fill`,
+`matmul`, `max.binary`, `max.reduction_no_dim`, `max.reduction_with_dim`,
+`max_pool2d_with_indices_backward`, `maximum`, `mean`, `median`,
 `meshgrid.list_of_tensors`, `meshgrid.variadic_tensors`, `min.binary`,
 `min.reduction_no_dim`, `min.reduction_with_dim`, `minimum`, `mm`, `movedim`,
-`mul`, `mv`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
+`msort`, `mul`, `mv`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
 `native_dropout_backward`, `native_group_norm`, `native_layer_norm`, `ne`,
 `neg`, `new_full`, `new_ones`, `new_zeros`,
 `nn.functional.adaptive_avg_pool1d`, `nn.functional.adaptive_avg_pool2d`,
@@ -60,21 +64,25 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `nn.functional.conv_transpose3d`, `nn.functional.cosine_embedding_loss`,
 `nn.functional.cosine_similarity`, `nn.functional.cross_entropy`,
 `nn.functional.elu`, `nn.functional.embedding`, `nn.functional.gelu`,
-`nn.functional.glu`, `nn.functional.group_norm`, `nn.functional.hardshrink`,
-`nn.functional.hardsigmoid`, `nn.functional.hardswish`,
-`nn.functional.hardtanh`, `nn.functional.hinge_embedding_loss`,
-`nn.functional.huber_loss`, `nn.functional.interpolate.area`,
-`nn.functional.interpolate.bicubic`, `nn.functional.interpolate.bilinear`,
-`nn.functional.interpolate.linear`, `nn.functional.interpolate.nearest`,
-`nn.functional.interpolate.nearest-exact`,
+`nn.functional.glu`, `nn.functional.grid_sample`, `nn.functional.group_norm`,
+`nn.functional.hardshrink`, `nn.functional.hardsigmoid`,
+`nn.functional.hardswish`, `nn.functional.hardtanh`,
+`nn.functional.hinge_embedding_loss`, `nn.functional.huber_loss`,
+`nn.functional.interpolate.area`, `nn.functional.interpolate.bicubic`,
+`nn.functional.interpolate.bilinear`, `nn.functional.interpolate.linear`,
+`nn.functional.interpolate.nearest`, `nn.functional.interpolate.nearest-exact`,
 `nn.functional.interpolate.trilinear`, `nn.functional.kl_div`,
 `nn.functional.l1_loss`, `nn.functional.layer_norm`,
 `nn.functional.leaky_relu`, `nn.functional.linear`,
 `nn.functional.linear_cross_entropy`, `nn.functional.local_response_norm`,
 `nn.functional.logsigmoid`, `nn.functional.margin_ranking_loss`,
 `nn.functional.max_pool1d`, `nn.functional.max_pool2d`,
-`nn.functional.max_pool3d`, `nn.functional.mish`, `nn.functional.mse_loss`,
-`nn.functional.multi_margin_loss`, `nn.functional.multilabel_margin_loss`,
+`nn.functional.max_pool3d`, `nn.functional.max_unpool1d`,
+`nn.functional.max_unpool1d.grad`, `nn.functional.max_unpool2d`,
+`nn.functional.max_unpool2d.grad`, `nn.functional.max_unpool3d`,
+`nn.functional.max_unpool3d.grad`, `nn.functional.mish`,
+`nn.functional.mse_loss`, `nn.functional.multi_margin_loss`,
+`nn.functional.multilabel_margin_loss`,
 `nn.functional.multilabel_soft_margin_loss`, `nn.functional.nll_loss`,
 `nn.functional.normalize`, `nn.functional.pad.circular`,
 `nn.functional.pad.constant`, `nn.functional.pad.reflect`,
@@ -92,15 +100,18 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `nn.functional.triplet_margin_with_distance_loss`, `nn.functional.unfold`,
 `nn.functional.upsample_bilinear`, `nn.functional.upsample_nearest`, `norm`,
 `norm.fro`, `norm.inf`, `ones_like`, `outer`, `permute`, `permute_copy`,
-`positive`, `pow`, `prod`, `rad2deg`, `ravel`, `real`, `reciprocal`,
+`positive`, `pow`, `prod`, `put`, `rad2deg`, `ravel`, `real`, `reciprocal`,
 `remainder`, `renorm`, `repeat`, `reshape`, `reshape_as`, `resolve_conj`,
 `resolve_neg`, `roll`, `rot90`, `round`, `round.decimals_0`,
-`round.decimals_3`, `round.decimals_neg_3`, `rsqrt`, `rsub`, `searchsorted`,
-`select`, `select_scatter`, `sgn`, `sigmoid`, `sign`, `signbit`, `sin`, `sinc`,
-`sinh`, `slice`, `softmax`, `softmax.with_dtype`, `split`, `split.list_args`,
-`split_with_sizes`, `split_with_sizes_copy`, `sqrt`, `square`, `squeeze`,
-`squeeze.multiple`, `squeeze_copy`, `stack`, `std`, `std.unbiased`, `std_mean`,
-`std_mean.unbiased`, `sub`, `sum`, `sum_to_size`, `t`, `t_copy`,
+`round.decimals_3`, `round.decimals_neg_3`, `rsqrt`, `rsub`, `scatter`,
+`scatter_add`, `scatter_reduce.amax`, `scatter_reduce.amin`,
+`scatter_reduce.mean`, `scatter_reduce.prod`, `scatter_reduce.sum`,
+`searchsorted`, `select`, `select_scatter`, `sgn`, `sigmoid`, `sign`,
+`signbit`, `sin`, `sinc`, `sinh`, `slice`, `softmax`, `softmax.with_dtype`,
+`sort`, `split`, `split.list_args`, `split_with_sizes`,
+`split_with_sizes_copy`, `sqrt`, `square`, `squeeze`, `squeeze.multiple`,
+`squeeze_copy`, `stack`, `std`, `std.unbiased`, `std_mean`,
+`std_mean.unbiased`, `sub`, `sum`, `sum_to_size`, `t`, `t_copy`, `take`,
 `take_along_dim`, `tan`, `tanh`, `tensordot`, `tile`, `topk`,
 `torch.ops.aten._safe_softmax.default`, `trace`, `transpose`, `transpose_copy`,
 `trapezoid`, `trapz`, `tril`, `triu`, `true_divide`, `trunc`, `unbind`,
@@ -109,12 +120,11 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `var_mean`, `var_mean.unbiased`, `vdot`, `view`, `view_as`, `view_copy`,
 `vsplit`, `vstack`, `where`, `xlogy`, `zero_`, `zeros_like`
 
-## Some samples pass (12)
+## Some samples pass (10)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
 | `digamma` | 1/3 | no kernel for `aten.digamma.default` |
-| `isin` | 1/2 | no kernel for `aten.sort.default` |
 | `lgamma` | 1/3 | no kernel for `aten.lgamma.default` |
 | `linspace.tensor_overload` | 2/3 | no kernel for `aten.copy.default` |
 | `narrow` | 2/4 | passes only with constant integer arguments |
@@ -124,49 +134,31 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `nn.functional.linear_cross_entropy.chunked_none` | 1/4 | no kernel for `torch_nn._linear_cross_entropy_batch_chunked_no_reduction.default` |
 | `nn.functional.scaled_dot_product_attention` | 2/4 | tracing failed (RuntimeError: cattorch SDPA decomposition requires dropout_p=0) |
 | `repeat_interleave` | 3/4 | passes only with constant integer arguments |
-| `scatter` | 2/4 | no kernel for `aten.scatter.reduce` |
 
-## No sample passes (72)
+## No sample passes (39)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
 | `_batch_norm_with_update` | 0/4 | no kernel for `aten.copy_.default` |
 | `_upsample_bilinear2d_aa` | 0/4 | no kernel for `aten._upsample_bilinear2d_aa.default` |
-| `argsort` | 0/3 | no kernel for `aten.sort.default` |
 | `as_strided_scatter` | 0/4 | no kernel for `aten.as_strided_scatter.default` |
 | `bucketize` | 0/4 | needs an input's value at export (`aten.item.default`) |
 | `cauchy` | 0/3 | no kernel for `aten.rand_like.default` |
 | `corrcoef` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `cov` | 0/4 | needs an input's value at export (`aten.equal.default`) |
-| `cummax` | 0/3 | no kernel for `aten.cummax.default` |
-| `cummin` | 0/3 | no kernel for `aten.cummin.default` |
 | `diagonal_scatter` | 0/4 | no kernel for `prims.copy_to.default` |
 | `erfinv` | 0/1 | no kernel for `prims.erf_inv.default` |
 | `exponential` | 0/3 | no kernel for `aten.rand_like.default` |
 | `frexp` | 0/3 | no kernel for `aten.frexp.Tensor` |
 | `geometric` | 0/3 | no kernel for `aten.rand_like.default` |
-| `grid_sampler_2d` | 0/4 | `aten.index.Tensor`: only the first argument can vary at runtime |
 | `grid_sampler_3d` | 0/1 | no kernel for `aten.grid_sampler_3d.default` |
 | `hash_tensor` | 0/4 | no kernel for `aten.hash_tensor.default` |
 | `i0` | 0/2 | no kernel for `prims.bessel_i0.default` |
 | `igamma` | 0/4 | no kernel for `aten.igamma.default` |
 | `igammac` | 0/4 | no kernel for `aten.igammac.default` |
-| `index_add` | 0/4 | no kernel for `aten.index_put.default` |
-| `index_copy` | 0/3 | no kernel for `aten.index_put.default` |
-| `index_fill` | 0/4 | no kernel for `aten.index_put.default` |
-| `index_put` | 0/4 | no kernel for `aten.index_put.default` |
-| `index_reduce.amax` | 0/4 | no kernel for `aten.index_reduce.default` |
-| `index_reduce.amin` | 0/4 | no kernel for `aten.index_reduce.default` |
-| `index_reduce.mean` | 0/4 | no kernel for `aten.index_reduce.default` |
-| `index_reduce.prod` | 0/4 | no kernel for `aten.index_reduce.default` |
-| `index_select` | 0/3 | passes only with constant integer arguments |
-| `kthvalue` | 0/4 | no kernel for `aten.kthvalue.default` |
 | `log_normal` | 0/3 | no kernel for `aten.randn_like.default` |
 | `masked_scatter` | 0/4 | no kernel for `aten.masked_scatter.default` |
-| `max_pool2d_with_indices_backward` | 0/4 | no kernel for `aten.scatter_add.default` |
-| `median` | 0/4 | no kernel for `aten.median.default` |
 | `mode` | 0/4 | no kernel for `aten.mode.default` |
-| `msort` | 0/1 | no kernel for `aten.sort.default` |
 | `mvlgamma.mvlgamma_p_1` | 0/4 | no kernel for `aten.lgamma.default` |
 | `mvlgamma.mvlgamma_p_3` | 0/4 | no kernel for `aten.lgamma.default` |
 | `mvlgamma.mvlgamma_p_5` | 0/4 | no kernel for `aten.lgamma.default` |
@@ -176,29 +168,13 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `nn.functional.fractional_max_pool2d` | 0/4 | no kernel for `aten.rand.default` |
 | `nn.functional.fractional_max_pool3d` | 0/4 | no kernel for `aten.rand.default` |
 | `nn.functional.gaussian_nll_loss` | 0/4 | needs an input's value at export (`aten.item.default`) |
-| `nn.functional.grid_sample` | 0/4 | `aten.index.Tensor`: only the first argument can vary at runtime |
 | `nn.functional.instance_norm` | 0/4 | no kernel for `aten.copy_.default` |
-| `nn.functional.max_unpool1d` | 0/4 | no kernel for `aten.index_put.default` |
-| `nn.functional.max_unpool1d.grad` | 0/4 | no kernel for `aten.index_put.default` |
-| `nn.functional.max_unpool2d` | 0/4 | no kernel for `aten.index_put.default` |
-| `nn.functional.max_unpool2d.grad` | 0/4 | no kernel for `aten.index_put.default` |
-| `nn.functional.max_unpool3d` | 0/4 | no kernel for `aten.index_put.default` |
-| `nn.functional.max_unpool3d.grad` | 0/4 | no kernel for `aten.index_put.default` |
 | `norm.nuc` | 0/2 | no kernel for `aten._linalg_svd.default` |
 | `polygamma.polygamma_n_0` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_1` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_2` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_3` | 0/4 | no kernel for `aten.polygamma.default` |
 | `polygamma.polygamma_n_4` | 0/4 | no kernel for `aten.polygamma.default` |
-| `put` | 0/4 | no kernel for `aten.put.default` |
 | `quantile` | 0/4 | needs an input's value at export (`aten.equal.default`) |
-| `scatter_add` | 0/4 | no kernel for `aten.scatter_add.default` |
-| `scatter_reduce.amax` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `scatter_reduce.amin` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `scatter_reduce.mean` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `scatter_reduce.prod` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `scatter_reduce.sum` | 0/4 | no kernel for `aten.scatter_reduce.two` |
-| `sort` | 0/3 | no kernel for `aten.sort.default` |
 | `stft` | 0/1 | no kernel for `aten._fft_r2c.default` |
-| `take` | 0/4 | passes only with constant integer arguments |
 | `tensor_split` | 0/4 | passes only with constant integer arguments |

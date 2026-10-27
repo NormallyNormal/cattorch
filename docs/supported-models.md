@@ -21,12 +21,12 @@ For persistent state and bounded variable-length tensors, use an experimental
 | Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
 | Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
-| Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `cumsum`, over any dimensions; `torch.topk` |
+| Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `median`, `kthvalue`, over any dimensions; `cumsum`, `cumprod`, `cummax`, `cummin`; `torch.topk`, `torch.sort`, `argsort` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
-| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling, `index_select` or indexing with indices that don't depend on the input, and `gather` and `scatter` (without `reduce`) with any indices |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
 | In-place updates | `x /= y`, `x.copy_(y)`, and slice or index assignment such as `x[..., :4] = y` on a tensor the model created, with step-one slices; updates of inputs, parameters, or a tensor read through an earlier view are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs

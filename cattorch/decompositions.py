@@ -14,6 +14,32 @@ import torch
 _aten = torch.ops.aten
 
 
+def traced_from_input(value) -> bool | None:
+    """Whether a tensor being traced depends on a model input.
+
+    ``None`` when the tracer doesn't know the tensor at all.
+    """
+    import torch.fx.experimental.proxy_tensor as proxy_tensor
+
+    mode = proxy_tensor.get_proxy_mode()
+    if mode is None:
+        return None
+    slot = proxy_tensor.get_proxy_slot(value, mode.tracer, None)
+    proxy = getattr(slot, "proxy", slot)
+    if not isinstance(proxy, torch.fx.Proxy):
+        return None
+    seen, stack = set(), [proxy.node]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node.op == "placeholder":
+            return True
+        stack.extend(node.all_input_nodes)
+    return False
+
+
 def _sign(value):
     positive = _aten.gt.Scalar(value, 0)
     negative = _aten.lt.Scalar(value, 0)
@@ -634,6 +660,289 @@ def _adaptive_avg_pool3d(value, output_size):
     )
 
 
+def _positive_index(index, size):
+    """Negative indices count from the end."""
+    return _aten.where.self(_aten.lt.Scalar(index, 0), _aten.add.Tensor(index, size), index)
+
+
+def _along(index, dim, shape):
+    """A 1D ``index`` laid along ``dim`` and expanded to ``shape``."""
+    view = [1] * len(shape)
+    view[dim] = index.numel()
+    return _aten.expand.default(_aten.reshape.default(index, view), list(shape))
+
+
+def _replaced(shape, dim, size):
+    shape = list(shape)
+    shape[dim] = size
+    return shape
+
+
+def _as_vector(decomposition):
+    """Run a decomposition on a 0-d tensor as a 1-element vector."""
+    def wrapped(value, dim, *args, **kwargs):
+        if value.ndim != 0:
+            return decomposition(value, dim, *args, **kwargs)
+        vectors = [
+            _aten.reshape.default(arg, [1])
+            if isinstance(arg, torch.Tensor) and arg.ndim == 0 and arg.is_floating_point()
+            else arg
+            for arg in args
+        ]
+        result = decomposition(_aten.reshape.default(value, [1]), 0, *vectors, **kwargs)
+        if result is NotImplemented:
+            return result
+        return _aten.reshape.default(result, [])
+    return wrapped
+
+
+def _index_select(value, dim, index):
+    """``index_select`` with input-dependent indices: a runtime ``gather``."""
+    if not traced_from_input(index):
+        return NotImplemented
+    dim %= value.ndim
+    index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
+    return _aten.gather.default(
+        value, dim, _along(index, dim, _replaced(value.shape, dim, index.numel())),
+    )
+
+
+def _take(value, index):
+    flat = _aten.reshape.default(value, [-1])
+    positions = _positive_index(_aten.reshape.default(index, [-1]), flat.numel())
+    return _aten.reshape.default(_aten.gather.default(flat, 0, positions), list(index.shape))
+
+
+def _scatter_along(update):
+    """``index_add``, ``index_copy`` and ``index_reduce`` as scatters."""
+    def decomposition(value, dim, index, source, *args, **kwargs):
+        dim %= value.ndim
+        index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
+        return update(value, dim, _along(index, dim, source.shape), source, *args, **kwargs)
+    return _as_vector(decomposition)
+
+
+def _index_add(value, dim, index, source, *, alpha=1):
+    if alpha != 1:
+        source = _aten.mul.Tensor(source, alpha)
+    return _aten.scatter_add.default(value, dim, index, source)
+
+
+def _index_reduce(value, dim, index, source, reduce, *, include_self=True):
+    return _aten.scatter_reduce.two(value, dim, index, source, reduce, include_self=include_self)
+
+
+@_as_vector
+def _index_fill(value, dim, index, fill):
+    dim %= value.ndim
+    index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
+    expanded = _along(index, dim, _replaced(value.shape, dim, index.numel()))
+    if isinstance(fill, torch.Tensor):
+        source = _aten.expand.default(_aten.to.dtype(fill, value.dtype), list(expanded.shape))
+        return _aten.scatter.src(value, dim, expanded, source)
+    return _aten.scatter.value(value, dim, expanded, fill)
+
+
+def _advanced_index(value, indices):
+    """Lay out integer advanced indexing as a gather from a 2D view.
+
+    The indexed dimensions are moved first and flattened, so one linear index
+    per element picks a row. Returns the view, the linear index, the
+    indexed result's broadcast shape, the remaining dimensions' sizes, and
+    where the broadcast dimensions go in the result.
+    """
+    indices = list(indices) + [None] * (value.ndim - len(indices))
+    indexed = [dim for dim, index in enumerate(indices) if index is not None]
+    rest = [dim for dim in range(value.ndim) if dim not in indexed]
+    broadcast = list(torch.broadcast_shapes(*(indices[dim].shape for dim in indexed)))
+    linear, stride = None, 1
+    for dim in reversed(indexed):
+        term = _positive_index(indices[dim], value.shape[dim])
+        if stride != 1:
+            term = _aten.mul.Tensor(term, stride)
+        linear = term if linear is None else _aten.add.Tensor(linear, term)
+        stride *= value.shape[dim]
+    linear = _aten.expand.default(linear, broadcast)
+    rest_shape = [value.shape[dim] for dim in rest]
+    rows = _aten.reshape.default(_aten.permute.default(value, indexed + rest), [stride, *rest_shape])
+    # PyTorch puts the broadcast dimensions where the indexed ones were if
+    # they are adjacent, else first.
+    adjacent = indexed == list(range(indexed[0], indexed[-1] + 1))
+    front = indexed[0] if adjacent else 0
+    return rows, linear, broadcast, rest_shape, front, indexed + rest
+
+
+def _rows_index(linear, rest_shape):
+    count = linear.numel()
+    view = _aten.reshape.default(linear, [count, *([1] * len(rest_shape))])
+    return _aten.expand.default(view, [count, *rest_shape])
+
+
+def _result_order(broadcast, rest_shape, front):
+    """Permutation from ``[*broadcast, *rest]`` to the indexing result's order."""
+    count, rests = len(broadcast), len(rest_shape)
+    return (
+        [count + position for position in range(front)]
+        + list(range(count))
+        + [count + position for position in range(front, rests)]
+    )
+
+
+def _integer_indices(indices):
+    present = [index for index in indices if index is not None]
+    return present and all(
+        not index.is_floating_point() and index.dtype != torch.bool for index in present
+    )
+
+
+def _index(value, indices):
+    """Tensor indexing with input-dependent integer indices."""
+    if not _integer_indices(indices) or not any(
+        traced_from_input(index) for index in indices if index is not None
+    ):
+        return NotImplemented
+    rows, linear, broadcast, rest_shape, front, _ = _advanced_index(value, indices)
+    picked = _aten.gather.default(rows, 0, _rows_index(linear, rest_shape))
+    picked = _aten.reshape.default(picked, [*broadcast, *rest_shape])
+    return _aten.permute.default(picked, _result_order(broadcast, rest_shape, front))
+
+
+def _index_put(value, indices, values, accumulate=False):
+    present = [index for index in indices if index is not None]
+    if len(present) == 1 and present[0].dtype == torch.bool and indices[0] is not None:
+        # ``x[mask] = v`` with the same values for every selected element: a
+        # select, whatever the mask holds.
+        mask = present[0]
+        trailing = list(value.shape[mask.ndim:])
+        if tuple(mask.shape) != tuple(value.shape[:mask.ndim]) or values.ndim > len(trailing):
+            return NotImplemented
+        try:
+            torch.broadcast_shapes(tuple(values.shape), tuple(trailing))
+        except RuntimeError:
+            return NotImplemented
+        mask = _aten.expand.default(
+            _aten.reshape.default(mask, [*mask.shape, *([1] * len(trailing))]),
+            list(value.shape),
+        )
+        fill = _aten.expand.default(_aten.to.dtype(values, value.dtype), list(value.shape))
+        if accumulate:
+            return _aten.add.Tensor(value, _aten.where.self(mask, fill, _aten.zeros_like.default(value)))
+        return _aten.where.self(mask, fill, value)
+    if not _integer_indices(indices):
+        return NotImplemented
+    rows, linear, broadcast, rest_shape, front, order = _advanced_index(value, indices)
+    result_shape = [*rest_shape[:front], *broadcast, *rest_shape[front:]]
+    values = _aten.expand.default(_aten.to.dtype(values, value.dtype), result_shape)
+    # Back from the result's order to ``[*broadcast, *rest]``.
+    forward = _result_order(broadcast, rest_shape, front)
+    inverse = [forward.index(position) for position in range(len(forward))]
+    values = _aten.reshape.default(
+        _aten.permute.default(values, inverse), [linear.numel(), *rest_shape],
+    )
+    positions = _rows_index(linear, rest_shape)
+    if accumulate:
+        rows = _aten.scatter_add.default(rows, 0, positions, values)
+    else:
+        rows = _aten.scatter.src(rows, 0, positions, values)
+    permuted = [value.shape[dim] for dim in order]
+    restore = [order.index(dim) for dim in range(value.ndim)]
+    return _aten.permute.default(_aten.reshape.default(rows, permuted), restore)
+
+
+def _put(value, index, source, accumulate=False):
+    flat = _aten.reshape.default(value, [-1])
+    updated = _index_put(
+        flat, [_aten.reshape.default(index, [-1])], _aten.reshape.default(source, [-1]), accumulate,
+    )
+    return _aten.reshape.default(updated, list(value.shape))
+
+
+def _sort(value, dim=-1, descending=False, *, stable=False):
+    """A full-length ``topk``, whose ties keep their order like a stable sort."""
+    if value.ndim == 0:
+        return value, _aten.zeros_like.default(value, dtype=torch.long)
+    dim %= value.ndim
+    count = value.shape[dim]
+    return (
+        torch.ops.cattorch.topk_values(value, count, dim, descending),
+        torch.ops.cattorch.topk_indices(value, count, dim, descending),
+    )
+
+
+def _stable_sort(value, *, stable=None, dim=-1, descending=False):
+    return _sort(value, dim, descending)
+
+
+def _argsort(value, dim=-1, descending=False, *, stable=False):
+    return _sort(value, dim, descending)[1]
+
+
+def _kthvalue(value, k, dim=-1, keepdim=False):
+    if value.ndim == 0:
+        return value, _aten.zeros_like.default(value, dtype=torch.long)
+    values, indices = _sort(value, dim)
+    dim %= value.ndim
+    values = _aten.slice.Tensor(values, dim, k - 1, k)
+    indices = _aten.slice.Tensor(indices, dim, k - 1, k)
+    if not keepdim:
+        values, indices = _aten.squeeze.dim(values, dim), _aten.squeeze.dim(indices, dim)
+    return values, indices
+
+
+def _median_dim(value, dim=-1, keepdim=False):
+    """The lower median, as in PyTorch."""
+    count = value.shape[dim % value.ndim] if value.ndim else 1
+    return _kthvalue(value, (count + 1) // 2, dim, keepdim)
+
+
+def _median(value):
+    flat = _aten.reshape.default(value, [-1])
+    return _median_dim(flat, 0)[0]
+
+
+def _cumulative_extreme(largest):
+    """``cummax``/``cummin`` through a triangular mask; PyTorch reports the
+    latest position of the running extreme."""
+    def decomposition(value, dim):
+        if value.ndim == 0:
+            return value, _aten.zeros_like.default(value, dtype=torch.long)
+        dim %= value.ndim
+        count = value.shape[dim]
+        moved = _aten.movedim.int(value, dim, -1)
+        earlier = torch.tensor(
+            [[column <= row for column in range(count)] for row in range(count)],
+            dtype=torch.bool, device=value.device,
+        )
+        rows = _aten.unsqueeze.default(moved, -2)
+        blocked = -math.inf if largest else math.inf
+        masked = _aten.where.self(earlier, rows, _aten.full_like.default(rows, blocked))
+        extreme = (_aten.amax if largest else _aten.amin).default(masked, [-1], True)
+        positions = torch.arange(count, device=value.device)
+        found = _aten.logical_and.default(earlier, _aten.eq.Tensor(masked, extreme))
+        latest = _aten.amax.default(_aten.where.self(
+            found, _aten.expand.default(positions, list(found.shape)),
+            _aten.full_like.default(found, -1, dtype=torch.long),
+        ), [-1])
+        return (
+            _aten.movedim.int(_aten.squeeze.dim(extreme, -1), -1, dim),
+            _aten.movedim.int(latest, -1, dim),
+        )
+    return decomposition
+
+
+def _isin(elements, test_elements, *, assume_unique=False, invert=False):
+    if not isinstance(elements, torch.Tensor):
+        return NotImplemented
+    tests = test_elements if isinstance(test_elements, torch.Tensor) else torch.tensor(
+        test_elements, device=elements.device,
+    )
+    found = _aten.any.dim(
+        _aten.eq.Tensor(_aten.unsqueeze.default(elements, -1), _aten.reshape.default(tests, [-1])),
+        -1,
+    )
+    return _aten.logical_not.default(found) if invert else found
+
+
 POINTWISE_DECOMPOSITIONS = {
     _aten.sign.default: _sign,
     _aten.sgn.default: _sign,
@@ -701,4 +1010,28 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.avg_pool3d.default: _avg_pool3d,
     _aten._adaptive_avg_pool3d.default: _adaptive_avg_pool3d,
     _aten.adaptive_avg_pool3d.default: _adaptive_avg_pool3d,
+    _aten.index_select.default: _as_vector(_index_select),
+    _aten.index.Tensor: _index,
+    _aten.take.default: _take,
+    _aten.index_add.default: _scatter_along(_index_add),
+    _aten.index_copy.default: _scatter_along(_aten.scatter.src),
+    _aten.index_reduce.default: _scatter_along(_index_reduce),
+    _aten.index_fill.int_Scalar: _index_fill,
+    _aten.index_fill.int_Tensor: _index_fill,
+    _aten.index_put.default: _index_put,
+    _aten.put.default: _put,
+    _aten.sort.default: _sort,
+    _aten.sort.stable: _stable_sort,
+    _aten.argsort.default: _argsort,
+    _aten.argsort.stable: lambda value, *, stable, dim=-1, descending=False: _sort(
+        value, dim, descending,
+    )[1],
+    _aten.msort.default: lambda value: _sort(value, 0)[0],
+    _aten.kthvalue.default: _kthvalue,
+    _aten.median.dim: _median_dim,
+    _aten.median.default: _median,
+    _aten.cummax.default: _cumulative_extreme(True),
+    _aten.cummin.default: _cumulative_extreme(False),
+    _aten.isin.Tensor_Tensor: _isin,
+    _aten.isin.Tensor_Scalar: _isin,
 }

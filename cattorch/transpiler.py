@@ -848,6 +848,23 @@ class _Compiler:
                 value = defaults[len(node_args) - 2]
                 node_args.append(value)
                 input_lists.append("_none" if value is None else f"C_{value}")
+        # Other keyword arguments, such as ``include_self``, take their schema
+        # positions; skipped ones before them get their defaults.
+        schema = getattr(node.target, "_schema", None)
+        if schema is not None and node.kwargs and not any(
+            hasattr(value, "name") for value in node.kwargs.values()
+        ):
+            names = [argument.name for argument in schema.arguments]
+            last = max(
+                (names.index(key) for key in node.kwargs if key in names), default=-1,
+            )
+            for argument in schema.arguments[len(node_args):last + 1]:
+                value = node.kwargs.get(
+                    argument.name,
+                    argument.default_value if argument.has_default_value() else None,
+                )
+                node_args.append(value)
+                input_lists.append("_none" if value is None else f"C_{value}")
         log.info("%s -> %s (%s) (Inputs: %s)",
                  aten_op, target_list, node.name, input_lists)
 

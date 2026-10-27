@@ -23,7 +23,7 @@ from torch.export import export
 from torch.utils._pytree import tree_flatten
 from torch._decomp import core_aten_decompositions, get_decompositions
 
-from cattorch.decompositions import POINTWISE_DECOMPOSITIONS
+from cattorch.decompositions import POINTWISE_DECOMPOSITIONS, traced_from_input
 from cattorch.errors import UnsupportedModelError
 
 
@@ -325,20 +325,8 @@ def _static_scalar_decomposition(operator):
     keep the data-dependent error.
     """
     def decomposition(value, *args, **kwargs):
-        mode = proxy_tensor.get_proxy_mode()
-        slot = proxy_tensor.get_proxy_slot(value, mode.tracer, None)
-        proxy = getattr(slot, "proxy", slot)
-        if not isinstance(proxy, torch.fx.Proxy):
+        if traced_from_input(value) is not False:
             return NotImplemented
-        seen, stack = set(), [proxy.node]
-        while stack:
-            node = stack.pop()
-            if node in seen:
-                continue
-            seen.add(node)
-            if node.op == "placeholder":
-                return NotImplemented
-            stack.extend(node.all_input_nodes)
         with proxy_tensor.disable_proxy_modes_tracing():
             result = operator(value, *args, **kwargs)
         log.info("specialised %s on input-independent value: %r", operator, result)

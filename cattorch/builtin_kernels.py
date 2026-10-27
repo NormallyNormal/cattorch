@@ -462,9 +462,27 @@ def _validate_runtime_index(ctx: KernelContext) -> str | None:
         index.shape[axis] > src.shape[axis] for axis in range(len(src.shape))
     ):
         return "index may not be larger than src"
-    if ctx.scalars.get("reduce") not in (None, "none"):
-        return "scatter reductions are not supported"
     return None
+
+
+def _validate_scatter(ctx: KernelContext) -> str | None:
+    if ctx.scalars.get("reduce") not in (None, "none"):
+        return "this scatter takes no reduction"
+    return _validate_runtime_index(ctx)
+
+
+# The identity each reduction starts a target from without ``include_self``.
+_SCATTER_REDUCTIONS = {
+    "sum": 0, "add": 0, "mean": 0, "prod": 1, "multiply": 1,
+    "amax": -math.inf, "amin": math.inf,
+}
+
+
+def _validate_scatter_reduce(ctx: KernelContext) -> str | None:
+    reduce = ctx.scalars.get("reduce", "sum")
+    if reduce not in _SCATTER_REDUCTIONS:
+        return f"scatter reduction {reduce!r} is not supported"
+    return _validate_runtime_index(ctx)
 
 
 def _emit_gather(ctx: KernelContext):
@@ -485,6 +503,85 @@ def _emit_gather(ctx: KernelContext):
             change_var(position, 1),
         )),
     )
+
+
+def _emit_scatter_reduce(ctx: KernelContext, *, scalar: bool, default: str | None = None):
+    """``scatter_add`` and ``scatter_reduce``: combine each entry into its target.
+
+    Targets start from the input, or from the reduction's identity without
+    ``include_self``. A mean also counts the values reaching each position.
+    """
+    source, index = ctx.inputs["self"], ctx.inputs["index"]
+    dim = int(ctx.scalars["dim"]) % len(source.shape)
+    stride = math.prod(source.shape[dim + 1:])
+    reduce = default or ctx.scalars.get("reduce") or "sum"
+    include_self = bool(ctx.scalars.get("include_self", True))
+    targets = ctx.static_list("scatter_targets", _index_bases(index.shape, source.shape, dim))
+    position = ctx.temp_var("index")
+    target = ctx.temp_var("target")
+    if scalar:
+        written = ctx.scalars["value"]
+    else:
+        src = ctx.inputs["src"]
+        sources = ctx.static_list(
+            "scatter_sources", _index_bases(index.shape, src.shape, len(src.shape)),
+        )
+        written = item(src.list, item(sources, var(position)))
+    out = ctx.output.list
+    current = item(out, var(target))
+    if reduce in {"amax", "amin"}:
+        better = gt if reduce == "amax" else lt
+        combine = (if_(better(written, current), (replace(out, var(target), written),)),)
+    elif reduce in {"prod", "multiply"}:
+        combine = (replace(out, var(target), mul(current, written)),)
+    else:
+        combine = (replace(out, var(target), add(current, written)),)
+
+    def each_entry(*statements):
+        return (
+            set_var(position, 1),
+            repeat(index.numel, (
+                set_var(target, add(
+                    item(targets, var(position)), mul(item(index.list, var(position)), stride),
+                )),
+                *statements,
+                change_var(position, 1),
+            )),
+        )
+
+    body = [
+        clear(out),
+        set_var(position, 1),
+        repeat(source.numel, (
+            append(out, item(source.list, var(position))),
+            change_var(position, 1),
+        )),
+    ]
+    if not include_self:
+        body += each_entry(replace(out, var(target), _SCATTER_REDUCTIONS[reduce]))
+    if reduce == "mean":
+        counts = ctx.temp_list("scatter_counts", source.numel)
+        body += [
+            clear(counts),
+            repeat(source.numel, (append(counts, 1 if include_self else 0),)),
+        ]
+        body += each_entry(
+            *combine,
+            replace(counts, var(target), add(item(counts, var(target)), 1)),
+        )
+        body += [
+            set_var(position, 1),
+            repeat(source.numel, (
+                if_(gt(item(counts, var(position)), 0), (replace(
+                    out, var(position),
+                    div(item(out, var(position)), item(counts, var(position))),
+                ),)),
+                change_var(position, 1),
+            )),
+        ]
+    else:
+        body += each_entry(*combine)
+    return tuple(body)
 
 
 def _emit_scatter(ctx: KernelContext, *, scalar: bool):
@@ -529,11 +626,27 @@ BUILTIN_KERNELS = (
     ),
     Kernel(
         "aten.scatter.src", partial(_emit_scatter, scalar=False), name="scatter_runtime",
-        validator=_validate_runtime_index,
+        validator=_validate_scatter,
     ),
     Kernel(
         "aten.scatter.value", partial(_emit_scatter, scalar=True), name="scatter_runtime",
-        validator=_validate_runtime_index,
+        validator=_validate_scatter,
+    ),
+    Kernel(
+        "aten.scatter_add.default", partial(_emit_scatter_reduce, scalar=False, default="sum"),
+        name="scatter_reduce", validator=_validate_runtime_index,
+    ),
+    Kernel(
+        "aten.scatter_reduce.two", partial(_emit_scatter_reduce, scalar=False),
+        name="scatter_reduce", validator=_validate_scatter_reduce,
+    ),
+    Kernel(
+        "aten.scatter.reduce", partial(_emit_scatter_reduce, scalar=False),
+        name="scatter_reduce", validator=_validate_scatter_reduce,
+    ),
+    Kernel(
+        "aten.scatter.value_reduce", partial(_emit_scatter_reduce, scalar=True),
+        name="scatter_reduce", validator=_validate_scatter_reduce,
     ),
     Kernel(
         "cattorch.rotary_embedding.default",
