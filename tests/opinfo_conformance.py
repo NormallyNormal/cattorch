@@ -39,7 +39,10 @@ COVERAGE = ROOT / "docs" / "operator-coverage.md"
 # Samples tried per operator variant; OpInfo's later samples mostly repeat the
 # first ones with other broadcasting or keyword combinations.
 SAMPLES_PER_OPERATOR = 4
-TIMEOUT_SECONDS = 60
+# A guard against hangs, not a speed limit: the slowest recorded case, a 3D
+# transposed convolution, emulates for about 30 s locally and over 60 s on CI
+# runners.
+TIMEOUT_SECONDS = 180
 # Bigger samples only test the emulator's patience, not another code path.
 MAX_SAMPLE_ELEMENTS = 4096
 ATOL, RTOL = 1e-4, 1e-4

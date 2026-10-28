@@ -2,6 +2,7 @@
   "name": "cattorch-scratch-benchmarks",
   "private": true,
   "scripts": {
+    "postinstall": "node install_vm_assets.cjs",
     "run-vm": "node run_scratch_vm.cjs artifacts/cattorch_suite.sb3"
   },
   "dependencies": {
