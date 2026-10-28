@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import inspect
 import re
-import types
 import typing
 from typing import Callable
 
@@ -96,25 +95,6 @@ def _fresh(result, args):
     return fresh(result)
 
 
-def _typing_form(hint):
-    """``hint`` with ``list[float]`` and ``X | None`` in their ``typing`` forms.
-
-    Older PyTorch infers schemas only from ``typing.List`` and
-    ``typing.Optional``, not from builtin generics or ``|`` unions.
-    """
-    origin, arguments = typing.get_origin(hint), typing.get_args(hint)
-    if origin is None or not arguments:
-        return hint
-    arguments = tuple(_typing_form(argument) for argument in arguments)
-    if origin in {list, typing.List}:
-        return typing.List[arguments[0]]
-    if origin in {tuple, typing.Tuple}:
-        return typing.Tuple[arguments]
-    if origin in {types.UnionType, typing.Union}:
-        return typing.Union[arguments]
-    return hint
-
-
 def op(function: Callable | None = None, *, name: str | None = None, fake: Callable | None = None):
     """Declare ``function`` as a new operation; usable as ``@op`` or ``@op(...)``.
 
@@ -138,9 +118,7 @@ def op(function: Callable | None = None, *, name: str | None = None, fake: Calla
         # The schema comes from the annotations, resolved in the function's
         # own module (they may be strings).
         try:
-            hints = {
-                key: _typing_form(hint) for key, hint in typing.get_type_hints(function).items()
-            }
+            hints = typing.get_type_hints(function)
         except NameError as error:
             raise TypeError(f"cannot resolve the annotations of {qualified}: {error}") from error
         signature = inspect.signature(function)

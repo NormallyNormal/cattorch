@@ -14,7 +14,7 @@ to see an exported transformer running in vanilla Scratch.
 pip install cattorch
 ```
 
-cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer.
+cattorch requires Python 3.11 or newer and PyTorch 2.10 or newer.
 
 ```python
 import torch

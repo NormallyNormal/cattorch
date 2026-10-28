@@ -279,6 +279,9 @@
 
 ## Breaking changes
 
+- cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from
+  Python 3.10 and PyTorch 2.6. Python 3.10 reached its end of life in
+  October 2026.
 - `op` moved back to `cattorch.experimental`, next to the kernel interface it
   uses. Only names outside `cattorch.experimental` are stable; see
   [stability](docs/stability.md).

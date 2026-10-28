@@ -11,7 +11,7 @@ and connects it to the rest of a project.
 pip install cattorch
 ```
 
-cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer. To use a
+cattorch requires Python 3.11 or newer and PyTorch 2.10 or newer. To use a
 specific PyTorch build, such as CPU-only, install it with the
 [PyTorch installer](https://pytorch.org/get-started/locally/) first. Tokenizer
 export needs extra packages; see [tokenizers](tokenizers.md).
