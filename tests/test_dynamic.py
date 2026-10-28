@@ -146,3 +146,52 @@ def test_entry_points_take_dynamic_inputs(tmp_path):
     assert result.entrypoints[0].inputs[0].shape == (BoundedDimension("rows", 1, 10), 3)
     calls = (ProgramCall("score", (torch.randn(2, 3),)), ProgramCall("score", (torch.randn(9, 3),)))
     assert verify(model, None, result, calls=calls).passed
+
+
+def test_an_entry_point_that_cant_follow_the_length_runs_per_item(tmp_path):
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+
+        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            return self.layer(sequences)
+
+    torch.manual_seed(0)
+    model = Encoder().eval()
+    result = transpile(model, None, tmp_path / "encoder")
+    assert any("runs once per item" in warning for warning in result.warnings)
+    assert result.entrypoints[0].outputs[0].shape == (BoundedDimension("sequences", 1, 6), 4, 8)
+    calls = tuple(ProgramCall("encode", (torch.randn(length, 4, 8),)) for length in (1, 5, 2))
+    assert verify(model, None, result, calls=calls).passed
+
+
+def test_an_entry_point_that_updates_state_doesnt_run_per_item(tmp_path):
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+            self.register_buffer("calls", torch.zeros(1))
+
+        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            self.calls += 1
+            return self.layer(sequences) * self.calls
+
+    with pytest.raises(UnsupportedModelError):
+        transpile(Encoder().eval(), None, tmp_path / "encoder")
+
+
+def test_an_entry_point_using_the_length_itself_is_rejected(tmp_path):
+    class Positions(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = nn.Parameter(torch.randn(10, 3))
+
+        @entrypoint(example=lambda: (torch.randn(4, 3),), dynamic={"rows": (1, 8)})
+        def add(self, rows):
+            return rows + self.table[torch.arange(rows.shape[0])]
+
+    with pytest.raises(UnsupportedModelError, match="input 'rows' of entry point 'add'"):
+        transpile(Positions().eval(), None, tmp_path / "positions")

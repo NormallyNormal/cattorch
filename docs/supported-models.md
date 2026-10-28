@@ -186,7 +186,10 @@ instead, which handles prompts of any length up to `max_context`.
 
 Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
 `@cattorch.entrypoint(dynamic={"rows": (1, 32)})` in [markers](markers.md),
-for an input's first dimension.
+for an input's first dimension. Export checks each such input at several
+lengths in the same way, calling the entry point from the initial state. An
+entry point whose operations can't follow the length runs once per item, as
+`forward` does, if it has one variable-length input and updates no state.
 
 Run [`verify`](api-reference.md#verify) whenever you change the model or export
 options. If export fails, see [troubleshooting](troubleshooting.md).

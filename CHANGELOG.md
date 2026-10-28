@@ -26,7 +26,8 @@
   from fixed queries over a variable-length memory. An entry point that
   appends to state can read the grown state in the same call.
   Entry points take `Input(..., dynamic=(1, 32))` or
-  `@entrypoint(dynamic=...)`. See
+  `@entrypoint(dynamic=...)`, with the same check at several lengths and,
+  for one that updates no state, the same run once per item. See
   [variable-length inputs](docs/supported-models.md#variable-length-inputs).
 - Markers (`cattorch.entrypoint` and others), decorators that describe a model's export interface
   without changing how it runs in PyTorch. `@entrypoint` exports methods as

@@ -453,25 +453,38 @@ def transpile_program(
                 compact_schema=False,
                 id_namespace=None,
             )
-            sub_result = _transpile(
-                wrapper,
-                tuple(args),
-                temporary_path,
-                sig_figs,
-                name=sprite_name,
-                optimization=optimization,
-                fast_config=fast_config,
-                storage=resolved_storage,
-                quantization=quantization,
-                calibration_inputs=None,
-                codegen=sub_codegen,
-                frontend="fx",
-                _registry=registry,
-                _prepared_model=True,
-                _prepared_quantization_report=quantization_report,
-                _dynamic_inputs=dynamic_inputs,
-                _defer_interface_sharding=True,
-            )
+            def capture(arguments, dynamic):
+                return _transpile(
+                    wrapper,
+                    tuple(arguments),
+                    temporary_path,
+                    sig_figs,
+                    name=sprite_name,
+                    optimization=optimization,
+                    fast_config=fast_config,
+                    storage=resolved_storage,
+                    quantization=quantization,
+                    calibration_inputs=None,
+                    codegen=sub_codegen,
+                    frontend="fx",
+                    _registry=registry,
+                    _prepared_model=True,
+                    _prepared_quantization_report=quantization_report,
+                    _dynamic_inputs=dynamic,
+                    _defer_interface_sharding=True,
+                )
+
+            try:
+                sub_result = capture(args, dynamic_inputs)
+            except UnsupportedModelError as error:
+                sub_result = _entry_by_item(
+                    error, entrypoint, wrapper, args, dynamic_inputs, capture,
+                )
+                sub_warnings.append(
+                    f"entry point {entrypoint.name!r} runs once per item of its "
+                    "variable-length input, because its operations can't take a "
+                    "variable length directly"
+                )
             if len(sub_result.inputs) != len(entrypoint.arguments):
                 raise UnsupportedModelError(
                     f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
@@ -675,7 +688,7 @@ def transpile_program(
         "cattorch init", "cattorch reset", "cattorch prepare for save",
         *(f"cattorch {entry.name}" for entry in program.entrypoints),
     )
-    return ProgramResult(
+    result = ProgramResult(
         path=finalized.path,
         sprite_name=sprite_name,
         archive_bytes=finalized.archive_bytes,
@@ -688,6 +701,45 @@ def transpile_program(
         states=state_results,
         procedures=procedures,
         quantization=quantization_report,
+    )
+    if any(
+        isinstance(binding, Input) and binding.dynamic is not None
+        for entry in program.entrypoints for binding in entry.arguments
+    ):
+        from cattorch.dynamic import check_entry_lengths
+        from cattorch.verify import verify
+
+        check_entry_lengths(
+            model, program, result, verify, adapters=adapters, quantization=quantization,
+        )
+    return result
+
+
+def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
+    """Export an entry point for one item and run it once per item.
+
+    Used when its operations can't follow a variable-length input directly.
+    The input must be its only variable-length one, with no append state,
+    the method must update no state, and its items must be independent.
+    """
+    from cattorch.dynamic import loop_over_units, unit_output_axes
+
+    if len(dynamic_inputs) != 1 or any(
+        isinstance(binding, StateUpdate) for binding in entrypoint.returns
+    ):
+        raise error
+    ((index, (name, minimum, maximum)),) = dynamic_inputs.items()
+    if not isinstance(entrypoint.arguments[index], Input):
+        raise error
+    spec = {index: (name, minimum, maximum, 0)}
+    try:
+        axes = unit_output_axes(wrapper, list(args), [], spec, None)
+    except UnsupportedModelError:
+        raise error from None
+    result = capture(args, None)
+    return loop_over_units(
+        result, spec, axes, [tuple(value.shape) for value in args],
+        [tuple(value.shape) for value in result.outputs],
     )
 
 

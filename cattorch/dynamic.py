@@ -77,12 +77,7 @@ def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example
     don't trip the check.
     """
     ((index, (_, minimum, maximum, axis)),) = spec.items()
-    original = flat_inputs[index].shape[axis]
-    lengths = sorted({
-        length for length in (minimum, 1, 2, original, maximum)
-        if minimum <= length <= maximum
-    })
-    lengths = [length for length in lengths if length <= max(minimum, 8) or length == original][:3]
+    lengths = _lengths(minimum, flat_inputs[index].shape[axis], maximum)
     positional = len(flat_inputs) - len(kwarg_names)
 
     def report(length):
@@ -117,6 +112,66 @@ def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example
                 "torch.arange or a position table sliced to it, which dynamic= can't "
                 "follow; a GenerationProgram handles variable-length token sequences"
             )
+
+
+def _lengths(minimum, original, maximum) -> list[int]:
+    """Up to three lengths to check, the first one as the baseline."""
+    lengths = sorted({
+        length for length in (minimum, 1, 2, original, maximum)
+        if max(minimum, 1) <= length <= maximum
+    })
+    return [length for length in lengths if length <= max(minimum, 8) or length == original][:3]
+
+
+def check_entry_lengths(model, program, result, verify, *, adapters=(), quantization=None) -> None:
+    """``check_lengths`` for each variable-length input of a program's entry points.
+
+    Each check calls the entry point once, from the initial state, with that
+    input at another length and the other inputs at their examples.
+    """
+    from cattorch.program import Input, ProgramCall
+
+    if quantization is not None and quantization.method != "symmetric":
+        return  # verify can't reproduce other quantization methods
+    for entry in program.entrypoints:
+        inputs = [binding for binding in entry.arguments if isinstance(binding, Input)]
+        for position, binding in enumerate(inputs):
+            if binding.dynamic is None:
+                continue
+            minimum, maximum = binding.dynamic
+
+            def error(length):
+                values = [value.example for value in inputs]
+                values[position] = at_length(binding.example, 0, length)
+                outcome = verify(
+                    model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
+                    atol=math.inf, rtol=math.inf, adapters=adapters, quantization=quantization,
+                )
+                (call,) = outcome.calls
+                reports = [*call.outputs, *(report for _, report in call.states)]
+                if call.status != "ok" or any(
+                    report.values_compared != report.actual_values for report in reports
+                ):
+                    return math.inf
+                return max((report.max_abs_error for report in reports), default=0.0)
+
+            lengths = _lengths(minimum, binding.example.shape[0], maximum)
+            baseline = error(lengths[0])
+            where = f"input {binding.name!r} of entry point {entry.name!r}"
+            if baseline == math.inf:
+                raise UnsupportedModelError(
+                    f"with {lengths[0]} items in {where} the sprite fails or returns the "
+                    "wrong number of values"
+                )
+            for length in lengths[1:]:
+                found = error(length)
+                if found > 10 * baseline + 1e-4:
+                    raise UnsupportedModelError(
+                        f"with {length} items in {where} the sprite doesn't match the model "
+                        f"(largest difference {found:.3g}), though it does with {lengths[0]}. "
+                        "The method probably uses the length itself, for example "
+                        "torch.arange or a table sliced to it, which a dynamic input can't follow"
+                    )
 
 
 def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> list[int]:
