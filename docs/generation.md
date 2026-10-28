@@ -58,8 +58,12 @@ that break the requirements below in ways the analysis can't see.
 - The model returns logits for every position, not only the last. Slicing to
   the last position inside `forward` isn't supported.
 - The input is a `[1, length]` tensor of token IDs, looked up in an embedding.
-- Attention masks are plain causal masks. Sliding windows and ALiBi biases are
-  rejected.
+- Attention masks are causal masks, optionally limited to a sliding window of
+  the last N tokens (Mistral, GPT-OSS). The scores may also carry an ALiBi
+  bias, `slope * (key - query)` per head, possibly plus a constant per row, and
+  per-head attention sinks: an extra softmax logit concatenated to the scores
+  and dropped afterwards, as GPT-OSS does. Any other float bias is rejected.
+  With a window, each decode step only reads the window's rows of the cache.
 
 ## Errors
 
@@ -78,17 +82,18 @@ With `hidden_prefill=True` (the default), prefill computes logits only for the
 last prompt token. For the other prompt tokens, the output head is skipped.
 When the layers aren't [shared](code-generation.md#optional-compaction), the
 final layer also keeps only its K/V append for those tokens and skips its
-attention output, MLP, and final norm. The final layer's query projection still
-runs. Set it to `False` only for debugging or measurement.
+attention output, MLP, and final norm, and the operations that only compute
+its query, such as the query projection and its RoPE. Set it to `False` only
+for debugging or measurement.
 
 ## Layer sharing
 
 `CodegenConfig(layer_sharing="auto")` shares one block of code across repeated
 layers when the attention blocks sit in consecutive modules named `blocks.0`,
 `blocks.1`, and so on. The caches are then banked into one list per K and V
-(`cattorch K cache` and `cattorch V cache`). Models with other layer names, such as
+(`_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
 Hugging Face's `model.layers.N`, export without sharing and with one list per
-layer (`cattorch K cache 1`, `cattorch V cache 1`, ...). If the layers look
+layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
 repeated but can't be factored, for example because the MLP widths differ,
 cattorch logs a warning and exports again without sharing. Sharing makes
 sprites smaller; shared layers can't skip the final layer's work during hidden
@@ -130,7 +135,9 @@ tokens into text are up to your Scratch project.
 
 These blocks and lists belong to the generated sprite. To drive generation from
 another sprite, use the
-[global-list bridge](getting-started.md#connect-another-sprite).
+[global-list bridge](getting-started.md#connect-another-sprite), or let
+[`build_project`](projects-and-cli.md) write a project with the model, its
+tokenizer, bridges, and a generation loop already wired together.
 
 ## Lifecycle notifications
 
@@ -189,36 +196,6 @@ shrink the sprite, see layer sharing in
 
 Generation sprites don't have `cattorch prepare for save`; see
 [save after running](storage.md#save-after-running).
-
-## Legacy: hand-written cached decoders
-
-Passing `example_token` selects the older recognizer, which doesn't derive the
-cache and instead looks for one graph shape. Use it only for a decoder already
-written that way:
-
-```python
-GenerationProgram(
-    method="next_token_logits",
-    example_token=torch.tensor([[0]]),
-    max_context=64,
-)
-```
-
-`example_token` must be a single integer token with shape `[1, 1]`. The
-method must take that one token and:
-
-- use a combined QKV projection with causal attention in a form cattorch
-  recognizes;
-- look up positions from a table, either learned position embeddings or
-  precomputed RoPE sine and cosine tables, so cattorch can index the table with
-  the current cache length;
-- return one tensor, and otherwise use [supported operations](supported-models.md).
-
-Watch out for stateless wrappers that slice the position or RoPE table by
-sequence length (`table[:length]`). Traced with a `[1, 1]` example, that slice
-only contains position zero, so every later token gets the wrong position.
-Instead, index the full table with an explicit position tensor. The automatic
-path above doesn't have this problem, and is the better choice for new work.
 
 Related: [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
 [supported models](supported-models.md), and

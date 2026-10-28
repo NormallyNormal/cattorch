@@ -11,7 +11,7 @@ and connects it to the rest of a project.
 pip install cattorch
 ```
 
-cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer. To use a
+cattorch requires Python 3.11 or newer and PyTorch 2.10 or newer. To use a
 specific PyTorch build, such as CPU-only, install it with the
 [PyTorch installer](https://pytorch.org/get-started/locally/) first. Tokenizer
 export needs extra packages; see [tokenizers](tokenizers.md).
@@ -89,7 +89,11 @@ If an input or output exceeds 200,000 values, use all its
 
 `cattorch forward` initializes the sprite on its first call. Call
 `cattorch init` yourself to load the weights ahead of time, for example
-before timing a run. Both blocks run without screen refresh.
+before timing a run. Both blocks run without screen refresh, and when each
+finishes it sets `cattorch status` to `ok` and broadcasts
+`cattorch forward complete` or `cattorch init complete`. The
+[Scratch interface](scratch-interface.md) lists every name a sprite offers;
+they won't change within cattorch 1.x.
 
 ## Connect another sprite
 
@@ -97,7 +101,10 @@ My Blocks and sprite-local lists belong to one Scratch sprite. A controller
 sprite cannot call `cattorch forward` or directly read the generated local
 `input` and `output` lists.
 
-To drive it from another sprite, bridge through global lists:
+[`build_project`](projects-and-cli.md) writes a project with these bridges
+already in place: `broadcast [NAME run] and wait` after filling the global
+`NAME input` list, then read `NAME output`. To build a bridge by hand, go
+through global lists:
 
 1. Create global input and output lists with your own names.
 2. On the generated processor sprite, add a `when I receive` script.

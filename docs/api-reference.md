@@ -5,9 +5,14 @@
 Functions, configuration classes, and result types are imported from
 `cattorch`. Paths can be strings or `pathlib.Path` objects.
 
-Experimental programs, state, adapters, analysis, and MoE classes are imported
-from `cattorch.experimental`; see
-[experimental programs and sparse MoE](programs-and-moe.md).
+Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
+`StateInput`, `StateUpdate`, `ProgramCall`), markers, and `ModuleAdapter` are
+described in [programs and sparse MoE](programs-and-moe.md) and
+[markers](markers.md). [Experimental](stability.md) APIs are imported from
+`cattorch.experimental`: the explicit MoE classes, `analyze`, and the kernel
+interface (`Kernel`, `op`, `check_kernel`, `build_kernel_benchmark`, and
+`cattorch.scratch`), described in
+[custom kernels and operations](custom-kernels.md).
 
 ## Model export
 
@@ -54,6 +59,8 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `adapters` | `ModuleAdapter`s for an `ExportProgram` or `GenerationProgram`. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
+| `dynamic` | One variable-length input, as `{input: (minimum, maximum)}` for its first dimension or `{input: {dimension: (minimum, maximum)}}`; see [variable-length inputs](supported-models.md#variable-length-inputs). Not valid with programs. |
+| `kernels` | Experimental `Kernel`s for this export; see [custom kernels](custom-kernels.md). Each replaces the built-in lowering of its operation for this export. |
 | `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
 
 Tensor-input and generation exports return a `TranspileResult`. An
@@ -92,6 +99,36 @@ rotary_embedding(value, cosine, sine) -> Tensor
 Apply rotary position embeddings (RoPE) to adjacent pairs of features. The
 last dimension of `value` must be even. `cosine` and `sine` must broadcast to
 `value`'s shape without making it larger.
+
+## Markers and programs
+
+Decorators on your own classes and methods. They only attach metadata, so the
+model runs unchanged in PyTorch; see [markers](markers.md).
+
+| Name | Use |
+|---|---|
+| `entrypoint` | On a method: export it as a Scratch block. Buffers it updates become state; `capacity=` for a buffer that grows; `name=`, `inputs=`, `outputs=`, `example=`. |
+| `example` | On a class: example inputs for `forward`, so `transpile(model, None, path)` needs none. |
+| `export_forward` | On a method: trace it instead of `forward` for every instance of the class. |
+| `moe` | On a class: export it as a sparse mixture of experts with the given `router`, `experts`, `top_k`, `scoring`, `normalize`, `shared`, and `scale`, checked against `forward`. |
+| `generate` | On a method: the method a `GenerationProgram` exports. |
+| `adapter` | On a function: build a `ModuleAdapter` for a class you don't own. |
+| `marked_program` | `marked_program(model)` returns the export copy and the `ExportProgram` a model's `entrypoint` markers describe. |
+
+Pass `None` as `example_inputs` to `transpile` and `verify` to take the
+interface from `entrypoint` or `example` markers.
+
+The classes markers compile to can also be used directly:
+
+| Name | Use |
+|---|---|
+| `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entrypoints-and-state). |
+| `ProgramCall` | One call in `verify(model, program, result, calls=...)`. |
+| `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
+| `CustomMoEWarning` | Warned when a hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
+
+`op`, for declaring a new operation, is [experimental](stability.md); see
+[custom kernels and operations](custom-kernels.md).
 
 ## Tokenizer export
 
@@ -179,6 +216,39 @@ The remaining arguments apply only to an `ExportProgram`:
   quantized weights, so the comparison shows conversion error separately from
   quantization error. GPTQ isn't supported here.
 
+## Projects
+
+### `build_project`
+
+```text
+build_project(
+    output_path,
+    model,
+    *,
+    tokenizer=None,
+    example_inputs=(),
+    labels=None,
+    max_new_tokens=40,
+    temperature=0.8,
+    eos_token_id=None,
+    prompt=None,
+) -> ProjectResult
+```
+
+Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
+missing. Every operation gets a bridge to global lists that other sprites can
+run with `broadcast and wait`. A plain model gets list monitors starting from
+`example_inputs` (or zeros) and runs on the green flag or space key; `labels`
+names a classifier's outputs. A `GenerationProgram` export needs `tokenizer`, a
+`TokenizerResult`, and gets a Demo sprite that continues typed prompts. A model
+with entry points gets bridges only. See
+[projects and the command line](projects-and-cli.md).
+
+### `ProjectResult`
+
+`path`, the `sprites` in the project, and the bridges' `messages`, global
+`lists`, and global `variables`, all by Scratch name, plus `warnings`.
+
 ## Configuration objects
 
 Configuration classes are immutable dataclasses. Invalid values raise an
@@ -210,10 +280,9 @@ multiplications. See [optimization modes](optimization.md#weight-transforms).
 
 | Field | Default | Meaning |
 |---|---:|---|
+| `max_context` | required | Maximum number of tokens the cache holds. The only positional field; the others are keyword-only. |
 | `method` | `"forward"` | Name of the model method that takes token IDs and returns next-token logits for every position. |
-| `example_token` | `None` | Leave unset to derive the cached step automatically from a stateless method. A `[1, 1]` integer tensor selects the [legacy recognizer](generation.md#legacy-hand-written-cached-decoders) for a hand-written cached decoder. |
-| `max_context` | required | Maximum number of tokens the cache holds. Keyword-only in practice, since `method` and `example_token` come first. |
-| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. Without layer sharing, the final layer's attention output and MLP are skipped too. |
+| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. Without layer sharing, the final layer's query, attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 
 See [KV-cached generation](generation.md) for model requirements and the
@@ -226,16 +295,8 @@ Scratch blocks.
 | `compression` | `True` | Compress stored tensors and decode them during initialization. |
 | `precision` | `"float32"` | `"float32"` or lossy `"float16"`. |
 
-The integer precisions `"int4"`, `"int6"`, and `"int8"` are deprecated; use
-`QuantizationConfig` instead. These fields only apply to the deprecated
-integer precisions:
-
-| Field | Default | Meaning |
-|---|---:|---|
-| `group_size` | `64` | Integer group size. |
-| `min_quantized_values` | `16384` | Threshold below which eligible tensors remain float16. |
-| `scale_precision` | `"float32"` | Integer scale precision. |
-| `grouping` | `"flat"` | Integer grouping, `"flat"` or `"row"`. |
+For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
+`transpile`; `StorageConfig` rejects integer precisions.
 
 ### `QuantizationConfig`
 
@@ -274,8 +335,8 @@ See [code generation](code-generation.md) before turning on `compact_schema` or
 An `ExportProgram` export returns a `ProgramResult`: the `ArtifactResult`
 fields plus `EntryPointResult` and `StateResult` records. Verifying a program
 returns a `ProgramVerifyResult`, with one `ProgramCallVerifyResult` per call.
-These result types are imported from `cattorch`; the classes that define
-programs and calls come from `cattorch.experimental`.
+These result types, and the classes that define programs and calls, are
+imported from `cattorch`.
 
 Each `ProgramCallVerifyResult` has `entrypoint`, `passed`, `outputs`, `states`,
 and the Scratch `status`. A call whose status isn't `"ok"` fails, and doesn't
@@ -318,8 +379,19 @@ Fields shared by model and tokenizer results:
 ### `TranspileResult`
 
 `ArtifactResult` plus `inputs`, `output`, `additional_outputs`, `procedures`
-(the custom block names), and `quantization` (a `QuantizationReport`, or
-`None`). The `outputs` property lists every output's `TensorSpec` in order.
+(the custom block names), `quantization` (a `QuantizationReport`, or
+`None`), `fallback_operations`, and `approximate_operations`. The `outputs`
+property lists every
+output's `TensorSpec` in order.
+
+`approximate_operations` lists, the same way, the operations that used an
+approximate kernel in fast mode.
+
+`fallback_operations` lists the operations that have no kernel of their own
+and ran as PyTorch's decomposition into simpler operations, as
+`(operation, calls)` pairs such as `("aten.mish.default", 2)`. These usually
+run slower than a dedicated kernel would, and `warnings` names them too.
+Calls that depend only on weights are computed at export and aren't listed.
 
 ### `TokenizerResult`
 
@@ -337,6 +409,7 @@ Fields shared by model and tokenizer results:
 | `max_rel_error` | Largest relative difference. |
 | `mean_abs_error` | Mean absolute difference. |
 | `worst_index` | Zero-based flattened index of the largest absolute error, or `None` for an empty result. |
+| `approximate_operations` | The export's `approximate_operations`, when `verify` was given its `TranspileResult`. Approximate kernels explain small differences. |
 
 If the sprite returns the wrong number of values, `passed` is `False` and the
 error fields are infinite; no exception is raised.

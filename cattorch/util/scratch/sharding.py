@@ -331,12 +331,15 @@ def shard_sprite_lists(
     sprite: dict,
     logical_sizes: dict[str, int],
     *,
-    limit: int = SCRATCH_LIST_LIMIT,
+    limit: int | None = None,
     alignments: dict[str, int] | None = None,
     limits: dict[str, int] | None = None,
     deferred_names: frozenset[str] = frozenset(),
 ) -> dict[str, ListLayout]:
     """Split oversized logical lists and rewrite every supported list access."""
+    # Read at call time, so tests can lower the limit for every module at once.
+    if limit is None:
+        limit = SCRATCH_LIST_LIMIT
     if limit != SCRATCH_LIST_LIMIT:
         raise ValueError("Scratch physical shard size is fixed at 200,000")
     layouts = {}

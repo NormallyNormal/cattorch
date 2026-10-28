@@ -7,6 +7,7 @@ through the emulator, and compares the output against PyTorch.
 
 import json
 import os
+import tempfile
 import zipfile
 
 import pytest
@@ -14,11 +15,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch.errors import UnsupportedOperationError
 from cattorch.transpiler import transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 TOLERANCE = 1e-4
+# One directory per process, so parallel test workers never share the file.
+_OUTPUT_DIRECTORY = tempfile.mkdtemp(prefix="cattorch-transpile-")
 
 
 def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
@@ -27,7 +29,7 @@ def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[fl
     with torch.no_grad():
         expected = model(x).flatten().tolist()
 
-    path = os.path.join(os.path.dirname(__file__), "_test_output")
+    path = os.path.join(_OUTPUT_DIRECTORY, "output")
     transpile(model, x, path)
 
     sprite_path = path + ".sprite3"
@@ -1342,11 +1344,11 @@ def test_pow_squared():
     _assert_close(expected, actual)
 
 
-def test_pow_general_is_rejected():
+def test_pow_general():
     model = PowGeneral()
     x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs for ln
-    with pytest.raises(UnsupportedOperationError, match="integer exponents"):
-        _run_sprite(model, x)
+    expected, actual = _run_sprite(model, x)
+    _assert_close(expected, actual)
 
 
 def test_rsqrt():

@@ -229,3 +229,91 @@ def test_positive_strided_slice_lowers_without_an_index_map(tmp_path):
 def test_frontend_argument_is_validated(tmp_path):
     with pytest.raises(ValueError, match="frontend must be"):
         transpile(nn.Identity(), torch.ones(1), tmp_path / "bad", frontend="other")
+
+
+class RouterUpdate(nn.Module):
+    """Mixtral's router: normalize the top-k values in place."""
+
+    def forward(self, value):
+        weights, ids = torch.topk(torch.softmax(value, dim=-1), 2, dim=-1)
+        weights /= weights.sum(dim=-1, keepdim=True)
+        return weights, ids
+
+
+class ReadBeforeUpdate(nn.Module):
+    def forward(self, value):
+        result = value.exp()
+        before = result * 3
+        result.mul_(0.5)
+        result.add_(torch.ones(1))
+        return before + result
+
+
+class CastUpdate(nn.Module):
+    def forward(self, value):
+        result = torch.zeros(value.shape, dtype=torch.float64)
+        result.copy_(value * 2)
+        return result.float() + 1
+
+
+class SliceFill(nn.Module):
+    """DeepSeek-V3's key assembly: fill both halves of a fresh tensor."""
+
+    def forward(self, value):
+        result = value.new_empty(3, 7)
+        result[..., :4].copy_(value * 2)
+        result[..., 4:].copy_(value[..., :3].exp())
+        return result
+
+
+class SelectAndNestedAssign(nn.Module):
+    def forward(self, value):
+        result = torch.zeros(3, 4, 5)
+        result[1] = value
+        result[:, 1:][..., -2:] = value[0, :2] + 1
+        result[0, :, ::1] = result[1] * 3
+        return result
+
+
+@pytest.mark.parametrize("model", [
+    RouterUpdate(), ReadBeforeUpdate(), CastUpdate(), SliceFill(),
+])
+def test_in_place_updates_of_intermediates_become_dataflow(tmp_path, model):
+    captured = capture_model(model.eval(), (torch.randn(3, 4),))
+    targets = [str(node.target) for node in captured.graph.nodes]
+    assert "aten.copy_.default" not in targets
+    value = torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "in-place")
+    assert verify(model, value, result).passed
+
+
+def test_slice_and_select_assignment_become_dataflow(tmp_path):
+    model = SelectAndNestedAssign().eval()
+    value = torch.randn(4, 5)
+    captured = capture_model(model, (value,))
+    assert "aten.copy_.default" not in [str(node.target) for node in captured.graph.nodes]
+    result = transpile(model, value, tmp_path / "assign")
+    assert verify(model, value, result).passed
+
+
+def test_strided_slice_assignment_stays_unsupported(tmp_path):
+    class EveryOther(nn.Module):
+        def forward(self, value):
+            result = torch.zeros(3, 8)
+            result[:, ::2] = value
+            return result
+
+    with pytest.raises(UnsupportedOperationError, match="copy_"):
+        transpile(EveryOther().eval(), torch.randn(3, 4), tmp_path / "strided-assign")
+
+
+def test_in_place_update_seen_through_an_earlier_view_stays_unsupported(tmp_path):
+    class ViewThenUpdate(nn.Module):
+        def forward(self, value):
+            result = value * 2
+            row = result[:, 0]
+            result += 1
+            return row * 1
+
+    with pytest.raises(UnsupportedOperationError, match="copy_"):
+        transpile(ViewThenUpdate().eval(), torch.randn(3, 4), tmp_path / "aliased")

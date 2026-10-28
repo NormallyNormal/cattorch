@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
-from typing import Literal
+from typing import Any, Callable, Literal
 
 import contextlib
 import functools
+import itertools
 import logging
 import math
+import threading
 import warnings
 
 import torch
@@ -21,6 +24,7 @@ from torch.export import export
 from torch.utils._pytree import tree_flatten
 from torch._decomp import core_aten_decompositions, get_decompositions
 
+from cattorch.decompositions import POINTWISE_DECOMPOSITIONS, traced_from_input
 from cattorch.errors import UnsupportedModelError
 
 
@@ -258,6 +262,12 @@ def _prims_broadcast_in_dim(value, shape, broadcast_dimensions):
     )
 
 
+def _prims_prod(value, dims, *, output_dtype=None):
+    for dim in sorted((dim % value.ndim for dim in dims), reverse=True):
+        value = torch.ops.aten.prod.dim_int(value, dim)
+    return value
+
+
 # Some PyTorch decompositions are written against primitives. Map the ones
 # that reach models back to ATen operations cattorch lowers.
 _PRIMITIVE_DECOMPOSITIONS = {
@@ -272,7 +282,31 @@ _PRIMITIVE_DECOMPOSITIONS = {
     "expm1": lambda value: torch.ops.aten.sub.Tensor(
         torch.ops.aten.exp.default(value), 1,
     ),
+    "signbit": lambda value: torch.ops.aten.lt.Scalar(value, 0),
+    "prod": _prims_prod,
 }
+
+
+_aten = torch.ops.aten
+
+
+def _addmm(bias, left, right, *, beta=1, alpha=1):
+    """GPT-2's ``Conv1D``: ``bias + left @ right`` is a linear layer.
+
+    Other calls, with scaling or a bias that isn't one value per output
+    column, use PyTorch's decomposition.
+    """
+    if beta != 1 or alpha != 1 or bias.shape != (right.shape[-1],):
+        generic = _available_decompositions()[_aten.addmm.default]
+        return _recorded_fallback("aten.addmm.default", generic)(
+            bias, left, right, beta=beta, alpha=alpha,
+        )
+    return _aten.linear.default(left, _aten.t.default(right), bias)
+
+
+# Pointwise operations whose PyTorch decompositions end in primitives
+# cattorch can't lower, written with ones it can.
+_POINTWISE_DECOMPOSITIONS = {**POINTWISE_DECOMPOSITIONS, _aten.addmm.default: _addmm}
 
 
 def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
@@ -292,20 +326,8 @@ def _static_scalar_decomposition(operator):
     keep the data-dependent error.
     """
     def decomposition(value, *args, **kwargs):
-        mode = proxy_tensor.get_proxy_mode()
-        slot = proxy_tensor.get_proxy_slot(value, mode.tracer, None)
-        proxy = getattr(slot, "proxy", slot)
-        if not isinstance(proxy, torch.fx.Proxy):
+        if traced_from_input(value) is not False:
             return NotImplemented
-        seen, stack = set(), [proxy.node]
-        while stack:
-            node = stack.pop()
-            if node in seen:
-                continue
-            seen.add(node)
-            if node.op == "placeholder":
-                return NotImplemented
-            stack.extend(node.all_input_nodes)
         with proxy_tensor.disable_proxy_modes_tracing():
             result = operator(value, *args, **kwargs)
         log.info("specialised %s on input-independent value: %r", operator, result)
@@ -332,7 +354,7 @@ def _available_decompositions() -> dict:
     implements in terms of other operations but keeps whole when capturing
     before autograd, decompose through ``OpOverload.decompose``.
     """
-    table = {}
+    table: dict[torch._ops.OpOverload, Callable] = {}
     for source in (core_aten_decompositions(), torch._decomp.decomposition_table):
         for operator, function in source.items():
             if isinstance(operator, torch._ops.OpOverload):
@@ -365,6 +387,51 @@ class _CallView:
             for value in args
         )
         self.kwargs = kwargs
+
+
+# Operations an export's own kernels lower, so tracing keeps them whole.
+_KEPT_OPERATIONS: ContextVar[frozenset[str]] = ContextVar(
+    "cattorch_kept_operations", default=frozenset(),
+)
+
+
+@contextlib.contextmanager
+def keep_operations(names):
+    """Don't decompose ``names`` in captures made inside this block."""
+    token = _KEPT_OPERATIONS.set(_KEPT_OPERATIONS.get() | frozenset(names))
+    try:
+        yield
+    finally:
+        _KEPT_OPERATIONS.reset(token)
+
+
+# ``node.meta`` key naming the operation whose generic PyTorch decomposition
+# produced the node, and which call of it, as ``(operation, call)``.
+FALLBACK_META = "cattorch_fallback"
+_fallback_calls = itertools.count()
+
+
+def _recorded_fallback(name: str, decomposition):
+    """Tag the nodes ``decomposition`` traces with the operation it replaces.
+
+    Lowering reports these as operations without a kernel of their own. An
+    outer decomposition runs after its inner ones and overwrites their tags,
+    so each node names the operation the model called.
+    """
+    def record(*args, **kwargs):
+        mode = proxy_tensor.get_proxy_mode()
+        if mode is None:
+            return decomposition(*args, **kwargs)
+        graph = mode.tracer.graph
+        last = graph._root.prev
+        result = decomposition(*args, **kwargs)
+        call = (name, next(_fallback_calls))
+        node = last.next
+        while node is not graph._root:
+            node.meta[FALLBACK_META] = call
+            node = node.next
+        return result
+    return record
 
 
 def _decompose_when_rejected(operator, validator, decomposition):
@@ -408,14 +475,14 @@ def _fx_decompositions() -> dict:
         packet = operator.overloadpacket.__name__
         dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
         if rule is None and name not in kept and not dead_end:
-            table[operator] = decomposition
+            table[operator] = _recorded_fallback(name, decomposition)
         elif (
             rule is not None and rule.validator is not None
             and name in _DECOMPOSE_WHEN_REJECTED
         ):
-            table[operator] = _decompose_when_rejected(
+            table[operator] = _recorded_fallback(name, _decompose_when_rejected(
                 operator, rule.validator, decomposition,
-            )
+            ))
     table.update(get_decompositions((torch.ops.aten.stack.default,)))
     table.update({
         torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
@@ -429,13 +496,46 @@ def _fx_decompositions() -> dict:
         ),
         torch.ops.aten.topk.default: _topk_decomposition,
     })
+    table.update(_POINTWISE_DECOMPOSITIONS)
     for operator in (
         torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
     ):
         table[operator] = _static_scalar_decomposition(operator)
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
-    return table
+    kept_by_export = _KEPT_OPERATIONS.get()
+    # Operations declared with ``cattorch.experimental.op`` and no kernel in
+    # this export run as their eager function.
+    from cattorch.custom_ops import declared_without_kernel
+    for operator, operation in declared_without_kernel(kept_by_export):
+        table[operator] = _recorded_fallback(str(operator), operation.eager)
+    return {
+        operator: _without_cycles(operator, decomposition)
+        for operator, decomposition in table.items()
+        if str(operator) not in kept_by_export
+    }
+
+
+_decomposing = threading.local()
+
+
+def _without_cycles(operator, decomposition):
+    """Keep ``operator`` whole when its decomposition leads back to it.
+
+    ``aten.sign`` decomposes to ``prims.sign``, which maps back to
+    ``aten.sign``. The inner call is traced as written, so lowering names the
+    operation instead of the trace failing with a recursion error.
+    """
+    def decompose(*args, **kwargs):
+        active = _decomposing.__dict__.setdefault("operators", set())
+        if operator in active:
+            return NotImplemented
+        active.add(operator)
+        try:
+            return decomposition(*args, **kwargs)
+        finally:
+            active.discard(operator)
+    return decompose
 
 
 # Elementwise primitives with an ATen operation of the same name and meaning.
@@ -525,6 +625,210 @@ def _erase_mode_switches(graph: Graph) -> None:
             graph.erase_node(node)
 
 
+def _returns_alias(node: Node) -> bool:
+    """Whether ``node``'s result may share storage with one of its inputs."""
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return True
+    return any(value.alias_info is not None for value in schema.returns)
+
+
+_VIEW_SLICE = torch.ops.aten.slice.Tensor
+_VIEW_SELECT = torch.ops.aten.select.int
+# Views that keep every element and only change the shape. Assigning through
+# one assigns the whole parent, viewed back to the parent's shape.
+_SHAPE_VIEWS = {
+    torch.ops.aten.view.default, torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.unsqueeze.default, torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.dims, torch.ops.aten.squeeze.default,
+}
+# Uninitialized buffers that a model fills by slice assignment. They become
+# zeros, so no unspecified values are stored in the sprite.
+_EMPTY_AS_ZEROS = {
+    torch.ops.aten.empty.memory_format: torch.ops.aten.zeros.default,
+    torch.ops.aten.new_empty.default: torch.ops.aten.new_zeros.default,
+    torch.ops.aten.empty_like.default: torch.ops.aten.zeros_like.default,
+}
+
+
+def _region_view(node: Node) -> tuple[int, int, int] | None:
+    """``(dim, start, end)`` written through a step-one slice or a select.
+
+    A shape-only view writes all of its parent and gives ``(-1, 0, 0)``.
+    """
+    parent = node.args[0]
+    shape = parent.meta.get("val").shape if isinstance(parent, Node) else None
+    if shape is None:
+        return None
+    if node.target in _SHAPE_VIEWS:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and value.numel() == math.prod(shape):
+            return -1, 0, 0
+        return None
+    if node.target is _VIEW_SLICE:
+        given = tuple(node.args[1:])
+        dim, start, end, step = given + (0, None, None, 1)[len(given):]
+        dim = node.kwargs.get("dim", dim)
+        start = node.kwargs.get("start", start)
+        end = node.kwargs.get("end", end)
+        if node.kwargs.get("step", step) != 1:
+            return None
+        dim %= len(shape)
+        size = shape[dim]
+        start = 0 if start is None else start
+        end = size if end is None else end
+        start = max(0, min(size, start + size if start < 0 else start))
+        end = max(start, min(size, end + size if end < 0 else end))
+        return dim, start, end
+    if node.target is _VIEW_SELECT:
+        dim, index = node.args[1:3]
+        dim %= len(shape)
+        index = index + shape[dim] if index < 0 else index
+        return dim, index, index + 1
+    return None
+
+
+def _replace_intermediate_copies(graph: Graph) -> None:
+    """Rewrite in-place updates of intermediate tensors as ordinary dataflow.
+
+    The capture records ``x /= y`` on a computed tensor as ``div`` followed by
+    ``copy_(x, quotient)``, and ``x[..., :4] = y`` as ``copy_`` into a slice
+    view of ``x``. When ``x`` is a fresh tensor rather than a view, and no
+    other view of it taken before the copy is read afterwards, the copy
+    becomes a new tensor: the source itself, or ``x`` with the sliced region
+    replaced (a ``cat`` of the untouched parts and the source). Later reads of
+    ``x`` take that tensor. Copies into inputs, state, strided slices, or other
+    views are left for the compiler to reject.
+    """
+    def read_after(node: Node, position: int) -> bool:
+        return any(
+            order[user] > position or (_returns_alias(user) and read_after(user, position))
+            for user in node.users
+        )
+
+    for copy in [node for node in graph.nodes if node.target is torch.ops.aten.copy_.default]:
+        order = {node: index for index, node in enumerate(graph.nodes)}
+        target, source = copy.args[:2]
+        if (
+            not isinstance(target, Node) or not isinstance(source, Node)
+            or target.op != "call_function" or copy.kwargs.get("non_blocking", False)
+        ):
+            continue
+        # Walk slice and select views up to the tensor that owns the storage.
+        chain: list[tuple[Node, tuple[int, int, int], bool]] = []
+        base = target
+        while _returns_alias(base):
+            region = _region_view(base) if base.op == "call_function" else None
+            if region is None:
+                break
+            chain.append((base, region, base.target is _VIEW_SELECT))
+            base = base.args[0]
+        if base.op != "call_function" or _returns_alias(base):
+            continue
+        if chain and copy.users:
+            continue
+        position = order[copy]
+        chain_nodes = {node for node, _, _ in chain}
+        if any(
+            user is not copy and user not in chain_nodes and order[user] < position
+            and _returns_alias(user) and read_after(user, position)
+            for user in base.users
+        ):
+            continue
+        expected, actual = target.meta.get("val"), source.meta.get("val")
+        if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
+            continue
+
+        def call(operation, args, meta_value):
+            node = graph.call_function(operation, args)
+            node.meta.update(copy.meta)
+            node.meta["val"] = meta_value
+            return node
+
+        with graph.inserting_before(copy):
+            # ``copy_`` casts and broadcasts its source to the target.
+            value = source
+            if actual.dtype != expected.dtype:
+                value = call(torch.ops.aten.to.dtype, (value, expected.dtype),
+                             actual.to(expected.dtype))
+            if tuple(actual.shape) != tuple(expected.shape):
+                value = call(torch.ops.aten.expand.default, (value, list(expected.shape)),
+                             expected)
+            for view, (dim, start, end), selected in chain:
+                parent = view.args[0]
+                whole = parent.meta["val"]
+                if dim < 0:
+                    value = call(torch.ops.aten.view.default, (value, list(whole.shape)),
+                                 whole)
+                    continue
+                if selected:
+                    value = call(torch.ops.aten.unsqueeze.default, (value, dim),
+                                 whole.narrow(dim, start, 1))
+                pieces = []
+                if start > 0:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, 0, start),
+                                       whole.narrow(dim, 0, start)))
+                pieces.append(value)
+                if end < whole.shape[dim]:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, end, whole.shape[dim]),
+                                       whole.narrow(dim, end, whole.shape[dim] - end)))
+                if len(pieces) > 1:
+                    value = call(torch.ops.aten.cat.default, (pieces, dim), whole)
+        if chain and base.target in _EMPTY_AS_ZEROS:
+            base.target = _EMPTY_AS_ZEROS[base.target]
+            base.kwargs = {
+                key: item for key, item in base.kwargs.items() if key != "memory_format"
+            }
+        for user in list(base.users):
+            if user is not copy and user not in chain_nodes and order.get(user, -1) > position:
+                user.replace_input_with(base, value)
+        copy.replace_all_uses_with(value)
+        graph.erase_node(copy)
+        for view, _, _ in chain:
+            if not view.users:
+                graph.erase_node(view)
+
+
+def _slice_cat_pieces(graph: Graph) -> None:
+    """Replace a slice of a ``cat`` that starts at a piece boundary by the pieces.
+
+    ``torch.cat([history, row])[len(history):]`` is ``row`` whatever
+    ``history``'s length, which is how append state commits its new rows.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.slice.Tensor":
+            continue
+        source = node.args[0]
+        if not isinstance(source, Node) or str(source.target) != "aten.cat.default":
+            continue
+        pieces = list(source.args[0])
+        rank = len(source.meta["val"].shape)
+        cat_dim = (source.args[1] if len(source.args) > 1 else 0) % rank
+        dim = (node.args[1] if len(node.args) > 1 else 0) % rank
+        start = node.args[2] if len(node.args) > 2 else 0
+        end = node.args[3] if len(node.args) > 3 else None
+        step = node.args[4] if len(node.args) > 4 else 1
+        total = source.meta["val"].shape[cat_dim]
+        if dim != cat_dim or step != 1 or not isinstance(start, int) or (
+            end is not None and end < total
+        ):
+            continue
+        offset = 0
+        for index, piece in enumerate(pieces):
+            if offset == start and 0 < index:
+                kept = pieces[index:]
+                with graph.inserting_before(node):
+                    replacement = kept[0] if len(kept) == 1 else graph.call_function(
+                        source.target, (kept, cat_dim),
+                    )
+                if replacement is not kept[0]:
+                    replacement.meta = dict(node.meta)
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+                break
+            offset += piece.meta["val"].shape[cat_dim]
+
+
 def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     example_kwargs = dict(example_kwargs or {})
     tensor_names = [
@@ -580,6 +884,11 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
         restore(graph_module.graph)
 
     _erase_mode_switches(graph_module.graph)
+    _replace_intermediate_copies(graph_module.graph)
+    _slice_cat_pieces(graph_module.graph)
+    # Unused results, such as pooling indices nobody reads, would otherwise
+    # still run in Scratch. Mutations are kept.
+    graph_module.graph.eliminate_dead_code()
     graph_module.recompile()
 
     nodes = list(graph_module.graph.nodes)

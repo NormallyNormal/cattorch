@@ -95,6 +95,11 @@ class Random(Expr):
 
 
 @dataclass(frozen=True)
+class Answer(Expr):
+    """The text typed into the last ``ask and wait``."""
+
+
+@dataclass(frozen=True)
 class CostumeNumber(Expr):
     """The current costume's one-based index.
 
@@ -280,6 +285,16 @@ class BroadcastAndWait(Statement):
     message: str
 
 
+@dataclass(frozen=True)
+class Ask(Statement):
+    question: Expr
+
+
+@dataclass(frozen=True)
+class Say(Statement):
+    message: Expr
+
+
 def set_var(name: str, expr) -> SetVariable:
     return SetVariable(name, value(expr))
 
@@ -369,6 +384,19 @@ def broadcast_and_wait(message: str) -> BroadcastAndWait:
     if not isinstance(message, str) or not message:
         raise ValueError("broadcast message must be a non-empty string")
     return BroadcastAndWait(message)
+
+
+def ask(question) -> Ask:
+    """Show ``question`` and wait for the user to type an answer."""
+    return Ask(value(question))
+
+
+def answer() -> Answer:
+    return Answer()
+
+
+def say(message) -> Say:
+    return Say(value(message))
 
 
 def costume_number() -> CostumeNumber:
@@ -605,6 +633,14 @@ class _Lowerer:
                 1, [11, statement.message, broadcast_id],
             ]
             self.blocks[block_id] = block
+        elif isinstance(statement, Ask):
+            block = self._base("sensing_askandwait", parent)
+            self.blocks[block_id] = block
+            block["inputs"]["QUESTION"] = self._expr(statement.question, block_id, text=True)
+        elif isinstance(statement, Say):
+            block = self._base("looks_say", parent)
+            self.blocks[block_id] = block
+            block["inputs"]["MESSAGE"] = self._expr(statement.message, block_id, text=True)
         elif isinstance(statement, SwitchCostume):
             block = self._base("looks_switchcostumeto", parent)
             self.blocks[block_id] = block
@@ -639,9 +675,9 @@ class _Lowerer:
 
         return block_id
 
-    def _expr(self, expr: Expr, parent: str) -> list:
+    def _expr(self, expr: Expr, parent: str, *, text: bool = False) -> list:
         if isinstance(expr, Literal):
-            type_code = 10 if isinstance(expr.value, str) else 4
+            type_code = 10 if isinstance(expr.value, str) or text else 4
             return [1, [type_code, expr.value]]
         if isinstance(expr, Variable):
             return [3, [12, expr.name, self.var_ids[expr.name]], [10, ""]]
@@ -699,6 +735,8 @@ class _Lowerer:
             self.blocks[block_id] = block
             block["inputs"]["FROM"] = self._expr(expr.low, block_id)
             block["inputs"]["TO"] = self._expr(expr.high, block_id)
+        elif isinstance(expr, Answer):
+            self.blocks[block_id] = self._base("sensing_answer", parent)
         elif isinstance(expr, CostumeNumber):
             block = self._base("looks_costumenumbername", parent)
             block["fields"]["NUMBER_NAME"] = ["number", None]
@@ -784,7 +822,7 @@ def _resolve_static_unrolling(
 def _expr_uses_variable(expr: Expr, name: str) -> bool:
     if isinstance(expr, Variable):
         return expr.name == name
-    if isinstance(expr, (Literal, ListLength, CostumeNumber)):
+    if isinstance(expr, (Literal, ListLength, CostumeNumber, Answer)):
         return False
     if isinstance(expr, ListItem):
         return _expr_uses_variable(expr.index, name)
@@ -824,6 +862,10 @@ def _statement_accesses_variable(statement: Statement, name: str) -> bool:
         return False
     if isinstance(statement, SwitchCostume):
         return _expr_uses_variable(statement.value, name)
+    if isinstance(statement, Ask):
+        return _expr_uses_variable(statement.question, name)
+    if isinstance(statement, Say):
+        return _expr_uses_variable(statement.message, name)
     if isinstance(statement, AppendList):
         return _expr_uses_variable(statement.value, name)
     if isinstance(statement, ReplaceListItem):
@@ -993,6 +1035,8 @@ def _render_expr(expr: Expr) -> str:
         return f"random({_render_expr(expr.low)}, {_render_expr(expr.high)})"
     if isinstance(expr, CostumeNumber):
         return "costume_number()"
+    if isinstance(expr, Answer):
+        return "answer()"
     raise TypeError(type(expr).__name__)
 
 
@@ -1047,3 +1091,7 @@ def _render_statements(statements: Iterable[Statement], lines: list[str], depth:
             lines.append(f"{indent}broadcast and wait {statement.message}")
         elif isinstance(statement, SwitchCostume):
             lines.append(f"{indent}switch costume to {_render_expr(statement.value)}")
+        elif isinstance(statement, Ask):
+            lines.append(f"{indent}ask {_render_expr(statement.question)} and wait")
+        elif isinstance(statement, Say):
+            lines.append(f"{indent}say {_render_expr(statement.message)}")

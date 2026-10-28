@@ -24,22 +24,28 @@ Tracing records a single path through `forward`. It can't follow `if`
 statements or loops that depend on the model's inputs. Branches on values
 that only depend on shapes, parameters, buffers, or constants, such as a mask
 built from `torch.arange`, are fine: they are evaluated once during export.
-If training and inference return different things, export an inference-only
-method:
+If training and inference return different things, mark an inference-only
+method with [`@export_forward`](markers.md#an-export-only-forward). cattorch
+traces it instead of `forward`, and your model is unchanged:
 
 ```python
-def forward(self, x, targets=None):
-    logits = self.head(x)
-    if targets is None:
-        return logits
-    return logits, F.cross_entropy(logits, targets)
+from cattorch import export_forward
 
-def forward_inference(self, x):
-    return self.head(x)
+class Net(nn.Module):
+    def forward(self, x, targets=None):
+        logits = self.head(x)
+        if targets is None:
+            return logits
+        return logits, F.cross_entropy(logits, targets)
 
-model.eval()
-model.forward = model.forward_inference
+    @export_forward
+    def inference(self, x):
+        return self.head(x)
 ```
+
+The marked method takes the arguments `transpile` passes and should return
+what `forward` returns for them, since `verify` compares the export with
+`forward`. It works on any module in the model, not only the top one.
 
 ## Unpack module tuples in the wrapper
 

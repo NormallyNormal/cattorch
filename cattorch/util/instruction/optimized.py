@@ -12,14 +12,9 @@ from cattorch.util.instruction.optimized_elementwise import (
     PairedLinearSwiGLUInstruction,
 )
 from cattorch.util.instruction.optimized_linear import (
-    CachedCausalScoreInstruction,
-    CachedSoftmaxInstruction,
-    CachedSoftmaxValueInstruction,
-    CachedValueMatMulInstruction,
     CausalScoreInstruction,
     CausalSoftmaxInstruction,
     CausalValueMatMulInstruction,
-    FastCachedSoftmaxInstruction,
     FastCausalSoftmaxInstruction,
     FastLowRankMatMulInstruction,
     FastPrunedMatMulInstruction,
@@ -38,8 +33,6 @@ from cattorch.util.instruction.optimized_normalization import (
     OptimizedSoftmaxInstruction,
 )
 from cattorch.util.instruction.optimized_tensor import (
-    CachedPositionEmbeddingAddInstruction,
-    CachedPositionEmbeddingInstruction,
     EmbeddingAddInstruction,
     OptimizedCatInstruction,
     OptimizedEmbeddingInstruction,
@@ -50,17 +43,10 @@ from cattorch.util.instruction.optimized_tensor import (
 )
 
 __all__ = [
-    "CachedCausalScoreInstruction",
-    "CachedPositionEmbeddingAddInstruction",
-    "CachedPositionEmbeddingInstruction",
-    "CachedSoftmaxInstruction",
-    "CachedSoftmaxValueInstruction",
-    "CachedValueMatMulInstruction",
     "CausalScoreInstruction",
     "CausalSoftmaxInstruction",
     "CausalValueMatMulInstruction",
     "EmbeddingAddInstruction",
-    "FastCachedSoftmaxInstruction",
     "FastCausalSoftmaxInstruction",
     "FastElementwiseInstruction",
     "FastLayerNormInstruction",

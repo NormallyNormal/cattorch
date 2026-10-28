@@ -98,8 +98,7 @@ Choose the calibration argument to match the export interface:
 | `GenerationProgram` | `calibration_sequences` | Full token sequences accepted by the generation method |
 
 Calibration data is read once, so a generator works. For cached generation,
-keep the export example at one token (`[1, 1]`) but calibrate with realistic
-full sequences. The model method must accept those sequence lengths.
+calibrate with realistic full sequences of up to `max_context` tokens.
 
 A matrix that saw too little calibration data, such as an expert the router
 never picked, falls back to symmetric quantization. Small matrices stay

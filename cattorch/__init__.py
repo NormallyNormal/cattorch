@@ -14,14 +14,23 @@ from cattorch.quantization import (
 )
 from cattorch.codegen import CodegenConfig
 from cattorch.ops import rotary_embedding
-from cattorch.program import GenerationProgram
+from cattorch.adapters import AdapterContext, ModuleAdapter
+from cattorch.moe_detection import CustomMoEWarning
+from cattorch.markers import (
+    adapter, entrypoint, example, export_forward, generate, marked_program, moe,
+)
+from cattorch.program import (
+    EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall, State,
+    StateInput, StateUpdate,
+)
 from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
 from cattorch.results import (
     ArtifactResult, BoundedDimension, EntryPointResult, ProgramCallVerifyResult, ProgramResult,
-    ProgramVerifyResult, StateResult, TensorSpec, TokenizerResult,
+    ProgramVerifyResult, ProjectResult, StateResult, TensorSpec, TokenizerResult,
     TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
 from cattorch.verify import verify
+from cattorch.project import build_project
 
 
 _BENCHMARK_EXPORTS = {
@@ -46,11 +55,14 @@ __all__ = [
     "StorageConfig", "QuantizationConfig", "QuantizationReport",
     "TensorQuantizationReport",
     "CodegenConfig", "rotary_embedding",
+    "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",
+    "EntryPoint", "ExportProgram", "Input", "Output", "ProgramCall", "State", "StateInput",
+    "StateUpdate", "AdapterContext", "ModuleAdapter", "CustomMoEWarning",
     "CattorchError", "UnsupportedModelError", "UnsupportedOperationError",
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",
     "TensorSpec", "TokenizerResult", "TranspileResult",
-    "VerifyResult", "MultiOutputVerifyResult", "verify",
+    "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project", "ProjectResult",
     "build_paired_benchmark", "build_benchmark_suite", "analyze_benchmark",
     "build_generation_benchmark_suite",
     "build_storage_benchmark_suite",

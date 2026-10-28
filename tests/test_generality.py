@@ -303,20 +303,15 @@ class LogitsOnly(nn.Module):
         return self.model(tokens, use_cache=self.use_cache).logits
 
 
-@pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
-def test_huggingface_decoder_logits(tmp_path, kind):
-    wrapper = LogitsOnly(_tiny_decoder(kind), use_cache=False)
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_wrapped_huggingface_decoder_logits(tmp_path, use_cache):
+    # With the cache on, its non-tensor outputs are dropped inside the wrapper.
+    wrapper = LogitsOnly(_tiny_decoder("gpt2"), use_cache=use_cache)
     _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
 
 
-def test_huggingface_gpt2_with_cache_dropped(tmp_path):
-    wrapper = LogitsOnly(_tiny_decoder("gpt2"), use_cache=True)
-    _export_and_verify(tmp_path, wrapper, (torch.randint(0, 64, (1, 8)),))
-
-
-@pytest.mark.parametrize("kind", ["gpt2", "llama"])
-def test_unwrapped_huggingface_decoder_with_explicit_cache_off(tmp_path, kind):
-    model = _tiny_decoder(kind).eval()
+def test_unwrapped_huggingface_decoder_with_explicit_cache_off(tmp_path):
+    model = _tiny_decoder("gpt2").eval()
     ids = torch.randint(0, 64, (1, 8))
     kwargs = {"use_cache": False}
     result = transpile(model, (ids,), tmp_path / "model", example_kwargs=kwargs)
@@ -338,22 +333,14 @@ def test_huggingface_model_in_training_mode_warns_and_stays_training(tmp_path):
 @pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
 def test_huggingface_decoder_needs_no_kwargs(tmp_path, kind):
     model = _tiny_decoder(kind).eval()
-    ids = torch.randint(0, 64, (1, 8))
-    with warnings.catch_warnings():
-        warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
-        result = transpile(model, (ids,), tmp_path / "model")
-        assert verify(model, (ids,), result).passed
-    assert len(result.outputs) == 1
-
-
-def test_huggingface_config_defaults_apply_to_copy_only(tmp_path):
-    model = _tiny_decoder("llama").eval()
+    # Defaults that add outputs apply to the export copy only.
     model.config.use_cache = True
     model.config.output_hidden_states = True
     ids = torch.randint(0, 64, (1, 8))
     with warnings.catch_warnings():
         warnings.filterwarnings("error", message="ignoring non-tensor model outputs")
         result = transpile(model, (ids,), tmp_path / "model")
+        assert verify(model, (ids,), result).passed
     assert len(result.outputs) == 1
     assert model.config.use_cache and model.config.output_hidden_states
 
@@ -481,9 +468,7 @@ def test_training_mode_model_exports_in_evaluation_mode(tmp_path):
 
 def test_example_kwargs_rejections(tmp_path):
     from cattorch import QuantizationConfig
-    from cattorch.experimental import (
-        EntryPoint, ExportProgram, GenerationProgram, Input, Output,
-    )
+    from cattorch import EntryPoint, ExportProgram, GenerationProgram, Input, Output
     model = KeywordMask().eval()
     x, mask = torch.randn(2, 4), torch.ones(1, 4)
     program = ExportProgram(entrypoints=(
@@ -491,9 +476,7 @@ def test_example_kwargs_rejections(tmp_path):
     ))
     with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
         transpile(model, program, tmp_path / "a", example_kwargs={"mask": mask})
-    generation = GenerationProgram(
-        "forward", torch.zeros(1, 1, dtype=torch.long), max_context=4,
-    )
+    generation = GenerationProgram(max_context=4)
     with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
         transpile(model, generation, tmp_path / "b", example_kwargs={"mask": mask})
     with pytest.raises(TypeError, match="dict with string keys"):
@@ -566,6 +549,22 @@ DECOMPOSED = {
     ),
     "lstm": (nn.LSTM(4, 4, batch_first=True), (torch.randn(1, 3, 4),)),
     "gru": (nn.GRU(4, 4, batch_first=True), (torch.randn(1, 3, 4),)),
+    "depthwise convolution": (nn.Conv2d(4, 4, 3, groups=4), (IMAGE,)),
+    "dilated convolution": (nn.Conv2d(4, 4, 3, dilation=2), (IMAGE,)),
+    "transposed convolution": (nn.ConvTranspose2d(4, 4, 2, stride=2), (IMAGE,)),
+    "3d convolution": (nn.Conv3d(4, 4, 3), (torch.randn(1, 4, 4, 4, 4),)),
+    "same padding": (nn.Conv1d(4, 2, 4, padding="same"), (torch.randn(1, 4, 6),)),
+    "sort": (Lambda(lambda x: torch.sort(x, -1, descending=True).values), (VECTOR,)),
+    "argsort": (Lambda(lambda x: x.argsort(0)), (VECTOR,)),
+    "median": (Lambda(lambda x: x.median(-1).values), (VECTOR,)),
+    "kthvalue indices": (Lambda(lambda x: x.kthvalue(3, -1).indices), (VECTOR,)),
+    "cummax": (Lambda(lambda x: torch.cummax(x, -1).values), (VECTOR,)),
+    "isin": (Lambda(lambda x: torch.isin(x.floor(), torch.tensor([-2.0, 1.0])).float()), (VECTOR,)),
+    "atan2": (Lambda(lambda x: torch.atan2(x, x.flip(-1))), (VECTOR,)),
+    "logsumexp": (Lambda(lambda x: x.logsumexp(-1)), (VECTOR,)),
+    "max pool indices": (
+        Lambda(lambda x: F.max_pool2d(x, 2, return_indices=True)[1].float()), (IMAGE,),
+    ),
 }
 
 
@@ -577,10 +576,6 @@ def test_decomposed_operation(tmp_path, name):
 
 
 KNOWN_UNSUPPORTED = {
-    "depthwise convolution": (nn.Conv2d(4, 4, 3, groups=4), (IMAGE,)),
-    "dilated convolution": (nn.Conv2d(4, 4, 3, dilation=2), (IMAGE,)),
-    "transposed convolution": (nn.ConvTranspose2d(4, 4, 2, stride=2), (IMAGE,)),
-    "3d convolution": (nn.Conv3d(4, 4, 3), (torch.randn(1, 4, 4, 4, 4),)),
     "log gamma": (Lambda(torch.lgamma), (POSITIVE,)),
 }
 

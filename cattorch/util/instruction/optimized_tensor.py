@@ -43,7 +43,8 @@ class OptimizedEmbeddingInstruction(Instruction):
     """Embedding lookup that computes the weight-row offset once per token."""
 
     def prepare(self):
-        self.tokens = math.prod(self.args[1].shape)
+        # A runtime-length token list sets the count when the code runs.
+        self.tokens = length("T2") if self.args[1].dynamic else math.prod(self.args[1].shape)
         self.width = self.args[0].shape[1]
 
     def finalize(self):
@@ -82,40 +83,12 @@ class OptimizedEmbeddingInstruction(Instruction):
         ).compile()
 
 
-class CachedPositionEmbeddingInstruction(Instruction):
-    """Look up the current autoregressive position from a persistent K cache."""
-
-    def prepare(self):
-        self.width = self.args[0].shape[1]
-        self.cache_token_width = self.args[3].value
-
-    def finalize(self):
-        return Program(
-            "embedding_cached_position",
-            variables=("weight_index",),
-            lists=("T1", "T2", "T3", "T4"),
-            body=(
-                clear("T4"),
-                set_var(
-                    "weight_index",
-                    add(
-                        mul(mathop("floor", div(length("T3"), self.cache_token_width)), self.width),
-                        1,
-                    ),
-                ),
-                *_static_unrolled_repeat(self.width, (
-                    append("T4", item("T1", var("weight_index"))),
-                    change_var("weight_index", 1),
-                )),
-            ),
-        ).compile()
-
-
 class EmbeddingAddInstruction(Instruction):
     """Fuse two equal-width embedding lookups and their elementwise add."""
 
     def prepare(self):
-        self.tokens = math.prod(self.args[1].shape)
+        # A runtime-length token list sets the count when the code runs.
+        self.tokens = length("T2") if self.args[1].dynamic else math.prod(self.args[1].shape)
         self.width = self.args[0].shape[1]
 
     def finalize(self):
@@ -164,47 +137,6 @@ class EmbeddingAddInstruction(Instruction):
             ),
             1,
         )
-
-
-class CachedPositionEmbeddingAddInstruction(EmbeddingAddInstruction):
-    """Embedding add whose positional index is derived from the first K cache."""
-
-    def prepare(self):
-        super().prepare()
-        self.position_side = self.args[5].value
-        self.cache_token_width = self.args[6].value
-
-    def finalize(self):
-        # Banked caches hold a partial token row mid-layer, so truncate.
-        position = mathop("floor", div(length("T5"), self.cache_token_width))
-        first_token = position if self.position_side == 0 else item("T2", var("token"))
-        second_token = position if self.position_side == 1 else item("T4", var("token"))
-        interleaved = getattr(self, "interleaved_sides", (False, False))
-        return Program(
-            "embedding_add_cached_position",
-            variables=("token", "first_weight", "second_weight"),
-            lists=("T1", "T2", "T3", "T4", "T5", "T6"),
-            body=(
-                clear("T6"),
-                set_var("token", 1),
-                repeat(self.tokens, (
-                    set_var("first_weight", self._weight_start(first_token, interleaved[0])),
-                    set_var("second_weight", self._weight_start(second_token, interleaved[1])),
-                    *_static_unrolled_repeat(self.width, (
-                        append(
-                            "T6",
-                            add(
-                                item("T1", var("first_weight")),
-                                item("T3", var("second_weight")),
-                            ),
-                        ),
-                        change_var("first_weight", 4 if interleaved[0] else 1),
-                        change_var("second_weight", 4 if interleaved[1] else 1),
-                    )),
-                    change_var("token", 1),
-                )),
-            ),
-        ).compile()
 
 
 class OptimizedTransposeInstruction(Instruction):

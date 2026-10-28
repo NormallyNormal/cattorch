@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import re
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -16,11 +18,12 @@ from cattorch.errors import UnsupportedModelError
 from cattorch.adapters import ModuleAdapter
 from cattorch.export_options import validate_export_options
 from cattorch.frontend import flat_example_inputs, tensor_output_leaves
+from cattorch.huggingface import prepare_huggingface_models
 from cattorch.operator_registry import default_registry, eval_mode_copy_warning
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
-from cattorch.storage import StorageConfig
+from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.program import ExportProgram, Input, Output, ProgramCall
 from cattorch.program_runtime import ProgramReplay
 from cattorch.graph_transforms import fold_eval_batch_norms
@@ -141,13 +144,7 @@ def _verify_program(
         # so this comparison isolates Scratch lowering from the independently
         # lossy storage decision.
         from cattorch.sprite import _static_storage_precision
-        storage = StorageConfig(
-            precision=quantization.precision,
-            group_size=quantization.group_size,
-            min_quantized_values=quantization.min_quantized_values,
-            scale_precision=quantization.scale_precision,
-            grouping="row",
-        )
+        storage = quantized_storage(StorageConfig(), quantization)
         effective_ndims = expert_bank_effective_ndims(owned)
         with torch.no_grad():
             for value in (*owned.parameters(), *owned.buffers()):
@@ -187,7 +184,7 @@ def _verify_program(
         status = str(emulator.variables.get("cattorch status", "missing runtime status"))
         output_results = []
         if status == "ok":
-            from cattorch.moe import _expert_family_context
+            from cattorch.experts import _expert_family_context
             with _expert_family_context(registry.expert_families):
                 leaves = replay.run(invocation)
             for binding, expected in zip(entry.returns, leaves):
@@ -228,7 +225,7 @@ def _verify_program(
 
 def verify(
     model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | None,
     sprite: str | Path | TranspileResult | ProgramResult,
     *,
     atol: float = 1e-4,
@@ -262,6 +259,15 @@ def verify(
     """
     if atol < 0 or rtol < 0:
         raise ValueError("atol and rtol must be non-negative")
+    if example_inputs is None:
+        # As in ``transpile``: the interface comes from the model's markers.
+        from cattorch.markers import example_inputs as marked_example, has_entrypoints, marked_program
+        if has_entrypoints(model):
+            model, example_inputs = marked_program(model)
+        else:
+            example_inputs = marked_example(model)
+            if example_inputs is None:
+                raise ValueError("example_inputs is None, but the model has no marker for them")
     validate_export_options(example_kwargs=example_kwargs)
     if example_kwargs is not None and isinstance(example_inputs, ExportProgram):
         raise ValueError("example_kwargs cannot be used with an ExportProgram")
@@ -290,9 +296,20 @@ def verify(
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
     emulator.run_procedure("cattorch forward")
 
-    if any(module.training for module in model.modules()):
-        model = copy.deepcopy(model).eval()
-        eval_mode_copy_warning()
+    training = any(module.training for module in model.modules())
+    transformers = sys.modules.get("transformers")
+    huggingface = transformers is not None and any(
+        isinstance(module, transformers.PreTrainedModel) for module in model.modules()
+    )
+    if training or huggingface:
+        # Compare against the model transpile exported: an evaluation-mode
+        # copy, with the same Hugging Face defaults (no cache or extra outputs).
+        model = copy.deepcopy(model)
+        if training:
+            model.eval()
+            eval_mode_copy_warning()
+        if huggingface:
+            prepare_huggingface_models(model)
     with torch.no_grad():
         expected = model(*inputs, **(example_kwargs or {}))
     leaves = tensor_output_leaves(expected, warn=False)
@@ -315,9 +332,11 @@ def verify(
         )
         for value, name in zip(leaves, output_names)
     )
+    approximate = sprite.approximate_operations if isinstance(sprite, TranspileResult) else ()
     if len(comparisons) == 1:
-        return comparisons[0]
+        return dataclasses.replace(comparisons[0], approximate_operations=approximate)
     return MultiOutputVerifyResult(
         passed=all(result.passed for result in comparisons),
         outputs=comparisons,
+        approximate_operations=approximate,
     )

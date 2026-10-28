@@ -7,6 +7,7 @@ and compares against the HuggingFace tokenizer output.
 
 import json
 import os
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -23,7 +24,8 @@ from cattorch.tokenizer import (
 from cattorch.results import TokenizerResult
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-SPRITE_PATH = os.path.join(os.path.dirname(__file__), "_test_tokenizer")
+# One directory per process, so parallel test workers never share the file.
+SPRITE_PATH = os.path.join(tempfile.mkdtemp(prefix="cattorch-tokenizer-"), "tokenizer")
 
 
 def _make_char_tokenizer(chars: str) -> PreTrainedTokenizerFast:
@@ -46,19 +48,19 @@ def _load_sprite() -> dict:
 
 
 def _encode(sprite: dict, text: str) -> list:
-    """Run the encode block stack and return token_ids."""
+    """Run the encode block stack and return the token IDs."""
     emu = ScratchEmulator(sprite)
-    emu.variables["input"] = text
+    emu.variables["cattorch text"] = text
     emu.run(root_index=0)
-    return emu.lists["token_ids"]
+    return emu.lists["cattorch token ids"]
 
 
 def _decode(sprite: dict, token_ids: list) -> str:
     """Run the decode block stack and return the output string."""
     emu = ScratchEmulator(sprite)
-    emu.lists["token_ids"] = list(token_ids)
+    emu.lists["cattorch token ids"] = list(token_ids)
     emu.run(root_index=1)
-    return emu.variables["output"]
+    return emu.variables["cattorch text"]
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -538,9 +540,9 @@ class TestSentencePieceBPE:
             sprite = json.loads(archive.read("sprite.json"))
 
         emulator = ScratchEmulator(sprite)
-        emulator.variables["input"] = "AB_ab!"
+        emulator.variables["cattorch text"] = "AB_ab!"
         emulator.run_procedure("cattorch tokenize")
-        assert [int(value) for value in emulator.lists["token_ids"]] == [3, 2, 3, 8]
+        assert [int(value) for value in emulator.lists["cattorch token ids"]] == [3, 2, 3, 8]
 
     def test_encode_considers_merges_beyond_vocabulary_length(self, tmp_path):
         result = SentencePieceBPETokenizer(
@@ -550,9 +552,9 @@ class TestSentencePieceBPE:
             sprite = json.loads(archive.read("sprite.json"))
 
         emulator = ScratchEmulator(sprite)
-        emulator.variables["input"] = "aaaaaaaa"
+        emulator.variables["cattorch text"] = "aaaaaaaa"
         emulator.run_procedure("cattorch tokenize")
-        assert [int(value) for value in emulator.lists["token_ids"]] == [9]
+        assert [int(value) for value in emulator.lists["cattorch token ids"]] == [9]
 
     def test_decode_skips_specials_and_converts_space_marker(self, tmp_path):
         result = SentencePieceBPETokenizer(
@@ -563,9 +565,9 @@ class TestSentencePieceBPE:
             sprite = json.loads(archive.read("sprite.json"))
 
         emulator = ScratchEmulator(sprite)
-        emulator.lists["token_ids"] = [0, 1, 3, 2, 4, 8]
+        emulator.lists["cattorch token ids"] = [0, 1, 3, 2, 4, 8]
         emulator.run_procedure("cattorch detokenize")
-        assert emulator.variables["output"] == "ab_ ab!"
+        assert emulator.variables["cattorch text"] == "ab_ ab!"
 
     def test_exports_clickable_stacks_warp_procedures_and_warning(self, tmp_path):
         result = SentencePieceBPETokenizer(

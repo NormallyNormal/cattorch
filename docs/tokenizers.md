@@ -32,12 +32,13 @@ As with `transpile`, parent directories are created, `.sprite3` is added if
 missing, and `name=` sets the sprite name.
 
 Every tokenizer sprite has two custom blocks, which run without screen
-refresh, and a clickable stack for each:
+refresh, and a clickable stack for each (see the
+[Scratch interface](scratch-interface.md#tokenizer-sprites)):
 
-- `cattorch tokenize` reads the `input` variable and writes token IDs to the
-  `token_ids` list.
-- `cattorch detokenize` reads `token_ids` and writes the text to the `output`
-  variable.
+- `cattorch tokenize` reads the `cattorch text` variable and writes token IDs
+  to the `cattorch token ids` list.
+- `cattorch detokenize` reads `cattorch token ids` and writes the text to
+  `cattorch text`.
 
 Token IDs are zero-based, as in Python, even though Scratch list positions
 start at 1. The variables and lists belong to the tokenizer sprite; to use them

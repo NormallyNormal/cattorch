@@ -159,6 +159,11 @@ class OptimizedElementwiseInstruction(Instruction):
         if self.args[1].value is not None:
             left = item("T1", var("index"))
             return operation(left, self.args[1].value), ("T1", "T2")
+        if self.args[0].value is not None:
+            # A constant left operand, as in ``1 - x``.
+            right = self._operand(1, "_right_broadcast_map")
+            lists = (*self.slots.values(), *self.broadcast_lists, self.output_list)
+            return operation(self.args[0].value, right), lists
 
         left_index, left_map = _broadcast_index(
             self.args[0].shape, self.output_shape, "_left_broadcast_map",
@@ -241,11 +246,17 @@ class OptimizedElementwiseInstruction(Instruction):
             )
             result = None
         elif self.op == "aten.elu.default":
-            alpha = self.args[1].value if len(self.args) > 1 else 1.0
+            # scale * x, or scale * alpha * (exp(input_scale * x) - 1); SELU
+            # and CELU use the scale arguments.
+            alpha, scale, input_scale = (
+                self.args[index].value if len(self.args) > index else 1.0
+                for index in (1, 2, 3)
+            )
+            exponent = direct if input_scale == 1 else mul(input_scale, direct)
             output = if_else(
                 gt(direct, 0),
-                (append("T2", direct),),
-                (append("T2", mul(alpha, add(mathop("e ^", direct), -1))),),
+                (append("T2", direct if scale == 1 else mul(scale, direct)),),
+                (append("T2", mul(alpha * scale, add(mathop("e ^", exponent), -1))),),
             )
             result = None
         elif self.op == "aten.pow.Tensor_Scalar":
@@ -263,14 +274,44 @@ class OptimizedElementwiseInstruction(Instruction):
                     result = mul(result, cached)
                 if exponent < 0:
                     result = div(1, result)
+            elif float(exponent).is_integer():
+                # |x| ^ n, negated for a negative base and an odd exponent.
+                setup = (set_var("value", direct),)
+                magnitude = mathop("e ^", mul(exponent, mathop("ln", mathop("abs", cached))))
+                if int(exponent) % 2:
+                    output = if_else(
+                        lt(cached, 0),
+                        (append(self.output_list, mul(-1, magnitude)),),
+                        (append(self.output_list, magnitude),),
+                    )
+                    result = None
+                else:
+                    result = magnitude
             else:
+                # A negative base gives NaN through ln, as in PyTorch.
                 result = mathop("e ^", mul(exponent, mathop("ln", direct)))
         elif self.op in self._MATHOP:
             result = mathop(self._MATHOP[self.op], direct)
-        elif self.op in {"aten.sin.default", "aten.cos.default"}:
+        elif self.op in {"aten.sin.default", "aten.cos.default", "aten.tan.default"}:
             # Scratch's trigonometry takes degrees.
-            name = "sin" if self.op == "aten.sin.default" else "cos"
+            name = self.op.split(".")[1]
             result = mathop(name, mul(direct, 57.29577951308232))
+        elif self.op in {"aten.asin.default", "aten.acos.default", "aten.atan.default"}:
+            # ... and returns them.
+            name = self.op.split(".")[1]
+            result = mul(mathop(name, direct), 0.017453292519943295)
+        elif self.op == "aten.exp2.default":
+            result = mathop("e ^", mul(direct, 0.6931471805599453))
+        elif self.op == "aten.log2.default":
+            result = mul(mathop("ln", direct), 1.4426950408889634)
+        elif self.op == "aten.erfc.default":
+            setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
+            output = if_else(
+                lt(cached, 0),
+                (append(self.output_list, sub(2, var("inner"))),),
+                (append(self.output_list, var("inner")),),
+            )
+            result = None
         elif self.op == "aten.reciprocal.default":
             result = div(1, direct)
         elif self.op == "aten.erf.default":
@@ -421,7 +462,7 @@ class FusedArithmeticInstruction(Instruction):
         destination = f"T{len(self.args) + 1}"
         lists = tuple(f"T{index}" for index in range(1, len(self.args) + 2))
         traversal = (
-            (repeat(self.size, (
+            (repeat(length("T1"), (
                 append(destination, self.expression),
                 change_var("index", 1),
             )),)

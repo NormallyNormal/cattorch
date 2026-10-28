@@ -45,6 +45,23 @@ timings as JSON. To run another project, call the runner directly:
 node benchmarks/run_scratch_vm.cjs benchmarks/artifacts/costume_codec_suite.sb3 --inspect-lists
 ```
 
+`run_project_vm.cjs` runs a project from `cattorch.build_project` instead: it
+clicks the green flag (or presses `--key=space`), answers each question with
+the next `--answer=TEXT`, and prints the stage's lists and variables and
+everything sprites said:
+
+```bash
+node benchmarks/run_project_vm.cjs build/rhyme.sb3 --answer=twinkle
+```
+
+`--list=NAME=JSON` and `--var=NAME=VALUE` set stage data before the green
+flag, and `--no-flag` skips it. `--broadcast=MESSAGE` then sends a bridge
+message and waits for it; a `--list` after a broadcast is set before the next
+one, so each call can get its own inputs. `--out=FILE` writes the JSON to a
+file. `tests/test_real_vm.py` uses this runner to compare exported sprites
+with PyTorch in the VM; run `npm ci` here first, and CI sets
+`CATTORCH_REQUIRE_VM=1` so those tests fail instead of skipping.
+
 The VM has no renderer, so it may print warnings about missing costumes; these
 are harmless. VM timings are repeatable, which makes them good for comparing
 candidates, while browser runs show what users actually get. Neither converts

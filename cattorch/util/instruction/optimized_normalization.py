@@ -385,22 +385,27 @@ class OptimizedRMSNormInstruction(Instruction):
             if self.args[0].dynamic
             else math.prod(self.args[0].shape) // self.norm_size
         )
+        # ``F.rms_norm(x, shape)`` passes neither a weight nor eps.
         self.eps = (
             self.args[3].value
-            if len(self.args) > 3
+            if len(self.args) > 3 and self.args[3].value is not None
             else torch.finfo(torch.float32).eps
         )
-        self.has_weight = self.args[2].value is not None or bool(self.args[2].shape)
+        self.has_weight = len(self.args) > 2 and (
+            self.args[2].value is not None or bool(self.args[2].shape)
+        )
 
     def finalize(self):
         current = item("T1", var("index"))
         weight = item("T2", var("feature")) if self.has_weight else 1
+        # Without a weight argument at all, the output takes the second slot.
+        out = "T3" if len(self.args) > 2 else "T2"
         return Program(
             "rmsnorm_optimized",
             variables=("index", "feature", "sum", "rms"),
-            lists=("T1", "T2", "T3"),
+            lists=("T1", "T2", "T3") if out == "T3" else ("T1", "T2"),
             body=(
-                clear("T3"),
+                clear(out),
                 set_var("index", 1),
                 repeat(self.groups, (
                     set_var("sum", 0),
@@ -418,7 +423,7 @@ class OptimizedRMSNormInstruction(Instruction):
                     change_var("index", -self.norm_size),
                     set_var("feature", 1),
                     *_static_unrolled_repeat(self.norm_size, (
-                        append("T3", mul(div(current, var("rms")), weight)),
+                        append(out, mul(div(current, var("rms")), weight)),
                         change_var("index", 1),
                         change_var("feature", 1),
                     )),
@@ -443,10 +448,18 @@ class OptimizedBatchNormInstruction(Instruction):
         eps = self.args[7].value
         var_key = self.args[4].name
         raw_key = var_key[2:] if var_key.startswith("W_") else var_key
-        if raw_key in static_lists:
+        # A stored variance becomes its standard deviation at export; one
+        # given as an input is converted in Scratch.
+        self.stored_std = raw_key in static_lists
+        if self.stored_std:
             static_lists[raw_key] = torch.sqrt(static_lists[raw_key] + eps)
 
     def finalize(self):
+        variance = item("T5", var("channel"))
+        std = (
+            variance if getattr(self, "stored_std", True)
+            else mathop("sqrt", add(variance, self.args[7].value))
+        )
         result = add(
             mul(
                 div(
@@ -471,7 +484,7 @@ class OptimizedBatchNormInstruction(Instruction):
                     set_var("channel", 1),
                     repeat(self.channels, (
                         set_var("mean", item("T4", var("channel"))),
-                        set_var("std", item("T5", var("channel"))),
+                        set_var("std", std),
                         set_var(
                             "scale",
                             item("T2", var("channel")) if self.has_weight else 1,

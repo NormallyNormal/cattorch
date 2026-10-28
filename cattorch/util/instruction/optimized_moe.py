@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import math
+import operator
 
 import torch
 
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized_common import _static_unrolled_repeat
+from cattorch.util.instruction.optimized_elementwise import _erfc_statements
 from cattorch.util.scratch.dsl import (
     Program, add, append, change_var, clear, div, eq, gt, if_, index_of, item,
-    if_else, length, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
+    if_else, length, lt, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
 )
+
+
+# Data movement inside an expert, lowered through static index tables.
+_EXPERT_MOVES = frozenset({
+    "aten.slice.Tensor", "aten.narrow.default", "aten.select.int",
+    "aten.transpose.int", "aten.permute.default", "aten.t.default",
+})
+# Multi-output moves; each ``getitem`` of one is lowered like a move.
+_EXPERT_SPLITS = frozenset({
+    "aten.split.Tensor", "aten.split_with_sizes.default", "aten.chunk.default",
+    "aten.unbind.int",
+})
 
 
 class StackedSwiGLUMoEInstruction(Instruction):
@@ -360,6 +374,8 @@ class ExpertFamilyMoEInstruction(Instruction):
     the base index used by static-list reporters.
     """
 
+    program_name = "expert_family_moe"
+
     def __init__(
         self, torch_name, output, *args, family, top_k: int,
         normalize_selected: bool, fast_activations: bool = False,
@@ -451,6 +467,8 @@ class ExpertFamilyMoEInstruction(Instruction):
         statements = []
         declared = ["_expert input"]
         list_values = {}
+        # Variables only some expert programs need; declared after the fixed set.
+        self.extra_variables = []
 
         def tensor_name(argument):
             if argument.op == "get_attr":
@@ -516,9 +534,18 @@ class ExpertFamilyMoEInstruction(Instruction):
                 "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
                 "aten.flatten.using_ints", "aten.contiguous.default", "aten.clone.default",
                 "aten.detach.default", "aten.alias.default",
-            }:
+            } or (
+                # Scratch keeps one number type, so float casts change nothing.
+                target in {"aten.to.dtype", "aten._to_copy.default"}
+                and node.meta["val"].dtype.is_floating_point
+                and node.args[0].meta["val"].dtype.is_floating_point
+            ):
                 names[node.name] = tensor_name(node.args[0])
                 shapes[node.name] = tuple(node.meta["val"].shape)
+                continue
+            if target in _EXPERT_SPLITS:
+                # Each output is lowered at its ``getitem``.
+                shapes[node.name] = tuple(node.args[0].meta["val"].shape)
                 continue
 
             output_name = f"_expert {len(declared)}"
@@ -527,6 +554,70 @@ class ExpertFamilyMoEInstruction(Instruction):
             shapes[node.name] = output_shape
             declared.append(output_name)
             statements.append(clear(output_name))
+
+            if target in _EXPERT_MOVES or (
+                node.target is operator.getitem and str(node.args[0].target) in _EXPERT_SPLITS
+            ):
+                # A static index table found by running the move on positions.
+                parent = node.args[0] if target in _EXPERT_MOVES else node.args[0].args[0]
+                source_shape = tensor_shape(parent)
+                positions = torch.arange(1, math.prod(source_shape) + 1, dtype=torch.float64)
+                positions = positions.reshape(source_shape)
+                with torch.no_grad():
+                    if target in _EXPERT_MOVES:
+                        moved = node.target(positions, *node.args[1:], **node.kwargs)
+                    else:
+                        split = node.args[0]
+                        moved = split.target(positions, *split.args[1:], **split.kwargs)
+                        moved = moved[node.args[1]]
+                map_name = f"_expert map {len(list_values)}"
+                list_values[map_name] = [int(value) for value in moved.reshape(-1).tolist()]
+                declared.append(map_name)
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(moved.numel(), (
+                        append(output_name, item(
+                            tensor_name(parent), item(map_name, var("expert index")),
+                        )),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
+
+            if target in {"aten.clamp.default", "aten.clamp_min.default", "aten.clamp_max.default"}:
+                low = high = None
+                if target == "aten.clamp_min.default":
+                    low = node.args[1]
+                elif target == "aten.clamp_max.default":
+                    high = node.args[1]
+                else:
+                    low = node.args[1] if len(node.args) > 1 else node.kwargs.get("min")
+                    high = node.args[2] if len(node.args) > 2 else node.kwargs.get("max")
+                if any(hasattr(bound, "op") for bound in (low, high)):
+                    raise ValueError(
+                        "unsupported operation inside generic ExpertFamily: "
+                        "clamp with tensor bounds"
+                    )
+                if "expert clamp value" not in self.extra_variables:
+                    self.extra_variables.append("expert clamp value")
+                value = var("expert clamp value")
+                limits = []
+                if low is not None:
+                    limits.append(if_(lt(value, low), (set_var("expert clamp value", low),)))
+                if high is not None:
+                    limits.append(if_(gt(value, high), (set_var("expert clamp value", high),)))
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(math.prod(output_shape), (
+                        set_var("expert clamp value", item(
+                            tensor_name(node.args[0]), var("expert index"),
+                        )),
+                        *limits,
+                        append(output_name, value),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
 
             if target == "aten.linear.default":
                 source, weight = node.args[:2]
@@ -571,22 +662,71 @@ class ExpertFamilyMoEInstruction(Instruction):
                 ))
                 continue
 
+            if target == "aten.pow.Tensor_Scalar":
+                # The elementwise kernel's exponents: integers up to 4 and ±0.5.
+                exponent = node.args[1]
+                magnitude = abs(exponent)
+                if magnitude not in {0.5, 1, 2, 3, 4}:
+                    raise ValueError(
+                        "unsupported operation inside generic ExpertFamily: "
+                        f"pow exponent {exponent} (integers from -4 to 4 and ±0.5 work)"
+                    )
+                source_name = tensor_name(node.args[0])
+                element_value = item(source_name, var("expert index"))
+                if magnitude == 0.5:
+                    power = mathop("sqrt", element_value)
+                else:
+                    power = element_value
+                    for _ in range(int(magnitude) - 1):
+                        power = mul(power, element_value)
+                statements.extend((
+                    set_var("expert index", 1),
+                    repeat(math.prod(output_shape), (
+                        append(output_name, div(1, power) if exponent < 0 else power),
+                        change_var("expert index", 1),
+                    )),
+                ))
+                continue
+
             if target in {
                 "aten.relu.default", "aten.sigmoid.default", "aten.silu.default",
                 "aten.tanh.default", "aten.gelu.default", "aten.neg.default",
             }:
-                if target == "aten.gelu.default":
-                    approximate = (
-                        node.args[1] if len(node.args) > 1
-                        else node.kwargs.get("approximate", "none")
-                    )
-                    if approximate != "tanh" and not self.fast_activations:
-                        raise ValueError(
-                            "unsupported operation inside generic ExpertFamily: "
-                            "exact GELU requires approximate='tanh'"
-                        )
                 source_name = tensor_name(node.args[0])
                 size = math.prod(output_shape)
+                approximate = (
+                    node.args[1] if len(node.args) > 1
+                    else node.kwargs.get("approximate", "none")
+                )
+                if (
+                    target == "aten.gelu.default" and approximate != "tanh"
+                    and not self.fast_activations
+                ):
+                    # 0.5 x (1 + erf(x / sqrt(2))) through erfc, as in the
+                    # elementwise kernel: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
+                    for name in ("expert gelu value", "expert gelu erfc"):
+                        if name not in self.extra_variables:
+                            self.extra_variables.append(name)
+                    value = var("expert gelu value")
+                    erfc = var("expert gelu erfc")
+                    statements.extend((
+                        set_var("expert index", 1),
+                        repeat(size, (
+                            set_var("expert gelu value", item(
+                                source_name, var("expert index"),
+                            )),
+                            *_erfc_statements(
+                                mul(value, 0.7071067811865476), "expert gelu erfc",
+                            ),
+                            if_else(
+                                lt(value, 0),
+                                (append(output_name, mul(mul(0.5, value), erfc)),),
+                                (append(output_name, mul(value, sub(1, mul(0.5, erfc)))),),
+                            ),
+                            change_var("expert index", 1),
+                        )),
+                    ))
+                    continue
                 statements.extend((
                     set_var("expert index", 1),
                     repeat(size, (
@@ -757,12 +897,8 @@ class ExpertFamilyMoEInstruction(Instruction):
             result = result[0]
         return tuple(statements), tensor_name(result), tuple(declared), list_values
 
-    def finalize(self):
-        expert_body, expert_output, expert_lists, expert_list_values = (
-            self._expert_program()
-        )
-        routes = "_moe route ids"
-        weights = "_moe route weights"
+    def _route_statements(self, routes, weights):
+        """Fill ``routes`` (one-based expert numbers) and ``weights`` for ``token``."""
         normalize = ()
         if self.normalize_selected:
             normalize = (
@@ -792,16 +928,75 @@ class ExpertFamilyMoEInstruction(Instruction):
                     ),
                 ),
             )
+        return (
+            set_var("route", 0),
+            repeat(self.top_k, (
+                set_var("expert", 1), set_var("best", "-Infinity"),
+                set_var("selected", 0),
+                repeat(self.experts, (
+                    if_(eq(index_of(routes, var("expert")), 0), (
+                        set_var("candidate score", item(
+                            "T2", add(
+                                mul(var("token"), self.experts),
+                                var("expert"),
+                            ),
+                        )),
+                        if_else(
+                            eq(var("selected"), 0),
+                            (
+                                set_var("best", var("candidate score")),
+                                set_var("selected", var("expert")),
+                            ),
+                            (if_else(
+                                not_(eq(
+                                    var("candidate score"),
+                                    var("candidate score"),
+                                )),
+                                (if_(eq(var("best"), var("best")), (
+                                    set_var("best", var("candidate score")),
+                                    set_var("selected", var("expert")),
+                                )),),
+                                (if_(eq(var("best"), var("best")), (
+                                    if_(gt(
+                                        var("candidate score"), var("best"),
+                                    ), (
+                                        set_var(
+                                            "best", var("candidate score"),
+                                        ),
+                                        set_var("selected", var("expert")),
+                                    )),
+                                )),),
+                            ),),
+                        ),
+                    )),
+                    change_var("expert", 1),
+                )),
+                append(routes, var("selected")),
+                append(weights, item(
+                    "T3", add(mul(var("token"), self.experts), var("selected")),
+                )),
+                change_var("route", 1),
+            )),
+            *normalize,
+        )
+
+    def finalize(self):
+        expert_body, expert_output, expert_lists, expert_list_values = (
+            self._expert_program()
+        )
+        routes = "_moe route ids"
+        weights = "_moe route weights"
         bank_lists = tuple(f"T{index}" for index in range(4, 4 + len(self.args) - 3))
         target_list = f"T{len(self.args) + 1}"
         return Program(
-            "expert_family_moe",
+            self.program_name,
             variables=(
                 "token", "expert", "best", "selected", "route", "active expert",
                 "input index", "output index", "selected denominator", "expert row",
                 "expert index", "expert input index", "expert weight index", "expert sum",
                 "expert mean", "expert variance", "expert centered", "expert scale",
                 "expert norm index", "expert source base", "candidate score",
+                *self.extra_variables,
             ),
             lists=("T1", "T2", "T3", *bank_lists, target_list, routes, weights, *expert_lists),
             list_values=expert_list_values,
@@ -811,55 +1006,7 @@ class ExpertFamilyMoEInstruction(Instruction):
                 repeat(self.tokens, (
                     repeat(self.output_width, (append(target_list, 0),)),
                     clear(routes), clear(weights),
-                    set_var("route", 0),
-                    repeat(self.top_k, (
-                        set_var("expert", 1), set_var("best", "-Infinity"),
-                        set_var("selected", 0),
-                        repeat(self.experts, (
-                            if_(eq(index_of(routes, var("expert")), 0), (
-                                set_var("candidate score", item(
-                                    "T2", add(
-                                        mul(var("token"), self.experts),
-                                        var("expert"),
-                                    ),
-                                )),
-                                if_else(
-                                    eq(var("selected"), 0),
-                                    (
-                                        set_var("best", var("candidate score")),
-                                        set_var("selected", var("expert")),
-                                    ),
-                                    (if_else(
-                                        not_(eq(
-                                            var("candidate score"),
-                                            var("candidate score"),
-                                        )),
-                                        (if_(eq(var("best"), var("best")), (
-                                            set_var("best", var("candidate score")),
-                                            set_var("selected", var("expert")),
-                                        )),),
-                                        (if_(eq(var("best"), var("best")), (
-                                            if_(gt(
-                                                var("candidate score"), var("best"),
-                                            ), (
-                                                set_var(
-                                                    "best", var("candidate score"),
-                                                ),
-                                                set_var("selected", var("expert")),
-                                            )),
-                                        )),),
-                                    ),),
-                                ),
-                            )),
-                            change_var("expert", 1),
-                        )),
-                        append(routes, var("selected")),
-                        append(weights, item(
-                            "T3", add(mul(var("token"), self.experts), var("selected")),
-                        )),
-                        change_var("route", 1),
-                    )),
-                    *normalize,
+                    *self._route_statements(routes, weights),
                     set_var("route", 1),
                     repeat(self.top_k, (
                         set_var("active expert", sub(item(routes, var("route")), 1)),
@@ -891,4 +1038,37 @@ class ExpertFamilyMoEInstruction(Instruction):
         ).compile()
 
 
-__all__ = ["ExpertFamilyMoEInstruction", "StackedSwiGLUMoEInstruction"]
+class RoutedExpertsInstruction(ExpertFamilyMoEInstruction):
+    """Banked experts whose routes (zero-based IDs and weights) are inputs.
+
+    ``T2`` and ``T3`` hold ``[tokens, top_k]`` expert IDs and weights, computed
+    by ordinary router code earlier in the graph.
+    """
+
+    program_name = "routed_experts"
+
+    def __init__(
+        self, torch_name, output, *args, family, fast_activations: bool = False,
+        fast_layer_norm: bool = False,
+    ):
+        super().__init__(
+            torch_name, output, *args, family=family, top_k=args[1].shape[-1],
+            normalize_selected=False, fast_activations=fast_activations,
+            fast_layer_norm=fast_layer_norm,
+        )
+
+    def _route_statements(self, routes, weights):
+        position = add(mul(var("token"), self.top_k), var("route"))
+        return (
+            set_var("route", 1),
+            repeat(self.top_k, (
+                append(routes, add(item("T2", position), 1)),
+                append(weights, item("T3", position)),
+                change_var("route", 1),
+            )),
+        )
+
+
+__all__ = [
+    "ExpertFamilyMoEInstruction", "RoutedExpertsInstruction", "StackedSwiGLUMoEInstruction",
+]

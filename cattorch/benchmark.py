@@ -442,11 +442,13 @@ def _compile_suite_variant(
     sig_figs: int | None,
     fast_config: FastConfig | None = None,
     storage: StorageConfig | None = None,
+    kernels=(),
 ) -> tuple[dict, dict[str, bytes]]:
     transpile(
         model, example_inputs, str(base), sig_figs,
         optimization=optimization,
         storage=storage,
+        kernels=kernels,
         **({"fast_config": fast_config} if optimization == "fast" else {}),
     )
     sprite, assets = _load_sprite(base.with_suffix(".sprite3"))
@@ -473,6 +475,41 @@ def build_benchmark_suite(
     as ``"<name> <variant>: <seconds>"`` in one visible stage list. Timing
     still happens entirely in stock Scratch.
     """
+    return _build_suite(
+        cases, output_path, (("exact", "exact", ()), ("fast", "fast", ())),
+        iterations=iterations, warmups=warmups, sig_figs=sig_figs,
+        fast_config=fast_config, storage=storage,
+    )
+
+
+def build_kernel_benchmark(
+    kernel,
+    cases,
+    output_path: str | Path,
+    *,
+    iterations: int = 100,
+    warmups: int = 0,
+) -> Path:
+    """Time a kernel against cattorch's own lowering of the same operation.
+
+    ``cases`` contains ``(name, model, example_inputs)`` tuples whose models
+    call the kernel's operation. Each runs once as cattorch would export it
+    and once with ``kernel``, and the project reports both as
+    ``"<name> builtin"`` and ``"<name> kernel"``. An approximate kernel is
+    compared in fast mode. Read the timings with ``analyze_benchmark``.
+    """
+    optimization = "fast" if kernel.approximate else "exact"
+    return _build_suite(
+        cases, output_path,
+        (("builtin", optimization, ()), ("kernel", optimization, (kernel,))),
+        iterations=iterations, warmups=warmups, sig_figs=None,
+        fast_config=None, storage=None,
+    )
+
+
+def _build_suite(
+    cases, output_path, variants, *, iterations, warmups, sig_figs, fast_config, storage,
+) -> Path:
     cases = list(cases)
     if not cases:
         raise ValueError("at least one benchmark case is required")
@@ -480,7 +517,6 @@ def build_benchmark_suite(
         raise ValueError("iterations must be positive and warmups must be non-negative")
     if storage is not None and not isinstance(storage, StorageConfig):
         raise TypeError("storage must be a StorageConfig")
-    variants = (("exact", "exact"), ("fast", "fast"))
     normalized_cases = []
     for case in cases:
         if len(case) not in {3, 4}:
@@ -511,7 +547,7 @@ def build_benchmark_suite(
         for index, (name, model, raw_inputs, case_fast_config) in enumerate(normalized_cases):
             example_inputs = _normalise_inputs(raw_inputs)
             controller_case = {"name": name}
-            for variant, optimization in variants:
+            for variant, optimization, kernels in variants:
                 sprite, sprite_assets = _compile_suite_variant(
                     model,
                     example_inputs,
@@ -520,6 +556,7 @@ def build_benchmark_suite(
                     sig_figs,
                     case_fast_config,
                     storage,
+                    kernels,
                 )
                 sprite_name = f"{name} {variant}"
                 sprite["name"] = sprite_name
@@ -547,7 +584,7 @@ def build_benchmark_suite(
     list_ids = {SUITE_RESULTS: results_id}
     stage_blocks = _StageBlocks(broadcasts, list_ids).build_suite(
         controller_cases, iterations, warmups,
-        tuple(variant for variant, _ in variants),
+        tuple(variant for variant, _, _ in variants),
     )
     stage, stage_md5ext, stage_bytes = _stage_target(
         stage_blocks,
@@ -561,7 +598,7 @@ def build_benchmark_suite(
                 "cattorch benchmark warmups", warmups,
             ],
             "cattorch_benchmark_comparison": [
-                "cattorch benchmark comparison", "fast",
+                "cattorch benchmark comparison", variants[-1][0],
             ],
         },
     )
@@ -648,11 +685,7 @@ def build_generation_benchmark_suite(
             cached_base = temp / f"generation_{index}_cached"
             transpile(
                 model,
-                GenerationProgram(
-                    method="forward",
-                    example_token=prompt_inputs[0][:, :1],
-                    max_context=prompt_inputs[0].shape[1] + iterations,
-                ),
+                GenerationProgram(max_context=prompt_inputs[0].shape[1] + iterations),
                 str(cached_base),
                 sig_figs,
                 optimization="exact",
@@ -969,11 +1002,12 @@ def _analyze_suite(path: str | Path, project: dict, stage: dict, entries: list) 
         parsed[name][variant] = elapsed
 
     all_variants = set().union(*(set(values) for values in parsed.values()))
-    expected_variants = {"exact", "fast"} if "fast" in all_variants else {"legacy", "exact"}
-    baseline_variant, candidate_variant = (
-        ("exact", "fast") if expected_variants == {"exact", "fast"}
-        else ("legacy", "exact")
+    pairs = (("exact", "fast"), ("builtin", "kernel"), ("legacy", "exact"))
+    baseline_variant, candidate_variant = next(
+        (pair for pair in pairs if pair[1] in all_variants and pair[0] in all_variants),
+        pairs[-1],
     )
+    expected_variants = {baseline_variant, candidate_variant}
     incomplete = [
         name for name, values in parsed.items()
         if set(values) != expected_variants

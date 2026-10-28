@@ -42,7 +42,7 @@ from cattorch.benchmark import (  # noqa: E402
     _stage_target,
     _write_project,
 )
-from cattorch.experimental import stacked_swiglu_moe_adapter  # noqa: E402
+from cattorch.experimental import stacked_swiglu_moe_adapter
 from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
 from cattorch.util.scratch.dsl import Program, append, call, clear  # noqa: E402
 
@@ -51,8 +51,6 @@ def _compile_variant(model, directory: Path, label: str, sharing: str, namespace
     result = transpile(
         model,
         GenerationProgram(
-            method="next_token_logits",
-            example_token=torch.tensor([[1]]),
             max_context=1 + DECODE_ITERATIONS,
             top_k=20,
         ),

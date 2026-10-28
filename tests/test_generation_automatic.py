@@ -76,7 +76,7 @@ MODELS = {
     "nanogpt": nano,
     "mqa_broadcast": lambda: (torch.manual_seed(8), NanoMQA(layers=2, heads=4, context=16).eval())[1],
     "rope_gqa": lambda: (torch.manual_seed(6), RopeLM(layers=2).eval())[1],
-    "legacy_cached_lm": lambda: (torch.manual_seed(7), CachedLM(context=16, layers=2).eval())[1],
+    "cached_lm": lambda: (torch.manual_seed(7), CachedLM(context=16, layers=2).eval())[1],
     "gpt2": lambda: tiny_decoder("gpt2").eval(),
     "llama": lambda: tiny_decoder("llama").eval(),
     "qwen2": lambda: tiny_decoder("qwen2").eval(),
@@ -93,10 +93,14 @@ def exported(request, tmp_path_factory):
 
 
 def test_prefill_then_decode_matches_full_forward(exported):
-    _, model, emulator, _ = exported
+    name, model, emulator, _ = exported
     prefill_and_decode(emulator, model, [1, 3, 5, 2, 7], [4, 6, 9, 11, 2])
     assert emulator.variables["cattorch cache length"] == 10
     assert len(emulator.lists["cattorch logits"]) == logits_of(model, [1]).numel()
+    if name in {"llama", "qwen2"}:
+        # 2 KV heads of width 32 / 4, not 4 query heads: caches hold KV heads.
+        assert len(emulator.lists["_cattorch K cache 1"]) == 10 * 2 * 8
+        assert len(emulator.lists["_cattorch V cache 2"]) == 10 * 2 * 8
 
 
 def test_reset_restores_the_first_step(exported):
@@ -104,7 +108,7 @@ def test_reset_restores_the_first_step(exported):
     prefill_and_decode(emulator, model, [3, 1], [2])
     emulator.run_procedure("cattorch reset")
     assert emulator.variables["cattorch cache length"] == 0
-    assert emulator.lists["cattorch K cache 1"] == []
+    assert emulator.lists["_cattorch K cache 1"] == []
     prefill_and_decode(emulator, model, [2, 4, 6], [1])
 
 
@@ -115,7 +119,7 @@ def test_overflow_rolls_back_and_reset_recovers(tmp_path):
     assert len(prefix) == 5
     caches = {
         name: list(emulator.lists[name])
-        for name in ("cattorch K cache 1", "cattorch V cache 2")
+        for name in ("_cattorch K cache 1", "_cattorch V cache 2")
     }
     emulator.lists["cattorch tokens"] = [6]
     emulator.run_procedure("cattorch decode")
@@ -145,28 +149,6 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     )
 
 
-def test_without_hidden_prefill_gives_the_same_logits(tmp_path):
-    model = nano()
-    emulator, _ = emulator_for(model, tmp_path, max_context=8, hidden_prefill=False)
-    prefill_and_decode(emulator, model, [5, 6, 7], [8])
-
-
-def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
-    model = nano()
-    counts = {}
-    for hidden in (False, True):
-        emulator, _ = emulator_for(
-            model, tmp_path, f"prefill_{hidden}", max_context=8, hidden_prefill=hidden,
-        )
-        emulator.run_procedure("cattorch init")
-        before = emulator.opcode_counts["data_changevariableby"]
-        emulator.lists["cattorch tokens"] = [1, 2, 3, 4]
-        emulator.run_procedure("cattorch prefill")
-        assert_logits(emulator, model, [1, 2, 3, 4])
-        counts[hidden] = emulator.opcode_counts["data_changevariableby"] - before
-    assert counts[True] < counts[False]
-
-
 def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
     torch.manual_seed(13)
     model = CachedLM(context=16, layers=2).eval()
@@ -189,20 +171,11 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
     assert counts[True] < counts[False] * 0.8
 
 
-def test_caches_hold_kv_heads_not_query_heads(tmp_path):
-    model = tiny_decoder("llama", kv_heads=1).eval()
-    emulator, _ = emulator_for(model, tmp_path, max_context=8)
-    prefill_and_decode(emulator, model, [1, 2, 3], [4])
-    kv_width = 1 * (32 // 4)
-    assert len(emulator.lists["cattorch K cache 1"]) == 4 * kv_width
-    assert len(emulator.lists["cattorch V cache 2"]) == 4 * kv_width
-
-
 def test_caches_and_position_are_not_static_weights(exported):
     _, _, _, result = exported
     sprite = load_sprite(result.path)
     names = [entry[0] for entry in sprite["lists"].values()]
-    assert "cattorch K cache 1" in names
+    assert "_cattorch K cache 1" in names
     assert not any(name.startswith("W_") and "cache" in name for name in names)
     assert not any("position" in name for name in names if name.startswith("W_"))
 
@@ -235,22 +208,21 @@ def test_layer_sharing_banks_the_caches(tmp_path):
     )
     assert shared.block_count < plain.block_count * 0.8
     emulator = ScratchEmulator(load_sprite(shared.path))
-    assert "cattorch shared transformer layer" in emulator._procedures
-    assert "cattorch K cache" in emulator.lists
+    assert "_cattorch shared transformer layer" in emulator._procedures
+    assert "_cattorch K cache" in emulator.lists
     prefill_and_decode(emulator, model, [1, 3, 5], [2, 4])
 
 
 def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
-    model = nano()  # layers live in `blocks`, but HF-style names do not
+    # Hugging Face layers live in `model.layers`, not `blocks.N`.
     hf = tiny_decoder("gpt2").eval()
     result = transpile(
         hf, GenerationProgram(max_context=8), tmp_path / "hf",
         codegen=CodegenConfig(layer_sharing="auto"),
     )
     emulator = ScratchEmulator(load_sprite(result.path))
-    assert "cattorch shared transformer layer" not in emulator._procedures
+    assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
-    del model
 
 
 def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
@@ -265,9 +237,9 @@ def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
             model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing="auto"),
         )
     assert "exporting without layer sharing" in caplog.text
-    assert "cattorch shared transformer layer" not in emulator._procedures
+    assert "_cattorch shared transformer layer" not in emulator._procedures
     # Per-layer caches again: the retry does not bank them.
-    assert "cattorch K cache 1" in emulator.lists and "cattorch K cache" not in emulator.lists
+    assert "_cattorch K cache 1" in emulator.lists and "_cattorch K cache" not in emulator.lists
     prefill_and_decode(emulator, model, [1, 2, 3], [4, 5])
 
 
@@ -287,26 +259,6 @@ def test_int8_storage_and_quantization_cover_buffer_weights(tmp_path):
         if entry[0].startswith("cattorch storage precision")
     }
     assert storage["cattorch storage precision"] == "int8"
-
-
-def test_quantized_legacy_and_automatic_exports_agree(tmp_path):
-    torch.manual_seed(12)
-    model = CachedLM(context=8, layers=2).eval()
-    quantization = QuantizationConfig(bits=8, min_quantized_values=64)
-    rows = {}
-    for label, program in (
-        ("legacy", GenerationProgram("forward", torch.tensor([[1]]), 8)),
-        ("auto", GenerationProgram(max_context=8)),
-    ):
-        result = transpile(
-            model, program, tmp_path / label, quantization=quantization,
-        )
-        emulator = ScratchEmulator(load_sprite(result.path))
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = [1, 3, 5]
-        emulator.run_procedure("cattorch prefill")
-        rows[label] = torch.tensor(emulator.lists["cattorch logits"])
-    torch.testing.assert_close(rows["auto"], rows["legacy"], atol=TOLERANCE, rtol=0)
 
 
 def test_module_paths_survive_into_the_traced_step():
@@ -343,33 +295,6 @@ def test_exports_a_named_method(tmp_path):
     prefill_and_decode(emulator, expected, [1, 2], [3])
 
 
-def test_legacy_and_automatic_exports_agree(tmp_path):
-    torch.manual_seed(10)
-    model = CachedLM(context=8, layers=2).eval()
-    legacy = ScratchEmulator(load_sprite(transpile(
-        model, GenerationProgram("forward", torch.tensor([[1]]), 8), tmp_path / "legacy",
-    ).path))
-    auto = ScratchEmulator(load_sprite(transpile(
-        model, GenerationProgram(max_context=8), tmp_path / "auto",
-    ).path))
-    for emulator in (legacy, auto):
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = [1, 3, 5]
-        emulator.run_procedure("cattorch prefill")
-    torch.testing.assert_close(
-        torch.tensor(auto.lists["cattorch logits"]),
-        torch.tensor(legacy.lists["cattorch logits"]), atol=TOLERANCE, rtol=0,
-    )
-    for token in (2, 4):
-        for emulator in (legacy, auto):
-            emulator.lists["cattorch tokens"] = [token]
-            emulator.run_procedure("cattorch decode")
-        torch.testing.assert_close(
-            torch.tensor(auto.lists["cattorch logits"]),
-            torch.tensor(legacy.lists["cattorch logits"]), atol=TOLERANCE, rtol=0,
-        )
-
-
 class LongContextLM(torch.nn.Module):
     """One attention layer with learned positions; caches outgrow one list."""
 
@@ -390,26 +315,29 @@ class LongContextLM(torch.nn.Module):
         return self.head(x)
 
 
-def test_long_context_shards_the_caches_and_tables(tmp_path):
+def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     torch.manual_seed(11)
-    context = 4096  # 4096 rows x 64 = 262,144 items, above Scratch's list limit
+    small_list_limit(2_000)
+    context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
-    assert "cattorch K cache 1" in result.sharded_lists
-    assert "cattorch V cache 1" in result.sharded_lists
+    assert "_cattorch K cache 1" in result.sharded_lists
+    assert "_cattorch V cache 1" in result.sharded_lists
     emulator = ScratchEmulator(load_sprite(result.path))
     prefill_and_decode(emulator, model, [3, 1, 4], [1])
-    assert len(emulator.lists["cattorch K cache 1"]) == 4 * 64
+    assert len(emulator.lists["_cattorch K cache 1"]) == 4 * 64
 
 
 def test_generation_program_signature_and_validation():
-    token = torch.tensor([[1]])
-    legacy = GenerationProgram("forward", token, 64)
-    assert (legacy.method, legacy.max_context) == ("forward", 64)
-    auto = GenerationProgram(max_context=32)
-    assert auto.example_token is None and auto.method == "forward"
-    with pytest.raises(TypeError, match="requires max_context"):
+    program = GenerationProgram(64)
+    assert (program.method, program.max_context) == ("forward", 64)
+    assert GenerationProgram(max_context=32, method="decode").method == "decode"
+    with pytest.raises(TypeError):
         GenerationProgram()
+    with pytest.raises(TypeError):
+        GenerationProgram("forward", torch.tensor([[1]]), 64)
+    with pytest.raises(TypeError, match="keyword-only"):
+        GenerationProgram("forward")
     with pytest.raises(ValueError, match="positive"):
         GenerationProgram(max_context=0)
 

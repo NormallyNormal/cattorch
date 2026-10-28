@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import operator
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -12,7 +13,7 @@ import torch
 
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
-from cattorch.frontend import CapturedGraph, Frontend, capture_model
+from cattorch.frontend import FALLBACK_META, CapturedGraph, Frontend, capture_model
 from cattorch.results import _tensor_spec
 from cattorch.operator_registry import (
     ELEMENTWISE_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
@@ -34,7 +35,6 @@ class _GenerationSpec:
     max_context: int
     hidden_prefill: bool = True
     top_k: int | None = None
-    automatic: bool = False
 
 # ── Op classification ────────────────────────────────────────────────────────
 
@@ -133,22 +133,6 @@ def _is_foldable(node) -> bool:
     return torch.Tag.nondeterministic_seeded not in tags
 
 
-def _is_legacy_position_lookup(node, args) -> bool:
-    """A single constant-index-0 embedding row in a legacy generation export.
-
-    The legacy lowerer treats the zero index as a placeholder for the current
-    position and reads the row from the cache length at run time, so folding it
-    to row zero would freeze every position at the first token.
-    """
-    if str(node.target) != "aten.embedding.default" or len(args) < 2:
-        return False
-    indices = args[1]
-    return (
-        isinstance(indices, torch.Tensor) and indices.numel() == 1
-        and float(indices.flatten()[0]) == 0
-    )
-
-
 def fold_static_values(
     nodes,
     state: dict[str, torch.Tensor],
@@ -156,7 +140,6 @@ def fold_static_values(
     seed: dict[str, torch.Tensor] | None = None,
     element_limit: int | None = _FOLD_ELEMENT_LIMIT,
     passthrough: frozenset[str] = frozenset(),
-    keep_runtime=None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate every foldable node whose tensor inputs are all static.
 
@@ -166,8 +149,6 @@ def fold_static_values(
     (``None`` folds them all). A node whose target is in ``passthrough``
     takes its first argument's value without being called, for aliasing
     operations such as ``detach_`` that are not otherwise foldable.
-    ``keep_runtime(node, args)`` returning true leaves a node unfolded because
-    its value changes at run time even though its inputs are static.
     """
     folded: dict[str, torch.Tensor] = {}
     known = dict(seed or {})
@@ -203,8 +184,6 @@ def fold_static_values(
             args = static_value(node.args)
             kwargs = static_value(node.kwargs)
             if args is missing or kwargs is missing:
-                continue
-            if keep_runtime is not None and keep_runtime(node, args):
                 continue
             try:
                 result = node.target(*args, **kwargs)
@@ -279,17 +258,9 @@ class _GenerationInfo:
     score_caches: dict[str, str] = field(default_factory=dict)
     value_caches: dict[str, str] = field(default_factory=dict)
     cache_widths: dict[str, int] = field(default_factory=dict)
-    softmax_heads: dict[str, int] = field(default_factory=dict)
     first_cache: tuple[str, int] | None = None
-    position_embeddings: dict[str, tuple[str, int]] = field(default_factory=dict)
-    qkv_caches: dict[str, tuple[str, str]] = field(default_factory=dict)
-    prepopulated_scores: set[str] = field(default_factory=set)
-    prepopulated_values: set[str] = field(default_factory=set)
-    hidden_prefill_qkv: str | None = None
     hidden_prefill_attention: str | None = None
-    attention_fusions: dict[str, object] = field(default_factory=dict)
     banked_caches: bool = False
-    automatic: bool = False
     cache_layers: int = 1
     cache_layer_width: int = 0
 
@@ -321,10 +292,41 @@ class _GraphInfo:
     registry: OperatorRegistry
     dynamic_axes: dict[str, int]
     dynamic_bounds: dict[str, tuple[str, int, int]]
+    # Operations a fusion approximates in fast mode, such as exact GELU in a
+    # linear epilogue.
+    approximate_fusions: tuple[str, ...] = ()
+    # Nodes whose one-row kernel runs once per row of a runtime extent.
+    row_loops: frozenset[str] = frozenset()
+    # Fixed items along a node's runtime axis beyond the runtime length.
+    dynamic_offsets: dict[str, int] = field(default_factory=dict)
+
+    def runtime_capacity(self, name: str, shape) -> int:
+        """The most items ``name``'s list can hold."""
+        axis = self.dynamic_axes[name]
+        offset = self.dynamic_offsets.get(name, 0)
+        width = math.prod(extent for index, extent in enumerate(shape) if index != axis)
+        return width * ((shape[axis] - offset) * self.dynamic_bounds[name][2] + offset)
 
     @property
     def output_name(self) -> str:
         return self.outputs[0][0]
+
+    def fallbacks(self) -> tuple[tuple[str, int], ...]:
+        """Operations lowered through PyTorch's generic decomposition.
+
+        Each entry is an operation and how many of its calls still run in
+        Scratch. Calls folded into constants at export, and decompositions
+        that only rename the operation (``expand_as`` to ``expand``), aren't
+        counted.
+        """
+        sizes = Counter(
+            node.meta[FALLBACK_META] for node in self.nodes
+            if node.op == "call_function" and FALLBACK_META in node.meta
+            and node.name not in self.generated_weights
+        )
+        return tuple(sorted(Counter(
+            name for (name, _), size in sizes.items() if size > 1
+        ).items()))
 
     @property
     def output_shape(self) -> torch.Size:
@@ -334,15 +336,152 @@ class _GraphInfo:
     def output_dtype(self) -> torch.dtype:
         return self.outputs[0][2]
 
+    def _public_bounds(self, name: str) -> tuple[str, int, int]:
+        origin, minimum, maximum = self.dynamic_bounds[name]
+        offset = self.dynamic_offsets.get(name, 0)
+        return origin, max(minimum + offset, 0), maximum + offset
+
     def output_specs(self):
         return tuple(
             _tensor_spec(
                 "output" if index == 0 else f"output_{index}", shape, dtype,
-                (self.dynamic_axes[name], self.dynamic_bounds[name])
+                (self.dynamic_axes[name], self._public_bounds(name))
                 if name in self.dynamic_axes else None,
             )
             for index, (name, shape, dtype) in enumerate(self.outputs)
         )
+
+
+def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | None:
+    """``(output axis, items per unit)`` of a unit-by-unit operation, or ``None``.
+
+    Each runtime-length input holds its units contiguously: only size-1
+    dimensions come before its axis. The operation runs on random inputs with
+    two units and with each unit alone. It treats units independently if the
+    two-unit output is the one-unit outputs joined along an axis that leads
+    the flat layout.
+    """
+    if not callable(node.target):
+        return None
+    for arg in node.all_input_nodes:
+        if arg.name in dynamic_axes:
+            if math.prod(_get_shape(arg)[:dynamic_axes[arg.name]]) != 1:
+                return None
+    found = _separable_with(node, dynamic_axes, dynamic_units, varied=False)
+    if found is None or not any(
+        arg.name in dynamic_axes and (dtype := _get_dtype(arg)) is not None
+        and not dtype.is_floating_point and dtype != torch.bool
+        for arg in node.all_input_nodes
+    ):
+        return found
+    # Zeros are safe for any index, but every unit of them looks alike, so a
+    # running sum over integer units would pass. Small varied integers show
+    # it, when the operation accepts them.
+    varied = _separable_with(node, dynamic_axes, dynamic_units, varied=True, strict=True)
+    return found if varied in {found, "failed"} else None
+
+
+def _separable_with(node, dynamic_axes, dynamic_units, *, varied, strict=False):
+    """The separable axis for one choice of integer samples.
+
+    ``varied`` fills runtime-length integer inputs with zeros and ones
+    instead of zeros. With ``strict``, an operation that fails on every axis
+    returns ``"failed"`` rather than ``None``.
+    """
+    import torch.utils._pytree as pytree
+
+    generator = torch.Generator().manual_seed(0)
+
+    def unit_of(name):
+        return dynamic_units.get(name, 1)
+
+    def sample(arg):
+        value = arg.meta.get("val") if hasattr(arg, "meta") else None
+        if not isinstance(value, torch.Tensor):
+            return None
+        shape = list(value.shape)
+        if arg.name in dynamic_axes:
+            shape[dynamic_axes[arg.name]] = 2 * unit_of(arg.name)
+        if value.dtype == torch.bool:
+            return torch.rand(shape, generator=generator) > 0.5
+        if not value.dtype.is_floating_point:
+            if varied and arg.name in dynamic_axes:
+                return torch.randint(0, 2, shape, generator=generator, dtype=value.dtype)
+            return torch.zeros(shape, dtype=value.dtype)
+        return torch.randn(shape, generator=generator, dtype=value.dtype)
+
+    output_shape = list(_get_shape(node))
+    samples = {}
+    for arg in node.all_input_nodes:
+        value = sample(arg)
+        if value is None:
+            return None
+        samples[arg.name] = value
+
+    def call(pick=None, sizes=None):
+        def convert(value):
+            if not isinstance(value, torch.fx.Node):
+                return value
+            tensor = samples[value.name]
+            if pick is not None and value.name in dynamic_axes:
+                unit = unit_of(value.name)
+                tensor = tensor.narrow(dynamic_axes[value.name], pick * unit, unit)
+            return tensor
+
+        def size_argument(value):
+            # A size for the whole output, such as expand's, grows with it.
+            if sizes is not None and isinstance(value, (list, tuple)) and list(value) == output_shape:
+                return type(value)(sizes)
+            return pytree.tree_map(convert, value)
+
+        args = tuple(size_argument(arg) for arg in node.args)
+        kwargs = pytree.tree_map(convert, node.kwargs)
+        return node.target(*args, **kwargs)
+
+    ran = False
+    for axis in range(len(output_shape)):
+        if math.prod(output_shape[:axis]) != 1:
+            break
+        sizes = list(output_shape)
+        sizes[axis] *= 2
+        try:
+            with torch.no_grad():
+                both, again = call(sizes=sizes), call(sizes=sizes)
+                first, second = call(0), call(1)
+        except Exception:  # noqa: BLE001 - an operation that can't run per unit isn't separable
+            continue
+        ran = True
+        if not all(isinstance(value, torch.Tensor) for value in (both, first, second, again)):
+            continue
+        if not torch.equal(both.nan_to_num(), again.nan_to_num()) or first.shape != second.shape:
+            continue
+        if (
+            both.ndim > axis and list(first.shape) == output_shape
+            and both.shape[axis] == 2 * first.shape[axis]
+            and torch.allclose(both, torch.cat([first, second], axis), equal_nan=True)
+        ):
+            return axis, first.shape[axis]
+    return "failed" if strict and not ran else None
+
+
+def _broadcasts_along(value, axis, output_shape) -> bool:
+    """Whether a fixed operand repeats along a runtime axis of the output.
+
+    Elementwise kernels index such an operand from the flat output position,
+    which is only right when it is one value or matches dimensions after the
+    axis.
+    """
+    shape = tuple(_get_shape(value))
+    if math.prod(shape) == 1:
+        return False
+    trimmed = shape
+    while trimmed and trimmed[0] == 1:
+        trimmed = trimmed[1:]
+    suffix = len(output_shape) - axis - 1
+    return not (
+        shape != tuple(output_shape) and len(trimmed) <= suffix
+        and trimmed == tuple(output_shape[len(output_shape) - len(trimmed):])
+    )
 
 
 def _drop_empty_cat_inputs(graph) -> None:
@@ -368,6 +507,383 @@ def _drop_empty_cat_inputs(graph) -> None:
             graph.erase_node(node)
 
 
+def _broadcast_matmul_batches(graph) -> None:
+    """Give both operands of a broadcasting ``matmul`` the same batch dimensions.
+
+    The matmul kernel needs identical batches. A vector becomes a one-row or
+    one-column matrix, both operands are expanded to the broadcast batch
+    shape, and the result is reshaped back to what ``matmul`` returns.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.matmul.default":
+            continue
+        left, right = node.args[0], node.args[1]
+        if not (isinstance(left, torch.fx.Node) and isinstance(right, torch.fx.Node)):
+            continue
+        left_shape, right_shape = tuple(_get_shape(left)), tuple(_get_shape(right))
+        if len(right_shape) <= 2 and len(left_shape) >= 1:
+            continue  # The kernel handles any left batch over a matrix.
+        if len(left_shape) >= 2 and left_shape[:-2] == right_shape[:-2]:
+            continue
+        dtype = node.meta["val"].dtype
+        operands = []
+        matrices = (
+            left_shape if len(left_shape) >= 2 else (1, *left_shape),
+            right_shape if len(right_shape) >= 2 else (*right_shape, 1),
+        )
+        batch = tuple(torch.broadcast_shapes(matrices[0][:-2], matrices[1][:-2]))
+        for operand, shape, matrix in zip((left, right), (left_shape, right_shape), matrices):
+            if shape != matrix:
+                operand = _insert(
+                    graph, node, torch.ops.aten.reshape.default, (operand, list(matrix)),
+                    matrix, _get_dtype(operand),
+                )
+            full = (*batch, *matrix[-2:])
+            if matrix != full:
+                operand = _insert(
+                    graph, node, torch.ops.aten.expand.default, (operand, list(full)),
+                    full, _get_dtype(operand),
+                )
+            operands.append(operand)
+        product_shape = (*batch, matrices[0][-2], matrices[1][-1])
+        product = _insert(
+            graph, node, torch.ops.aten.matmul.default, tuple(operands), product_shape, dtype,
+        )
+        node.target = torch.ops.aten.reshape.default
+        node.args, node.kwargs = (product, list(_get_shape(node))), {}
+
+
+_RUNTIME_END = 2**63 - 1
+
+
+def _length_literals(
+    model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend, items=2,
+):
+    """Literal arguments that change when each dynamic input has ``items`` items.
+
+    The graph is traced with one item, where ``x[-1]`` and ``x[0]`` are the
+    same slice. A second trace with two items tells them apart. Returns
+    ``{node name: {location: value}}``, with the value at ``items`` items, or
+    ``None`` if the trace fails or has another structure.
+    """
+    from cattorch.dynamic import at_length
+    from cattorch.frontend import flat_example_inputs
+
+    if isinstance(example_inputs, torch.Tensor):
+        example_inputs = (example_inputs,)
+    example_inputs = tuple(example_inputs)
+    values = list(flat_example_inputs(example_inputs, example_kwargs))
+    for index, bound in dynamic_inputs.items():
+        axis = bound[3] if len(bound) > 3 else 0
+        if index >= len(values) or values[index].shape[axis] != 1:
+            return None
+        values[index] = at_length(values[index], axis, items)
+    keywords = dict(example_kwargs or {})
+    names = [key for key, value in keywords.items() if isinstance(value, torch.Tensor)]
+    keywords.update(zip(names, values[len(example_inputs):]))
+    try:
+        longer = capture_model(
+            model, tuple(values[:len(example_inputs)]), frontend=frontend,
+            example_kwargs=keywords or None,
+        )
+    except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
+        return None
+    _drop_empty_cat_inputs(longer.graph)
+    _broadcast_matmul_batches(longer.graph)
+    first, second = list(captured.graph.nodes), list(longer.graph.nodes)
+    if len(first) != len(second) or any(
+        (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
+    ):
+        return None
+    result: dict[str, dict[tuple, object]] = {}
+
+    def walk(node, a, b, location) -> bool:
+        if isinstance(a, torch.fx.Node) or isinstance(b, torch.fx.Node):
+            return isinstance(a, torch.fx.Node) and isinstance(b, torch.fx.Node)
+        if isinstance(a, (list, tuple)):
+            return (
+                isinstance(b, (list, tuple)) and len(a) == len(b)
+                and all(walk(node, x, y, (*location, i)) for i, (x, y) in enumerate(zip(a, b)))
+            )
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and a != b:
+            result.setdefault(node.name, {})[location] = b
+        return True
+
+    for a, b in zip(first, second):
+        if a.op == "call_function" and not (
+            walk(a, a.args, b.args, ("args",))
+            and walk(a, dict(a.kwargs), dict(b.kwargs), ("kwargs",))
+        ):
+            return None
+    return result
+
+
+def _reduction(node) -> tuple[str, tuple[int, ...] | None, bool] | None:
+    """``(kind, dimensions or None for all, keepdim)`` of a reduction node."""
+    target = str(node.target)
+    kinds = {
+        "aten.sum.dim_IntList": "sum", "aten.sum.default": "sum",
+        "aten.mean.dim": "mean", "aten.mean.default": "mean",
+        "aten.amax.default": "amax", "aten.amin.default": "amin",
+        "aten.prod.dim_int": "prod", "aten.prod.default": "prod",
+    }
+    if target not in kinds:
+        return None
+    if target.endswith(".default") and target not in {"aten.amax.default", "aten.amin.default"}:
+        return kinds[target], None, False
+    raw = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    keepdim = bool(node.args[2] if len(node.args) > 2 else node.kwargs.get("keepdim", False))
+    if raw is None or (isinstance(raw, (list, tuple)) and not raw):
+        return kinds[target], None, keepdim
+    dims = tuple(raw) if isinstance(raw, (list, tuple)) else (raw,)
+    return kinds[target], tuple(int(value) for value in dims), keepdim
+
+
+def _insert(graph, before, target, args, shape, dtype):
+    with graph.inserting_before(before):
+        node = graph.call_function(target, args)
+    node.meta["val"] = torch.empty(tuple(shape), dtype=dtype)
+    return node
+
+
+_REDUCE_ONE = {
+    "sum": (torch.ops.aten.sum.dim_IntList, True),
+    "mean": (torch.ops.aten.mean.dim, True),
+    "amax": (torch.ops.aten.amax.default, True),
+    "amin": (torch.ops.aten.amin.default, True),
+    "prod": (torch.ops.aten.prod.dim_int, False),
+}
+_SOFTMAXES = {
+    "aten._softmax.default": False, "aten.softmax.int": False,
+    "aten._log_softmax.default": True, "aten.log_softmax.int": True,
+}
+
+
+def _mix_runtime_axis(
+    node, target, parent, axis, offset, input_shape, output_shape, *,
+    graph, runtime, dynamic_axes, dynamic_units, dynamic_offsets, literals, shortest, mark,
+) -> bool:
+    """Rewrite an operation that mixes values along the runtime axis.
+
+    Reductions, softmax, matmul contraction, ``cat`` and slices along the
+    axis become ``cattorch::runtime_*`` operations, whose kernels read the
+    extent from the list's length. Returns whether ``node`` was handled.
+    """
+    dtype = node.meta["val"].dtype
+    reshape = torch.ops.aten.reshape.default
+    reduction = _reduction(node)
+    if reduction is not None:
+        kind, dims, keepdim = reduction
+        rank = max(len(input_shape), 1)
+        dims = tuple(range(len(input_shape))) if dims is None else tuple(
+            sorted({value % rank for value in dims})
+        )
+        if axis not in dims:
+            return False
+        kept = list(input_shape)
+        kept[axis] = 1
+        last = _insert(graph, node, runtime.runtime_reduce.default, (parent, axis, kind), kept, dtype)
+        # Other dimensions are static after the runtime one, one at a time.
+        operation, listed = _REDUCE_ONE[kind]
+        for dim in dims:
+            if dim != axis:
+                kept[dim] = 1
+                last = _insert(graph, node, operation, (last, [dim] if listed else dim, True), kept, dtype)
+        node.target, node.args, node.kwargs = reshape, (last, list(output_shape)), {}
+        return True
+    if target in _SOFTMAXES:
+        if int(node.args[1]) % len(input_shape) != axis:
+            return False
+        node.target = runtime.runtime_softmax.default
+        node.args, node.kwargs = (parent, axis, _SOFTMAXES[target]), {}
+        mark(node.name, axis, parent.name, offset)
+        return True
+    if target in MATMUL_OPS:
+        left, right = node.args[0], node.args[1]
+        left_shape, right_shape = _get_shape(left), _get_shape(right)
+        left_axis = dynamic_axes.get(left.name)
+        right_axis = dynamic_axes.get(right.name)
+        contraction = (
+            left_axis == len(left_shape) - 1 and right_axis == max(len(right_shape) - 2, 0)
+        )
+        columns = left_axis is None and len(right_shape) >= 2 and right_axis == len(right_shape) - 1
+        if not (contraction or columns):
+            return False
+        if any(dynamic_units.get(value.name, 1) != 1 for value in (left, right)):
+            raise UnsupportedModelError(
+                "matmul over a runtime extent folded into another dimension isn't supported"
+            )
+        batches = [tuple(shape[:-2]) for shape in (left_shape, right_shape) if len(shape) > 2]
+        if len(batches) == 2 and batches[0] != batches[1]:
+            raise UnsupportedModelError(
+                "a matmul over a runtime extent needs operands with the same batch dimensions"
+            )
+        node.target, node.args, node.kwargs = runtime.runtime_matmul.default, (left, right), {}
+        if columns:
+            mark(node.name, len(output_shape) - 1, right.name, dynamic_offsets.get(right.name, 0))
+        return True
+    if target == "aten.cat.default":
+        pieces = list(node.args[0])
+        dim = int(node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0))
+        dim %= len(output_shape)
+        if dim != axis or len(pieces) < 2:
+            return False
+        moving = [piece for piece in pieces if piece.name in dynamic_axes]
+        if len(moving) != 1 or dynamic_units.get(moving[0].name, 1) != 1:
+            raise UnsupportedModelError(
+                "cat along the runtime extent can join one variable-length tensor "
+                "with fixed-size ones, not several variable-length tensors"
+            )
+        (source,) = moving
+
+        def extent(piece):
+            return dynamic_offsets.get(source.name, 0) if piece is source else _get_shape(piece)[dim]
+
+        # Joined in pairs; ``extra`` counts the fixed items joined so far,
+        # which become the offset once the variable-length piece is in.
+        joined, holds, extra = pieces[0], pieces[0] is source, extent(pieces[0])
+        for position in range(1, len(pieces)):
+            piece = pieces[position]
+            holds = holds or piece is source
+            extra += extent(piece)
+            if position == len(pieces) - 1:
+                node.target = runtime.runtime_cat.default
+                node.args, node.kwargs = (joined, piece, dim), {}
+                mark(node.name, dim, source.name, extra)
+                break
+            shape = list(_get_shape(joined))
+            shape[dim] += _get_shape(piece)[dim]
+            joined = _insert(graph, node, runtime.runtime_cat.default, (joined, piece, dim), shape, dtype)
+            if holds:
+                mark(joined.name, dim, source.name, extra)
+        return True
+    if target in {"aten.slice.Tensor", "aten.select.int"}:
+        if int(node.args[1]) % len(input_shape) != axis:
+            return False
+        traced = input_shape[axis]
+
+        def place(value, location):
+            """``(counts from the end, position)`` for a traced bound."""
+            if value is None or value >= _RUNTIME_END:
+                return True, 0
+            if value < 0:
+                return True, value
+            if location in literals and literals[location] != value:
+                return True, value - traced
+            return False, value
+
+        if target == "aten.select.int":
+            first_from_end, first = place(int(node.args[2]), ("args", 2))
+            last_from_end, last = first_from_end, first + 1
+        else:
+            start = node.args[2] if len(node.args) > 2 else 0
+            end = node.args[3] if len(node.args) > 3 else None
+            if start in {0, None} and (end is None or end >= _RUNTIME_END):
+                return False
+            if (node.args[4] if len(node.args) > 4 else 1) != 1:
+                raise UnsupportedModelError(
+                    "slicing a runtime extent with a step isn't supported"
+                )
+            first_from_end, first = place(start or 0, ("args", 2))
+            last_from_end, last = place(end, ("args", 3))
+        if first_from_end and not last_from_end:
+            raise UnsupportedModelError(
+                "a slice from the end of a runtime extent to a fixed position isn't supported"
+            )
+        fewest = shortest(parent.name)
+        end = last
+        if first_from_end == last_from_end:
+            size = end - first
+            reach = -first if first_from_end else last
+            if reach > traced:
+                raise UnsupportedModelError(
+                    f"a fixed slice of a runtime extent reaches {reach} items, but the "
+                    f"export traces it with {traced}"
+                )
+            if size <= 0 or reach > fewest:
+                raise UnsupportedModelError(
+                    f"a fixed slice of a runtime extent reaches {reach} items, but it can "
+                    f"hold as few as {fewest}"
+                )
+            extent = None
+        else:
+            extent = traced - first + end
+            if extent <= 0 or fewest - first + end < 0:
+                raise UnsupportedModelError(
+                    "slicing the runtime extent leaves no items in the one-item trace; "
+                    "it can't follow the length"
+                )
+        expected = size if extent is None else extent
+        sliced_shape = list(input_shape)
+        sliced_shape[axis] = expected
+        if target == "aten.slice.Tensor" and tuple(sliced_shape) != output_shape:
+            raise UnsupportedModelError(
+                "a slice of the runtime extent doesn't match its traced shape"
+            )
+        encoded_end = _RUNTIME_END if last_from_end and last == 0 else last
+        args = (parent, axis, first, encoded_end)
+        if target == "aten.select.int":
+            sliced = _insert(graph, node, runtime.runtime_slice.default, args, sliced_shape, dtype)
+            node.target, node.args, node.kwargs = reshape, (sliced, list(output_shape)), {}
+        else:
+            node.target, node.args, node.kwargs = runtime.runtime_slice.default, args, {}
+            if extent is not None:
+                mark(node.name, axis, parent.name, offset - first + end)
+        return True
+    return False
+
+
+_ARITHMETIC = {"aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"}
+
+
+def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis) -> None:
+    """Replace arithmetic constants computed from the length by its runtime value.
+
+    A constant that changes between the traces with one, two and three items
+    is rebuilt from ``n``, read from the list's length, when it is ``a + b n``
+    (the ``n - 1`` in a variance, ``x.shape[0]`` in a hand-written mean) or
+    ``a + b / n`` (``1 / x.shape[0]``). Without a third trace it is taken to
+    be ``a + b n``.
+    """
+    for position in (0, 1):
+        location = ("args", position)
+        one = node.args[position] if position < len(node.args) else None
+        if location not in at_two or isinstance(one, (bool, torch.fx.Node)):
+            continue
+        two, three = at_two[location], at_three.get(location)
+        slope = two - one
+        # ``a + b / n`` through one and two items.
+        scale = 2 * (one - two)
+        if three is None or math.isclose(three, one + 2 * slope, rel_tol=1e-9, abs_tol=1e-12):
+            reciprocal = False
+        elif math.isclose(three, one - scale + scale / 3, rel_tol=1e-9, abs_tol=1e-12):
+            reciprocal = True
+        else:
+            raise UnsupportedModelError(
+                f"{node.target} uses a value computed from the variable length that "
+                "cattorch can't follow; it follows a + b * n and a + b / n"
+            )
+        count = _insert(
+            graph, node, runtime.runtime_length.default, (source, axis), (), torch.float32,
+        )
+        if reciprocal:
+            count = _insert(
+                graph, node, torch.ops.aten.pow.Tensor_Scalar, (count, -1), (), torch.float32,
+            )
+            factor, constant = scale, one - scale
+        else:
+            factor, constant = slope, one - slope
+        if factor != 1:
+            count = _insert(graph, node, torch.ops.aten.mul.Tensor, (count, factor), (), torch.float32)
+        if constant:
+            count = _insert(
+                graph, node, torch.ops.aten.add.Tensor, (count, constant), (), torch.float32,
+            )
+        arguments = list(node.args)
+        arguments[position] = count
+        node.args = tuple(arguments)
+
+
 def _prepare_graph(
     model,
     example_inputs,
@@ -386,14 +902,14 @@ def _prepare_graph(
     fast = optimization == "fast"
     fast_config = fast_config or FastConfig()
     registry = _registry or default_registry()
-    from cattorch.moe import _expert_family_context
+    from cattorch.experts import _expert_family_context
     with _expert_family_context(registry.expert_families):
         captured = _captured or capture_model(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
     _drop_empty_cat_inputs(captured.graph)
-    automatic = generation is not None and generation.automatic
-    if automatic:
+    _broadcast_matmul_batches(captured.graph)
+    if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
         for node in list(captured.graph.nodes):
@@ -410,14 +926,53 @@ def _prepare_graph(
     ]
     dynamic_axes: dict[str, int] = {}
     dynamic_bounds: dict[str, tuple[str, int, int]] = {}
+    row_loops: set[str] = set()
+    # Items along a node's dynamic axis per unit of runtime length: 1, or
+    # more once a view folds the length into a larger dimension.
+    dynamic_units: dict[str, int] = {}
     for index, bound in dynamic_inputs.items():
         if index >= len(placeholders):
             raise UnsupportedModelError("dynamic input index is outside the captured signature")
         node = placeholders[index]
-        if len(_get_shape(node)) < 1:
-            raise UnsupportedModelError("a dynamic input must have a leading dimension")
-        dynamic_axes[node.name] = 0
-        dynamic_bounds[node.name] = bound
+        # ``(name, minimum, maximum)``, with an optional fourth item for the
+        # axis; the leading one by default.
+        axis = bound[3] if len(bound) > 3 else 0
+        if len(_get_shape(node)) <= axis:
+            raise UnsupportedModelError("a dynamic input must have the dynamic dimension")
+        dynamic_axes[node.name] = axis
+        dynamic_bounds[node.name] = tuple(bound[:3])
+    # Items along a node's dynamic axis beyond the runtime length, from a
+    # ``cat`` with static tensors along it; a slice can make it negative.
+    dynamic_offsets: dict[str, int] = {}
+    length_literals = None
+    third_literals: dict = {}
+    if dynamic_inputs:
+        with _expert_family_context(registry.expert_families):
+            length_literals = _length_literals(
+                model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend,
+            )
+            # A third trace tells how arithmetic constants depend on the length.
+            if length_literals and len(dynamic_inputs) == 1 and any(
+                str(node.target) in _ARITHMETIC and node.name in length_literals
+                for node in nodes
+            ):
+                third_literals = _length_literals(
+                    model, example_inputs, example_kwargs, dynamic_inputs, captured,
+                    frontend, items=3,
+                ) or {}
+    graph = captured.graph
+    import cattorch.ops  # noqa: F401 - registers the runtime operations
+    runtime = torch.ops.cattorch
+
+    def mark(name, axis, origin, offset):
+        dynamic_axes[name] = axis
+        dynamic_bounds[name] = dynamic_bounds[origin]
+        if offset:
+            dynamic_offsets[name] = offset
+
+    def shortest(name) -> int:
+        """The fewest items the runtime axis of ``name`` can hold."""
+        return dynamic_bounds[name][1] + dynamic_offsets.get(name, 0)
 
     shape_only = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
     elementwise = {
@@ -429,9 +984,19 @@ def _prepare_graph(
         "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
         "aten.mean.dim", "aten.embedding.default",
     } | ELEMENTWISE_OPS
+    pointwise = elementwise - {
+        "aten.linear.default", "aten.layer_norm.default", "aten.native_layer_norm.default",
+        "aten._softmax.default", "aten.softmax.int", "aten.mean.dim", "aten.embedding.default",
+    }
     for node in nodes:
         if node.op != "call_function":
             continue
+        if len(dynamic_inputs) == 1 and str(node.target) in _ARITHMETIC:
+            _follow_length_literals(
+                node, (length_literals or {}).get(node.name, {}),
+                third_literals.get(node.name, {}), graph, runtime,
+                placeholders[next(iter(dynamic_inputs))], next(iter(dynamic_axes.values())),
+            )
         dynamic_parents = [
             value for value in node.all_input_nodes if value.name in dynamic_axes
         ]
@@ -444,9 +1009,23 @@ def _prepare_graph(
             )
         parent = dynamic_parents[0]
         axis = dynamic_axes[parent.name]
+        unit = dynamic_units.get(parent.name, 1)
         target = str(node.target)
+        if not isinstance(node.meta.get("val"), torch.Tensor):
+            raise UnsupportedModelError(
+                f"{target} returns several tensors from a runtime-length input"
+            )
         input_shape = tuple(_get_shape(parent))
         output_shape = tuple(_get_shape(node))
+        offset = dynamic_offsets.get(parent.name, 0)
+        if unit == 1 and _mix_runtime_axis(
+            node, target, parent, axis, offset, input_shape, output_shape,
+            graph=graph, runtime=runtime, dynamic_axes=dynamic_axes,
+            dynamic_units=dynamic_units, dynamic_offsets=dynamic_offsets,
+            literals=(length_literals or {}).get(node.name, {}),
+            shortest=shortest, mark=mark,
+        ):
+            continue
         if target == "aten.transpose.int":
             left = int(node.args[1]) % len(input_shape)
             right = int(node.args[2]) % len(input_shape)
@@ -463,16 +1042,39 @@ def _prepare_graph(
             "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
             "aten.unflatten.int",
         }:
-            suffix = math.prod(input_shape[axis + 1:])
+            if offset or math.prod(input_shape[:axis]) != 1:
+                # With fixed items along the axis, or items before it, the
+                # view must keep the axis whole, with the same items before
+                # and after it.
+                before = math.prod(input_shape[:axis])
+                after = math.prod(input_shape[axis + 1:])
+                axis = next((
+                    position for position, extent in enumerate(output_shape)
+                    if extent == input_shape[axis]
+                    and math.prod(output_shape[:position]) == before
+                    and math.prod(output_shape[position + 1:]) == after
+                ), None)
+                if axis is None or unit != 1:
+                    raise UnsupportedModelError(
+                        f"{target} reshapes across a runtime extent that isn't leading"
+                    )
+                mark(node.name, axis, parent.name, offset)
+                continue
+            # One unit of runtime length is the whole traced tensor; a view
+            # keeps it as a contiguous block, on a dimension of its own when
+            # one fits, or folded into the first dimension that holds it.
+            block = math.prod(output_shape)
             candidates = [
                 position for position, extent in enumerate(output_shape)
-                if extent == 1 and math.prod(output_shape[position + 1:]) == suffix
+                if extent == 1 and math.prod(output_shape[position + 1:]) == block
             ]
-            if len(candidates) != 1:
-                raise UnsupportedModelError(
-                    f"{target} folds or splits the runtime extent; only a movable extent is supported"
+            if candidates:
+                axis, unit = candidates[-1], 1
+            else:
+                axis = next(
+                    (position for position, extent in enumerate(output_shape) if extent != 1), 0,
                 )
-            axis = candidates[0]
+                unit = output_shape[axis] if output_shape else 1
         elif target == "aten.unsqueeze.default":
             inserted = int(node.args[1]) % len(output_shape)
             if inserted <= axis:
@@ -527,20 +1129,91 @@ def _prepare_graph(
             if axis >= len(input_shape) - normalized_rank:
                 raise UnsupportedModelError("layer normalization cannot normalize the runtime extent")
         elif target in MATMUL_OPS:
+            if len(dynamic_parents) > 1:
+                raise UnsupportedModelError(
+                    "matmul between two tensors that both vary along the runtime extent, "
+                    "as in self-attention over it, gives two runtime dimensions, which "
+                    "aren't supported"
+                )
             if parent is not node.args[0] or axis == len(input_shape) - 1:
                 raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+        elif target in {"cattorch.recurrent_scan.default", "cattorch.recurrent_final.default"}:
+            if len(dynamic_parents) != 1 or parent is not node.args[0] or axis != 0 or unit != 1:
+                raise UnsupportedModelError(
+                    "a recurrent layer takes a runtime extent only along its sequence"
+                )
+            if target == "cattorch.recurrent_final.default":
+                # The final state has no runtime extent.
+                continue
         elif target == "aten.slice.Tensor":
             dimension = int(node.args[1]) % len(input_shape)
             start = int(node.args[2]) if len(node.args) > 2 else 0
             end = node.args[3] if len(node.args) > 3 else None
             if dimension == axis and (start != 0 or end not in {None, 9223372036854775807}):
                 raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
+            if output_shape != input_shape:
+                # A fixed slice of another dimension.
+                size = input_shape[dimension]
+                first, last, _ = slice(
+                    int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0,
+                    min(int(end), size) if end is not None else size,
+                ).indices(size)
+                if (node.args[4] if len(node.args) > 4 else 1) != 1:
+                    raise UnsupportedModelError(
+                        "slicing a variable-length tensor with a step isn't supported"
+                    )
+                node.target = runtime.runtime_slice.default
+                node.args, node.kwargs = (parent, dimension, first, last), {}
+        elif target in elementwise and not (
+            # These kernels size their rows from the list's length.
+            target == "aten.linear.default" and dynamic_parents == [node.args[0]]
+            and axis < len(input_shape) - 1
+            or target == "aten.embedding.default" and dynamic_parents == [node.args[1]]
+        ) and (
+            any(tuple(_get_shape(value)) != output_shape for value in dynamic_parents)
+            # Elementwise kernels size their loop from the first operand.
+            or not (node.args and getattr(node.args[0], "name", None) in dynamic_axes)
+            or (target in pointwise and any(
+                _broadcasts_along(value, axis, output_shape)
+                for value in node.all_input_nodes if value.name not in dynamic_axes
+            ))
+        ):
+            # Broadcasting the runtime-length operand: the kernel's broadcast
+            # tables describe one row.
+            row_loops.add(node.name)
         elif target not in shape_only and target not in elementwise:
+            # Any other operation that treats rows independently runs its
+            # one-row kernel once per row.
+            axis, unit = _row_separable_axis(node, dynamic_axes, dynamic_units) or (None, 1)
+            if axis is None:
+                raise UnsupportedModelError(
+                    f"{target} mixes values across the runtime extent, or doesn't "
+                    "keep it as a dimension of its own, so it can't take a "
+                    "variable-length input"
+                )
+            row_loops.add(node.name)
+        if unit != 1 and math.prod(output_shape[:axis]) != 1:
             raise UnsupportedModelError(
-                f"{target} does not yet define runtime-extent propagation"
+                f"{target} moves a folded runtime extent away from the front"
             )
-        dynamic_axes[node.name] = axis
-        dynamic_bounds[node.name] = dynamic_bounds[parent.name]
+        if node.name in row_loops and (offset or any(
+            math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
+            for value in dynamic_parents
+        )):
+            raise UnsupportedModelError(
+                f"{target} runs once per item of the runtime extent, which needs "
+                "the extent to lead its tensor, without fixed items joined to it"
+            )
+        mark(node.name, axis, parent.name, offset)
+        if unit != 1:
+            dynamic_units[node.name] = unit
+    nodes = list(graph.nodes)
+    for name in captured.user_output_names:
+        if dynamic_units.get(name, 1) != 1:
+            raise UnsupportedModelError(
+                "an output keeps the runtime extent folded into another dimension; "
+                "reshape it back so the extent has a dimension of its own"
+            )
     node_order = {node.name: index for index, node in enumerate(nodes)}
     state_inputs = captured.state_inputs
     user_input_placeholders = captured.user_input_names
@@ -591,7 +1264,20 @@ def _prepare_graph(
     if use_fusions:
         # Position and cache buffers change at run time: nothing derived from
         # them is a constant.
-        runtime_state = _generation_state_names(nodes, state_inputs) if automatic else set()
+        runtime_state = (
+            _generation_state_names(nodes, state_inputs) if generation is not None else set()
+        )
+        # A zero-element tensor's value is known from its shape alone, so
+        # it and everything computed only from such tensors (an empty sum,
+        # ``mm`` over an empty dimension) fold too.
+        for node in nodes:
+            value = node.meta.get("val")
+            if (
+                node.op in {"placeholder", "call_function", "get_attr"}
+                and isinstance(value, torch.Tensor) and value.numel() == 0
+                and node.name not in generated_weights
+            ):
+                generated_weights[node.name] = torch.zeros(value.shape, dtype=value.dtype)
         generated_weights.update(fold_static_values(
             nodes,
             {
@@ -599,10 +1285,6 @@ def _prepare_graph(
                 if name not in runtime_state
             },
             seed=generated_weights,
-            keep_runtime=(
-                _is_legacy_position_lookup
-                if generation is not None and not automatic else None
-            ),
         ))
 
     def resolve_weight(arg_name):
@@ -677,15 +1359,16 @@ def _prepare_graph(
 
         elif aten_op == "aten.transpose.int" and hasattr(node.args[0], "name"):
             input_shape = _get_shape(node.args[0])
-            dim0 = node.args[1] % len(input_shape)
-            dim1 = node.args[2] % len(input_shape)
+            # A 0-d tensor accepts dimension 0 or -1, like a 1-d one.
+            dim0 = node.args[1] % max(len(input_shape), 1)
+            dim1 = node.args[2] % max(len(input_shape), 1)
             low, high = sorted((dim0, dim1))
-            singleton_move_is_flat = (
+            singleton_move_is_flat = not input_shape or (
                 (input_shape[dim0] == 1 or input_shape[dim1] == 1)
                 and all(size == 1 for size in input_shape[low + 1:high])
             )
             runtime_axis = dynamic_axes.get(node.args[0].name)
-            if runtime_axis in {dim0, dim1} and dim0 != dim1:
+            if runtime_axis is not None and low <= runtime_axis <= high and dim0 != dim1:
                 # The representative extent is one only for capture. It may
                 # not be erased by the ordinary singleton-transpose alias.
                 singleton_move_is_flat = False
@@ -738,6 +1421,7 @@ def _prepare_graph(
             raise _unsupported_operation(node, detail)
 
     linear_fusions = {}
+    approximate_fusions: list[str] = []
     fused_nodes = set()
     if use_fusions:
         scalar_ops = {
@@ -750,7 +1434,11 @@ def _prepare_graph(
             "aten.gelu.default": "gelu",
         }
         for node in nodes:
-            if node.op != "call_function" or str(node.target) != "aten.linear.default":
+            if (
+                node.op != "call_function" or str(node.target) != "aten.linear.default"
+                # A folded linear is never compiled, so it can't carry an epilogue.
+                or node.name in generated_weights
+            ):
                 continue
             current = node
             epilogue = []
@@ -778,6 +1466,8 @@ def _prepare_graph(
                         not hasattr(other, "name")
                         or _get_shape(other) != _get_shape(user)
                         or node_order.get(other.name, -1) >= node_order[node.name]
+                        # The linear kernel reads one residual list.
+                        or any(operation == "tensor_add" for operation, _ in epilogue)
                     ):
                         break
                     epilogue.append(("tensor_add", other))
@@ -786,9 +1476,10 @@ def _prepare_graph(
                         break
                     # The fused linear epilogue only implements tanh GELU;
                     # exact GELU runs as its own elementwise kernel.
-                    if target == "aten.gelu.default" and _gelu_approximation(user) != "tanh" and not (
-                        fast and fast_config.activations
-                    ):
+                    exact_gelu = (
+                        target == "aten.gelu.default" and _gelu_approximation(user) != "tanh"
+                    )
+                    if exact_gelu and not (fast and fast_config.activations):
                         break
                     # Leave SiLU materialization to the broader SiLU-times-
                     # tensor fusion below when it feeds a single multiply.
@@ -797,6 +1488,8 @@ def _prepare_graph(
                         if str(next_user.target) == "aten.mul.Tensor":
                             break
                     epilogue.append((activation_ops[target], None))
+                    if exact_gelu:
+                        approximate_fusions.append(target)
                     chain.append(user)
                     current = user
                     break  # Activations terminate the simple expression epilogue.
@@ -907,6 +1600,8 @@ def _prepare_graph(
             current = root
             while (
                 current.name not in claimed
+                # A row-looped step broadcasts over the runtime extent.
+                and current.name not in row_loops
                 and current.op == "call_function"
                 and str(current.target) in arithmetic_ops
                 and not current.kwargs
@@ -1089,7 +1784,7 @@ def _prepare_graph(
             # Reordered QKV emission adds outer-loop dispatch.  Official-VM
             # A/B runs show the removed copies pay for that only once the
             # sequence is moderately long.
-            if _get_shape(q)[-2] < 16 and generation is None:
+            if _get_shape(q)[-2] < 16:
                 continue
             q_item = alias_source(q.args[0]) if str(q.target) == "aten.transpose.int" else None
             k_item = alias_source(k.args[0]) if str(k.target) == "aten.transpose.int" else None
@@ -1158,16 +1853,9 @@ def _prepare_graph(
     generation_score_caches = {}
     generation_value_caches = {}
     generation_cache_widths = {}
-    generation_softmax_heads = {}
     generation_first_cache = None
-    generation_position_embeddings = {}
-    generation_qkv_caches = {}
-    generation_prepopulated_scores = set()
-    generation_prepopulated_values = set()
-    generation_hidden_prefill_qkv = None
     generation_hidden_prefill_attention = None
-    generation_attention_fusions = {}
-    if automatic:
+    if generation is not None:
         if len(example_inputs) != 1 or tuple(example_inputs[0].shape) != (1, 1):
             raise ValueError("generation export example input must have shape [1, 1]")
         for node in nodes:
@@ -1190,110 +1878,6 @@ def _prepare_graph(
             )
         if generation.hidden_prefill:
             generation_hidden_prefill_attention = next(reversed(generation_score_caches))
-    elif generation is not None:
-        if len(example_inputs) != 1 or example_inputs[0].ndim != 2:
-            raise ValueError("generation export requires one [1, 1] token tensor input")
-        if tuple(example_inputs[0].shape) != (1, 1):
-            raise ValueError("generation export example input must have shape [1, 1]")
-        layer = 0
-        for qk_name, fusion in causal_score_fusions.items():
-            mask_node, q, k, _, _, _ = fusion
-            softmax = next(
-                (candidate for candidate in mask_node.users if candidate.name in causal_softmaxes),
-                None,
-            )
-            value_matmul = next(
-                (
-                    candidate for candidate in nodes
-                    if candidate.name in causal_value_matmuls
-                    and softmax is not None and candidate.args[0] is softmax
-                ),
-                None,
-            )
-            if softmax is None or value_matmul is None:
-                continue
-            layer += 1
-            embed = _get_shape(k)[-3] * _get_shape(k)[-1]
-            k_cache = f"cattorch K cache {layer}"
-            v_cache = f"cattorch V cache {layer}"
-            generation_score_caches[qk_name] = k_cache
-            generation_value_caches[value_matmul.name] = v_cache
-            generation_cache_widths[k_cache] = embed
-            generation_cache_widths[v_cache] = embed
-            generation_softmax_heads[softmax.name] = _get_shape(q)[-3]
-            current_v = value_matmul.args[1]
-            for linear_name, qkv_fusion in qkv_linear_fusions.items():
-                _, _, fused_q, fused_k, fused_v, *_ = qkv_fusion
-                if fused_q is q and fused_k is k and fused_v is current_v:
-                    generation_qkv_caches[linear_name] = (k_cache, v_cache)
-                    generation_prepopulated_scores.add(qk_name)
-                    generation_prepopulated_values.add(value_matmul.name)
-                    break
-            if generation_first_cache is None:
-                generation_first_cache = (k_cache, embed)
-        if not generation_score_caches:
-            raise ValueError(
-                "generation export requires a recognized causal attention block"
-            )
-        node_positions = {node.name: index for index, node in enumerate(nodes)}
-        if generation.hidden_prefill and generation_qkv_caches:
-            generation_hidden_prefill_qkv = max(
-                generation_qkv_caches,
-                key=lambda name: node_positions.get(name, -1),
-            )
-        if not fast and generation.max_context >= 64:
-            for value_name in generation_prepopulated_values:
-                value_node = next(node for node in nodes if node.name == value_name)
-                softmax = value_node.args[0]
-                if (
-                    hasattr(softmax, "name")
-                    and softmax.name in generation_softmax_heads
-                    and len(softmax.users) == 1
-                ):
-                    generation_attention_fusions[softmax.name] = value_node
-                    fused_nodes.add(value_node.name)
-        first_cache_name, first_cache_width = generation_first_cache
-        score_positions = sorted(
-            (
-                node_positions[name], cache_name,
-                generation_cache_widths[cache_name],
-            )
-            for name, cache_name in generation_score_caches.items()
-        )
-        for node in nodes:
-            if node.op != "call_function" or str(node.target) != "aten.embedding.default":
-                continue
-            indices = resolve_weight(node.args[1].name) if hasattr(node.args[1], "name") else None
-            if (
-                isinstance(indices, torch.Tensor) and indices.numel() == 1
-                and float(indices.flatten()[0]) == 0
-            ):
-                table = (
-                    resolve_weight(node.args[0].name)
-                    if hasattr(node.args[0], "name") else None
-                )
-                if (
-                    isinstance(table, torch.Tensor)
-                    and table.ndim >= 1
-                    and generation.max_context > table.shape[0]
-                ):
-                    raise ValueError(
-                        f"generation max_context ({generation.max_context}) exceeds "
-                        f"recognized position table capacity ({table.shape[0]}) at "
-                        f"exported node {node.name!r}"
-                    )
-                # RoPE tables live inside attention blocks. Use the next
-                # causal score's own K cache so later layers do not observe
-                # layer 1 after it has already appended the current token.
-                next_score = next(
-                    (
-                        (cache_name, cache_width)
-                        for position, cache_name, cache_width in score_positions
-                        if position > node_positions[node.name]
-                    ),
-                    (first_cache_name, first_cache_width),
-                )
-                generation_position_embeddings[node.name] = next_score
 
     graph = _GraphInfo(
         nodes=nodes,
@@ -1309,18 +1893,12 @@ def _prepare_graph(
             score_caches=generation_score_caches,
             value_caches=generation_value_caches,
             cache_widths=generation_cache_widths,
-            softmax_heads=generation_softmax_heads,
             first_cache=generation_first_cache,
-            position_embeddings=generation_position_embeddings,
-            qkv_caches=generation_qkv_caches,
-            prepopulated_scores=generation_prepopulated_scores,
-            prepopulated_values=generation_prepopulated_values,
-            hidden_prefill_qkv=generation_hidden_prefill_qkv,
             hidden_prefill_attention=generation_hidden_prefill_attention,
-            attention_fusions=generation_attention_fusions,
-            automatic=automatic,
         ),
         linear_fusions=linear_fusions,
+        approximate_fusions=tuple(approximate_fusions),
+        row_loops=frozenset(row_loops),
         paired_swiglu_fusions=paired_swiglu_fusions,
         silu_mul_fusions=silu_mul_fusions,
         embedding_add_fusions=embedding_add_fusions,
@@ -1334,6 +1912,7 @@ def _prepare_graph(
         registry=registry,
         dynamic_axes=dynamic_axes,
         dynamic_bounds=dynamic_bounds,
+        dynamic_offsets=dynamic_offsets,
     )
     _validate_lowering_operations(graph)
     return graph
@@ -1344,7 +1923,7 @@ def _validate_lowering_operations(graph: _GraphInfo) -> None:
     skipped = set(graph.aliases) | set(graph.generated_weights) | graph.fused_nodes
     for roots in (
         graph.causal_score_fusions, graph.qkv_linear_fusions,
-        graph.generation.attention_fusions, graph.embedding_add_fusions,
+        graph.embedding_add_fusions,
         graph.elementwise_fusions, graph.linear_fusions,
         graph.paired_swiglu_fusions, graph.silu_mul_fusions,
     ):

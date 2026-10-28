@@ -7,26 +7,27 @@ and dtypes in `example_inputs`. The Python code can't branch on tensor values.
 Parameters, buffers, and constants are stored in the sprite, and tensor
 arguments become Scratch input lists.
 
-For persistent state and bounded variable-length tensors, use an experimental
+For persistent state, use [`@entrypoint` markers](markers.md) or an
 [`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state).
 
 ## Operations
 
 | Category | Operations |
 |---|---|
-| Convolution | Batched `nn.Conv1d`, `nn.Conv2d`, with optional bias, stride, and padding; dilation and groups must be 1 |
-| Pooling | Batched `nn.MaxPool1d/2d`, `nn.AvgPool1d/2d`, `nn.AdaptiveAvgPool1d/2d`, `nn.AdaptiveMaxPool1d/2d`; non-default dilation, ceiling, padding-count, and divisor options are rejected |
-| Linear algebra | `nn.Linear`, `@`, `torch.matmul`; two batched operands must have identical batch dimensions |
+| Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
+| Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
+| Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
 | Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
-| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`; unary `-`; `exp`, `log`, `log10`, `sqrt`, `rsqrt`, `abs`, `floor`, `ceil`, `reciprocal`, `erf`, `sin`, `cos`; `clamp`; `torch.pow` with an integer exponent from -4 to 4 or ±0.5 |
-| Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `cumsum`, over any dimensions; `torch.topk` |
+| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
+| Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `median`, `kthvalue`, over any dimensions; `cumsum`, `cumprod`, `cummax`, `cummin`; `torch.topk`, `torch.sort`, `argsort` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
 | Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
-| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling, and `gather`, `index_select`, or indexing with indices that don't depend on the input |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
+| In-place updates | `x /= y`, `x.copy_(y)`, and slice or index assignment such as `x[..., :4] = y` on a tensor the model created, with step-one slices; updates of inputs, parameters, or a tensor read through an earlier view are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs
 once during export, whatever operations it uses. Masks such as
@@ -70,22 +71,42 @@ against the model's own `forward` during export. GPT-2, Llama, and Qwen2
 causal language models work this way; BERT doesn't, because its attention isn't
 causal.
 
+Mixture-of-experts models from transformers, such as Mixtral, Qwen2-MoE,
+Qwen3-MoE, OLMoE, and DeepSeek-V3, export the same way, with or without a
+`GenerationProgram`. Their experts classes, marked with transformers'
+`@use_experts_implementation`, are replaced on the export copy by banked experts
+that take their routes from the model's own router, and only the selected experts
+run in Scratch. Experts with their own gate function, such as GPT-OSS's
+clamped GLU, run that function in Scratch. Experts using operations that
+[experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
+hand-written normalization, can't export yet. GPT-OSS, with its attention
+sinks and sliding-window layers, exports with or without a `GenerationProgram`.
+
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
 requires an even final dimension.
 
-Mixture-of-experts layers are supported through the experimental
-`ExpertFamily` and `SparseMoE` classes; see
-[experimental programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
+Hand-written mixture-of-experts blocks with a `ModuleList` of experts and a
+linear router are usually recognized automatically. Others are supported
+through the [`@moe` marker](markers.md), or the experimental `ExpertFamily`
+and `SparseMoE` classes and `routed_experts` with your own router code; see
+[programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
 Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
 `var`, export when PyTorch can express them in terms of supported
-operations. They may run slower than an operation with a dedicated kernel.
+operations. They may run slower than an operation with a dedicated kernel;
+`TranspileResult.fallback_operations` and `warnings` list the ones a sprite
+uses. [Operator coverage](operator-coverage.md) shows which operators pass
+PyTorch's own test samples.
 
-`nn.LSTM` and `nn.GRU` export for the fixed sequence length of the example,
-including stacked and bidirectional layers. Every time step is unrolled into
-its own blocks, so sprite size grows with sequence length and layer count.
-Check `expanded_json_bytes` for longer sequences.
+`nn.GRU`, `nn.LSTM` (including `proj_size`) and `nn.RNN` export with stacked
+and bidirectional layers, and so do `nn.GRUCell`, `nn.LSTMCell` and
+`nn.RNNCell`. A recurrent layer runs as one Scratch loop over time, so the
+sprite doesn't grow with the sequence length, and the sequence can vary at
+run time (see [variable-length inputs](#variable-length-inputs)). To process
+one step per call, write a step method around a cell and keep the hidden
+state in a buffer; [`@cattorch.entrypoint`](markers.md) exports it with the
+state kept between calls.
 
 A listed operation can still be rejected for an unsupported shape,
 broadcasting pattern, or option. The error names the operation that failed.
@@ -99,7 +120,8 @@ broadcasting pattern, or option. The error names the operation that failed.
   Hugging Face `ModelOutput` of tensors. Leaves are flattened into `output`,
   `output_1`, and so on in order. Non-tensor leaves are skipped with a
   warning; at least one tensor is required.
-- Input shapes are fixed to the shapes of the example values.
+- Input shapes are fixed to the shapes of the example values, unless one
+  input is [variable-length](#variable-length-inputs).
 - A model with modules in training mode is exported as an evaluation-mode
   copy, with a warning.
 - `torch.no_grad()` and `torch.autocast` blocks inside `forward` are ignored.
@@ -111,6 +133,63 @@ broadcasting pattern, or option. The error names the operation that failed.
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
 return value without any tensors, raise `UnsupportedModelError`.
+
+## Variable-length inputs
+
+`dynamic=` lets one input's length vary at run time, within bounds:
+
+```python
+result = cattorch.transpile(model, torch.randn(4, 16), "model.sprite3",
+                            dynamic={0: (1, 32)})
+```
+
+`{0: (1, 32)}` lets input 0's first dimension hold 1 to 32 items. Use
+`{0: {1: (1, 32)}}` for another dimension, after dimensions of size 1, such
+as the tokens in a `(1, tokens)` input; name a tensor in `example_kwargs` by
+its key. The Scratch input list then takes any whole number of items, and
+the output lists grow with it. `TensorSpec.shape` shows the bounded
+dimension as a `BoundedDimension`.
+
+Most operations treat the items independently, as models treat a batch or
+tokens processed one at a time. These operations mix them, and follow the
+length too:
+
+- Reductions over the items: `sum`, `mean`, `amax`, `amin`, `max` and `min`
+  values, `prod`, `logsumexp`, `var` and `std`, also over several dimensions
+  or with `keepdim`, as in mean pooling or `x - x.mean(0)`.
+- `softmax` and `log_softmax` across the items.
+- Matrix products that sum over the items (`x.T @ x`, or attention weights
+  times values) or produce one column per item (`query @ keys.T`). Together
+  these cover attention from fixed queries over a variable-length memory,
+  such as `nn.MultiheadAttention` with a learned query.
+- `torch.cat` with fixed-size tensors along the items, such as a class token
+  in front of a sequence. The output's `BoundedDimension` counts the fixed
+  items too.
+- Fixed slices at either end, such as `x[0]`, `x[-1]` or `x[:, -1]`.
+- Arithmetic with the length itself, as in `x.sum(0) / x.shape[0]`.
+- Recurrent layers, whose final state (`h_n`) has a fixed shape.
+
+A tensor can have only one dimension that varies, so self-attention across
+the items (`x @ x.T`, `nn.TransformerEncoderLayer` over a variable sequence)
+is rejected. So are slices that drop items or reach past the first item
+(`x[1:]`, `x[-2:]`), and convolution or pooling along the items. When a
+model's operations can't follow the length directly, for example attention
+layers that reorder their batch internally, cattorch runs the whole model once
+per item if the items are independent, and adds a warning.
+
+cattorch traces the model with one item, and again with two to tell bounds
+like `x[-1]` and `x[0]` apart. It then checks the sprite against the model at
+several lengths during export. A model that builds something from the length,
+such as `torch.arange(tokens.shape[1])` for positions or a `cumsum`, fails
+that check. Language models should use a [`GenerationProgram`](generation.md)
+instead, which handles prompts of any length up to `max_context`.
+
+Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
+`@cattorch.entrypoint(dynamic={"rows": (1, 32)})` in [markers](markers.md),
+for an input's first dimension. Export checks each such input at several
+lengths in the same way, calling the entry point from the initial state. An
+entry point whose operations can't follow the length runs once per item, as
+`forward` does, if it has one variable-length input and updates no state.
 
 Run [`verify`](api-reference.md#verify) whenever you change the model or export
 options. If export fails, see [troubleshooting](troubleshooting.md).

@@ -264,7 +264,7 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
         nn.ELU, nn.LeakyReLU, nn.Identity,
     )
     try:
-        from cattorch.moe import _BankedSparseMoE
+        from cattorch.experts import _BankedSparseMoE
 
         class _FastTransformTracer(Tracer):
             def is_leaf_module(self, module, qualified_name):
@@ -367,7 +367,7 @@ def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
     """
     if not fraction:
         return
-    from cattorch.moe import StackedSwiGLUMoE
+    from cattorch.experts import StackedSwiGLUMoE
 
     for name, module in model.named_modules():
         if not isinstance(module, StackedSwiGLUMoE):
@@ -411,14 +411,10 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     # Kernel-level approximations remain valid, but changing hidden widths or
     # replacing a template Linear with a low-rank Sequential would invalidate
     # every expert-major stride.
-    from cattorch.moe import _BankedSparseMoE
-    generic_paths = {
-        name for name, module in model.named_modules()
-        if isinstance(module, _BankedSparseMoE)
-    }
+    from cattorch.experts import ExpertFamily
     expert_prefixes = tuple(
-        f"{path}.expert_family" if path else "expert_family"
-        for path in generic_paths
+        name or "<root>" for name, module in model.named_modules()
+        if isinstance(module, ExpertFamily)
     )
     if any(
         name == prefix or name.startswith(f"{prefix}.")

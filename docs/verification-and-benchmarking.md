@@ -41,6 +41,14 @@ A model returning one tensor gets a `VerifyResult`, even if the tensor is
 wrapped in a tuple, list, or dictionary. For stateful call sequences, see
 [program verification](programs-and-moe.md#named-entrypoints-and-state).
 
+`verify` uses cattorch's emulator, not Scratch itself. cattorch's own tests
+also run a set of exported sprites in the official `@scratch/scratch-vm`: an
+MLP, a CNN, a transformer layer, each weight storage format, a
+variable-length input, a stateful program, and cached generation with its
+tokenizer. To check your own project the same way, use
+`benchmarks/run_project_vm.cjs` (see the
+[benchmarks README](../benchmarks/README.md)).
+
 ## Scratch benchmark projects
 
 Compare exact and fast mode for one model:

@@ -410,6 +410,11 @@ def _share_repeated_transformer_layers(
         bank_roles.append((role, names, sizes[0]))
     if not bank_roles:
         return reject("no layer-varying static weights were found")
+    banked = [name for _, names, _ in bank_roles for name in names]
+    if len(set(banked)) != len(banked):
+        # A deduplicated tensor read by only some layers, or in a different
+        # role per layer, can't become one row of a bank.
+        return reject("a static tensor would fill more than one bank slot")
     log.info("Repeated layer bank roles: %s", bank_roles)
 
     layer_zero_owned = owned_groups[0]
@@ -959,6 +964,32 @@ def _add_procedure_completion_broadcast(
         "shadow": False,
         "topLevel": False,
     }
+
+
+def _remove_completion_broadcast(sprite: dict, message: str) -> None:
+    """Undo ``_add_procedure_completion_broadcast`` for ``message``.
+
+    The notification, and the status it sets, are the last blocks of their
+    procedure.
+    """
+    blocks = sprite["blocks"]
+    for identifier, block in list(blocks.items()):
+        if block.get("opcode") != "event_broadcastandwait":
+            continue
+        menu = block.get("inputs", {}).get("BROADCAST_INPUT", [None, None])[1]
+        if not (isinstance(menu, list) and len(menu) > 1 and menu[1] == message):
+            continue
+        last = identifier
+        parent = block.get("parent")
+        if parent is not None and blocks[parent].get("fields", {}).get(
+            "VARIABLE", [None],
+        )[0] == "cattorch status":
+            last, parent = parent, blocks[parent].get("parent")
+        if parent is not None:
+            blocks[parent]["next"] = None
+        del blocks[identifier]
+        if last != identifier:
+            del blocks[last]
 
 
 def _logical_list_sizes(
@@ -1633,6 +1664,25 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
         "fields": {}, "shadow": False, "topLevel": False,
     }
     blocks[suffix_root]["parent"] = guard
+
+
+def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
+    """Run the chain from ``start`` up to ``stop`` only for projected tokens.
+
+    Hidden prefill tokens never read what this range computes, such as the
+    final layer's query projection.
+    """
+    blocks = sprite["blocks"]
+    last = start
+    while blocks[last].get("next") not in (stop, None):
+        last = blocks[last]["next"]
+    if blocks[last].get("next") != stop:
+        raise ValueError("the guarded range does not end at the next operation")
+    blocks[last]["next"] = None
+    _guard_generation_suffix(sprite, start)
+    guard = blocks[start]["parent"]
+    blocks[guard]["next"] = stop
+    blocks[stop]["parent"] = guard
 
 
 _TOP_K_VALUES = "cattorch top k values"

@@ -320,7 +320,7 @@ def expert_bank_effective_ndims(model: torch.nn.Module) -> dict[int, int]:
     per expert, so storage treats it like any other bias.
     """
     effective_ndims: dict[int, int] = {}
-    from cattorch.moe import ExpertFamily
+    from cattorch.experts import ExpertFamily
     for module in model.modules():
         if not isinstance(module, ExpertFamily):
             continue
@@ -399,7 +399,7 @@ def quantize_model(
     else:
         observed_inputs = orientation_inputs or ()
     if observing:
-        from cattorch.moe import _expert_family_context
+        from cattorch.experts import _expert_family_context
         with torch.inference_mode(), _expert_family_context(registry.expert_families), capture:
             for raw_batch in observed_inputs:
                 model(*_normalize_batch(raw_batch), **(call_kwargs or {}))

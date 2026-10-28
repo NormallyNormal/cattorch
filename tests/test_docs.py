@@ -76,8 +76,15 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
         ("docs/getting-started.md", (0, 1)),
         ("docs/programs-and-moe.md", (0, 1)),
         ("docs/programs-and-moe.md", (3,)),
+        ("docs/programs-and-moe.md", (5,)),
+        ("docs/custom-kernels.md", (0, 1, 2, 3)),
+        ("docs/markers.md", (0,)),
+        ("docs/projects-and-cli.md", (0,)),
     ],
-    ids=("quick-start", "getting-started", "stateful-program", "sparse-moe"),
+    ids=(
+        "quick-start", "getting-started", "stateful-program", "sparse-moe",
+        "routed-experts", "custom-kernels", "markers", "projects",
+    ),
 )
 def test_documented_export_examples_run(
     relative_path: str,

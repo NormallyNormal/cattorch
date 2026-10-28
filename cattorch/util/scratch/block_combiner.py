@@ -119,7 +119,7 @@ def _apply_remap(blocks: dict, var_remap: dict, list_remap: dict) -> dict:
     return remap_ids(blocks, {**var_remap, **list_remap})
 
 
-def combine(sprite_a: dict, sprite_b: dict) -> dict:
+def combine(sprite_a: dict, sprite_b: dict, *, in_place: bool = False) -> dict:
     """
     Chain sprite_b's block chain onto the end of sprite_a's, merging
     variables and lists by display name.
@@ -128,14 +128,18 @@ def combine(sprite_a: dict, sprite_b: dict) -> dict:
     ----------
     sprite_a : dict  — the leading sprite (modified copy is returned)
     sprite_b : dict  — the trailing sprite (its chain is appended)
+    in_place : bool  — reuse both sprites' contents instead of copying them,
+        for a caller that owns them and discards them, such as the compiler
+        appending one instruction at a time. Copying would make that
+        quadratic in the number of instructions.
 
     Returns
     -------
     A new sprite dict with combined blocks, variables, and lists.
     """
     import copy
-    a = copy.deepcopy(sprite_a)
-    b = copy.deepcopy(sprite_b)
+    a = sprite_a if in_place else copy.deepcopy(sprite_a)
+    b = sprite_b if in_place else copy.deepcopy(sprite_b)
 
     blocks_a = a["blocks"]
     blocks_b = b["blocks"]

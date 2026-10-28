@@ -1,20 +1,26 @@
-# Experimental programs and sparse MoE
+# Programs and sparse MoE
 
 [Documentation home](index.md)
 
 `ExportProgram` puts several model methods, and state that persists between
-calls, into one sprite. Everything in this guide is experimental and may
-change. For a model with just a `forward` method and no state, use the
+calls, into one sprite. Programs and adapters are stable; the
+[mixture-of-experts classes](#mixture-of-experts) and `analyze` are
+[experimental](stability.md). For a model with just a `forward` method and no state, use the
 [ordinary export](getting-started.md) instead.
+
+[Markers](markers.md) declare the same things with decorators on your own
+model: `@entrypoint` methods and the buffers they update instead of
+`ExportProgram`, and `@moe` instead of rebuilding a block with `ExpertFamily`
+and `SparseMoE`. The classes here remain for code you can't decorate.
 
 ## Named entrypoints and state
 
-Import the interface types from `cattorch.experimental`:
+Import the interface types from `cattorch`:
 
 ```python
 import torch
 import cattorch
-from cattorch.experimental import (
+from cattorch import (
     EntryPoint, ExportProgram, Input, Output, State, StateInput, StateUpdate,
 )
 
@@ -77,7 +83,7 @@ can use it, with these limits, all checked at export:
 To test a sequence of calls, pass `ProgramCall` values to `verify()`:
 
 ```python
-from cattorch.experimental import ProgramCall
+from cattorch import ProgramCall
 
 check = cattorch.verify(
     model,
@@ -104,7 +110,7 @@ To check support and estimated size without writing a sprite, call
 export, for example to turn a third-party block into supported operations:
 
 ```python
-from cattorch.experimental import ModuleAdapter
+from cattorch import ModuleAdapter
 
 adapter = ModuleAdapter(ThirdPartyBlock, convert_block)
 result = cattorch.transpile(model, program, "model.sprite3", adapters=(adapter,))
@@ -116,6 +122,10 @@ that export, and apply to child modules before their parents. A module used in
 several places is replaced once, and every use gets the same replacement.
 
 ## Mixture of experts
+
+These classes are experimental, imported from `cattorch.experimental`, and may
+change in any release; [`@moe`](markers.md) and automatic detection cover most
+models.
 
 `ExpertFamily` holds a set of experts with identical structure. `SparseMoE`
 sends each token to its top-k experts and combines their outputs. In Scratch,
@@ -175,14 +185,83 @@ The first dimension of each stacked tensor is the number of experts.
 
 An expert must process each token independently and keep no state. It can use
 linear layers (with or without bias), elementwise arithmetic, residual
-connections, ReLU, GELU, SiLU, sigmoid, and tanh, LayerNorm and RMSNorm, and
-low-rank linear layers written as two matrix products. Convolution, attention,
+connections, ReLU, GELU, SiLU, sigmoid, and tanh, `clamp` with constant
+bounds, powers with integer exponents from -4 to 4 or ±0.5, LayerNorm and
+RMSNorm, slicing, `chunk`, `split`, transposes and float casts, and low-rank
+linear layers written as two matrix products. Convolution, attention,
 in-place modification, and data-dependent control flow are rejected.
 
 For SwiGLU experts without biases, `StackedSwiGLUMoE` is a faster
 implementation. If your MoE module has `router.weight`, `gate.weight`,
 `up.weight`, and `down.weight` attributes, `stacked_swiglu_moe_adapter(YourMoEClass)`
 converts it.
+
+### Hand-written MoE blocks
+
+A block that holds a `ModuleList` of identical experts and a linear router
+with one output per expert, and loops over the experts the usual way, usually
+exports without changes. cattorch runs the block on probe inputs next to
+`SparseMoE` with each routing configuration it knows: every `top_k`, softmax,
+sigmoid or raw router scores, and selected weights renormalized or not. The
+first one that gives the same output replaces the block, and a
+`CustomMoEWarning` names it, for example `top_k=2, softmax scores,
+renormalized weights`. Softmax over the top-k logits, as in Mixtral, is the
+same as softmax scores with renormalized weights. Run `verify` on real inputs
+afterwards.
+
+Anything else in the block, such as a shared expert, a routed scaling factor,
+or router bias added only for selection, doesn't match. Such a block is kept
+as it is if it traces; otherwise export stops with an error pointing here.
+Rebuild it with `ExpertFamily` and `SparseMoE`, or keep its router and call
+`routed_experts` as described next.
+
+### Routing with your own router code
+
+A typical MoE block picks experts with `torch.topk` and then loops over the
+experts with `torch.where` and `index_add_`. That loop depends on tensor
+values, so it can't be traced. Keep the router as it is and replace only the
+loop with `routed_experts(value, expert_ids, weights, experts)`:
+
+```python
+import torch
+from torch import nn
+from cattorch import transpile, verify
+from cattorch.experimental import ExpertFamily, routed_experts
+
+class Block(nn.Module):
+    def __init__(self, width=4, experts=4, top_k=2):
+        super().__init__()
+        self.gate = nn.Linear(width, experts, bias=False)
+        self.experts = ExpertFamily.from_modules(
+            [nn.Sequential(nn.Linear(width, 8), nn.SiLU(), nn.Linear(8, width))
+             for _ in range(experts)],
+            example_input=torch.zeros(1, width),
+        )
+        self.top_k = top_k
+
+    def forward(self, value):
+        probabilities = torch.softmax(self.gate(value), dim=-1)
+        weights, ids = torch.topk(probabilities, self.top_k, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return routed_experts(value, ids, weights, self.experts)
+
+model = Block().eval()
+example = torch.randn(3, 4)
+artifact = transpile(model, example, "routed-moe")
+assert verify(model, example, artifact).passed
+```
+
+`expert_ids` and `weights` have shape `[..., top_k]`, where `value` has shape
+`[..., width]`. Each token's output is the sum of `weights[t, r]` times
+expert `expert_ids[t, r]` applied to the token, over its routes `r`. The router
+is ordinary exported code, so softmax or sigmoid scoring, normalization,
+shared experts, and other variations need no special support. Expert IDs are
+zero-based, as `torch.topk` returns them. In PyTorch, IDs outside the expert
+bank raise `IndexError`; in Scratch they aren't checked.
+
+When router scores tie exactly, Scratch's `topk` picks the lower expert ID.
+PyTorch doesn't define which of the tied experts `torch.topk` returns, so
+`verify` can fail on inputs that make scores tie, such as all zeros.
 
 For GPTQ, use calibration data that routes tokens the way real use does.
 Experts that receive too little data fall back to symmetric quantization; see

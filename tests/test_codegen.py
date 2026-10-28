@@ -320,12 +320,19 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
         atol=1e-6,
         rtol=0,
     )
-    assert "cattorch shared transformer layer" in auto._procedures
+    assert "_cattorch shared transformer layer" in auto._procedures
 
 
-def test_shared_quantized_bank_can_cross_physical_list_boundary(tmp_path):
+def test_shared_quantized_bank_can_cross_physical_list_boundary(
+    tmp_path, small_list_limit, monkeypatch,
+):
     """A layer base may land in either shard of one logical weight bank."""
-    width = 320  # two matrices contain 204,800 values, just over Scratch's cap
+    from cattorch.util.instruction.optimized import LinearInstruction
+
+    small_list_limit(2_000)
+    # Keep the grouped linear layout a full-size model would use.
+    monkeypatch.setattr(LinearInstruction, "grouped_min_macs", 1)
+    width = 32  # two matrices contain 2,048 values, just over the lowered cap
 
     class Block(torch.nn.Module):
         def __init__(self):
@@ -367,7 +374,8 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(tmp_path):
         sprites[mode].lists["input"] = value.flatten().tolist()
         sprites[mode].run_procedure("cattorch forward")
 
-    assert "cattorch shared transformer layer" in sprites["auto"]._procedures
+    assert "_cattorch shared transformer layer" in sprites["auto"]._procedures
+    assert "W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
     torch.testing.assert_close(
         torch.tensor(sprites["auto"].lists["output"]),
         torch.tensor(sprites["off"].lists["output"]),

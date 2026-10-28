@@ -2,7 +2,9 @@ import logging
 import math
 import re
 import operator
+import dataclasses
 import warnings
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -13,7 +15,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
-from cattorch.frontend import Frontend, flat_example_inputs
+from cattorch.frontend import Frontend, flat_example_inputs, keep_operations
 from cattorch.graph import (
     _GenerationSpec,
     _GraphInfo,
@@ -23,9 +25,12 @@ from cattorch.graph import (
     _unsupported_operation,
 )
 from cattorch.graph_transforms import fold_eval_batch_norms
-from cattorch.results import TensorSpec, TranspileResult, _tensor_spec as boundary_spec
+from cattorch.results import (
+    TensorSpec, TranspileResult, _tensor_spec as boundary_spec, fallback_warning,
+)
 from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
 from cattorch.adapters import ModuleAdapter
+from cattorch.kernel_api import Kernel, active_kernel_targets, validate_kernels
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
@@ -39,6 +44,7 @@ from cattorch.sprite import (
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
     _guard_generation_output,
+    _guard_generation_range,
     _guard_generation_suffix,
     _logical_list_sizes,
     _merge_duplicate_lists,
@@ -53,7 +59,8 @@ from cattorch.sprite import (
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
-from cattorch.storage import StorageConfig
+from cattorch.interface import final_data_name
+from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
 from cattorch.operator_registry import (
@@ -108,23 +115,27 @@ def _bank_generation_caches(graph: _GraphInfo) -> bool:
     generation.value_caches = {name: value_bank for name, _ in value_entries}
     generation.cache_widths = {key_bank: bank_width, value_bank: bank_width}
     generation.first_cache = (key_bank, bank_width)
-    generation.position_embeddings = {
-        name: (key_bank, bank_width)
-        for name in generation.position_embeddings
-    }
-    generation.qkv_caches = {
-        name: (key_bank, value_bank)
-        for name in generation.qkv_caches
-    }
     generation.banked_caches = True
     generation.cache_layers = layers
     generation.cache_layer_width = layer_width
-
-    # The old hidden-prefill shortcut specialized only the last layer's QKV
-    # projection. A shared body must be identical for every layer, so retain
-    # the still-important output-head guard and compile uniform QKV work.
-    generation.hidden_prefill_qkv = None
     return True
+
+
+def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
+    """Nodes whose values reach nothing but ``attention``'s query argument."""
+    nodes = {node.name: node for node in graph.nodes}
+    target = nodes[attention]
+    query_only: set[str] = set()
+    for node in reversed(graph.nodes):
+        if node.op != "call_function" or node is target or not node.users:
+            continue
+        if all(
+            user.name in query_only
+            or (user is target and node is target.args[0] and node not in target.args[1:])
+            for user in node.users
+        ):
+            query_only.add(node.name)
+    return query_only
 
 
 def _wrap_transactional_generation_step(
@@ -206,6 +217,8 @@ class _Compiler:
 
     def __init__(self, graph: _GraphInfo, *, row_aligned_weights: bool = False):
         self.graph = graph
+        # Operations lowered by an approximate kernel, for the result.
+        self.approximate: Counter[str] = Counter(graph.approximate_fusions)
         self.scope = ScopeManager()
         self.block_manager = BlockManager()
         self.dynamic_lists: set[str] = set()
@@ -292,8 +305,6 @@ class _Compiler:
     def _automatic_bindings(self, node) -> dict[int, str]:
         """Argument positions of an automatic-generation op bound to named lists."""
         generation = self.graph.generation
-        if not generation.automatic:
-            return {}
         target = str(node.target)
         if target == "cattorch.cached_attention.default":
             return {
@@ -308,10 +319,7 @@ class _Compiler:
     def _lowering_options(self, node) -> dict[str, object]:
         """Compile-time facts for a context kernel (``KernelContext.options``)."""
         generation = self.graph.generation
-        if not (
-            generation.automatic
-            and str(node.target) == "cattorch.cached_attention.default"
-        ):
+        if str(node.target) != "cattorch.cached_attention.default":
             return {}
         if generation.banked_caches:
             return {
@@ -414,9 +422,6 @@ class _Compiler:
         if node.name in self.graph.qkv_linear_fusions:
             self._compile_qkv_linear(node)
             return
-        if node.name in self.graph.generation.attention_fusions:
-            self._compile_cached_attention(node)
-            return
         if node.name in self.graph.embedding_add_fusions:
             self._compile_embedding_add(node)
             return
@@ -454,11 +459,23 @@ class _Compiler:
               and hasattr(node.args[0], 'name')
               and node.args[0].name in self.graph.split_meta):
             self._compile_getitem(node, target_list)
-        elif aten_op in INDEX_MAP_OPS:
+        elif aten_op in INDEX_MAP_OPS and not self._runtime_gather(node):
             self._compile_index_map(node, target_list)
         else:
             self._compile_instruction(node, target_list, aten_op)
         self.scope.release_dependencies(node)
+
+    def _runtime_gather(self, node) -> bool:
+        """A ``gather`` whose indices are computed at run time."""
+        if str(node.target) != "aten.gather.default":
+            return False
+        index = node.args[2] if len(node.args) > 2 else node.kwargs.get("index")
+        name = getattr(index, "name", None)
+        while name in self.graph.aliases:
+            name = self.graph.aliases[name]
+        return name is not None and not isinstance(
+            self.graph.resolve_weight(name), torch.Tensor,
+        )
 
     def _compile_index_map(self, node, target_list):
         """Lower a data-movement operation through a static index table."""
@@ -474,14 +491,17 @@ class _Compiler:
                     raise _unsupported_operation(
                         node, "only the first argument can vary at runtime",
                     )
-                return tensor
+                # Aliases are views such as reshapes; keep this value's shape.
+                return tensor.reshape(_get_shape(value))
             if isinstance(value, (list, tuple)):
                 return type(value)(static(entry) for entry in value)
             return value
 
         if not hasattr(source, "name"):
             raise _unsupported_operation(node, "the first argument must be a tensor")
-        if node.name in self.graph.dynamic_axes or source.name in self.graph.dynamic_axes:
+        if node.name not in self.graph.row_loops and (
+            node.name in self.graph.dynamic_axes or source.name in self.graph.dynamic_axes
+        ):
             raise _unsupported_operation(
                 node, "data movement on a runtime extent is not supported",
             )
@@ -521,32 +541,8 @@ class _Compiler:
                 value=self.graph.qkv_offsets.get(k.name, 0),
             ),
         ]
-        if node.name in self.graph.generation.score_caches:
-            cache_name = self.graph.generation.score_caches[node.name]
-            input_lists = [input_lists[0], input_lists[1], cache_name]
-            args = [
-                args[0],
-                args[1],
-                Argument(cache_name, torch.Size([])),
-                args[2],
-                args[3],
-                args[4],
-            ]
-            from cattorch.util.instruction.optimized import CachedCausalScoreInstruction
-            instruction = CachedCausalScoreInstruction(
-                node.target,
-                target_list,
-                *args,
-                cache_prepopulated=(
-                    node.name in self.graph.generation.prepopulated_scores
-                ),
-            )
-            if self.graph.generation.banked_caches:
-                instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-                instruction.cache_base_variable = _LAYER_CACHE_BASE
-        else:
-            from cattorch.util.instruction.optimized import CausalScoreInstruction
-            instruction = CausalScoreInstruction(node.target, target_list, *args)
+        from cattorch.util.instruction.optimized import CausalScoreInstruction
+        instruction = CausalScoreInstruction(node.target, target_list, *args)
         self._emit(instruction, input_lists, target_list)
 
         # Mirror the dependency releases of the materialized chain that this
@@ -576,62 +572,10 @@ class _Compiler:
             Argument("C_query_heads", torch.Size([]), value=query_heads),
             Argument("C_kv_heads", torch.Size([]), value=kv_heads),
         ))
-        direct_caches = node.name in self.graph.generation.qkv_caches
-        if direct_caches:
-            input_lists, weight_shard_specs = self._prepare_cached_qkv_weights(
-                node, input_lists, query_heads, kv_heads,
-            )
-            args[1] = Argument(
-                input_lists[1], args[1].shape,
-                dtype=args[1].dtype, static=input_lists[1].startswith("W_"),
-            )
-            k_cache, v_cache = self.graph.generation.qkv_caches[node.name]
-            input_lists.extend((k_cache, v_cache))
-        else:
-            weight_shard_specs = ()
         from cattorch.util.instruction.optimized import QKVLinearInstruction
-        instruction = QKVLinearInstruction(
-            node.target,
-            target_list,
-            *args,
-            direct_caches=direct_caches,
-            hidden_prefill=(
-                node.name == self.graph.generation.hidden_prefill_qkv
-            ),
-            weight_shard_specs=weight_shard_specs,
-        )
+        instruction = QKVLinearInstruction(node.target, target_list, *args)
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(node)
-
-    def _compile_cached_attention(self, node):
-        value_node = self.graph.generation.attention_fusions[node.name]
-        target_list = self.scope.get_list_for_node(value_node)
-        self.last_target_list = target_list
-        score = node.args[0]
-        value = value_node.args[1]
-        cache_name = self.graph.generation.value_caches[value_node.name]
-        value_shape = _get_shape(value)
-        heads = self.graph.generation.softmax_heads[node.name]
-        kv_heads = value_shape[-3]
-        width = value_shape[-1]
-        input_lists = [self._resolve_name(score.name), cache_name]
-        args = (
-            Argument(input_lists[0], _get_shape(score)),
-            Argument(cache_name, torch.Size([])),
-            Argument("C_heads", torch.Size([]), value=heads),
-            Argument("C_kv_heads", torch.Size([]), value=kv_heads),
-            Argument("C_width", torch.Size([]), value=width),
-        )
-        from cattorch.util.instruction.optimized import CachedSoftmaxValueInstruction
-        instruction = CachedSoftmaxValueInstruction(
-            node.target, target_list, *args,
-        )
-        if self.graph.generation.banked_caches:
-            instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-            instruction.cache_base_variable = _LAYER_CACHE_BASE
-        self._emit(instruction, input_lists, target_list)
-        self.scope.release_dependencies(node)
-        self.scope.release_dependencies(value_node)
 
     def _compile_embedding_add(self, node):
         first, second = self.graph.embedding_add_fusions[node.name]
@@ -643,31 +587,8 @@ class _Compiler:
             self._argument(name, value)
             for name, value in zip(input_lists, tensor_nodes)
         ]
-        cached_position_side = None
-        if self.graph.generation.first_cache is not None:
-            for side, embedding in enumerate((first, second)):
-                indices = self.graph.resolve_weight(embedding.args[1].name)
-                if (
-                    isinstance(indices, torch.Tensor)
-                    and indices.numel() == 1 and float(indices.flatten()[0]) == 0
-                ):
-                    cached_position_side = side
-                    break
-        if cached_position_side is not None:
-            cache_name, cache_width = self.graph.generation.first_cache
-            input_lists.append(cache_name)
-            args.extend((
-                Argument(cache_name, torch.Size([])),
-                Argument("C_position_side", torch.Size([]), value=cached_position_side),
-                Argument("C_cache_width", torch.Size([]), value=cache_width),
-            ))
-            from cattorch.util.instruction.optimized import CachedPositionEmbeddingAddInstruction
-            instruction = CachedPositionEmbeddingAddInstruction(
-                node.target, target_list, *args,
-            )
-        else:
-            from cattorch.util.instruction.optimized import EmbeddingAddInstruction
-            instruction = EmbeddingAddInstruction(node.target, target_list, *args)
+        from cattorch.util.instruction.optimized import EmbeddingAddInstruction
+        instruction = EmbeddingAddInstruction(node.target, target_list, *args)
         instruction.interleaved_sides = (
             self._uses_grouped_tied_weight(first),
             self._uses_grouped_tied_weight(second),
@@ -845,7 +766,9 @@ class _Compiler:
         )
         if detail is not None:
             raise _unsupported_operation(node, detail)
-        if aten_op == "cattorch.expert_family_moe.default":
+        if aten_op in {
+            "cattorch.expert_family_moe.default", "cattorch.routed_experts.default",
+        }:
             value_nodes = list(node.args[:3])
             bank_nodes = list(node.args[3])
             tensor_nodes = [*value_nodes, *bank_nodes]
@@ -855,19 +778,27 @@ class _Compiler:
                 for name, value in zip(input_lists, tensor_nodes)
             ]
             handle = int(node.args[4])
-            from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
-            instruction = ExpertFamilyMoEInstruction(
-                node.target, target_list, *args,
-                family=self.graph.registry.expert_family(handle),
-                top_k=int(node.args[5]),
-                normalize_selected=bool(node.args[6]),
-                fast_activations=(
-                    self.graph.fast and self.graph.fast_config.activations
-                ),
-                fast_layer_norm=(
-                    self.graph.fast and self.graph.fast_config.layer_norm
-                ),
+            from cattorch.util.instruction.optimized_moe import (
+                ExpertFamilyMoEInstruction, RoutedExpertsInstruction,
             )
+            fast_options = {
+                "fast_activations": self.graph.fast and self.graph.fast_config.activations,
+                "fast_layer_norm": self.graph.fast and self.graph.fast_config.layer_norm,
+            }
+            if aten_op == "cattorch.routed_experts.default":
+                instruction = RoutedExpertsInstruction(
+                    node.target, target_list, *args,
+                    family=self.graph.registry.expert_family(handle),
+                    **fast_options,
+                )
+            else:
+                instruction = ExpertFamilyMoEInstruction(
+                    node.target, target_list, *args,
+                    family=self.graph.registry.expert_family(handle),
+                    top_k=int(node.args[5]),
+                    normalize_selected=bool(node.args[6]),
+                    **fast_options,
+                )
             family = self.graph.registry.expert_family(handle)
             template_state = {}
             template_state.update(dict(
@@ -923,6 +854,23 @@ class _Compiler:
             defaults = (None, [1] * dimensions, [0] * dimensions)
             while len(node_args) < 5:
                 value = defaults[len(node_args) - 2]
+                node_args.append(value)
+                input_lists.append("_none" if value is None else f"C_{value}")
+        # Other keyword arguments, such as ``include_self``, take their schema
+        # positions; skipped ones before them get their defaults.
+        schema = getattr(node.target, "_schema", None)
+        if schema is not None and node.kwargs and not any(
+            hasattr(value, "name") for value in node.kwargs.values()
+        ):
+            names = [argument.name for argument in schema.arguments]
+            last = max(
+                (names.index(key) for key in node.kwargs if key in names), default=-1,
+            )
+            for argument in schema.arguments[len(node_args):last + 1]:
+                value = node.kwargs.get(
+                    argument.name,
+                    argument.default_value if argument.has_default_value() else None,
+                )
                 node_args.append(value)
                 input_lists.append("_none" if value is None else f"C_{value}")
         log.info("%s -> %s (%s) (Inputs: %s)",
@@ -1013,70 +961,31 @@ class _Compiler:
                 node.target, target_list, *args,
                 weight=factors[0],
             )
-        elif node.name in self.graph.generation.softmax_heads:
-            args.append(Argument(
-                "C_heads", torch.Size([]),
-                value=self.graph.generation.softmax_heads[node.name],
-            ))
-            if self.graph.fast and self.graph.fast_config.softmax:
-                from cattorch.util.instruction.optimized import FastCachedSoftmaxInstruction
-                instruction = FastCachedSoftmaxInstruction(node.target, target_list, *args)
-            else:
-                from cattorch.util.instruction.optimized import CachedSoftmaxInstruction
-                instruction = CachedSoftmaxInstruction(node.target, target_list, *args)
         elif node.name in self.graph.causal_softmaxes:
             if self.graph.fast and self.graph.fast_config.softmax:
                 from cattorch.util.instruction.optimized import FastCausalSoftmaxInstruction
                 instruction = FastCausalSoftmaxInstruction(node.target, target_list, *args)
+                self.approximate[aten_op] += 1
             else:
                 from cattorch.util.instruction.optimized import CausalSoftmaxInstruction
                 instruction = CausalSoftmaxInstruction(node.target, target_list, *args)
         elif aten_op == "aten.embedding.default":
-            if node.name in self.graph.generation.position_embeddings:
-                cache_name, cache_width = self.graph.generation.position_embeddings[node.name]
-                input_lists.append(cache_name)
-                args.extend((
-                    Argument(cache_name, torch.Size([])),
-                    Argument("C_cache_width", torch.Size([]), value=cache_width),
-                ))
-                from cattorch.util.instruction.optimized import CachedPositionEmbeddingInstruction
-                instruction = CachedPositionEmbeddingInstruction(node.target, target_list, *args)
-            else:
-                kernel = self.graph.registry.kernel(
-                    aten_op,
-                    fast=self.graph.fast,
-                    config=self.graph.fast_config,
-                )
-                instruction = self._instantiate(
-                    kernel, lowering_target, node, target_list, args,
-                )
+            kernel = self.graph.registry.kernel(
+                aten_op,
+                fast=self.graph.fast,
+                config=self.graph.fast_config,
+            )
+            instruction = self._instantiate(
+                kernel, lowering_target, node, target_list, args,
+            )
             instruction.interleaved_weight = self._uses_grouped_tied_weight(node)
         elif node.name in self.graph.causal_value_matmuls:
-            if node.name in self.graph.generation.value_caches:
-                from cattorch.util.instruction.optimized import CachedValueMatMulInstruction
-                cache_name = self.graph.generation.value_caches[node.name]
-                input_lists.append(cache_name)
-                instruction = CachedValueMatMulInstruction(
-                    node.target, target_list, *args,
-                    Argument(cache_name, torch.Size([])),
-                    Argument(
-                        "C_value_offset", torch.Size([]),
-                        value=self.graph.qkv_offsets.get(node.args[1].name, 0),
-                    ),
-                    cache_prepopulated=(
-                        node.name in self.graph.generation.prepopulated_values
-                    ),
-                )
-                if self.graph.generation.banked_caches:
-                    instruction.cache_stride = self.graph.generation.cache_widths[cache_name]
-                    instruction.cache_base_variable = _LAYER_CACHE_BASE
-            else:
-                from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
-                value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
-                instruction = CausalValueMatMulInstruction(
-                    node.target, target_list, *args,
-                    Argument("C_value_offset", torch.Size([]), value=value_offset),
-                )
+            from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
+            value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
+            instruction = CausalValueMatMulInstruction(
+                node.target, target_list, *args,
+                Argument("C_value_offset", torch.Size([]), value=value_offset),
+            )
         else:
             kernel = self.graph.registry.kernel(
                 aten_op,
@@ -1085,6 +994,8 @@ class _Compiler:
             )
             if kernel is None:
                 raise _unsupported_operation(node)
+            if self.graph.fast and rule is not None and kernel is rule.fast_kernel:
+                self.approximate[aten_op] += 1
             if aten_op == "aten.linear.default" and linear_layout is not None:
                 weight_shard_rows, interleaved = linear_layout
                 instruction = kernel(
@@ -1428,65 +1339,6 @@ class _Compiler:
             row_counts.append(end - start)
         return [input_lists[0], *names, input_lists[2], input_lists[4]], tuple(row_counts)
 
-    def _prepare_cached_qkv_weights(
-        self, node, input_lists, query_heads, kv_heads,
-    ):
-        from cattorch.util.instruction.optimized import LinearInstruction
-
-        weight = self.graph.resolve_weight(node.args[1].name)
-        if (
-            not isinstance(weight, torch.Tensor)
-            or weight.ndim != 2
-        ):
-            return input_lists, ()
-        rows, embed = weight.shape
-        head_width = embed // query_heads
-        segments = (
-            ("query", query_heads * head_width),
-            ("key", kv_heads * head_width),
-            ("value", kv_heads * head_width),
-        )
-        if sum(size for _, size in segments) != rows:
-            return input_lists, ()
-        grouped = (
-            weight.numel() >= LinearInstruction.grouped_min_macs
-            and all(size % 4 == 0 for _, size in segments)
-        )
-        if weight.numel() <= SCRATCH_LIST_LIMIT and not grouped:
-            return input_lists, ()
-        rows_per_shard = SCRATCH_LIST_LIMIT // embed
-        if grouped:
-            rows_per_shard -= rows_per_shard % 4
-        if rows_per_shard < 1:
-            return input_lists, ()
-
-        names = []
-        specs = []
-        start = 0
-        shard_index = 0
-        for destination, segment_rows in segments:
-            remaining = segment_rows
-            while remaining:
-                count = min(rows_per_shard, remaining)
-                shard_index += 1
-                key = f"qkv_{node.name}_{destination}_weight_{shard_index}"
-                shard = weight[start:start + count].detach().clone()
-                if grouped:
-                    shard = (
-                        shard.reshape(-1, 4, embed)
-                        .permute(0, 2, 1)
-                        .contiguous()
-                        .reshape(shard.shape)
-                    )
-                self.static_lists[key] = shard
-                if grouped and self.row_aligned_weights:
-                    self.interleaved_static_layouts[key] = ((0, count, embed),)
-                names.append(f"W_{key}")
-                specs.append((destination, count, grouped))
-                start += count
-                remaining -= count
-        return [input_lists[0], *names, input_lists[2]], tuple(specs)
-
     def _large_static_matmul(self, node, target_list, left_arg, rhs):
         """Use row-aligned output-major weights only when sharding dominates."""
         from cattorch.util.instruction.optimized import LinearInstruction
@@ -1574,7 +1426,10 @@ class _Compiler:
 
     def _emit(self, instruction, input_lists, target_list):
         """Generate Scratch blocks for an instruction and merge into sprite."""
-        data = instruction.finalize()
+        if self.active_node in self.graph.row_loops:
+            data = self._row_looped(instruction, input_lists, target_list)
+        else:
+            data = instruction.finalize()
 
         self.block_manager.new_context()
         data["blocks"] = self.block_manager.apply_to_blocks(data["blocks"])
@@ -1596,7 +1451,30 @@ class _Compiler:
         if self.sprite is None:
             self.sprite = data
         else:
-            self.sprite = combine(self.sprite, data)
+            self.sprite = combine(self.sprite, data, in_place=True)
+
+    def _row_looped(self, instruction, input_lists, target_list) -> dict:
+        """Run a one-row kernel once per row of its runtime-length inputs."""
+        from cattorch.util.instruction.row_loop import captured_programs, row_loop
+
+        node = next(node for node in self.graph.nodes if node.name == self.active_node)
+        with captured_programs() as programs:
+            instruction.finalize()
+        if len(programs) != 1:
+            raise _unsupported_operation(
+                node, "its kernel can't run once per row of a variable-length input",
+            )
+        dynamic = {
+            self._resolve_name(arg.name): math.prod(_get_shape(arg))
+            for arg in node.all_input_nodes if arg.name in self.graph.dynamic_axes
+        }
+        tensor_lists = [name for name in input_lists if not name.startswith("C_")]
+        rows = {
+            f"T{position}": dynamic[name]
+            for position, name in enumerate(tensor_lists, 1) if name in dynamic
+        }
+        output = f"T{len(tensor_lists) + 1}"
+        return row_loop(programs[0], rows, output, math.prod(_get_shape(node))).compile()
 
     @staticmethod
     def _is_full_slice(node) -> bool:
@@ -1693,7 +1571,7 @@ def _select_unroll_factor(
 
 def transpile(
     model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram | None,
     output_path: str | Path,
     sig_figs: int | None = None,
     *,
@@ -1713,6 +1591,8 @@ def transpile(
         torch.Tensor | tuple[torch.Tensor, ...]
     ] | None = None,
     example_kwargs: dict[str, Any] | None = None,
+    kernels: tuple[Kernel, ...] = (),
+    dynamic: dict | None = None,
 ):
     """Export a PyTorch module as a Scratch ``.sprite3`` file.
 
@@ -1725,7 +1605,9 @@ def transpile(
     example_inputs:
         One tensor or a tuple defining a fixed interface, an ``ExportProgram``
         defining named methods and state, or a ``GenerationProgram`` defining
-        the cached decoder interface.
+        the cached decoder interface. ``None`` takes the interface from the
+        model's experimental markers: its ``@entrypoint`` methods, or the
+        ``@example`` inputs of ``forward``.
     output_path:
         Destination path. ``.sprite3`` is appended when absent and missing
         parent directories are created.
@@ -1766,6 +1648,17 @@ def transpile(
         (``input_k`` in order); other values, such as ``use_cache=False``, are
         constants of the trace. Not valid for programs, and tensor values
         cannot be combined with GPTQ ``calibration_inputs``.
+    kernels:
+        Experimental ``cattorch.experimental.Kernel`` lowerings for this
+        export. A kernel for an operation cattorch already lowers replaces the
+        built-in one; an approximate kernel applies only in fast mode.
+    dynamic:
+        Bounded variable-length inputs, as ``{input: (minimum, maximum)}`` for
+        an input's first dimension or ``{input: {dimension: (minimum,
+        maximum)}}``; an input is its position or tensor keyword name. The
+        sprite then accepts any length in the bounds. The export is checked
+        against the model at several lengths and fails if the model uses the
+        length in a way the sprite can't follow. Not valid for programs.
 
     Returns
     -------
@@ -1785,6 +1678,117 @@ def transpile(
         sig_figs=sig_figs, frontend=frontend, adapters=adapters,
         example_kwargs=example_kwargs,
     )
+    kernels = validate_kernels(kernels)
+    kept = active_kernel_targets(
+        kernels, fast=optimization == "fast", config=fast_config or FastConfig(),
+    )
+    with keep_operations(kept):
+        return _transpile_any(
+            model, example_inputs, output_path, sig_figs,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_inputs=calibration_inputs, codegen=codegen,
+            frontend=frontend, adapters=adapters,
+            calibration_calls=calibration_calls,
+            calibration_sequences=calibration_sequences,
+            example_kwargs=example_kwargs, kernels=kernels, dynamic=dynamic,
+        )
+
+
+def _transpile_dynamic(
+    model, example_inputs, output_path, sig_figs, dynamic, *, example_kwargs, kernels,
+    **options,
+):
+    """Trace one row of the dynamic input, export, and check other lengths."""
+    from cattorch.dynamic import (
+        at_length, check_lengths, loop_over_units, normalize_dynamic, unit_output_axes,
+    )
+    from cattorch.verify import verify
+
+    if isinstance(example_inputs, torch.Tensor):
+        example_inputs = (example_inputs,)
+    example_inputs = tuple(example_inputs)
+    kwarg_names = [
+        key for key, value in (example_kwargs or {}).items() if isinstance(value, torch.Tensor)
+    ]
+    flat = flat_example_inputs(example_inputs, example_kwargs)
+    spec = normalize_dynamic(dynamic, flat, kwarg_names)
+    ((index, (_, minimum, maximum, axis)),) = spec.items()
+    representative = list(flat)
+    representative[index] = at_length(flat[index], axis, 1)
+    positional = len(example_inputs)
+    traced_kwargs = dict(example_kwargs or {})
+    traced_kwargs.update(zip(kwarg_names, representative[positional:]))
+    arguments = dict(
+        generation=None, example_kwargs=traced_kwargs or None,
+        _registry=_registry_with(kernels) if kernels else None, **options,
+    )
+    try:
+        result = _transpile(
+            model, tuple(representative[:positional]), output_path, sig_figs,
+            _dynamic_inputs=spec, **arguments,
+        )
+    except UnsupportedModelError as error:
+        # Operations that can't follow the length directly: run the whole
+        # model once per item instead, if items are independent.
+        try:
+            axes = unit_output_axes(model, flat, kwarg_names, spec, example_kwargs)
+        except UnsupportedModelError:
+            raise error from None
+        result = _transpile(
+            model, tuple(representative[:positional]), output_path, sig_figs, **arguments,
+        )
+        result = loop_over_units(
+            result, spec, axes,
+            [tuple(value.shape) for value in representative],
+            [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
+        )
+    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs)
+    return result
+
+
+def _registry_with(kernels, adapters=()) -> OperatorRegistry:
+    registry = default_registry().clone()
+    for adapter in adapters:
+        registry.register_adapter(adapter)
+    for kernel in kernels:
+        registry.register_kernel(kernel)
+    return registry
+
+
+def _transpile_any(
+    model, example_inputs, output_path, sig_figs, *, name, optimization,
+    fast_config, storage, quantization, calibration_inputs, codegen, frontend,
+    adapters, calibration_calls, calibration_sequences, example_kwargs, kernels,
+    dynamic=None,
+):
+    if example_inputs is None:
+        # The model describes its own interface with markers.
+        from cattorch.markers import example_inputs as marked_example, has_entrypoints, marked_program
+        if has_entrypoints(model):
+            model, example_inputs = marked_program(model)
+        else:
+            example_inputs = marked_example(model)
+            if example_inputs is None:
+                raise ValueError(
+                    "example_inputs is None, but the model has no @example or "
+                    "@entrypoint marker to take them from"
+                )
+    if isinstance(example_inputs, GenerationProgram) and example_inputs.method == "forward":
+        from cattorch.markers import generation_method
+        method = generation_method(model)
+        if method is not None:
+            example_inputs = dataclasses.replace(example_inputs, method=method)
+    if dynamic is not None and isinstance(example_inputs, ExportProgram):
+        raise ValueError(
+            "dynamic= applies to forward; give an entry point's bounds with "
+            "Input(..., dynamic=...) or @entrypoint(dynamic=...)"
+        )
+    if dynamic is not None and isinstance(example_inputs, GenerationProgram):
+        raise ValueError(
+            "dynamic= can't be used with a GenerationProgram, whose prompts already "
+            "vary up to max_context"
+        )
     if example_kwargs is not None and isinstance(
         example_inputs, (ExportProgram, GenerationProgram),
     ):
@@ -1814,6 +1818,7 @@ def transpile(
             calibration_calls=calibration_calls,
             codegen=codegen,
             adapters=adapters,
+            kernels=kernels,
         )
     if isinstance(example_inputs, GenerationProgram):
         if frontend != "fx":
@@ -1834,61 +1839,28 @@ def transpile(
             )
         from cattorch.program_runtime import MethodModule
         generation_program = example_inputs
-        registry = default_registry().clone()
-        for adapter in adapters:
-            registry.register_adapter(adapter)
-        if generation_program.example_token is None:
-            return _transpile_automatic_generation(
-                model, generation_program, output_path, sig_figs,
-                name=name, optimization=optimization, fast_config=fast_config,
-                storage=storage, quantization=quantization,
-                calibration_sequences=calibration_sequences,
-                codegen=codegen, registry=registry,
-            )
-        if calibration_sequences is not None:
-            # A retry without layer sharing must see the same one-pass data.
-            calibration_sequences = list(calibration_sequences)
-
-        def export_legacy(config):
-            return _transpile(
-                MethodModule(model, generation_program.method),
-                (generation_program.example_token,),
-                output_path,
-                sig_figs,
-                name=name,
-                optimization=optimization,
-                fast_config=fast_config,
-                generation=_GenerationSpec(
-                    generation_program.max_context,
-                    generation_program.hidden_prefill,
-                    generation_program.top_k,
-                ),
-                storage=storage,
-                quantization=quantization,
-                calibration_inputs=calibration_sequences,
-                codegen=config,
-                frontend="fx",
-                _generation_public_interface=True,
-                _registry=registry,
-            )
-
-        try:
-            return export_legacy(codegen)
-        except _LayerSharingUnavailable:
-            log.warning(
-                "layer_sharing='auto' could not factor this model's layers; "
-                "exporting without layer sharing"
-            )
-            return export_legacy(replace(
-                codegen if codegen is not None else CodegenConfig(),
-                layer_sharing="off",
-            ))
+        registry = _registry_with(kernels, adapters)
+        return _transpile_automatic_generation(
+            model, generation_program, output_path, sig_figs,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_sequences=calibration_sequences,
+            codegen=codegen, registry=registry,
+        )
     if adapters:
         raise ValueError("adapters require an ExportProgram or GenerationProgram")
     if calibration_calls is not None:
         raise ValueError("calibration_calls require an ExportProgram")
     if calibration_sequences is not None:
         raise ValueError("calibration_sequences require a GenerationProgram")
+    if dynamic is not None:
+        return _transpile_dynamic(
+            model, example_inputs, output_path, sig_figs, dynamic,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_inputs=calibration_inputs, codegen=codegen,
+            frontend=frontend, example_kwargs=example_kwargs, kernels=kernels,
+        )
     return _transpile(
         model, example_inputs, output_path, sig_figs,
         name=name,
@@ -1898,6 +1870,7 @@ def transpile(
         codegen=codegen,
         frontend=frontend,
         example_kwargs=example_kwargs,
+        _registry=_registry_with(kernels) if kernels else None,
     )
 
 
@@ -1932,11 +1905,6 @@ def _transpile_automatic_generation(
     config = fast_config or FastConfig()
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
-    if quantization is not None and storage.precision in {"int8", "int6", "int4"}:
-        raise ValueError(
-            "quantization cannot be combined with legacy integer "
-            "StorageConfig.precision"
-        )
     if calibration_sequences is not None and (
         quantization is None or quantization.method != "gptq"
     ):
@@ -1957,10 +1925,10 @@ def _transpile_automatic_generation(
             _registry=registry,
         )
     step = GenerationStepModule(build_generation_step(
-        prepared, max_context, prepared=True,
+        prepared, max_context, prepared=True, registry=registry,
     ))
     spec = _GenerationSpec(
-        max_context, program.hidden_prefill, program.top_k, automatic=True,
+        max_context, program.hidden_prefill, program.top_k,
     )
     options = dict(
         name=name, optimization=optimization, fast_config=fast_config,
@@ -2013,6 +1981,14 @@ def _transpile(
 ) -> TranspileResult:
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
+    for index, value in enumerate(example_inputs):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"example input {index} is a {type(value).__name__}, not a tensor; "
+                "each positional input becomes one Scratch list, so pass nested "
+                "values (such as an LSTM's (hidden, cell) state) through a "
+                "wrapper that takes them as separate tensors"
+            )
     output_path = Path(output_path)
     if output_path.suffix.lower() != ".sprite3":
         output_path = Path(f"{output_path}.sprite3")
@@ -2023,20 +1999,6 @@ def _transpile(
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
     registry = _registry or default_registry().clone()
-    integer_storage = storage.precision in {"int8", "int6", "int4"}
-    legacy_integer_storage = integer_storage and quantization is None
-    if quantization is not None and integer_storage and not _prepared_model:
-        raise ValueError(
-            "quantization cannot be combined with legacy integer "
-            "StorageConfig.precision"
-        )
-    if legacy_integer_storage:
-        warnings.warn(
-            "StorageConfig(precision='int4'/'int6'/'int8') is deprecated; pass "
-            "quantization=QuantizationConfig(bits=4/6/8) instead",
-            DeprecationWarning,
-            stacklevel=3,
-        )
     if calibration_inputs is not None and (
         quantization is None or quantization.method != "gptq"
     ):
@@ -2067,14 +2029,7 @@ def _transpile(
     elif calibration_inputs is not None:
         raise ValueError("prepared model calibration has already been consumed")
     if quantization is not None:
-        storage = replace(
-            storage,
-            precision=quantization.precision,
-            group_size=quantization.group_size,
-            min_quantized_values=quantization.min_quantized_values,
-            scale_precision=quantization.scale_precision,
-            grouping="row",
-        )
+        storage = quantized_storage(storage, quantization)
 
     # 1. Analyse the PyTorch graph
     graph = _prepare_graph(
@@ -2088,7 +2043,7 @@ def _transpile(
         example_kwargs=example_kwargs,
     )
     if generation is not None and codegen.layer_sharing == "auto":
-        if generation.automatic and not _layers_can_share_caches(graph):
+        if not _layers_can_share_caches(graph):
             log.info(
                 "Banked generation caches skipped: attention blocks are not in "
                 "consecutive `blocks.N` layers"
@@ -2164,13 +2119,7 @@ def _transpile(
     for node in graph.nodes:
         if node.name not in graph.dynamic_axes:
             continue
-        bound = graph.dynamic_bounds[node.name]
-        axis = graph.dynamic_axes[node.name]
-        shape = tuple(_get_shape(node))
-        maximum = math.prod(
-            bound[2] if index == axis else extent
-            for index, extent in enumerate(shape)
-        )
+        maximum = graph.runtime_capacity(node.name, _get_shape(node))
         if node.name in graph.input_names:
             # Program input/state lists are renamed before their one global
             # interface-sharding pass.
@@ -2186,16 +2135,17 @@ def _transpile(
         # Output copies (including returned inputs and repeated leaves) have
         # no scope assignment of their own. Size every public output from its
         # contract so those copies are sharded too, using runtime capacity.
-        axis = graph.dynamic_axes.get(node_name)
-        capacity = math.prod(
-            graph.dynamic_bounds[node_name][2] if index == axis else extent
-            for index, extent in enumerate(shape)
+        capacity = (
+            graph.runtime_capacity(node_name, shape) if node_name in graph.dynamic_axes
+            else math.prod(shape)
         )
         logical_sizes[public_name] = max(
             capacity, logical_sizes.get(public_name, 0), logical_sizes.pop(old_name, 0),
         )
     if generation is not None and generation.top_k is not None:
-        output_size = logical_sizes.get("output", 0)
+        # The output list may be a reused, larger scratch list; the logits
+        # row is the output's own shape.
+        output_size = math.prod(graph.outputs[0][1])
         if generation.top_k > output_size:
             raise ValueError(
                 f"top_k ({generation.top_k}) exceeds output size ({output_size})"
@@ -2209,12 +2159,11 @@ def _transpile(
     _wrap_optimized_lifecycle(sprite)
     if generation is not None:
         if generation.hidden_prefill:
-            hidden_qkv = graph.generation.hidden_prefill_qkv
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
             hidden_attention = graph.generation.hidden_prefill_attention
             if (
-                graph.generation.automatic and not graph.generation.banked_caches
+                not graph.generation.banked_caches
                 and hidden_attention in root_names
                 and root_names.index(hidden_attention) + 1 < len(root_entries)
             ):
@@ -2223,14 +2172,22 @@ def _transpile(
                 for entry in sprite.get("variables", {}).values():
                     if entry[0] == "cattorch project output":
                         entry[1] = 1
-                _guard_generation_suffix(
-                    sprite, root_entries[root_names.index(hidden_attention) + 1][1],
-                )
-            elif hidden_qkv is not None and hidden_qkv in root_names:
-                position = root_names.index(hidden_qkv)
-                if position + 1 >= len(root_entries):
-                    raise ValueError("final cached QKV projection has no suffix")
-                _guard_generation_suffix(sprite, root_entries[position + 1][1])
+                attention_position = root_names.index(hidden_attention)
+                _guard_generation_suffix(sprite, root_entries[attention_position + 1][1])
+                # The final layer's query only feeds that attention output.
+                query_only = _query_only_nodes(graph, hidden_attention)
+                position = 0
+                while position < attention_position:
+                    if root_names[position] not in query_only:
+                        position += 1
+                        continue
+                    end = position
+                    while end < attention_position and root_names[end] in query_only:
+                        end += 1
+                    _guard_generation_range(
+                        sprite, root_entries[position][1], root_entries[end][1],
+                    )
+                    position = end
             else:
                 if not compiler.emitted_roots:
                     raise ValueError(
@@ -2350,6 +2307,17 @@ def _transpile(
             _add_procedure_completion_broadcast(
                 sprite, "cattorch decode", "cattorch decode complete",
             )
+    if generation is None and not _defer_interface_sharding:
+        # Like generation and programs: a status and a notification when each
+        # public block finishes. Program entry points get theirs from the
+        # program.
+        variables = sprite.setdefault("variables", {})
+        if not any(entry[0] == "cattorch status" for entry in variables.values()):
+            variables["cattorch_status"] = ["cattorch status", ""]
+        for procedure in ("cattorch init", "cattorch forward"):
+            _add_procedure_completion_broadcast(
+                sprite, procedure, f"{procedure} complete", status="ok",
+            )
     sprite.setdefault("variables", {}).update({
         "cattorch_storage_compression": [
             "cattorch storage compression",
@@ -2367,16 +2335,11 @@ def _transpile(
         ],
         "cattorch_quantization_method": [
             "cattorch quantization method",
-            quantization.method if quantization is not None else (
-                "symmetric" if legacy_integer_storage else "none"
-            ),
+            quantization.method if quantization is not None else "none",
         ],
         "cattorch_quantization_bits": [
             "cattorch quantization bits",
-            quantization.bits if quantization is not None else (
-                int(storage.precision.removeprefix("int"))
-                if legacy_integer_storage else 0
-            ),
+            quantization.bits if quantization is not None else 0,
         ],
     })
     _remove_unused(sprite)
@@ -2387,6 +2350,8 @@ def _transpile(
 
     finalized = finalize_sprite(
         sprite, output_path, sprite_name=sprite_name, codegen=codegen,
+        # A program finishes its entry points' interface itself.
+        public_interface=not _defer_interface_sharding,
     )
 
     input_specs = tuple(
@@ -2399,7 +2364,10 @@ def _transpile(
             tuple(value.shape),
             value.dtype,
             (
-                (0, _dynamic_inputs[index])
+                (
+                    _dynamic_inputs[index][3] if len(_dynamic_inputs[index]) > 3 else 0,
+                    tuple(_dynamic_inputs[index][:3]),
+                )
                 if _dynamic_inputs is not None and index in _dynamic_inputs
                 else None
             ),
@@ -2423,7 +2391,8 @@ def _transpile(
         block_count=len(sprite.get("blocks", {})),
         list_count=len(sprite.get("lists", {})),
         sharded_lists=tuple(
-            layout.name for layout in layouts.values() if len(layout.shards) > 1
+            (layout.name if _defer_interface_sharding else final_data_name(layout.name))
+            for layout in layouts.values() if len(layout.shards) > 1
         ),
         inputs=input_specs,
         output=boundary_spec(
@@ -2435,7 +2404,7 @@ def _transpile(
             tuple(graph.output_shape),
             graph.output_dtype,
             (
-                (graph.dynamic_axes[graph.output_name], graph.dynamic_bounds[graph.output_name])
+                (graph.dynamic_axes[graph.output_name], graph._public_bounds(graph.output_name))
                 if graph.output_name in graph.dynamic_axes else None
             ),
         ),
@@ -2445,7 +2414,7 @@ def _transpile(
                 tuple(shape),
                 dtype,
                 (
-                    (graph.dynamic_axes[node_name], graph.dynamic_bounds[node_name])
+                    (graph.dynamic_axes[node_name], graph._public_bounds(node_name))
                     if node_name in graph.dynamic_axes else None
                 ),
             )
@@ -2456,6 +2425,8 @@ def _transpile(
             f"GPTQ fallback for {item.name}: {item.fallback_reason}"
             for item in (quantization_report.tensors if quantization_report else ())
             if item.method == "symmetric" and item.fallback_reason is not None
-        ),
+        ) + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
         quantization=quantization_report,
+        fallback_operations=graph.fallbacks(),
+        approximate_operations=tuple(sorted(compiler.approximate.items())),
     )

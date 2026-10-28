@@ -38,6 +38,38 @@ from cattorch.util.instruction.optimized_common import (
     _unrolled_offset_dot_statements,
 )
 
+def pool_windows(length, size, stride, padding, dilation, ceil_mode):
+    """PyTorch's pooling windows along one dimension.
+
+    Each window is ``(positions, extent)``: the input positions it reads,
+    some of which may be padding, and how many padded positions average
+    pooling counts.
+    """
+    reach = dilation * (size - 1) + 1
+    span = length + 2 * padding - reach
+    outputs = (-(-span // stride) if ceil_mode else span // stride) + 1
+    # PyTorch drops a last window that would start in the padding.
+    if ceil_mode and (outputs - 1) * stride >= length + padding:
+        outputs -= 1
+    windows = []
+    for index in range(outputs):
+        start = index * stride - padding
+        # Average pooling counts padding, but not beyond it.
+        extent = min(start + size, length + padding) - start
+        windows.append((range(start, start + reach, dilation), extent))
+    return windows
+
+
+def adaptive_windows(length, outputs):
+    """Adaptive pooling's windows along one dimension, as in ``pool_windows``."""
+    windows = []
+    for index in range(outputs):
+        start = math.floor(index * length / outputs)
+        end = math.ceil((index + 1) * length / outputs)
+        windows.append((range(start, end), end - start))
+    return windows
+
+
 class OptimizedConvolutionInstruction(Instruction):
     """Convolution using compact, export-time spatial/kernel index maps.
 
@@ -51,6 +83,18 @@ class OptimizedConvolutionInstruction(Instruction):
         weight_shape = self.args[1].shape
         stride = self.args[3].value
         padding = self.args[4].value
+        dimensions = len(weight_shape) - 2
+        dilation = (
+            self.args[5].value if len(self.args) > 5 and self.args[5].value is not None
+            else [1] * dimensions
+        )
+        self.groups = (
+            self.args[6].value if len(self.args) > 6 and self.args[6].value is not None
+            else 1
+        )
+        if len(input_shape) == dimensions + 1:
+            # Unbatched: the same layout as a batch of one.
+            input_shape = (1, *input_shape)
         if len(input_shape) == 3:
             self.batches, self.input_channels, self.input_width = input_shape
             self.input_height = 1
@@ -59,6 +103,7 @@ class OptimizedConvolutionInstruction(Instruction):
             self.kernel_width = weight_shape[2]
             self.stride_height, self.stride_width = 1, stride[0]
             self.padding_height, self.padding_width = 0, padding[0]
+            self.dilation_height, self.dilation_width = 1, dilation[0]
         else:
             (
                 self.batches, self.input_channels,
@@ -68,6 +113,12 @@ class OptimizedConvolutionInstruction(Instruction):
             self.kernel_height, self.kernel_width = weight_shape[2:]
             self.stride_height, self.stride_width = stride
             self.padding_height, self.padding_width = padding
+            self.dilation_height, self.dilation_width = (
+                (dilation[0], dilation[0]) if len(dilation) == 1 else dilation
+            )
+        # Each output channel reads only its group's input channels.
+        self.group_channels = weight_shape[1]
+        self.outputs_per_group = self.output_channels // self.groups
 
         if self.args[0].dynamic:
             self.batches = div(
@@ -76,10 +127,12 @@ class OptimizedConvolutionInstruction(Instruction):
             )
 
         self.output_height = (
-            self.input_height + 2 * self.padding_height - self.kernel_height
+            self.input_height + 2 * self.padding_height
+            - self.dilation_height * (self.kernel_height - 1) - 1
         ) // self.stride_height + 1
         self.output_width = (
-            self.input_width + 2 * self.padding_width - self.kernel_width
+            self.input_width + 2 * self.padding_width
+            - self.dilation_width * (self.kernel_width - 1) - 1
         ) // self.stride_width + 1
         self.input_plane = self.input_height * self.input_width
         self.kernel_plane = self.kernel_height * self.kernel_width
@@ -98,12 +151,12 @@ class OptimizedConvolutionInstruction(Instruction):
                 for kernel_row in range(self.kernel_height):
                     input_row = (
                         output_row * self.stride_height
-                        - self.padding_height + kernel_row
+                        - self.padding_height + kernel_row * self.dilation_height
                     )
                     for kernel_column in range(self.kernel_width):
                         input_column = (
                             output_column * self.stride_width
-                            - self.padding_width + kernel_column
+                            - self.padding_width + kernel_column * self.dilation_width
                         )
                         if (
                             0 <= input_row < self.input_height
@@ -126,11 +179,11 @@ class OptimizedConvolutionInstruction(Instruction):
         starts = []
         counts = []
         channels = []
-        total = self.output_channels * self.input_channels
+        total = self.output_channels * self.group_channels
         for output in range(self.output_channels):
             starts.append(len(channels) + 1)
             before = len(channels)
-            for channel in range(self.input_channels):
+            for channel in range(self.group_channels):
                 if bool(torch.any(weight[output, channel] != 0)):
                     channels.append(channel)
             counts.append(len(channels) - before)
@@ -178,10 +231,12 @@ class OptimizedConvolutionInstruction(Instruction):
             sequential_taps += (repeat(chunks, sequential_step * 4),)
         sequential_taps += sequential_step * remainder
 
+        # The first input of the output channel's group.
+        group_input_start = var("batch_input_start") if self.groups == 1 else var("group_start")
         if self.sparse_channel_starts is None:
             full_kernel = (
                 set_var("weight_index", var("output_weight_start")),
-                repeat(self.input_channels, (
+                repeat(self.group_channels, (
                     set_var("map_index", var("map_start")),
                     *sequential_taps,
                     change_var("input_base", self.input_plane),
@@ -189,7 +244,7 @@ class OptimizedConvolutionInstruction(Instruction):
             )
             clipped_kernel = (
                 set_var("weight_base", var("output_weight_start")),
-                repeat(self.input_channels, (
+                repeat(self.group_channels, (
                     set_var("map_index", var("map_start")),
                     repeat(var("valid_count"), (
                         change_var("sum", mapped_product),
@@ -199,12 +254,12 @@ class OptimizedConvolutionInstruction(Instruction):
                     change_var("weight_base", self.kernel_plane),
                 )),
             )
-            output_setup = ()
+            output_setup = []
             sparse_lists = ()
             sparse_values = {}
         else:
             channel_input_base = add(
-                var("batch_input_start"),
+                group_input_start,
                 mul(var("active_channel"), self.input_plane),
             )
             channel_weight_base = add(
@@ -243,7 +298,7 @@ class OptimizedConvolutionInstruction(Instruction):
                     *active_finish,
                 )),
             )
-            output_setup = (
+            output_setup = [
                 set_var(
                     "active_start",
                     item("_conv_active_starts", var("bias_index")),
@@ -252,7 +307,7 @@ class OptimizedConvolutionInstruction(Instruction):
                     "active_count",
                     item("_conv_active_counts", var("bias_index")),
                 ),
-            )
+            ]
             sparse_lists = (
                 "_conv_active_starts", "_conv_active_counts", "_conv_active_channels",
             )
@@ -261,6 +316,12 @@ class OptimizedConvolutionInstruction(Instruction):
                 "_conv_active_counts": self.sparse_channel_counts,
                 "_conv_active_channels": self.sparse_channels,
             }
+        if self.groups != 1:
+            group = mathop("floor", div(sub(var("bias_index"), 1), self.outputs_per_group))
+            output_setup.insert(0, set_var("group_start", add(
+                var("batch_input_start"),
+                mul(group, self.group_channels * self.input_plane),
+            )))
         return Program(
             "convolution_optimized",
             variables=(
@@ -269,6 +330,7 @@ class OptimizedConvolutionInstruction(Instruction):
                 "sum", "map_start", "map_index", "valid_count",
                 "input_base", "weight_base", "weight_index",
                 "active_start", "active_count", "active_map_index", "active_channel",
+                *(("group_start",) if self.groups != 1 else ()),
             ),
             lists=(
                 "T1", "T2", "T3", "T4", "_conv_map_starts",
@@ -302,7 +364,7 @@ class OptimizedConvolutionInstruction(Instruction):
                                 "valid_count",
                                 item("_conv_map_counts", var("spatial")),
                             ),
-                            set_var("input_base", var("batch_input_start")),
+                            set_var("input_base", group_input_start),
                             if_else(
                                 eq(var("valid_count"), self.kernel_plane),
                                 full_kernel,
@@ -314,7 +376,7 @@ class OptimizedConvolutionInstruction(Instruction):
                         change_var("bias_index", 1),
                         change_var(
                             "output_weight_start",
-                            self.input_channels * self.kernel_plane,
+                            self.group_channels * self.kernel_plane,
                         ),
                     )),
                     change_var(
@@ -331,6 +393,10 @@ class OptimizedPoolingInstruction(Instruction):
 
     def prepare(self):
         shape = self.args[0].shape
+        op = str(self.torch_name)
+        if len(shape) == (2 if "pool1d" in op else 3):
+            # Unbatched: the same layout as a batch of one.
+            shape = (1, *shape)
         self.batches = (
             div(length("T1"), math.prod(shape[1:]))
             if self.args[0].dynamic else shape[0]
@@ -341,81 +407,98 @@ class OptimizedPoolingInstruction(Instruction):
         else:
             self.input_height, self.input_width = shape[2:]
         self.input_plane = self.input_height * self.input_width
-        op = str(self.torch_name)
         self.is_max = "max_pool" in op
         self.is_adaptive = "adaptive_avg_pool" in op
-
-        if self.is_adaptive:
-            self.output_height, self.output_width = self.args[1].value
-            fields = []
-            for output_row in range(self.output_height):
-                row_start = math.floor(output_row * self.input_height / self.output_height)
-                row_end = math.ceil((output_row + 1) * self.input_height / self.output_height)
-                for output_column in range(self.output_width):
-                    column_start = math.floor(
-                        output_column * self.input_width / self.output_width,
-                    )
-                    column_end = math.ceil(
-                        (output_column + 1) * self.input_width / self.output_width,
-                    )
-                    fields.append((row_start, row_end, column_start, column_end))
-            self.include_padding = False
-            self.kernel_area = None
-        else:
-            kernel = self.args[1].value
-            # An omitted or empty stride means the kernel size, as in PyTorch.
-            stride = (self.args[2].value if len(self.args) > 2 else None) or kernel
-            padding = self.args[3].value if len(self.args) > 3 else [0]
-            if len(shape) == 3:
-                kernel_height, kernel_width = 1, kernel[0]
-                stride_height, stride_width = 1, stride[0]
-                padding_height, padding_width = 0, padding[0]
-            else:
-                kernel_height, kernel_width = (
-                    (kernel[0], kernel[0]) if len(kernel) == 1 else kernel
-                )
-                stride_height, stride_width = (
-                    (stride[0], stride[0]) if len(stride) == 1 else stride
-                )
-                padding_height, padding_width = (
-                    (padding[0], padding[0]) if len(padding) == 1 else padding
-                )
-            self.output_height = (
-                self.input_height + 2 * padding_height - kernel_height
-            ) // stride_height + 1
-            self.output_width = (
-                self.input_width + 2 * padding_width - kernel_width
-            ) // stride_width + 1
-            fields = []
-            for output_row in range(self.output_height):
-                row_start = output_row * stride_height - padding_height
-                for output_column in range(self.output_width):
-                    column_start = output_column * stride_width - padding_width
-                    fields.append((
-                        row_start, row_start + kernel_height,
-                        column_start, column_start + kernel_width,
-                    ))
-            self.include_padding = not self.is_max
-            self.kernel_area = kernel_height * kernel_width
+        rows, columns = self._windows(len(shape) == 3)
+        self.output_height, self.output_width = len(rows), len(columns)
 
         self.map_starts = []
         self.map_counts = []
         self.input_offsets = []
-        for row_start, row_end, column_start, column_end in fields:
+        divisors = []
+        for (row_positions, row_extent), (column_positions, column_extent) in (
+            (row, column) for row in rows for column in columns
+        ):
             self.map_starts.append(len(self.input_offsets) + 1)
             count = 0
-            for row in range(row_start, row_end):
-                for column in range(column_start, column_end):
+            for row in row_positions:
+                for column in column_positions:
                     if 0 <= row < self.input_height and 0 <= column < self.input_width:
                         self.input_offsets.append(row * self.input_width + column)
                         count += 1
             self.map_counts.append(count)
+            if self.divisor_override is not None:
+                divisors.append(self.divisor_override)
+            elif self.include_padding:
+                divisors.append(row_extent * column_extent)
+            else:
+                divisors.append(count)
+        # One divisor for every window is a constant; otherwise a list.
+        self.divisors = divisors
+        self.uniform_divisor = divisors[0] if divisors and len(set(divisors)) == 1 else None
         self.output_spatial = self.output_height * self.output_width
+        # Per-window divisors need the window's index, which only the
+        # general traversal keeps.
         self.uniform_count = (
             self.map_counts[0]
             if self.map_counts and len(set(self.map_counts)) == 1
+            and (self.is_max or self.uniform_divisor is not None)
             else None
         )
+
+    def _windows(self, one_dimensional):
+        """Per output row and column: input positions and padded extent."""
+        self.divisor_override = None
+        if self.is_adaptive:
+            self.include_padding = False
+            sizes = self.args[1].value
+            sizes = (1, sizes[0]) if one_dimensional else sizes
+
+            return (
+                adaptive_windows(self.input_height, sizes[0]),
+                adaptive_windows(self.input_width, sizes[1]),
+            )
+
+        def option(position, default):
+            value = self.args[position].value if len(self.args) > position else None
+            return default if value is None or value == [] else value
+
+        def spatial(value, trivial):
+            """``(height, width)``; 1D pooling has a trivial height."""
+            value = list(value) if isinstance(value, (list, tuple)) else [value]
+            if one_dimensional:
+                return trivial, value[0]
+            return (value[0], value[0]) if len(value) == 1 else tuple(value)
+
+        kernel = spatial(self.args[1].value, 1)
+        # An omitted or empty stride means the kernel size, as in PyTorch.
+        stride = spatial(option(2, self.args[1].value), 1)
+        padding = spatial(option(3, [0]), 0)
+        if self.is_max:
+            dilation = spatial(option(4, [1]), 1)
+            ceil_mode = bool(option(5, False))
+            self.include_padding = False
+        else:
+            dilation = (1, 1)
+            ceil_mode = bool(option(4, False))
+            self.include_padding = bool(option(5, True))
+            self.divisor_override = option(6, None)
+
+        return (
+            pool_windows(
+                self.input_height, kernel[0], stride[0], padding[0], dilation[0], ceil_mode,
+            ),
+            pool_windows(
+                self.input_width, kernel[1], stride[1], padding[1], dilation[1], ceil_mode,
+            ),
+        )
+
+    def _divisor(self):
+        if self.uniform_divisor is not None:
+            return self.uniform_divisor
+        if self.divisors == self.map_counts:
+            return var("remaining")
+        return item("_pool_divisors", var("spatial"))
 
     def finalize(self):
         current = item(
@@ -452,10 +535,7 @@ class OptimizedPoolingInstruction(Instruction):
                 reduction_body = _static_unrolled_repeat(
                     self.uniform_count, reduction_step,
                 )
-                denominator = (
-                    self.kernel_area if self.include_padding else self.uniform_count
-                )
-                finish = append("T2", div(var("result"), denominator))
+                finish = append("T2", div(var("result"), self._divisor()))
             channel_body = (
                 set_var("map_index", 1),
                 repeat(self.output_spatial, (
@@ -476,8 +556,7 @@ class OptimizedPoolingInstruction(Instruction):
                 finish = append("T2", var("result"))
             else:
                 initialize = (set_var("result", 0),)
-                denominator = self.kernel_area if self.include_padding else var("remaining")
-                finish = append("T2", div(var("result"), denominator))
+                finish = append("T2", div(var("result"), self._divisor()))
             channel_body = (
                 set_var("spatial", 1),
                 repeat(self.output_spatial, (
@@ -504,6 +583,9 @@ class OptimizedPoolingInstruction(Instruction):
                 "_pool_input_offsets": self.input_offsets,
             }
 
+        if not self.is_max and self.uniform_divisor is None and self.divisors != self.map_counts:
+            map_lists = (*map_lists, "_pool_divisors")
+            map_values["_pool_divisors"] = self.divisors
         return Program(
             "pooling_optimized",
             variables=(

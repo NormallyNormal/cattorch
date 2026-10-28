@@ -12,15 +12,17 @@ from torch import nn
 from cattorch.adapters import ModuleAdapter
 from cattorch.export_options import validate_export_options
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
-from cattorch.frontend import capture_model
+from cattorch.fast import FastConfig
+from cattorch.frontend import capture_model, keep_operations
+from cattorch.kernel_api import active_kernel_targets, validate_kernels
 from cattorch.graph import _prepare_graph
-from cattorch.moe import (
-    SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
+from cattorch.experts import (
+    ExpertFamily, SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
 )
 from cattorch.operator_registry import default_registry
 from cattorch.program import ExportProgram, Output
 from cattorch.program_runtime import MethodModule, entry_examples, validate_entry_outputs
-from cattorch.results import TensorSpec
+from cattorch.results import TensorSpec, fallback_warning
 from cattorch.storage import StorageConfig
 
 
@@ -34,6 +36,8 @@ class EntryPointAnalysis:
     module_paths: tuple[str, ...]
     unsupported_operations: tuple[str, ...]
     outputs: tuple[TensorSpec, ...]
+    # Operations that ran as PyTorch decompositions, with their call counts.
+    fallback_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,24 +97,50 @@ def analyze(
     adapters: tuple[ModuleAdapter, ...] = (),
     storage: StorageConfig | None = None,
     optimization: str = "exact",
+    kernels=(),
 ) -> AnalysisReport:
-    """Capture every entrypoint and report compatibility and approximate size."""
+    """Capture every entrypoint and report compatibility and approximate size.
+
+    ``kernels`` are the experimental ``Kernel`` lowerings the export would use.
+    """
     if not isinstance(program, ExportProgram):
         raise TypeError("program must be an ExportProgram")
     validate_export_options(optimization=optimization, storage=storage, adapters=adapters)
+    kernels = validate_kernels(kernels)
+    with keep_operations(active_kernel_targets(
+        kernels, fast=optimization == "fast", config=FastConfig(),
+    )):
+        return _analyze(model, program, adapters, storage, optimization, kernels)
+
+
+def _analyze(model, program, adapters, storage, optimization, kernels) -> AnalysisReport:
     registry = default_registry().clone()
     for adapter in adapters:
         registry.register_adapter(adapter)
+    for kernel in kernels:
+        registry.register_kernel(kernel)
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )
     generic_expert_errors = []
     from cattorch.util.argument import Argument
     from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
+    probed = set()
     for path, module in owned.named_modules():
-        if not isinstance(module, _BankedSparseMoE):
+        # A SparseMoE's family is probed with its routing; a family used
+        # through ``routed_experts`` takes its routes from the graph, and the
+        # expert program doesn't depend on ``top_k``.
+        if isinstance(module, _BankedSparseMoE):
+            family, top_k, normalize = (
+                module.expert_family, module.top_k, module.normalize_selected,
+            )
+        elif isinstance(module, ExpertFamily):
+            family, top_k, normalize = module, 1, False
+        else:
             continue
-        family = module.expert_family
+        if id(family) in probed:
+            continue
+        probed.add(id(family))
         probe_args = [
             Argument("value", family.example_input.shape),
             Argument("selection", torch.Size((1, family.expert_count))),
@@ -123,8 +153,7 @@ def analyze(
         try:
             instruction = ExpertFamilyMoEInstruction(
                 "cattorch.expert_family_moe.default", "output", *probe_args,
-                family=family, top_k=module.top_k,
-                normalize_selected=module.normalize_selected,
+                family=family, top_k=top_k, normalize_selected=normalize,
             )
             instruction._expert_program()
         except ValueError as error:
@@ -148,11 +177,13 @@ def analyze(
         }
         unsupported = list(generic_expert_errors)
         outputs = ()
+        fallbacks: tuple[tuple[str, int], ...] = ()
         try:
             graph = _prepare_graph(
                 wrapper, args, optimization=optimization,
                 _registry=registry, dynamic_inputs=dynamic_inputs, _captured=captured,
             )
+            fallbacks = graph.fallbacks()
             specs = graph.output_specs()
             validate_entry_outputs(program, entrypoint, specs)
             outputs = tuple(
@@ -169,6 +200,7 @@ def analyze(
             module_paths=tuple(sorted(paths)),
             unsupported_operations=tuple(dict.fromkeys(unsupported)),
             outputs=outputs,
+            fallback_operations=fallbacks,
         ))
 
     moe_reports = []
@@ -213,6 +245,11 @@ def analyze(
     })
     if unsupported_count:
         warnings.append(f"{unsupported_count} captured operation contracts are unsupported")
+    fallbacks = Counter()
+    for entry in entries:
+        fallbacks.update(dict(entry.fallback_operations))
+    if (message := fallback_warning(tuple(sorted(fallbacks.items())))) is not None:
+        warnings.append(message)
     return AnalysisReport(
         entrypoints=tuple(entries),
         moe=tuple(moe_reports),

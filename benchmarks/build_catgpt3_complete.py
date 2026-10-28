@@ -42,7 +42,8 @@ from cattorch import (  # noqa: E402
     transpile,
     transpile_tokenizer,
 )
-from cattorch.experimental import ModuleAdapter, stacked_swiglu_moe_adapter  # noqa: E402
+from cattorch import ModuleAdapter
+from cattorch.experimental import stacked_swiglu_moe_adapter
 from cattorch.util.scratch.finalize_scratch import finalize_sprite  # noqa: E402
 
 
@@ -126,8 +127,6 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
     processor = transpile(
         source,
         GenerationProgram(
-            method="next_token_logits",
-            example_token=torch.tensor([[1]]),
             max_context=config.block_size,
         ),
         processor_path,
@@ -182,7 +181,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
         },
         "export": {
             "optimization": "exact",
-            "generation_method": "next_token_logits",
+            "generation_method": "forward",
             "generation_wrapper": "cached MQA with fused semantic RoPE",
             "quantization": "symmetric q4",
             "group_size": 256,

@@ -181,7 +181,7 @@ class ExportAttention(nn.Module):
 
 
 class CachedMQAExportAttention(nn.Module):
-    """Single-token MQA whose RoPE position is supplied by cache length in Scratch."""
+    """MQA over every row; generation derives the one-token cached step."""
 
     def __init__(self, source: nn.Module, context: int):
         super().__init__()
@@ -198,15 +198,12 @@ class CachedMQAExportAttention(nn.Module):
                 source.v_proj.weight,
             )))
         self.o_proj = copy.deepcopy(source.o_proj)
-        self.rope_cos = nn.Embedding.from_pretrained(
-            source.rope.cos[0, 0, :context].clone(), freeze=True,
+        self.register_buffer("cos", source.rope.cos[:, :, :context].detach().clone())
+        self.register_buffer("sin", source.rope.sin[:, :, :context].detach().clone())
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(context, context, dtype=torch.bool), diagonal=1),
         )
-        self.rope_sin = nn.Embedding.from_pretrained(
-            source.rope.sin[0, 0, :context].clone(), freeze=True,
-        )
-        # The generation lowerer replaces this zero with the current cache length.
-        self.register_buffer("position", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("causal_mask", torch.zeros(1, 1, dtype=torch.bool))
 
     def forward(self, value):
         batch, length, width = value.shape
@@ -219,12 +216,15 @@ class CachedMQAExportAttention(nn.Module):
         projected_value = projected_value.view(
             batch, length, self.kv_heads, self.head_dim,
         ).transpose(1, 2)
-        cos = self.rope_cos(self.position).view(1, 1, 1, self.head_dim)
-        sin = self.rope_sin(self.position).view(1, 1, 1, self.head_dim)
+        cos, sin = self.cos[:, :, :length], self.sin[:, :, :length]
         query = rotary_embedding(query, cos, sin)
         key = rotary_embedding(key, cos, sin)
+        if self.kv_heads not in (1, self.heads):
+            groups = self.heads // self.kv_heads
+            key = key.repeat_interleave(groups, dim=1)
+            projected_value = projected_value.repeat_interleave(groups, dim=1)
         scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores = scores.masked_fill(self.causal_mask, float("-inf"))
+        scores = scores.masked_fill(self.causal_mask[:length, :length], float("-inf"))
         attended = F.softmax(scores, dim=-1) @ projected_value
         return self.o_proj(
             attended.transpose(1, 2).contiguous().view(batch, length, width)
@@ -514,8 +514,6 @@ def _build_cached_project(
         transpile(
             model,
             GenerationProgram(
-                method="forward",
-                example_token=prompt[:, :1],
                 max_context=prompt.shape[1] + decode_iterations,
                 hidden_prefill=hidden_prefill,
             ),
