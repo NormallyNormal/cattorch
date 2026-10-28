@@ -92,10 +92,10 @@ def test_a_model_using_the_length_itself_is_rejected(tmp_path):
         transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
 
 
-def test_a_model_mixing_its_batch_is_rejected(tmp_path):
-    with pytest.raises(UnsupportedModelError):
+def test_a_model_with_two_runtime_dimensions_is_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match="two runtime dimensions"):
         transpile(
-            Lambda(lambda x: x - x.mean(0)).eval(), torch.randn(3, 4), tmp_path / "m",
+            Lambda(lambda x: x @ x.T).eval(), torch.randn(3, 4), tmp_path / "m",
             dynamic={0: (1, 8)},
         )
 

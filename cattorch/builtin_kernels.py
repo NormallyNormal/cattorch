@@ -802,7 +802,285 @@ def _emit_recurrent_final(ctx: KernelContext):
     )
 
 
+def _runtime_layout(tensor, dim: int):
+    """``(outer, extent, inner)`` item counts before, along and after ``dim``.
+
+    The count that holds a runtime axis is an expression the list's length
+    gives; the others are integers.
+    """
+    shape = tensor.shape
+    counts = [math.prod(shape[:dim]), shape[dim], math.prod(shape[dim + 1:])]
+    axis = tensor.dynamic_axis
+    if axis is not None:
+        part = 0 if axis < dim else 1 if axis == dim else 2
+        others = math.prod(count for index, count in enumerate(counts) if index != part)
+        counts[part] = length(tensor.list) if others == 1 else div(length(tensor.list), others)
+    return tuple(counts)
+
+
+def _emit_runtime_length(ctx: KernelContext):
+    """The number of items along a runtime axis."""
+    value = ctx.inputs["value"]
+    _, extent, _ = _runtime_layout(value, int(ctx.scalars["dim"]) % len(value.shape))
+    out = ctx.output.list
+    return (clear(out), append(out, extent))
+
+
+def _emit_runtime_reduce(ctx: KernelContext):
+    """Reduce along a runtime axis, one output per position around it."""
+    value = ctx.inputs["value"]
+    dim = int(ctx.scalars["dim"]) % len(value.shape)
+    kind = ctx.scalars["kind"]
+    outer, extent, inner = _runtime_layout(value, dim)
+    count, base, column, position, total = (
+        ctx.temp_var(f"reduce {name}") for name in ("count", "base", "column", "position", "total")
+    )
+    current = item(value.list, var(position))
+    if kind in {"amax", "amin"}:
+        start = (set_var(total, current), change_var(position, inner))
+        steps = sub(var(count), 1)
+        better = gt(current, var(total)) if kind == "amax" else lt(current, var(total))
+        combine = if_(better, (set_var(total, current),))
+    elif kind == "prod":
+        start, steps = (set_var(total, 1),), var(count)
+        combine = set_var(total, mul(var(total), current))
+    else:
+        start, steps = (set_var(total, 0),), var(count)
+        combine = change_var(total, current)
+    result = div(var(total), var(count)) if kind == "mean" else var(total)
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(count, extent),
+        set_var(base, 0),
+        repeat(outer, (
+            set_var(column, 1),
+            repeat(inner, (
+                set_var(position, add(var(base), var(column))),
+                *start,
+                repeat(steps, (combine, change_var(position, inner))),
+                append(out, result),
+                change_var(column, 1),
+            )),
+            change_var(base, mul(var(count), inner)),
+        )),
+    )
+
+
+def _emit_runtime_softmax(ctx: KernelContext):
+    """Softmax along a runtime axis: maximum, sum of exponentials, then scale."""
+    value = ctx.inputs["value"]
+    dim = int(ctx.scalars["dim"]) % len(value.shape)
+    outer, extent, inner = _runtime_layout(value, dim)
+    count, base, column, start, position, peak, total = (
+        ctx.temp_var(f"softmax {name}")
+        for name in ("count", "base", "column", "start", "position", "peak", "total")
+    )
+    current = item(value.list, var(position))
+    shifted = sub(current, var(peak))
+    if ctx.scalars["log"]:
+        result = sub(shifted, mathop("ln", var(total)))
+    else:
+        result = div(mathop("e ^", shifted), var(total))
+    out = ctx.output.list
+    # Positions along the axis are ``inner`` apart, so with ``inner > 1`` the
+    # output is filled first and written in place.
+    write = append(out, result) if inner == 1 else replace(out, var(position), result)
+    prefill = () if inner == 1 else (repeat(length(value.list), (append(out, 0),)),)
+    return (
+        clear(out),
+        *prefill,
+        set_var(count, extent),
+        set_var(base, 0),
+        repeat(outer, (
+            set_var(column, 1),
+            repeat(inner, (
+                set_var(start, add(var(base), var(column))),
+                set_var(position, var(start)),
+                set_var(peak, current),
+                repeat(sub(var(count), 1), (
+                    change_var(position, inner),
+                    if_(gt(current, var(peak)), (set_var(peak, current),)),
+                )),
+                set_var(total, 0),
+                set_var(position, var(start)),
+                repeat(var(count), (
+                    change_var(total, mathop("e ^", shifted)),
+                    change_var(position, inner),
+                )),
+                set_var(position, var(start)),
+                repeat(var(count), (write, change_var(position, inner))),
+                change_var(column, 1),
+            )),
+            change_var(base, mul(var(count), inner)),
+        )),
+    )
+
+
+def _matrix(tensor, side: str):
+    """``(batch, rows, columns, runtime)`` of a matmul operand.
+
+    A vector is a row on the left and a column on the right. ``runtime`` is
+    ``rows`` or ``columns`` when that dimension holds the runtime extent.
+    """
+    shape = tensor.shape
+    if len(shape) == 1:
+        shape = (1, shape[0]) if side == "left" else (shape[0], 1)
+        axis = None if tensor.dynamic_axis is None else (1 if side == "left" else 0)
+    else:
+        axis = None if tensor.dynamic_axis is None else tensor.dynamic_axis - (len(shape) - 2)
+    batch = math.prod(shape[:-2])
+    runtime = {0: "rows", 1: "columns"}.get(axis) if axis is not None else None
+    if axis is not None and runtime is None:
+        raise ValueError("a runtime matmul extent must be a matrix dimension")
+    return batch, shape[-2], shape[-1], runtime
+
+
+def _emit_runtime_matmul(ctx: KernelContext):
+    """``left @ right`` whose contraction, or right's columns, have a runtime extent."""
+    left, right = ctx.inputs["left"], ctx.inputs["right"]
+    left_batch, rows, inner, left_runtime = _matrix(left, "left")
+    right_batch, _, columns, right_runtime = _matrix(right, "right")
+    batch = max(left_batch, right_batch)
+    if {left_batch, right_batch} - {1, batch}:
+        raise ValueError("runtime matmul operands need the same batch dimensions")
+    size, width, left_base, right_base, row, column, left_position, right_position, total = (
+        ctx.temp_var(f"matmul {name}") for name in (
+            "inner", "columns", "left base", "right base", "row", "column",
+            "left position", "right position", "total",
+        )
+    )
+    contraction = inner
+    if left_runtime == "columns":
+        contraction = div(length(left.list), left_batch * rows) if left_batch * rows != 1 else (
+            length(left.list)
+        )
+    elif left_runtime is not None:
+        raise ValueError("the left operand's rows can't have a runtime extent here")
+    if right_runtime == "columns":
+        columns = div(length(right.list), mul(right_batch, var(size)) if right_batch != 1 else var(
+            size,
+        ))
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(size, contraction),
+        set_var(width, columns),
+        set_var(left_base, 0),
+        set_var(right_base, 0),
+        repeat(batch, (
+            set_var(row, 0),
+            repeat(rows, (
+                set_var(column, 1),
+                repeat(var(width), (
+                    set_var(total, 0),
+                    set_var(left_position, add(add(var(left_base), var(row)), 1)),
+                    set_var(right_position, add(var(right_base), var(column))),
+                    repeat(var(size), (
+                        change_var(total, mul(
+                            item(left.list, var(left_position)),
+                            item(right.list, var(right_position)),
+                        )),
+                        change_var(left_position, 1),
+                        change_var(right_position, var(width)),
+                    )),
+                    append(out, var(total)),
+                    change_var(column, 1),
+                )),
+                change_var(row, var(size)),
+            )),
+            *((change_var(left_base, mul(rows, var(size))),) if left_batch > 1 else ()),
+            *((change_var(right_base, mul(var(size), var(width))),) if right_batch > 1 else ()),
+        )),
+    )
+
+
+def _emit_runtime_cat(ctx: KernelContext):
+    """Join two tensors along an axis where either has a runtime extent."""
+    first, second = ctx.inputs["first"], ctx.inputs["second"]
+    dim = int(ctx.scalars["dim"]) % len(first.shape)
+    outer, first_extent, inner = _runtime_layout(first, dim)
+    _, second_extent, _ = _runtime_layout(second, dim)
+    first_width, second_width, first_position, second_position = (
+        ctx.temp_var(f"cat {name}")
+        for name in ("first width", "second width", "first position", "second position")
+    )
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(first_width, mul(first_extent, inner)),
+        set_var(second_width, mul(second_extent, inner)),
+        set_var(first_position, 1),
+        set_var(second_position, 1),
+        repeat(outer, (
+            repeat(var(first_width), (
+                append(out, item(first.list, var(first_position))),
+                change_var(first_position, 1),
+            )),
+            repeat(var(second_width), (
+                append(out, item(second.list, var(second_position))),
+                change_var(second_position, 1),
+            )),
+        )),
+    )
+
+
+_END = 2**63 - 1
+
+
+def _emit_runtime_slice(ctx: KernelContext):
+    """Copy ``start:end`` along a runtime axis, counting negatives from its end."""
+    value = ctx.inputs["value"]
+    dim = int(ctx.scalars["dim"]) % len(value.shape)
+    outer, extent, inner = _runtime_layout(value, dim)
+    count, first, last, base, position = (
+        ctx.temp_var(f"slice {name}") for name in ("count", "first", "last", "base", "position")
+    )
+
+    def bound(name, offset):
+        if offset >= _END:
+            return (set_var(name, var(count)),)
+        place = add(var(count), offset) if offset < 0 else offset
+        return (
+            set_var(name, place),
+            if_(lt(var(name), 0), (set_var(name, 0),)),
+            if_(gt(var(name), var(count)), (set_var(name, var(count)),)),
+        )
+
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(count, extent),
+        *bound(first, int(ctx.scalars["start"])),
+        *bound(last, int(ctx.scalars["end"])),
+        if_(lt(var(last), var(first)), (set_var(last, var(first)),)),
+        set_var(base, 0),
+        repeat(outer, (
+            set_var(position, add(add(var(base), mul(var(first), inner)), 1)),
+            repeat(mul(sub(var(last), var(first)), inner), (
+                append(out, item(value.list, var(position))),
+                change_var(position, 1),
+            )),
+            change_var(base, mul(var(count), inner)),
+        )),
+    )
+
+
 BUILTIN_KERNELS = (
+    Kernel(
+        "cattorch.runtime_length.default", _emit_runtime_length, name="runtime_length",
+    ),
+    Kernel(
+        "cattorch.runtime_reduce.default", _emit_runtime_reduce, name="runtime_reduce",
+    ),
+    Kernel(
+        "cattorch.runtime_softmax.default", _emit_runtime_softmax, name="runtime_softmax",
+    ),
+    Kernel(
+        "cattorch.runtime_matmul.default", _emit_runtime_matmul, name="runtime_matmul",
+    ),
+    Kernel("cattorch.runtime_cat.default", _emit_runtime_cat, name="runtime_cat"),
+    Kernel("cattorch.runtime_slice.default", _emit_runtime_slice, name="runtime_slice"),
     Kernel(
         "cattorch.recurrent_scan.default", _emit_recurrent_scan, name="recurrent_scan",
     ),

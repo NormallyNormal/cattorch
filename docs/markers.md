@@ -71,7 +71,8 @@ interface from the markers. Each entry point becomes a block named
   point can read every state.
 - A buffer that grows along its first dimension, like `seen`, needs its
   largest length in `capacity=`. Another entry point can read it, as `score`
-  does. The method that grows it can't read it again in the same call yet.
+  does, and so can the method that grows it, after appending, with the
+  [operations that follow a variable length](supported-models.md#variable-length-inputs).
 - A buffer that changes shape without a capacity, or a capacity for a buffer
   that never grows, fails the export.
 

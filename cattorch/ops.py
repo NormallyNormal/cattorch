@@ -153,6 +153,86 @@ def _recurrent_final(steps: torch.Tensor, reverse: bool) -> torch.Tensor:
     return (steps[0] if reverse else steps[-1]).clone()
 
 
+# ── Private ops on a runtime extent ─────────────────────────────────────────
+# ``transpile(dynamic=)`` traces one item of the variable-length input. The
+# graph pass rewrites operations that mix values along that axis into these,
+# whose kernels read the actual extent from the list's length.
+
+_REDUCTIONS = {
+    "sum": torch.sum, "mean": torch.mean, "prod": torch.prod,
+    "amax": torch.amax, "amin": torch.amin,
+}
+
+
+def _keep_one(value: torch.Tensor, dim: int) -> torch.Tensor:
+    shape = list(value.shape)
+    shape[dim] = 1
+    return value.new_empty(shape)
+
+
+@op(
+    name="cattorch::runtime_length",
+    fake=lambda value, dim: value.new_empty((), dtype=torch.float32),
+)
+def _runtime_length(value: torch.Tensor, dim: int) -> torch.Tensor:
+    """The number of items along ``dim``, as a float scalar."""
+    return torch.tensor(float(value.shape[dim]))
+
+
+@op(name="cattorch::runtime_reduce",fake=lambda value, dim, kind: _keep_one(value, dim))
+def _runtime_reduce(value: torch.Tensor, dim: int, kind: str) -> torch.Tensor:
+    """``kind`` (sum, mean, prod, amax or amin) over ``dim``, keeping it."""
+    if kind == "prod":
+        return torch.prod(value, dim, keepdim=True)
+    return _REDUCTIONS[kind](value, (dim,), keepdim=True)
+
+
+@op(name="cattorch::runtime_softmax", fake=lambda value, dim, log: torch.empty_like(value))
+def _runtime_softmax(value: torch.Tensor, dim: int, log: bool) -> torch.Tensor:
+    """Softmax, or log-softmax if ``log``, along ``dim``."""
+    return torch.log_softmax(value, dim) if log else torch.softmax(value, dim)
+
+
+@op(
+    name="cattorch::runtime_matmul",
+    fake=lambda left, right: torch.matmul(left, right),
+)
+def _runtime_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """``left @ right`` where the contraction or ``right``'s columns vary."""
+    return torch.matmul(left, right)
+
+
+def _joined(first, second, dim):
+    shape = list(first.shape)
+    shape[dim] += second.shape[dim]
+    return first.new_empty(shape)
+
+
+@op(name="cattorch::runtime_cat", fake=_joined)
+def _runtime_cat(first: torch.Tensor, second: torch.Tensor, dim: int) -> torch.Tensor:
+    """``torch.cat((first, second), dim)`` along the runtime axis."""
+    return torch.cat((first, second), dim)
+
+
+def _sliced(value, dim, start, end):
+    index = [slice(None)] * value.ndim
+    index[dim] = slice(start, end)
+    return value[tuple(index)]
+
+
+@op(
+    name="cattorch::runtime_slice",
+    fake=lambda value, dim, start, end: torch.empty_like(_sliced(value, dim, start, end)),
+)
+def _runtime_slice(value: torch.Tensor, dim: int, start: int, end: int) -> torch.Tensor:
+    """``value[..., start:end]`` along ``dim``, with Python's negative indices.
+
+    A negative ``start`` or ``end`` counts from the runtime end, and an
+    ``end`` of ``2**63 - 1`` runs to it.
+    """
+    return _sliced(value, dim, start, end).clone()
+
+
 # ── Private ops for the automatic generation step module ────────────────────
 # These are not exported: ``cattorch.autoregressive.build_step_module`` inserts
 # them, and the generation lowering gives them dedicated Scratch kernels.

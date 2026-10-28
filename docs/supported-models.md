@@ -150,20 +150,39 @@ its key. The Scratch input list then takes any whole number of items, and
 the output lists grow with it. `TensorSpec.shape` shows the bounded
 dimension as a `BoundedDimension`.
 
-The model must treat the items independently, as most models treat a batch,
-or tokens processed one at a time. Recurrent layers are the exception: a
-sequence's length can vary, and the final state (`h_n`) is an output of fixed
-shape. Other operations that mix items, such as a softmax across them or
-`x - x.mean(0)`, are rejected. When a model's
-operations can't follow the length directly, for example attention layers
-that reorder their batch internally, cattorch runs the whole model once per
-item and adds a warning.
+Most operations treat the items independently, as models treat a batch or
+tokens processed one at a time. These operations mix them, and follow the
+length too:
 
-cattorch traces the model with one item, then checks the sprite against the
-model at several lengths during export. A model that uses the length itself,
-such as `torch.arange(tokens.shape[1])` for positions, fails that check.
-Language models should use a [`GenerationProgram`](generation.md) instead,
-which handles prompts of any length up to `max_context`.
+- Reductions over the items: `sum`, `mean`, `amax`, `amin`, `max` and `min`
+  values, `prod`, `logsumexp`, `var` and `std`, also over several dimensions
+  or with `keepdim`, as in mean pooling or `x - x.mean(0)`.
+- `softmax` and `log_softmax` across the items.
+- Matrix products that sum over the items (`x.T @ x`, or attention weights
+  times values) or produce one column per item (`query @ keys.T`). Together
+  these cover attention from fixed queries over a variable-length memory,
+  such as `nn.MultiheadAttention` with a learned query.
+- `torch.cat` with fixed-size tensors along the items, such as a class token
+  in front of a sequence. The output's `BoundedDimension` counts the fixed
+  items too.
+- Fixed slices at either end, such as `x[0]`, `x[-1]` or `x[:, -1]`.
+- Arithmetic with the length itself, as in `x.sum(0) / x.shape[0]`.
+- Recurrent layers, whose final state (`h_n`) has a fixed shape.
+
+A tensor can have only one dimension that varies, so self-attention across
+the items (`x @ x.T`, `nn.TransformerEncoderLayer` over a variable sequence)
+is rejected. So are slices that drop items or reach past the first item
+(`x[1:]`, `x[-2:]`), and convolution or pooling along the items. When a
+model's operations can't follow the length directly, for example attention
+layers that reorder their batch internally, cattorch runs the whole model once
+per item if the items are independent, and adds a warning.
+
+cattorch traces the model with one item, and again with two to tell bounds
+like `x[-1]` and `x[0]` apart. It then checks the sprite against the model at
+several lengths during export. A model that builds something from the length,
+such as `torch.arange(tokens.shape[1])` for positions or a `cumsum`, fails
+that check. Language models should use a [`GenerationProgram`](generation.md)
+instead, which handles prompts of any length up to `max_context`.
 
 Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
 `@cattorch.entrypoint(dynamic={"rows": (1, 32)})` in [markers](markers.md),

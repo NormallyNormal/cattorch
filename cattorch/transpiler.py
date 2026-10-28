@@ -2134,9 +2134,7 @@ def _transpile(
     for node in graph.nodes:
         if node.name not in graph.dynamic_axes:
             continue
-        bound = graph.dynamic_bounds[node.name]
-        # The traced tensor is one unit of the runtime length.
-        maximum = math.prod(_get_shape(node)) * bound[2]
+        maximum = graph.runtime_capacity(node.name, _get_shape(node))
         if node.name in graph.input_names:
             # Program input/state lists are renamed before their one global
             # interface-sharding pass.
@@ -2152,10 +2150,9 @@ def _transpile(
         # Output copies (including returned inputs and repeated leaves) have
         # no scope assignment of their own. Size every public output from its
         # contract so those copies are sharded too, using runtime capacity.
-        axis = graph.dynamic_axes.get(node_name)
-        capacity = math.prod(
-            graph.dynamic_bounds[node_name][2] if index == axis else extent
-            for index, extent in enumerate(shape)
+        capacity = (
+            graph.runtime_capacity(node_name, shape) if node_name in graph.dynamic_axes
+            else math.prod(shape)
         )
         logical_sizes[public_name] = max(
             capacity, logical_sizes.get(public_name, 0), logical_sizes.pop(old_name, 0),
@@ -2413,7 +2410,7 @@ def _transpile(
             tuple(graph.output_shape),
             graph.output_dtype,
             (
-                (graph.dynamic_axes[graph.output_name], graph.dynamic_bounds[graph.output_name])
+                (graph.dynamic_axes[graph.output_name], graph._public_bounds(graph.output_name))
                 if graph.output_name in graph.dynamic_axes else None
             ),
         ),
@@ -2423,7 +2420,7 @@ def _transpile(
                 tuple(shape),
                 dtype,
                 (
-                    (graph.dynamic_axes[node_name], graph.dynamic_bounds[node_name])
+                    (graph.dynamic_axes[node_name], graph._public_bounds(node_name))
                     if node_name in graph.dynamic_axes else None
                 ),
             )

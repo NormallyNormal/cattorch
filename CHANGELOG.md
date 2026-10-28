@@ -20,6 +20,11 @@
   item, and a model whose operations can't follow the length runs whole once
   per item. The export is checked against the model at several lengths, so a
   model that uses the length itself fails instead of exporting wrong numbers.
+  Reductions, softmax, matrix products over the items, `cat` with fixed-size
+  tensors, fixed slices at either end (`x[-1]`) and arithmetic with
+  `x.shape[0]` follow the length too, which covers mean pooling and attention
+  from fixed queries over a variable-length memory. An entry point that
+  appends to state can read the grown state in the same call.
   Entry points take `Input(..., dynamic=(1, 32))` or
   `@entrypoint(dynamic=...)`. See
   [variable-length inputs](docs/supported-models.md#variable-length-inputs).
@@ -190,6 +195,11 @@
 
 ## Fixes
 
+- With a variable-length input or append state, three cases gave wrong values:
+  - adding a fixed `[1, features]` tensor to the variable-length rows;
+  - transposing across the variable axis while it had one item in the trace;
+  - reshaping a tensor whose variable axis isn't its first dimension, as
+    attention heads do.
 - A linear layer whose result could be computed at export, such as one
   applied to `torch.zeros`, followed by an addition and an activation made
   export fail when a view of the result was the output.
