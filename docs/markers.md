@@ -62,7 +62,9 @@ interface from the markers. Each entry point becomes a block named
 - `example=` gives the arguments to export with: a tuple, a tensor, or a
   function returning one. They must be tensors.
 - `name=` names the block, `inputs=` and `outputs=` name its lists. Outputs
-  default to `output`, `output_1`, and so on.
+  default to `output`, `output_1`, and so on. Only the method's tensor
+  results become outputs, as with `forward`; other results, such as `None`,
+  are skipped with a warning.
 - `dynamic={"rows": (1, 32)}` lets an input's first dimension vary between
   those bounds at run time, checked at several lengths during export (see
   [variable-length inputs](supported-models.md#variable-length-inputs)).

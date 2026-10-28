@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import inspect
 import types
+import warnings
 from typing import Callable
 
 import torch
@@ -408,6 +409,22 @@ def marked_program(model: nn.Module):
             if modes.setdefault(name, mode) != mode:
                 raise UnsupportedModelError(f"entry points update buffer {name!r} in different ways")
         outputs = _tensor_leaves(result)
+        if result is not None:
+            from torch.utils import _pytree as pytree
+
+            dropped = [
+                type(leaf).__name__ for leaf in pytree.tree_leaves(result)
+                if not isinstance(leaf, torch.Tensor)
+            ]
+            if dropped:
+                # As transpile does for forward; declared Output bindings
+                # stay strict.
+                warnings.warn(
+                    f"@entrypoint {method_name}: ignoring non-tensor results ("
+                    + ", ".join(dropped) + ")",
+                    UserWarning,
+                    stacklevel=3,
+                )
         output_names = options["outputs"] or tuple(
             "output" if index == 0 else f"output_{index}" for index in range(len(outputs))
         )

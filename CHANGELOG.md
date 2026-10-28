@@ -208,6 +208,8 @@
   works with a `DeprecationWarning`. [Stability](docs/stability.md) lists what
   1.x keeps compatible; the kernel interface, `op`, the explicit MoE classes,
   and `analyze` stay experimental.
+- An `@entrypoint` method's non-tensor results, such as `None`, are skipped
+  with a warning, as they are for `forward`, instead of silently.
 
 ## Performance
 

@@ -238,3 +238,19 @@ def test_markers_are_inherited_and_can_be_overridden():
     assert example_inputs(Base())[0].shape == (1,)
     assert example_inputs(Child())[0].shape == (2,)
     assert example_inputs(type("Grandchild", (Child,), {})())[0].shape == (2,)
+
+
+def test_an_entry_points_non_tensor_results_are_skipped_with_a_warning(tmp_path):
+    class Totals(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(2))
+
+        @entrypoint(example=lambda: (torch.ones(2),))
+        def add(self, value):
+            self.total += value
+            return self.total.sum(), None, {"count": 3}
+
+    with pytest.warns(UserWarning, match=r"@entrypoint add: ignoring non-tensor results \(NoneType, int\)"):
+        result = transpile(Totals().eval(), None, tmp_path / "totals")
+    assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["cattorch add output"]
