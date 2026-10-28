@@ -59,6 +59,7 @@ from cattorch.sprite import (
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
+from cattorch.interface import final_data_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
@@ -2306,6 +2307,17 @@ def _transpile(
             _add_procedure_completion_broadcast(
                 sprite, "cattorch decode", "cattorch decode complete",
             )
+    if generation is None and not _defer_interface_sharding:
+        # Like generation and programs: a status and a notification when each
+        # public block finishes. Program entry points get theirs from the
+        # program.
+        variables = sprite.setdefault("variables", {})
+        if not any(entry[0] == "cattorch status" for entry in variables.values()):
+            variables["cattorch_status"] = ["cattorch status", ""]
+        for procedure in ("cattorch init", "cattorch forward"):
+            _add_procedure_completion_broadcast(
+                sprite, procedure, f"{procedure} complete", status="ok",
+            )
     sprite.setdefault("variables", {}).update({
         "cattorch_storage_compression": [
             "cattorch storage compression",
@@ -2338,6 +2350,8 @@ def _transpile(
 
     finalized = finalize_sprite(
         sprite, output_path, sprite_name=sprite_name, codegen=codegen,
+        # A program finishes its entry points' interface itself.
+        public_interface=not _defer_interface_sharding,
     )
 
     input_specs = tuple(
@@ -2377,7 +2391,8 @@ def _transpile(
         block_count=len(sprite.get("blocks", {})),
         list_count=len(sprite.get("lists", {})),
         sharded_lists=tuple(
-            layout.name for layout in layouts.values() if len(layout.shards) > 1
+            (layout.name if _defer_interface_sharding else final_data_name(layout.name))
+            for layout in layouts.values() if len(layout.shards) > 1
         ),
         inputs=input_specs,
         output=boundary_spec(

@@ -966,6 +966,32 @@ def _add_procedure_completion_broadcast(
     }
 
 
+def _remove_completion_broadcast(sprite: dict, message: str) -> None:
+    """Undo ``_add_procedure_completion_broadcast`` for ``message``.
+
+    The notification, and the status it sets, are the last blocks of their
+    procedure.
+    """
+    blocks = sprite["blocks"]
+    for identifier, block in list(blocks.items()):
+        if block.get("opcode") != "event_broadcastandwait":
+            continue
+        menu = block.get("inputs", {}).get("BROADCAST_INPUT", [None, None])[1]
+        if not (isinstance(menu, list) and len(menu) > 1 and menu[1] == message):
+            continue
+        last = identifier
+        parent = block.get("parent")
+        if parent is not None and blocks[parent].get("fields", {}).get(
+            "VARIABLE", [None],
+        )[0] == "cattorch status":
+            last, parent = parent, blocks[parent].get("parent")
+        if parent is not None:
+            blocks[parent]["next"] = None
+        del blocks[identifier]
+        if last != identifier:
+            del blocks[last]
+
+
 def _logical_list_sizes(
     compiler: _Compiler,
     graph: _GraphInfo,

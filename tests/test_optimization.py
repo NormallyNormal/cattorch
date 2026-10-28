@@ -1208,8 +1208,8 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
     assert emulator.variables["cattorch cache length"] == 3
-    assert len(emulator.lists["cattorch K cache 1"]) == 3 * 8
-    assert len(emulator.lists["cattorch K cache 2"]) == 3 * 8
+    assert len(emulator.lists["_cattorch K cache 1"]) == 3 * 8
+    assert len(emulator.lists["_cattorch K cache 2"]) == 3 * 8
 
     for token in (2, 4):
         prompt.append(token)
@@ -1230,8 +1230,8 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     emulator._exec_chain(emulator._procedures["cattorch reset"])
     assert emulator.variables["cattorch status"] == "ok"
     assert emulator.variables["cattorch cache length"] == 0
-    assert emulator.lists["cattorch K cache 1"] == []
-    assert emulator.lists["cattorch V cache 2"] == []
+    assert emulator.lists["_cattorch K cache 1"] == []
+    assert emulator.lists["_cattorch V cache 2"] == []
 
 
 def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_path):
@@ -1282,8 +1282,8 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
-    assert len(emulator.lists["cattorch K cache 1"]) == 3 * 4
-    assert len(emulator.lists["cattorch V cache 2"]) == 3 * 4
+    assert len(emulator.lists["_cattorch K cache 1"]) == 3 * 4
+    assert len(emulator.lists["_cattorch V cache 2"]) == 3 * 4
 
     emulator.lists["cattorch tokens"] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
@@ -1312,10 +1312,10 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     assert result.block_count < baseline.block_count * 0.75
     sprite = _load_sprite(result.path)
     emulator = ScratchEmulator(sprite)
-    assert "cattorch shared transformer layer" in emulator._procedures
-    assert "cattorch K cache" in emulator.lists
-    assert "cattorch V cache" in emulator.lists
-    assert "cattorch K cache 1" not in emulator.lists
+    assert "_cattorch shared transformer layer" in emulator._procedures
+    assert "_cattorch K cache" in emulator.lists
+    assert "_cattorch V cache" in emulator.lists
+    assert "_cattorch K cache 1" not in emulator.lists
 
     prompt = [1, 3, 5]
     emulator.lists["cattorch tokens"] = prompt
@@ -1326,7 +1326,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
         atol=1e-4,
         rtol=0,
     )
-    assert len(emulator.lists["cattorch K cache"]) == len(prompt) * 2 * 8
+    assert len(emulator.lists["_cattorch K cache"]) == len(prompt) * 2 * 8
     assert emulator.variables["cattorch cache length"] == len(prompt)
 
     emulator.lists["cattorch tokens"] = [2]
@@ -1350,7 +1350,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         str(path),
     )
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    assert "cattorch select top k" in emulator._procedures
+    assert "_cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
     emulator.lists["cattorch tokens"] = prompt

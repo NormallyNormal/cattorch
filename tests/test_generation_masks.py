@@ -112,7 +112,7 @@ def _project_output_guards(sprite) -> int:
             continue
         condition = blocks.get(block["inputs"].get("CONDITION", [None, None])[1])
         operand = (condition or {}).get("inputs", {}).get("OPERAND1", [None, None])[1]
-        if isinstance(operand, list) and operand[1] == "cattorch project output":
+        if isinstance(operand, list) and operand[1] == "_cattorch project output":
             count += 1
     return count
 

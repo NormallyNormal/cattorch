@@ -193,6 +193,14 @@
   with its tokenizer. `benchmarks/run_project_vm.cjs` takes `--list`,
   `--var`, `--broadcast`, `--no-flag` and `--out` to drive a project's
   bridges.
+- The Scratch interface is versioned: [Scratch interface](docs/scratch-interface.md)
+  lists every public block, list, variable, and broadcast, and within interface
+  version 1 none is renamed or removed. Each sprite records its version in the
+  `cattorch interface version` variable, and `cattorch.interface` holds the
+  version and the public names.
+- Plain model sprites set `cattorch status` and broadcast
+  `cattorch init complete` and `cattorch forward complete` when those blocks
+  finish, as generation and program sprites do.
 
 ## Performance
 
@@ -257,6 +265,14 @@
 
 ## Breaking changes
 
+- Tokenizer sprites read and write the `cattorch text` variable and the
+  `cattorch token ids` list, instead of the `input` and `output` variables and
+  the `token_ids` list, so every public name starts with `cattorch `. The
+  `tokens` list is internal.
+- Internal blocks, lists, and variables whose names started with `cattorch `,
+  such as the weight decoders and the generation caches (`cattorch K cache 1`),
+  now start with `_cattorch`. Names starting with `cattorch ` are the public
+  interface.
 - `StorageConfig` no longer takes the deprecated `"int8"`, `"int6"` and
   `"int4"` precisions or their `group_size`, `min_quantized_values`,
   `scale_precision` and `grouping` fields. Pass

@@ -22,6 +22,7 @@ from typing import Sequence
 from cattorch.codegen import CodegenConfig
 from cattorch.results import TokenizerResult
 from cattorch.sprite import (
+    _merge_variables_by_name,
     _add_warp_procedure,
     _merge_lists_by_name,
     _merge_variables_by_name,
@@ -55,7 +56,12 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.util.scratch.interface import rename_list, rename_variable
 from cattorch.util.scratch.ids import uniquify_data_ids
+
+# The Scratch interface; see ``docs/scratch-interface.md``.
+TEXT_VARIABLE = "cattorch text"
+TOKEN_IDS_LIST = "cattorch token ids"
 
 
 class _TokenizerBase(ABC):
@@ -117,10 +123,11 @@ class _TokenizerBase(ABC):
 
         The generated sprite has two top-level block stacks:
 
-        - **Encode**: reads the ``input`` variable (a string), writes
-          token IDs to the ``token_ids`` list.
-        - **Decode**: reads the ``token_ids`` list, writes the decoded
-          string to the ``output`` variable.
+        - **Encode**: ``cattorch tokenize`` reads the ``cattorch text``
+          variable (a string) and writes token IDs to the
+          ``cattorch token ids`` list.
+        - **Decode**: ``cattorch detokenize`` reads ``cattorch token ids``
+          and writes the decoded string to ``cattorch text``.
 
         Token IDs are 0-based, matching PyTorch embedding conventions.
 
@@ -136,6 +143,12 @@ class _TokenizerBase(ABC):
         tokens = self._build_tokens_list()
 
         sprite = self._build_sprite(tokens)
+        # The public interface: one text variable for both directions.
+        rename_variable(sprite, "input", TEXT_VARIABLE)
+        rename_variable(sprite, "output", TEXT_VARIABLE)
+        _merge_variables_by_name(sprite, {TEXT_VARIABLE})
+        rename_list(sprite, "token_ids", TOKEN_IDS_LIST)
+        rename_list(sprite, "tokens", "_cattorch tokens")
 
         uniquify_data_ids(sprite)
         output_path = Path(output_path)

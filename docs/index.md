@@ -32,6 +32,8 @@ connecting it to the rest of a project.
 
 - [API reference](api-reference.md): functions, configuration classes, result
   types, benchmark builders, and exceptions.
+- [Scratch interface](scratch-interface.md): the blocks, lists, variables, and
+  broadcasts of exported sprites, versioned for 1.x.
 - [Code generation and JSON size](code-generation.md): trade sprite size for
   speed.
 - [Experimental programs and sparse MoE](programs-and-moe.md): multiple

@@ -91,9 +91,9 @@ for debugging or measurement.
 `CodegenConfig(layer_sharing="auto")` shares one block of code across repeated
 layers when the attention blocks sit in consecutive modules named `blocks.0`,
 `blocks.1`, and so on. The caches are then banked into one list per K and V
-(`cattorch K cache` and `cattorch V cache`). Models with other layer names, such as
+(`_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
 Hugging Face's `model.layers.N`, export without sharing and with one list per
-layer (`cattorch K cache 1`, `cattorch V cache 1`, ...). If the layers look
+layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
 repeated but can't be factored, for example because the MLP widths differ,
 cattorch logs a warning and exports again without sharing. Sharing makes
 sprites smaller; shared layers can't skip the final layer's work during hidden

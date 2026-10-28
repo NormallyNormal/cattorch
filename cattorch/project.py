@@ -27,6 +27,7 @@ from cattorch.results import (
 )
 from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
 from cattorch.templates.template import TEMPLATE_DIR
+from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
 from cattorch.util.scratch.dsl import (
     Program,
     add,
@@ -481,15 +482,15 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
     text = builder.global_variable(f"{tokenizer_name} text", "")
     ids = builder.global_list(f"{tokenizer_name} token ids")
     builder.receiver(words, f"{tokenizer_name} tokenize", (
-        set_var("input", var(text)),
+        set_var(TEXT_VARIABLE, var(text)),
         call("cattorch tokenize"),
-        *_copy("token_ids", ids),
-    ), lists=("token_ids", ids), variables=("input", text, _INDEX))
+        *_copy(TOKEN_IDS_LIST, ids),
+    ), lists=(TOKEN_IDS_LIST, ids), variables=(TEXT_VARIABLE, text, _INDEX))
     builder.receiver(words, f"{tokenizer_name} detokenize", (
-        *_copy(ids, "token_ids"),
+        *_copy(ids, TOKEN_IDS_LIST),
         call("cattorch detokenize"),
-        set_var(text, var("output")),
-    ), lists=("token_ids", ids), variables=("output", text, _INDEX))
+        set_var(text, var(TEXT_VARIABLE)),
+    ), lists=(TOKEN_IDS_LIST, ids), variables=(TEXT_VARIABLE, text, _INDEX))
 
     demo = builder.add_demo_sprite("Demo")
     generated = "_cattorch demo generated"

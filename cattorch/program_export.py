@@ -31,6 +31,7 @@ from cattorch.results import (
     EntryPointResult, ProgramResult, StateResult, TensorSpec,
 )
 from cattorch.quantization import QuantizationConfig, quantize_model
+from cattorch.interface import final_data_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
@@ -688,7 +689,9 @@ def transpile_program(
         expanded_json_bytes=finalized.expanded_json_bytes,
         block_count=len(combined.get("blocks", {})),
         list_count=len(combined.get("lists", {})),
-        sharded_lists=tuple(sorted(sharded_names)),
+        sharded_lists=tuple(sorted(
+            final_data_name(name, frozenset(public_data_names)) for name in sharded_names
+        )),
         warnings=tuple(dict.fromkeys((*sub_warnings, *finalized.warnings))),
         entrypoints=tuple(entry_results),
         states=state_results,

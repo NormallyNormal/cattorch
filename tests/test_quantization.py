@@ -240,7 +240,7 @@ def test_row_aligned_quantization_preserves_large_grouped_linear(tmp_path):
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
     emulator = ScratchEmulator(_load(result.path))
-    assert "cattorch interleave grouped weights" in emulator._procedures
+    assert "_cattorch interleave grouped weights" in emulator._procedures
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(

@@ -89,7 +89,11 @@ If an input or output exceeds 200,000 values, use all its
 
 `cattorch forward` initializes the sprite on its first call. Call
 `cattorch init` yourself to load the weights ahead of time, for example
-before timing a run. Both blocks run without screen refresh.
+before timing a run. Both blocks run without screen refresh, and when each
+finishes it sets `cattorch status` to `ok` and broadcasts
+`cattorch forward complete` or `cattorch init complete`. The
+[Scratch interface](scratch-interface.md) lists every name a sprite offers;
+they won't change within cattorch 1.x.
 
 ## Connect another sprite
 

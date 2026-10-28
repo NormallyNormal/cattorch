@@ -280,10 +280,13 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     import zipfile
 
     from cattorch.results import BoundedDimension, TensorSpec
-    from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+    from cattorch.sprite import (
+        _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
+        _remove_completion_broadcast,
+    )
     from cattorch.util.scratch.dsl import (
-        Program, add, append, call, change_var, clear, div, for_each, item, length, mul,
-        set_var, var,
+        Program, add, append, broadcast_and_wait, call, change_var, clear, div, for_each,
+        item, length, mul, set_var, var,
     )
     from cattorch.util.scratch.interface import rename_list, rename_procedure
 
@@ -299,6 +302,8 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     public_input = "input" if index == 0 else f"input_{index}"
     private_input = f"_cattorch unit {public_input}"
     rename_procedure(sprite, "cattorch forward", "_cattorch forward unit")
+    # The new forward reports completion once, after every unit.
+    _remove_completion_broadcast(sprite, "cattorch forward complete")
     rename_list(sprite, public_input, private_input)
     input_size = math.prod(input_shapes[index])
     outputs = []
@@ -322,10 +327,12 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
             ),
             change_var(unit, 1),
         )),
+        set_var("cattorch status", "ok"),
+        broadcast_and_wait("cattorch forward complete"),
     ]
     program = Program(
         "forward_by_unit",
-        variables=(unit, position, "_cattorch units"),
+        variables=(unit, position, "_cattorch units", "cattorch status"),
         lists=(public_input, private_input, *(entry for pair in outputs for entry in pair[:2])),
         body=tuple(body),
     )
@@ -334,6 +341,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     _merge_lists_by_name(sprite, {public_input, private_input, *(
         entry for pair in outputs for entry in pair[:2]
     )})
+    _merge_variables_by_name(sprite, {"cattorch status"})
     data = json.dumps(sprite, separators=(",", ":"))
     members["sprite.json"] = data.encode()
     with zipfile.ZipFile(result.path, "w", zipfile.ZIP_DEFLATED) as archive:

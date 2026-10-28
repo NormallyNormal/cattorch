@@ -99,8 +99,8 @@ def test_prefill_then_decode_matches_full_forward(exported):
     assert len(emulator.lists["cattorch logits"]) == logits_of(model, [1]).numel()
     if name in {"llama", "qwen2"}:
         # 2 KV heads of width 32 / 4, not 4 query heads: caches hold KV heads.
-        assert len(emulator.lists["cattorch K cache 1"]) == 10 * 2 * 8
-        assert len(emulator.lists["cattorch V cache 2"]) == 10 * 2 * 8
+        assert len(emulator.lists["_cattorch K cache 1"]) == 10 * 2 * 8
+        assert len(emulator.lists["_cattorch V cache 2"]) == 10 * 2 * 8
 
 
 def test_reset_restores_the_first_step(exported):
@@ -108,7 +108,7 @@ def test_reset_restores_the_first_step(exported):
     prefill_and_decode(emulator, model, [3, 1], [2])
     emulator.run_procedure("cattorch reset")
     assert emulator.variables["cattorch cache length"] == 0
-    assert emulator.lists["cattorch K cache 1"] == []
+    assert emulator.lists["_cattorch K cache 1"] == []
     prefill_and_decode(emulator, model, [2, 4, 6], [1])
 
 
@@ -119,7 +119,7 @@ def test_overflow_rolls_back_and_reset_recovers(tmp_path):
     assert len(prefix) == 5
     caches = {
         name: list(emulator.lists[name])
-        for name in ("cattorch K cache 1", "cattorch V cache 2")
+        for name in ("_cattorch K cache 1", "_cattorch V cache 2")
     }
     emulator.lists["cattorch tokens"] = [6]
     emulator.run_procedure("cattorch decode")
@@ -175,7 +175,7 @@ def test_caches_and_position_are_not_static_weights(exported):
     _, _, _, result = exported
     sprite = load_sprite(result.path)
     names = [entry[0] for entry in sprite["lists"].values()]
-    assert "cattorch K cache 1" in names
+    assert "_cattorch K cache 1" in names
     assert not any(name.startswith("W_") and "cache" in name for name in names)
     assert not any("position" in name for name in names if name.startswith("W_"))
 
@@ -208,8 +208,8 @@ def test_layer_sharing_banks_the_caches(tmp_path):
     )
     assert shared.block_count < plain.block_count * 0.8
     emulator = ScratchEmulator(load_sprite(shared.path))
-    assert "cattorch shared transformer layer" in emulator._procedures
-    assert "cattorch K cache" in emulator.lists
+    assert "_cattorch shared transformer layer" in emulator._procedures
+    assert "_cattorch K cache" in emulator.lists
     prefill_and_decode(emulator, model, [1, 3, 5], [2, 4])
 
 
@@ -221,7 +221,7 @@ def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
         codegen=CodegenConfig(layer_sharing="auto"),
     )
     emulator = ScratchEmulator(load_sprite(result.path))
-    assert "cattorch shared transformer layer" not in emulator._procedures
+    assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
 
 
@@ -237,9 +237,9 @@ def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
             model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing="auto"),
         )
     assert "exporting without layer sharing" in caplog.text
-    assert "cattorch shared transformer layer" not in emulator._procedures
+    assert "_cattorch shared transformer layer" not in emulator._procedures
     # Per-layer caches again: the retry does not bank them.
-    assert "cattorch K cache 1" in emulator.lists and "cattorch K cache" not in emulator.lists
+    assert "_cattorch K cache 1" in emulator.lists and "_cattorch K cache" not in emulator.lists
     prefill_and_decode(emulator, model, [1, 2, 3], [4, 5])
 
 
@@ -321,11 +321,11 @@ def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
-    assert "cattorch K cache 1" in result.sharded_lists
-    assert "cattorch V cache 1" in result.sharded_lists
+    assert "_cattorch K cache 1" in result.sharded_lists
+    assert "_cattorch V cache 1" in result.sharded_lists
     emulator = ScratchEmulator(load_sprite(result.path))
     prefill_and_decode(emulator, model, [3, 1, 4], [1])
-    assert len(emulator.lists["cattorch K cache 1"]) == 4 * 64
+    assert len(emulator.lists["_cattorch K cache 1"]) == 4 * 64
 
 
 def test_generation_program_signature_and_validation():

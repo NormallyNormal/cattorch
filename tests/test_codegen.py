@@ -320,7 +320,7 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
         atol=1e-6,
         rtol=0,
     )
-    assert "cattorch shared transformer layer" in auto._procedures
+    assert "_cattorch shared transformer layer" in auto._procedures
 
 
 def test_shared_quantized_bank_can_cross_physical_list_boundary(
@@ -374,7 +374,7 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
         sprites[mode].lists["input"] = value.flatten().tolist()
         sprites[mode].run_procedure("cattorch forward")
 
-    assert "cattorch shared transformer layer" in sprites["auto"]._procedures
+    assert "_cattorch shared transformer layer" in sprites["auto"]._procedures
     assert "W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
     torch.testing.assert_close(
         torch.tensor(sprites["auto"].lists["output"]),

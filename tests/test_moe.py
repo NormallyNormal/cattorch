@@ -586,7 +586,7 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
         emulator.run_procedure("cattorch forward")
         outputs[mode] = torch.tensor(emulator.lists["output"])
         if mode == "auto":
-            assert "cattorch shared transformer layer" in emulator._procedures
+            assert "_cattorch shared transformer layer" in emulator._procedures
             assert {
                 f"W__param_constant{index} shard 2" for index in (1, 2, 3)
             } <= set(emulator._list_name_to_ids)

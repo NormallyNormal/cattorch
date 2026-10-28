@@ -57,7 +57,9 @@ FREQUENCY_PENALTY = 0.3
 
 MODEL_INPUT = "cattorch tokens"
 MODEL_OUTPUT = "cattorch logits"
-TOKEN_IDS = "token_ids"
+TOKEN_IDS = "cattorch token ids"
+# The tokenizer sprite reads and writes its text here.
+TOKENIZER_TEXT = "cattorch text"
 TOP_VALUES = "tinystories sampler top values"
 TOP_IDS = "tinystories sampler top ids"
 TOP_WEIGHTS = "tinystories sampler top weights"
@@ -334,9 +336,9 @@ def add_sampler(sprite: dict) -> dict:
         LOAD_INPUT_PROCEDURE,
         Program(
             "TinyStories editable input bridge",
-            variables=("input", TEXT_INPUT),
+            variables=(TOKENIZER_TEXT, TEXT_INPUT),
             variable_values={TEXT_INPUT: "Once upon a time,"},
-            body=(set_var("input", var(TEXT_INPUT)),),
+            body=(set_var(TOKENIZER_TEXT, var(TEXT_INPUT)),),
         ),
         x=960,
         y=900,
@@ -346,9 +348,9 @@ def add_sampler(sprite: dict) -> dict:
         STREAM_OUTPUT_PROCEDURE,
         Program(
             "TinyStories editable output bridge",
-            variables=("output", TEXT_OUTPUT),
+            variables=(TOKENIZER_TEXT, TEXT_OUTPUT),
             variable_values={TEXT_OUTPUT: "Generated story streams here"},
-            body=(set_var(TEXT_OUTPUT, var("output")),),
+            body=(set_var(TEXT_OUTPUT, var(TOKENIZER_TEXT)),),
         ),
         x=960,
         y=1040,
@@ -377,8 +379,7 @@ def add_sampler(sprite: dict) -> dict:
     _merge_variables_by_name(
         sprite,
         {
-            "input",
-            "output",
+            TOKENIZER_TEXT,
             TEXT_INPUT,
             TEXT_OUTPUT,
             CACHE_LENGTH,
