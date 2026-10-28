@@ -1778,6 +1778,16 @@ def _transpile_any(
         method = generation_method(model)
         if method is not None:
             example_inputs = dataclasses.replace(example_inputs, method=method)
+    if dynamic is not None and isinstance(example_inputs, ExportProgram):
+        raise ValueError(
+            "dynamic= applies to forward; give an entry point's bounds with "
+            "Input(..., dynamic=...) or @entrypoint(dynamic=...)"
+        )
+    if dynamic is not None and isinstance(example_inputs, GenerationProgram):
+        raise ValueError(
+            "dynamic= can't be used with a GenerationProgram, whose prompts already "
+            "vary up to max_context"
+        )
     if example_kwargs is not None and isinstance(
         example_inputs, (ExportProgram, GenerationProgram),
     ):

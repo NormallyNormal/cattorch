@@ -195,3 +195,42 @@ def test_an_entry_point_using_the_length_itself_is_rejected(tmp_path):
 
     with pytest.raises(UnsupportedModelError, match="input 'rows' of entry point 'add'"):
         transpile(Positions().eval(), None, tmp_path / "positions")
+
+
+def test_dynamic_is_rejected_for_programs(tmp_path):
+    class Tally(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(3))
+
+        @entrypoint(example=lambda: (torch.ones(3),))
+        def add(self, value):
+            self.total += value
+            return self.total.sum()
+
+    with pytest.raises(ValueError, match="@entrypoint"):
+        transpile(Tally().eval(), None, tmp_path / "tally", dynamic={0: (1, 4)})
+
+
+def test_row_loop_capture_sees_only_its_own_thread():
+    import threading
+
+    from cattorch.util.instruction.row_loop import captured_programs
+    from cattorch.util.scratch.dsl import Program, set_var
+
+    started, finish = threading.Event(), threading.Event()
+
+    def other():
+        started.wait()
+        Program("other", variables=("v",), body=(set_var("v", 1),)).compile()
+        finish.set()
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    with captured_programs() as programs:
+        mine = Program("mine", variables=("v",), body=(set_var("v", 2),))
+        started.set()
+        finish.wait()
+        mine.compile()
+    thread.join()
+    assert programs == [mine]

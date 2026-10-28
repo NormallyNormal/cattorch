@@ -67,6 +67,33 @@ def at_length(value: torch.Tensor, axis: int, length: int) -> torch.Tensor:
     return value.index_select(axis, index)
 
 
+def varied_at_length(value: torch.Tensor, axis: int, length: int, seed: int = 0) -> torch.Tensor:
+    """``value`` with ``length`` items along ``axis`` that differ from each other.
+
+    Repeated rows would hide an operation that mixes items, such as a sort.
+    Floats are drawn from the example's own values, and integers from the
+    range it uses, so inputs stay in the range the model expects, and token
+    IDs stay valid.
+    """
+    generator = torch.Generator().manual_seed(seed + length)
+    repeated = at_length(value, axis, length)
+    if value.dtype == torch.bool:
+        return torch.rand(repeated.shape, generator=generator) > 0.5
+    if value.is_floating_point():
+        pool = value.flatten().unique()
+        if pool.numel() == 1:
+            # One value: vary it by its own size.
+            scale = abs(float(pool[0])) or 1.0
+            noise = torch.randn(repeated.shape, generator=generator, dtype=value.dtype)
+            return pool[0] + 0.1 * scale * noise
+        picks = torch.randint(0, pool.numel(), repeated.shape, generator=generator)
+        return pool[picks]
+    low, high = int(value.min()), int(value.max())
+    if low == high:
+        low = 0 if high > 0 else low
+    return torch.randint(low, high + 1, repeated.shape, generator=generator, dtype=value.dtype)
+
+
 def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs) -> None:
     """Compare the sprite with PyTorch at lengths other than the traced one.
 
@@ -82,7 +109,7 @@ def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example
 
     def report(length):
         values = list(flat_inputs)
-        values[index] = at_length(values[index], axis, length)
+        values[index] = varied_at_length(values[index], axis, length)
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
         return verify(
@@ -115,12 +142,17 @@ def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example
 
 
 def _lengths(minimum, original, maximum) -> list[int]:
-    """Up to three lengths to check, the first one as the baseline."""
-    lengths = sorted({
-        length for length in (minimum, 1, 2, original, maximum)
-        if max(minimum, 1) <= length <= maximum
+    """Lengths to check, the first one as the baseline.
+
+    The export traces one item and literals at two, so three items or more
+    are needed to catch a wrong extrapolation, and a long length catches
+    capacity mistakes.
+    """
+    longest = maximum if maximum <= 32 else max(16, min(original, maximum))
+    return sorted({
+        length for length in (minimum, 1, 2, 3, original, longest)
+        if max(minimum, 1) <= length <= maximum and (length <= 8 or length in {original, longest})
     })
-    return [length for length in lengths if length <= max(minimum, 8) or length == original][:3]
 
 
 def check_entry_lengths(model, program, result, verify, *, adapters=(), quantization=None) -> None:
@@ -142,7 +174,7 @@ def check_entry_lengths(model, program, result, verify, *, adapters=(), quantiza
 
             def error(length):
                 values = [value.example for value in inputs]
-                values[position] = at_length(binding.example, 0, length)
+                values[position] = varied_at_length(binding.example, 0, length)
                 outcome = verify(
                     model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
                     atol=math.inf, rtol=math.inf, adapters=adapters, quantization=quantization,
@@ -193,6 +225,17 @@ def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> l
         pair = torch.randn(shape, generator=generator, dtype=source.dtype)
     else:
         pair = at_length(source, axis, 2)
+        first, second = pair.narrow(axis, 0, 1), pair.narrow(axis, 1, 1)
+        if torch.equal(first, second):
+            # One example item: make the second unit differ, with values the
+            # example already uses, so mixing across units shows.
+            second = first.flatten().roll(1).reshape(first.shape)
+            if torch.equal(first, second) and source.dtype != torch.bool and int(source.max()) > 0:
+                second = torch.randint(
+                    0, int(source.max()) + 1, tuple(first.shape), generator=generator,
+                    dtype=source.dtype,
+                )
+            pair = torch.cat([first, second], axis)
 
     def run(value):
         values = list(flat_inputs)

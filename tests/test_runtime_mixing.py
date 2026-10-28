@@ -49,6 +49,7 @@ ROWS = {
     "variance": lambda x: x.var(0),
     "standard deviation": lambda x: x.std(0, keepdim=True),
     "mean from the shape": lambda x: x.sum(0) / x.shape[0],
+    "reciprocal of the length": lambda x: x.sum(0, keepdim=True) * (1.0 / x.shape[0]),
     "softmax along columns": lambda x: x.T.softmax(-1),
     "maximum along columns": lambda x: x.T.amax(1),
     "contraction": lambda x: x.T @ x,
@@ -184,3 +185,25 @@ def test_an_entry_point_reads_the_state_it_appends_to(tmp_path):
     calls = tuple(ProgramCall("remember", (torch.randn(3),)) for _ in range(6))
     assert verify(model, None, result, calls=calls).passed
 
+
+
+def test_other_functions_of_the_length_are_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match="a \\+ b \\* n and a \\+ b / n"):
+        transpile(
+            Mixing(lambda x: x.sum(0) * (x.shape[0] * x.shape[0])).eval(), torch.randn(1, 4),
+            tmp_path / "square", dynamic={0: (1, 8)},
+        )
+
+
+def test_mixing_integer_items_with_a_one_item_example_is_rejected(tmp_path):
+    class Sorted(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(10, 4)
+
+        def forward(self, tokens):
+            return torch.sort(self.embedding(tokens), dim=0).values
+
+    torch.manual_seed(0)
+    with pytest.raises(UnsupportedModelError):
+        transpile(Sorted().eval(), torch.tensor([3]), tmp_path / "sorted", dynamic={0: (1, 8)})

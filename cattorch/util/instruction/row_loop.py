@@ -10,6 +10,7 @@ and its output row is appended to the real output.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 
 from cattorch.util.scratch import dsl
@@ -25,21 +26,32 @@ _LIST_NODES = (
 )
 
 
+_CAPTURED: contextvars.ContextVar[list[Program] | None] = contextvars.ContextVar(
+    "cattorch_captured_programs", default=None,
+)
+_original_compile = Program.compile
+
+
+def _recording_compile(self, *args, **kwargs):
+    programs = _CAPTURED.get()
+    if programs is not None:
+        programs.append(self)
+    return _original_compile(self, *args, **kwargs)
+
+
+# Installed once: each thread or context records only its own compiles.
+Program.compile = _recording_compile  # type: ignore[method-assign]
+
+
 @contextlib.contextmanager
 def captured_programs():
-    """Record every ``Program`` compiled inside the block."""
+    """Record every ``Program`` compiled inside the block, in this context only."""
     programs: list[Program] = []
-    original = Program.compile
-
-    def compile(self, *args, **kwargs):
-        programs.append(self)
-        return original(self, *args, **kwargs)
-
-    Program.compile = compile  # type: ignore[method-assign]
+    token = _CAPTURED.set(programs)
     try:
         yield programs
     finally:
-        Program.compile = original  # type: ignore[method-assign]
+        _CAPTURED.reset(token)
 
 
 def _renamed(value, names: dict[str, str]):

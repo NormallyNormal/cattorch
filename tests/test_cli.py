@@ -77,6 +77,15 @@ def test_export_with_shapes_from_a_module_path(models, capsys):
     assert report["sprite"] == "out/net.sprite3"
 
 
+def test_fast_exports_verify_and_dotted_names_keep_their_project(models, capsys):
+    code, report = run(
+        capsys, "export", "models.py:Marked", "--fast", "-o", "out/net.v2", "--project",
+    )
+    assert code == 0 and report["verified"]
+    assert report["sprite"] == "out/net.v2.sprite3"
+    assert report["project"] == "out/net.v2.sb3"
+
+
 def test_export_a_saved_module_with_a_dynamic_batch(models, capsys):
     torch.save(nn.Sequential(nn.Linear(4, 2), nn.Sigmoid()), models / "saved.pt")
     code, report = run(capsys, "export", "saved.pt", "--shape", "3,4", "--dynamic", "0=1:8")

@@ -732,8 +732,11 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
     if not isinstance(entrypoint.arguments[index], Input):
         raise error
     spec = {index: (name, minimum, maximum, 0)}
+    # The full example, whose items differ, shows mixing across them.
+    examples = list(args)
+    examples[index] = entrypoint.arguments[index].example
     try:
-        axes = unit_output_axes(wrapper, list(args), [], spec, None)
+        axes = unit_output_axes(wrapper, examples, [], spec, None)
     except UnsupportedModelError:
         raise error from None
     result = capture(args, None)

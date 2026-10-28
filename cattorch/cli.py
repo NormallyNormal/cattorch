@@ -123,6 +123,13 @@ def _summary(result, extra: dict) -> dict:
     return report
 
 
+def _project_path(output: Path) -> Path:
+    """The project beside the sprite, which keeps any dots in its name."""
+    if output.suffix.lower() == ".sprite3":
+        return output.with_suffix(".sb3")
+    return output.with_name(f"{output.name}.sb3")
+
+
 def _export(args) -> int:
     from cattorch.transpiler import transpile
     from cattorch.verify import verify
@@ -140,8 +147,9 @@ def _export(args) -> int:
     )
     extra: dict = {}
     if not args.no_verify:
-        # Lossy weight storage is checked against what it can reach.
-        tolerance = 1e-4 if args.precision == "float32" else 0.05
+        # Lossy weight storage and approximate kernels are checked against
+        # what they can reach.
+        tolerance = 1e-4 if args.precision == "float32" and not args.fast else 0.05
         report = verify(
             model, example, result, atol=tolerance, rtol=1e-5 if tolerance < 0.05 else 0.05,
         )
@@ -151,7 +159,7 @@ def _export(args) -> int:
     if args.project:
         labels = args.labels.split(",") if args.labels else None
         project = build_project(
-            output.with_suffix(".sb3"), result, example_inputs=example or (), labels=labels,
+            _project_path(output), result, example_inputs=example or (), labels=labels,
         )
         extra["project"] = str(project.path)
     print(json.dumps(_summary(result, extra), indent=2))
@@ -204,7 +212,7 @@ def _generate(args) -> int:
         if eos is None and tokenizer is not None:
             eos = getattr(tokenizer, "eos_token_id", None)
         project = build_project(
-            output.with_suffix(".sb3"), result, tokenizer=tokenizer_result,
+            _project_path(output), result, tokenizer=tokenizer_result,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             eos_token_id=eos,
         )

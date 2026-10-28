@@ -61,6 +61,8 @@ from cattorch.util.scratch.remap import remap_ids
 
 _INDEX = "_cattorch bridge index"
 _BEST = "_cattorch bridge best"
+# Set once the generation bridge has decoded the model's weights.
+_READY = "_cattorch bridge ready"
 _TOTAL = "_cattorch bridge total"
 _PICK = "_cattorch bridge pick"
 _BACKDROP = (
@@ -398,6 +400,11 @@ def _forward_project(builder, result, example_inputs, labels) -> None:
     _layout(builder, shown)
     if labels is not None:
         output = result.outputs[0]
+        if output.numel is None:
+            raise ValueError(
+                f"labels needs an output of fixed size, but {output.list_name!r} has a "
+                "variable-length dimension"
+            )
         if output.numel != len(labels):
             raise ValueError(
                 f"labels has {len(labels)} entries but output {output.list_name!r} "
@@ -454,7 +461,7 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
     heat = builder.global_variable(f"{name} temperature", float(temperature))
     for operation in ("prefill", "decode"):
         builder.receiver(model, f"{name} {operation}", (
-            call("cattorch init"),
+            if_(eq(var(_READY), 0), (call("cattorch init"), set_var(_READY, 1))),
             *_copy(tokens, "cattorch tokens"),
             call(f"cattorch {operation}"),
             set_var(status, var("cattorch status")),
@@ -463,8 +470,14 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
                 set_var(next_token, sub(var(_BEST), 1)),
             )),
         ), lists=(tokens, "cattorch tokens", "cattorch logits"),
-            variables=(_INDEX, _BEST, _TOTAL, _PICK, status, next_token, heat, "cattorch status"))
+            variables=(
+                _INDEX, _BEST, _TOTAL, _PICK, _READY, status, next_token, heat, "cattorch status",
+            ))
 
+    # Decode the weights again after a restart, in case they were re-encoded
+    # for saving.
+    builder.script(model, {"opcode": "event_whenflagclicked", "fields": {}},
+                   (set_var(_READY, 0),), variables=(_READY,))
     text = builder.global_variable(f"{tokenizer_name} text", "")
     ids = builder.global_list(f"{tokenizer_name} token ids")
     builder.receiver(words, f"{tokenizer_name} tokenize", (

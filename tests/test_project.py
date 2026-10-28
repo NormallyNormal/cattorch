@@ -47,6 +47,9 @@ def test_inputs_start_as_zeros_and_labels_must_match(tmp_path):
     assert emulator.stage.lists["linear input"] == [0, 0]
     with pytest.raises(ValueError, match="labels has 3 entries"):
         build_project(tmp_path / "bad", result, labels=["a", "b", "c"])
+    batch = transpile(model, torch.ones(3, 2), tmp_path / "batch", dynamic={0: (1, 4)})
+    with pytest.raises(ValueError, match="variable-length dimension"):
+        build_project(tmp_path / "batch", batch, labels=["a", "b"])
 
 
 class Counter(nn.Module):
@@ -140,6 +143,9 @@ def test_a_text_generator_continues_each_prompt(generator):
         text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
         assert prompt + text in said
     assert len(emulator.questions) == 3
+    # The weights are decoded once, not before every token.
+    model_sprite = next(name for name in emulator.sprites if name not in {"Demo", tokenizer.sprite_name})
+    assert emulator.sprites[model_sprite].broadcasts.count("cattorch init complete") == 1
 
 
 def test_generation_stops_at_the_end_token_and_the_context(generator):

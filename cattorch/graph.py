@@ -361,10 +361,35 @@ def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | 
     two-unit output is the one-unit outputs joined along an axis that leads
     the flat layout.
     """
-    import torch.utils._pytree as pytree
-
     if not callable(node.target):
         return None
+    for arg in node.all_input_nodes:
+        if arg.name in dynamic_axes:
+            if math.prod(_get_shape(arg)[:dynamic_axes[arg.name]]) != 1:
+                return None
+    found = _separable_with(node, dynamic_axes, dynamic_units, varied=False)
+    if found is None or not any(
+        arg.name in dynamic_axes and (dtype := _get_dtype(arg)) is not None
+        and not dtype.is_floating_point and dtype != torch.bool
+        for arg in node.all_input_nodes
+    ):
+        return found
+    # Zeros are safe for any index, but every unit of them looks alike, so a
+    # running sum over integer units would pass. Small varied integers show
+    # it, when the operation accepts them.
+    varied = _separable_with(node, dynamic_axes, dynamic_units, varied=True, strict=True)
+    return found if varied in {found, "failed"} else None
+
+
+def _separable_with(node, dynamic_axes, dynamic_units, *, varied, strict=False):
+    """The separable axis for one choice of integer samples.
+
+    ``varied`` fills runtime-length integer inputs with zeros and ones
+    instead of zeros. With ``strict``, an operation that fails on every axis
+    returns ``"failed"`` rather than ``None``.
+    """
+    import torch.utils._pytree as pytree
+
     generator = torch.Generator().manual_seed(0)
 
     def unit_of(name):
@@ -380,13 +405,11 @@ def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | 
         if value.dtype == torch.bool:
             return torch.rand(shape, generator=generator) > 0.5
         if not value.dtype.is_floating_point:
+            if varied and arg.name in dynamic_axes:
+                return torch.randint(0, 2, shape, generator=generator, dtype=value.dtype)
             return torch.zeros(shape, dtype=value.dtype)
         return torch.randn(shape, generator=generator, dtype=value.dtype)
 
-    for arg in node.all_input_nodes:
-        if arg.name in dynamic_axes:
-            if math.prod(_get_shape(arg)[:dynamic_axes[arg.name]]) != 1:
-                return None
     output_shape = list(_get_shape(node))
     samples = {}
     for arg in node.all_input_nodes:
@@ -415,6 +438,7 @@ def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | 
         kwargs = pytree.tree_map(convert, node.kwargs)
         return node.target(*args, **kwargs)
 
+    ran = False
     for axis in range(len(output_shape)):
         if math.prod(output_shape[:axis]) != 1:
             break
@@ -426,6 +450,7 @@ def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | 
                 first, second = call(0), call(1)
         except Exception:  # noqa: BLE001 - an operation that can't run per unit isn't separable
             continue
+        ran = True
         if not all(isinstance(value, torch.Tensor) for value in (both, first, second, again)):
             continue
         if not torch.equal(both.nan_to_num(), again.nan_to_num()) or first.shape != second.shape:
@@ -436,7 +461,7 @@ def _row_separable_axis(node, dynamic_axes, dynamic_units) -> tuple[int, int] | 
             and torch.allclose(both, torch.cat([first, second], axis), equal_nan=True)
         ):
             return axis, first.shape[axis]
-    return None
+    return "failed" if strict and not ran else None
 
 
 def _broadcasts_along(value, axis, output_shape) -> bool:
@@ -485,13 +510,15 @@ def _drop_empty_cat_inputs(graph) -> None:
 _RUNTIME_END = 2**63 - 1
 
 
-def _length_literals(model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend):
-    """Literal arguments that change when each dynamic input has two items.
+def _length_literals(
+    model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend, items=2,
+):
+    """Literal arguments that change when each dynamic input has ``items`` items.
 
     The graph is traced with one item, where ``x[-1]`` and ``x[0]`` are the
     same slice. A second trace with two items tells them apart. Returns
-    ``{node name: {location: value}}``, with the value at two items, or
-    ``None`` if the second trace fails or has another structure.
+    ``{node name: {location: value}}``, with the value at ``items`` items, or
+    ``None`` if the trace fails or has another structure.
     """
     from cattorch.dynamic import at_length
     from cattorch.frontend import flat_example_inputs
@@ -504,7 +531,7 @@ def _length_literals(model, example_inputs, example_kwargs, dynamic_inputs, capt
         axis = bound[3] if len(bound) > 3 else 0
         if index >= len(values) or values[index].shape[axis] != 1:
             return None
-        values[index] = at_length(values[index], axis, 2)
+        values[index] = at_length(values[index], axis, items)
     keywords = dict(example_kwargs or {})
     names = [key for key, value in keywords.items() if isinstance(value, torch.Tensor)]
     keywords.update(zip(names, values[len(example_inputs):]))
@@ -762,27 +789,48 @@ def _mix_runtime_axis(
 _ARITHMETIC = {"aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"}
 
 
-def _follow_length_literals(node, literals, graph, runtime, source, axis) -> None:
-    """Replace arithmetic constants that grow with the length by its runtime value.
+def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis) -> None:
+    """Replace arithmetic constants computed from the length by its runtime value.
 
-    A constant that is ``a`` with one item and ``b`` with two, such as the
-    ``n - 1`` in a variance or ``x.shape[0]`` in a hand-written mean, becomes
-    ``a + (b - a) * (n - 1)`` with ``n`` read from the list's length.
+    A constant that changes between the traces with one, two and three items
+    is rebuilt from ``n``, read from the list's length, when it is ``a + b n``
+    (the ``n - 1`` in a variance, ``x.shape[0]`` in a hand-written mean) or
+    ``a + b / n`` (``1 / x.shape[0]``). Without a third trace it is taken to
+    be ``a + b n``.
     """
     for position in (0, 1):
         location = ("args", position)
-        value = node.args[position] if position < len(node.args) else None
-        if location not in literals or isinstance(value, (bool, torch.fx.Node)):
+        one = node.args[position] if position < len(node.args) else None
+        if location not in at_two or isinstance(one, (bool, torch.fx.Node)):
             continue
-        slope = literals[location] - value
+        two, three = at_two[location], at_three.get(location)
+        slope = two - one
+        # ``a + b / n`` through one and two items.
+        scale = 2 * (one - two)
+        if three is None or math.isclose(three, one + 2 * slope, rel_tol=1e-9, abs_tol=1e-12):
+            reciprocal = False
+        elif math.isclose(three, one - scale + scale / 3, rel_tol=1e-9, abs_tol=1e-12):
+            reciprocal = True
+        else:
+            raise UnsupportedModelError(
+                f"{node.target} uses a value computed from the variable length that "
+                "cattorch can't follow; it follows a + b * n and a + b / n"
+            )
         count = _insert(
             graph, node, runtime.runtime_length.default, (source, axis), (), torch.float32,
         )
-        if slope != 1:
-            count = _insert(graph, node, torch.ops.aten.mul.Tensor, (count, slope), (), torch.float32)
-        if value - slope:
+        if reciprocal:
             count = _insert(
-                graph, node, torch.ops.aten.add.Tensor, (count, value - slope), (), torch.float32,
+                graph, node, torch.ops.aten.pow.Tensor_Scalar, (count, -1), (), torch.float32,
+            )
+            factor, constant = scale, one - scale
+        else:
+            factor, constant = slope, one - slope
+        if factor != 1:
+            count = _insert(graph, node, torch.ops.aten.mul.Tensor, (count, factor), (), torch.float32)
+        if constant:
+            count = _insert(
+                graph, node, torch.ops.aten.add.Tensor, (count, constant), (), torch.float32,
             )
         arguments = list(node.args)
         arguments[position] = count
@@ -849,11 +897,21 @@ def _prepare_graph(
     # ``cat`` with static tensors along it; a slice can make it negative.
     dynamic_offsets: dict[str, int] = {}
     length_literals = None
+    third_literals: dict = {}
     if dynamic_inputs:
         with _expert_family_context(registry.expert_families):
             length_literals = _length_literals(
                 model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend,
             )
+            # A third trace tells how arithmetic constants depend on the length.
+            if length_literals and len(dynamic_inputs) == 1 and any(
+                str(node.target) in _ARITHMETIC and node.name in length_literals
+                for node in nodes
+            ):
+                third_literals = _length_literals(
+                    model, example_inputs, example_kwargs, dynamic_inputs, captured,
+                    frontend, items=3,
+                ) or {}
     graph = captured.graph
     import cattorch.ops  # noqa: F401 - registers the runtime operations
     runtime = torch.ops.cattorch
@@ -887,7 +945,8 @@ def _prepare_graph(
             continue
         if len(dynamic_inputs) == 1 and str(node.target) in _ARITHMETIC:
             _follow_length_literals(
-                node, (length_literals or {}).get(node.name, {}), graph, runtime,
+                node, (length_literals or {}).get(node.name, {}),
+                third_literals.get(node.name, {}), graph, runtime,
                 placeholders[next(iter(dynamic_inputs))], next(iter(dynamic_axes.values())),
             )
         dynamic_parents = [
