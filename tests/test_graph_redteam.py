@@ -135,19 +135,25 @@ def test_linear_division_by_zero_falls_back_from_epilogue(tmp_path):
     assert verify(model, value, result).passed
 
 
+@pytest.mark.parametrize(("left", "right"), [
+    ((1, 3, 4), (2, 4, 5)),
+    ((4,), (2, 4, 5)),
+    ((2, 3, 4), (4,)),
+    ((3, 4), (2, 4, 5)),
+    ((2, 1, 3, 4), (1, 5, 4, 6)),
+    ((5, 3, 4), (2, 5, 4, 6)),
+])
+def test_matmul_broadcasts_batch_dimensions(tmp_path, left, right):
+    torch.manual_seed(0)
+    model = FunctionModel(lambda a, b: a @ b).eval()
+    inputs = (torch.randn(left), torch.randn(right))
+    result = transpile(model, inputs, tmp_path / "broadcast")
+    assert verify(model, inputs, result).passed
+
+
 @pytest.mark.parametrize(
     ("model", "inputs", "message"),
     [
-        (
-            FunctionModel(lambda left, right: left @ right),
-            (torch.randn(1, 3, 4), torch.randn(2, 4, 5)),
-            "identical batch dimensions",
-        ),
-        (
-            FunctionModel(lambda left, right: left @ right),
-            (torch.randn(4), torch.randn(2, 4, 5)),
-            "vector-by-batched",
-        ),
         (
             FunctionModel(lambda left, right: torch.add(left, right, alpha=2)),
             (torch.randn(2, 3), torch.randn(2, 3)),

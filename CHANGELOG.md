@@ -210,6 +210,8 @@
   and `analyze` stay experimental.
 - An `@entrypoint` method's non-tensor results, such as `None`, are skipped
   with a warning, as they are for `forward`, instead of silently.
+- `torch.matmul` with broadcast batch dimensions, such as `[3, 4] @ [2, 4, 5]`
+  or `[2, 1, 3, 4] @ [5, 4, 6]`, and a vector times a batch of matrices.
 
 ## Performance
 

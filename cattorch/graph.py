@@ -507,6 +507,52 @@ def _drop_empty_cat_inputs(graph) -> None:
             graph.erase_node(node)
 
 
+def _broadcast_matmul_batches(graph) -> None:
+    """Give both operands of a broadcasting ``matmul`` the same batch dimensions.
+
+    The matmul kernel needs identical batches. A vector becomes a one-row or
+    one-column matrix, both operands are expanded to the broadcast batch
+    shape, and the result is reshaped back to what ``matmul`` returns.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.matmul.default":
+            continue
+        left, right = node.args[0], node.args[1]
+        if not (isinstance(left, torch.fx.Node) and isinstance(right, torch.fx.Node)):
+            continue
+        left_shape, right_shape = tuple(_get_shape(left)), tuple(_get_shape(right))
+        if len(right_shape) <= 2 and len(left_shape) >= 1:
+            continue  # The kernel handles any left batch over a matrix.
+        if len(left_shape) >= 2 and left_shape[:-2] == right_shape[:-2]:
+            continue
+        dtype = node.meta["val"].dtype
+        operands = []
+        matrices = (
+            left_shape if len(left_shape) >= 2 else (1, *left_shape),
+            right_shape if len(right_shape) >= 2 else (*right_shape, 1),
+        )
+        batch = tuple(torch.broadcast_shapes(matrices[0][:-2], matrices[1][:-2]))
+        for operand, shape, matrix in zip((left, right), (left_shape, right_shape), matrices):
+            if shape != matrix:
+                operand = _insert(
+                    graph, node, torch.ops.aten.reshape.default, (operand, list(matrix)),
+                    matrix, _get_dtype(operand),
+                )
+            full = (*batch, *matrix[-2:])
+            if matrix != full:
+                operand = _insert(
+                    graph, node, torch.ops.aten.expand.default, (operand, list(full)),
+                    full, _get_dtype(operand),
+                )
+            operands.append(operand)
+        product_shape = (*batch, matrices[0][-2], matrices[1][-1])
+        product = _insert(
+            graph, node, torch.ops.aten.matmul.default, tuple(operands), product_shape, dtype,
+        )
+        node.target = torch.ops.aten.reshape.default
+        node.args, node.kwargs = (product, list(_get_shape(node))), {}
+
+
 _RUNTIME_END = 2**63 - 1
 
 
@@ -543,6 +589,7 @@ def _length_literals(
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
     _drop_empty_cat_inputs(longer.graph)
+    _broadcast_matmul_batches(longer.graph)
     first, second = list(captured.graph.nodes), list(longer.graph.nodes)
     if len(first) != len(second) or any(
         (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
@@ -861,6 +908,7 @@ def _prepare_graph(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
     _drop_empty_cat_inputs(captured.graph)
+    _broadcast_matmul_batches(captured.graph)
     if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
