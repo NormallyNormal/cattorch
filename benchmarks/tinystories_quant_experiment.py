@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from cattorch import StorageConfig, transpile
+from cattorch import QuantizationConfig, StorageConfig, transpile
 from cattorch.benchmark import (
     SUITE_RESULTS,
     _StageBlocks,
@@ -30,6 +30,7 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
+from cattorch.quantization import quantize_model
 from cattorch.storage import rounded_codebook_values, rounded_values
 from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.scratch.dsl import (
@@ -54,15 +55,14 @@ OUTPUT = ROOT / "benchmarks" / "artifacts" / "tinystories_quant"
 VM_RUNNER = ROOT / "benchmarks" / "run_scratch_vm.cjs"
 LOGIT_PREFIX = "cattorch quant logits "
 
+# Each format is its storage and, for integer formats, its quantization.
 FORMATS = {
-    "f32": StorageConfig(precision="float32"),
-    "f16": StorageConfig(precision="float16"),
-    "int8": StorageConfig(precision="int8", group_size=64),
-    "int8_f16_scales": StorageConfig(
-        precision="int8", group_size=64, scale_precision="float16",
-    ),
-    "int6": StorageConfig(precision="int6", group_size=64),
-    "int4": StorageConfig(precision="int4", group_size=64),
+    "f32": (StorageConfig(precision="float32"), None),
+    "f16": (StorageConfig(precision="float16"), None),
+    "int8": (StorageConfig(), QuantizationConfig(bits=8, scale_precision="float32")),
+    "int8_f16_scales": (StorageConfig(), QuantizationConfig(bits=8, scale_precision="float16")),
+    "int6": (StorageConfig(), QuantizationConfig(bits=6, scale_precision="float32")),
+    "int4": (StorageConfig(), QuantizationConfig(bits=4, scale_precision="float32")),
 }
 
 
@@ -93,25 +93,22 @@ def _validation_windows(count: int, context: int) -> tuple[torch.Tensor, torch.T
 
 def _storage_rounded_model(
     model: torch.nn.Module,
-    config: StorageConfig,
+    storage: StorageConfig,
+    quantization: QuantizationConfig | None,
+    example: torch.Tensor,
 ) -> torch.nn.Module:
+    """The model with the weights a sprite in this format reconstructs."""
     result = copy.deepcopy(model).eval()
+    if quantization is not None:
+        quantize_model(result, quantization, None, orientation_inputs=[(example,)])
+        return result
     seen: set[int] = set()
     with torch.no_grad():
         for value in (*result.parameters(), *result.buffers()):
             if id(value) in seen or not value.is_floating_point():
                 continue
             seen.add(id(value))
-            precision = config.precision
-            if precision in {"int8", "int6", "int4"}:
-                if value.ndim < 2:
-                    precision = "float16"
-                elif value.numel() < config.min_quantized_values:
-                    precision = "float16"
-            rounded = rounded_values(
-                value.flatten(), precision, config.group_size,
-                config.scale_precision,
-            )
+            rounded = rounded_values(value.flatten(), storage.precision)
             value.copy_(torch.tensor(rounded, dtype=value.dtype).reshape_as(value))
     return result
 
@@ -162,8 +159,10 @@ def evaluate_python(*, windows: int = 256, context: int = 16) -> dict:
     results = {}
     with torch.inference_mode():
         baseline = model(inputs)[:, -1, :]
-        for name, config in FORMATS.items():
-            variant = model if name == "f32" else _storage_rounded_model(model, config)
+        for name, (storage, quantization) in FORMATS.items():
+            variant = model if name == "f32" else _storage_rounded_model(
+                model, storage, quantization, inputs[:1],
+            )
             logits = baseline if name == "f32" else variant(inputs)[:, -1, :]
             results[name] = _logit_metrics(logits, baseline, targets)
         codebook = _codebook_rounded_model(model)
@@ -207,6 +206,7 @@ def _build_project(
     inputs: torch.Tensor,
     name: str,
     storage: StorageConfig,
+    quantization: QuantizationConfig | None,
 ) -> tuple[Path, dict]:
     OUTPUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as directory:
@@ -216,6 +216,7 @@ def _build_project(
             Path(directory) / name,
             optimization="exact",
             storage=storage,
+            quantization=quantization,
         )
         sprite, assets = _load_sprite(export.path)
     _set_inputs(sprite, (inputs[:1],))
@@ -281,8 +282,8 @@ def build_vm(*, windows: int = 8, context: int = 16) -> dict:
     model = ExportModel(source.eval(), context, last_only=True).eval()
     inputs, targets = _validation_windows(windows, context)
     projects = {}
-    for name, storage in FORMATS.items():
-        _, projects[name] = _build_project(model, inputs, name, storage)
+    for name, (storage, quantization) in FORMATS.items():
+        _, projects[name] = _build_project(model, inputs, name, storage, quantization)
     manifest = {
         "checkpoint": str(CHECKPOINT),
         "checkpoint_sha256": _checkpoint_hash(),

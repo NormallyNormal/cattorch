@@ -520,13 +520,6 @@ def test_select_preserves_valid_indices(tmp_path, index):
         ({"storage": {}}, TypeError),
         ({"codegen": {}}, TypeError),
         ({"name": ""}, ValueError),
-        (
-            {
-                "storage": StorageConfig(precision="int4"),
-                "quantization": QuantizationConfig(bits=4),
-            },
-            ValueError,
-        ),
     ],
 )
 def test_export_options_are_validated_before_interface_dispatch(tmp_path, kind, options, error):

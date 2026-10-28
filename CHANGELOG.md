@@ -251,6 +251,11 @@
 
 ## Breaking changes
 
+- `StorageConfig` no longer takes the deprecated `"int8"`, `"int6"` and
+  `"int4"` precisions or their `group_size`, `min_quantized_values`,
+  `scale_precision` and `grouping` fields. Pass
+  `quantization=QuantizationConfig(bits=8)` instead, which groups weights by
+  row and uses float16 scales by default.
 - The legacy cached-generation recognizer is removed, along with
   `GenerationProgram.example_token`. Export the model's stateless
   `forward(tokens) -> logits` with `GenerationProgram(max_context=...)`

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from cattorch import CodegenConfig, StorageConfig, transpile
+from cattorch import CodegenConfig, QuantizationConfig, transpile
 from cattorch.benchmark import (
     SUITE_RESULTS,
     _StageBlocks,
@@ -70,9 +70,7 @@ def build_json_size_suite(
                 model,
                 inputs,
                 temporary / variant,
-                storage=StorageConfig(
-                    precision="int8", scale_precision="float16",
-                ),
+                quantization=QuantizationConfig(bits=8, scale_precision="float16"),
                 codegen=codegen,
             )
             sprite, sprite_assets = _load_sprite(result.path)

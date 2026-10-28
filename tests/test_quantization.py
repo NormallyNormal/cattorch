@@ -210,7 +210,7 @@ def test_transpile_gptq_reconstructs_expected_weights_in_scratch(tmp_path, bits)
     assert emulator.variables["cattorch quantization bits"] == bits
 
 
-def test_transpile_quantization_validation_and_legacy_alias(tmp_path):
+def test_transpile_quantization_validation(tmp_path):
     model = torch.nn.Linear(3, 2).eval()
     value = torch.randn(1, 3)
     gptq = QuantizationConfig(
@@ -218,22 +218,8 @@ def test_transpile_quantization_validation_and_legacy_alias(tmp_path):
     )
     with pytest.raises(ValueError, match="nonempty calibration_inputs"):
         transpile(model, value, tmp_path / "missing", quantization=gptq)
-    with pytest.raises(ValueError, match="cannot be combined"):
-        transpile(
-            model,
-            value,
-            tmp_path / "conflict",
-            storage=StorageConfig(precision="int4"),
-            quantization=gptq,
-            calibration_inputs=[value],
-        )
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        transpile(
-            model,
-            value,
-            tmp_path / "legacy",
-            storage=StorageConfig(precision="int4"),
-        )
+    with pytest.raises(ValueError, match=r"QuantizationConfig\(bits=4\)"):
+        StorageConfig(precision="int4")
 
 
 def test_row_aligned_quantization_preserves_large_grouped_linear(tmp_path):

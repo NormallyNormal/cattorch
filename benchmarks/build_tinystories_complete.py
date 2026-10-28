@@ -32,7 +32,7 @@ from benchmarks.combine_sprites import combine_sprites
 from cattorch import (
     CodegenConfig,
     GenerationProgram,
-    StorageConfig,
+    QuantizationConfig,
     transpile,
     transpile_tokenizer,
 )
@@ -80,11 +80,7 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
         compact_internal_names=True,
         id_namespace="",
     )
-    storage = StorageConfig(
-        precision="int8",
-        group_size=64,
-        scale_precision="float16",
-    )
+    quantization = QuantizationConfig(bits=8, group_size=64, scale_precision="float16")
 
     # Generation must use the cached wrapper. It presents all RoPE positions
     # as dynamic embeddings; a one-token stateless wrapper only contains
@@ -98,7 +94,7 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
         processor_path,
         name=f"{STEM} int8",
         optimization="exact",
-        storage=storage,
+        quantization=quantization,
         codegen=codegen,
     )
     tokenizer = transpile_tokenizer(

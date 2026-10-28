@@ -31,7 +31,7 @@ from cattorch.results import (
     EntryPointResult, ProgramResult, StateResult, TensorSpec,
 )
 from cattorch.quantization import QuantizationConfig, quantize_model
-from cattorch.storage import StorageConfig
+from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
 )
@@ -420,14 +420,7 @@ def transpile_program(
             _registry=registry,
         )
         prepared_model = calibration_model.model
-        resolved_storage = replace(
-            resolved_storage,
-            precision=quantization.precision,
-            group_size=quantization.group_size,
-            min_quantized_values=quantization.min_quantized_values,
-            scale_precision=quantization.scale_precision,
-            grouping="row",
-        )
+        resolved_storage = quantized_storage(resolved_storage, quantization)
 
     combined = None
     entry_results = []

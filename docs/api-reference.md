@@ -282,16 +282,8 @@ Scratch blocks.
 | `compression` | `True` | Compress stored tensors and decode them during initialization. |
 | `precision` | `"float32"` | `"float32"` or lossy `"float16"`. |
 
-The integer precisions `"int4"`, `"int6"`, and `"int8"` are deprecated; use
-`QuantizationConfig` instead. These fields only apply to the deprecated
-integer precisions:
-
-| Field | Default | Meaning |
-|---|---:|---|
-| `group_size` | `64` | Integer group size. |
-| `min_quantized_values` | `16384` | Threshold below which eligible tensors remain float16. |
-| `scale_precision` | `"float32"` | Integer scale precision. |
-| `grouping` | `"flat"` | Integer grouping, `"flat"` or `"row"`. |
+For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
+`transpile`; `StorageConfig` rejects integer precisions.
 
 ### `QuantizationConfig`
 

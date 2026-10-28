@@ -23,7 +23,7 @@ from cattorch.operator_registry import default_registry, eval_mode_copy_warning
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
-from cattorch.storage import StorageConfig
+from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.program import ExportProgram, Input, Output, ProgramCall
 from cattorch.program_runtime import ProgramReplay
 from cattorch.graph_transforms import fold_eval_batch_norms
@@ -144,13 +144,7 @@ def _verify_program(
         # so this comparison isolates Scratch lowering from the independently
         # lossy storage decision.
         from cattorch.sprite import _static_storage_precision
-        storage = StorageConfig(
-            precision=quantization.precision,
-            group_size=quantization.group_size,
-            min_quantized_values=quantization.min_quantized_values,
-            scale_precision=quantization.scale_precision,
-            grouping="row",
-        )
+        storage = quantized_storage(StorageConfig(), quantization)
         effective_ndims = expert_bank_effective_ndims(owned)
         with torch.no_grad():
             for value in (*owned.parameters(), *owned.buffers()):

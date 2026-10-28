@@ -59,7 +59,7 @@ from cattorch.sprite import (
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
-from cattorch.storage import StorageConfig
+from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
 from cattorch.util.instruction import Instruction
 from cattorch.operator_registry import (
@@ -1904,11 +1904,6 @@ def _transpile_automatic_generation(
     config = fast_config or FastConfig()
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
-    if quantization is not None and storage.precision in {"int8", "int6", "int4"}:
-        raise ValueError(
-            "quantization cannot be combined with legacy integer "
-            "StorageConfig.precision"
-        )
     if calibration_sequences is not None and (
         quantization is None or quantization.method != "gptq"
     ):
@@ -2003,20 +1998,6 @@ def _transpile(
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
     registry = _registry or default_registry().clone()
-    integer_storage = storage.precision in {"int8", "int6", "int4"}
-    legacy_integer_storage = integer_storage and quantization is None
-    if quantization is not None and integer_storage and not _prepared_model:
-        raise ValueError(
-            "quantization cannot be combined with legacy integer "
-            "StorageConfig.precision"
-        )
-    if legacy_integer_storage:
-        warnings.warn(
-            "StorageConfig(precision='int4'/'int6'/'int8') is deprecated; pass "
-            "quantization=QuantizationConfig(bits=4/6/8) instead",
-            DeprecationWarning,
-            stacklevel=3,
-        )
     if calibration_inputs is not None and (
         quantization is None or quantization.method != "gptq"
     ):
@@ -2047,14 +2028,7 @@ def _transpile(
     elif calibration_inputs is not None:
         raise ValueError("prepared model calibration has already been consumed")
     if quantization is not None:
-        storage = replace(
-            storage,
-            precision=quantization.precision,
-            group_size=quantization.group_size,
-            min_quantized_values=quantization.min_quantized_values,
-            scale_precision=quantization.scale_precision,
-            grouping="row",
-        )
+        storage = quantized_storage(storage, quantization)
 
     # 1. Analyse the PyTorch graph
     graph = _prepare_graph(
@@ -2349,16 +2323,11 @@ def _transpile(
         ],
         "cattorch_quantization_method": [
             "cattorch quantization method",
-            quantization.method if quantization is not None else (
-                "symmetric" if legacy_integer_storage else "none"
-            ),
+            quantization.method if quantization is not None else "none",
         ],
         "cattorch_quantization_bits": [
             "cattorch quantization bits",
-            quantization.bits if quantization is not None else (
-                int(storage.precision.removeprefix("int"))
-                if legacy_integer_storage else 0
-            ),
+            quantization.bits if quantization is not None else 0,
         ],
     })
     _remove_unused(sprite)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import struct
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal, cast
 
@@ -63,46 +63,47 @@ BASE85_ALPHABET = BASE92_ALPHABET[:85]
 class StorageConfig:
     """Control serialized numeric tensor storage.
 
-    Compressed storage is the default.  ``float16`` and integer precisions are
-    explicitly lossy and are permitted with either exact or fast kernels.
-    Integer formats use symmetric quantization over fixed-size flat groups and
-    are dequantized once during ``cattorch init``.
-
-    The integer ``precision`` values and their grouping fields are deprecated.
-    Use ``QuantizationConfig`` instead, which uses row-aligned groups and
-    float16 scales by default.
+    Compressed storage is the default. ``float16`` is explicitly lossy and is
+    permitted with either exact or fast kernels. For integer formats, pass
+    ``quantization=QuantizationConfig(bits=...)`` to ``transpile``.
     """
 
     compression: bool = True
-    precision: Literal["float32", "float16", "int8", "int6", "int4"] = "float32"
-    group_size: int = 64
-    min_quantized_values: int = 16384
-    scale_precision: Literal["float32", "float16"] = "float32"
-    grouping: Literal["flat", "row"] = "flat"
+    precision: Literal["float32", "float16"] = "float32"
+    # Set only by ``quantized_storage`` from a QuantizationConfig.
+    group_size: int = field(default=64, init=False, repr=False)
+    min_quantized_values: int = field(default=16384, init=False, repr=False)
+    scale_precision: Literal["float32", "float16"] = field(
+        default="float32", init=False, repr=False,
+    )
+    grouping: Literal["flat", "row"] = field(default="flat", init=False, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.compression, bool):
             raise TypeError("compression must be a bool")
-        if self.precision not in {"float32", "float16", "int8", "int6", "int4"}:
+        if self.precision in {"int8", "int6", "int4"}:
             raise ValueError(
-                "precision must be 'float32', 'float16', 'int8', 'int6', or 'int4'"
+                f"StorageConfig no longer takes precision={self.precision!r}; pass "
+                f"quantization=QuantizationConfig(bits={self.precision[3:]}) instead"
             )
-        if self.scale_precision not in {"float32", "float16"}:
-            raise ValueError("scale_precision must be 'float32' or 'float16'")
-        if self.grouping not in {"flat", "row"}:
-            raise ValueError("grouping must be 'flat' or 'row'")
-        if (
-            isinstance(self.group_size, bool)
-            or not isinstance(self.group_size, int)
-            or self.group_size < 1
-        ):
-            raise ValueError("group_size must be a positive integer")
-        if (
-            isinstance(self.min_quantized_values, bool)
-            or not isinstance(self.min_quantized_values, int)
-            or self.min_quantized_values < 1
-        ):
-            raise ValueError("min_quantized_values must be a positive integer")
+        if self.precision not in {"float32", "float16"}:
+            raise ValueError("precision must be 'float32' or 'float16'")
+
+
+def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
+    """The storage a ``QuantizationConfig`` implies: its integer format and groups."""
+    result = StorageConfig(compression=storage.compression)
+    # Integer formats aren't a public StorageConfig option, so set them past
+    # the frozen dataclass's validation.
+    for name, value in (
+        ("precision", quantization.precision),
+        ("group_size", quantization.group_size),
+        ("min_quantized_values", quantization.min_quantized_values),
+        ("scale_precision", quantization.scale_precision),
+        ("grouping", "row"),
+    ):
+        object.__setattr__(result, name, value)
+    return result
 
 
 def encode_values(values, precision: Literal["float32", "float16"]) -> str:

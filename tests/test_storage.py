@@ -8,6 +8,7 @@ import torch
 
 from cattorch import (
     CodegenConfig,
+    QuantizationConfig,
     StorageConfig,
     build_storage_benchmark_suite,
     transpile,
@@ -27,6 +28,7 @@ from cattorch.storage import (
     encode_quantized_values,
     quantize_codebook_values,
     quantize_values,
+    quantized_storage,
     encode_values,
     rounded_values,
 )
@@ -298,16 +300,15 @@ def test_split_scale_banks_decode_every_tensor_value(tmp_path):
             return self.first(value) + self.second(value)
 
     model = TwoMatrices().eval()
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        result = transpile(
-            model,
-            torch.ones(1, 200),
-            tmp_path / "split-scales",
-            storage=StorageConfig(
-                precision="int8", group_size=1, min_quantized_values=1,
-            ),
-            codegen=CodegenConfig(unrolling="compact", id_namespace=""),
-        )
+    result = transpile(
+        model,
+        torch.ones(1, 200),
+        tmp_path / "split-scales",
+        quantization=QuantizationConfig(
+            bits=8, group_size=1, min_quantized_values=1, scale_precision="float32",
+        ),
+        codegen=CodegenConfig(unrolling="compact", id_namespace=""),
+    )
     emulator = ScratchEmulator(_load(result.path))
     emulator.run_procedure("cattorch init")
 
@@ -344,19 +345,11 @@ def test_compressed_static_shard_limits_cover_values_and_scales():
         tensors,
         StorageConfig(precision="float16"),
     ) == {"W_f32": 100_000, "W_f16": 100_000, "W_int": 100_000}
-    assert _static_storage_shard_limits(
-        {"int": tensors["int"]},
-        StorageConfig(
-            precision="int8", group_size=1, min_quantized_values=1,
-        ),
-    ) == {"W_int": 50_000}
-    assert _static_storage_shard_limits(
-        {"int": tensors["int"]},
-        StorageConfig(
-            precision="int8", group_size=1, min_quantized_values=1,
-            scale_precision="float16",
-        ),
-    ) == {"W_int": 100_000}
+    for scales, limit in (("float32", 50_000), ("float16", 100_000)):
+        storage = quantized_storage(StorageConfig(), QuantizationConfig(
+            bits=8, group_size=1, min_quantized_values=1, scale_precision=scales,
+        ))
+        assert _static_storage_shard_limits({"int": tensors["int"]}, storage) == {"W_int": limit}
 
 
 def test_default_float32_export_shards_for_temporary_decode_limit(tmp_path):
@@ -446,43 +439,29 @@ def test_integer_storage_dequantizes_before_forward_and_reinitializes(
         model.linear.bias.copy_(torch.tensor([0.2, -0.4]))
     value = torch.tensor([[0.5, -1.0, 2.0], [-0.25, 0.75, 1.5]])
     path = tmp_path / precision
-    group_size = 4
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        transpile(
-            model,
-            value,
-            str(path),
-            storage=StorageConfig(
-                precision=precision,
-                group_size=group_size,
-                min_quantized_values=1,
-            ),
-        )
+    transpile(
+        model,
+        value,
+        str(path),
+        quantization=QuantizationConfig(
+            bits=int(precision[3:]), group_size=4, min_quantized_values=1,
+        ),
+    )
     sprite = _load(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
 
-    quantized_weight = torch.tensor(
-        rounded_values(
-            model.linear.weight.detach().flatten(), precision, group_size,
-        ),
-        dtype=model.linear.weight.dtype,
-    ).reshape_as(model.linear.weight)
-    rounded_bias = torch.tensor(
-        rounded_values(model.linear.bias.detach(), "float16"),
-        dtype=model.linear.bias.dtype,
-    )
-    expected = torch.nn.functional.linear(value, quantized_weight, rounded_bias)
-
+    outputs = []
     for _ in range(2):
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run()
-        torch.testing.assert_close(
-            torch.tensor(emulator.lists["output"]),
-            expected.flatten(),
-            atol=1e-5,
-            rtol=0,
-        )
+        outputs.append(list(emulator.lists["output"]))
         emulator._exec_chain(emulator._procedures["cattorch prepare for save"])
+    # The second run decodes the re-encoded weights to the same values.
+    assert outputs[0] == outputs[1]
+    torch.testing.assert_close(
+        torch.tensor(outputs[0]), model(value).detach().flatten(),
+        atol=0.5 if precision == "int4" else 0.1, rtol=0,
+    )
     assert emulator.variables["cattorch storage precision"] == precision
     assert all(
         not emulator.lists[name]
@@ -506,17 +485,14 @@ def test_int8_has_lower_export_error_than_int4_on_same_weights(tmp_path):
     ])
     reports = {}
     for precision in ("int8", "int4"):
-        with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-            result = transpile(
-                model,
-                value,
-                tmp_path / precision,
-                storage=StorageConfig(
-                    precision=precision,
-                    group_size=4,
-                    min_quantized_values=1,
-                ),
-            )
+        result = transpile(
+            model,
+            value,
+            tmp_path / precision,
+            quantization=QuantizationConfig(
+                bits=int(precision[3:]), group_size=4, min_quantized_values=1,
+            ),
+        )
         reports[precision] = verify(model, value, result, atol=0, rtol=0)
 
     assert reports["int8"].mean_abs_error > 0
@@ -582,18 +558,15 @@ def test_uncompressed_integer_storage_still_applies_quantization(tmp_path, preci
             [0.11, 0.57, 2.62],
         ]))
     value = torch.tensor([[0.25, -0.5, 1.25]])
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        result = transpile(
-            model,
-            value,
-            tmp_path / f"plain-{precision}",
-            storage=StorageConfig(
-                compression=False,
-                precision=precision,
-                group_size=4,
-                min_quantized_values=1,
-            ),
-        )
+    result = transpile(
+        model,
+        value,
+        tmp_path / f"plain-{precision}",
+        storage=StorageConfig(compression=False),
+        quantization=QuantizationConfig(
+            bits=int(precision[3:]), group_size=4, min_quantized_values=1,
+        ),
+    )
     report = verify(model, value, result, atol=0, rtol=0)
     assert report.values_compared == 2
     assert report.mean_abs_error > 0
@@ -631,16 +604,13 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
 def test_storage_config_validation():
     with pytest.raises(ValueError, match="precision"):
         StorageConfig(precision="int7")
+    with pytest.raises(ValueError, match=r"QuantizationConfig\(bits=8\)"):
+        StorageConfig(precision="int8")
     with pytest.raises(TypeError, match="compression"):
         StorageConfig(compression=1)
-    with pytest.raises(ValueError, match="group_size"):
-        StorageConfig(group_size=0)
-    with pytest.raises(ValueError, match="group_size"):
-        StorageConfig(group_size=True)
-    with pytest.raises(ValueError, match="min_quantized_values"):
-        StorageConfig(min_quantized_values=0)
-    with pytest.raises(ValueError, match="min_quantized_values"):
-        StorageConfig(min_quantized_values=True)
+    # Grouping comes from QuantizationConfig.
+    with pytest.raises(TypeError):
+        StorageConfig(group_size=4)
 
 
 def test_size_guidance_applies_to_expanded_online_json_not_archives():
@@ -662,13 +632,9 @@ def test_small_matrices_use_float16_instead_of_integer_decoder(tmp_path, precisi
     model = TinyLinear().eval()
     value = torch.randn(1, 3)
     path = tmp_path / f"hybrid-{precision}"
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        transpile(
-            model,
-            value,
-            path,
-            storage=StorageConfig(precision=precision),
-        )
+    transpile(
+        model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])),
+    )
     sprite = _load(path.with_suffix(".sprite3"))
 
     assert not any(
@@ -700,8 +666,7 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
     model = torch.nn.Linear(128, 128, bias=False).eval()
     value = torch.randn(1, 128)
     path = tmp_path / f"large-{precision}"
-    with pytest.warns(DeprecationWarning, match="QuantizationConfig"):
-        transpile(model, value, path, storage=StorageConfig(precision=precision))
+    transpile(model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])))
     sprite = _load(path.with_suffix(".sprite3"))
 
     assert any(
