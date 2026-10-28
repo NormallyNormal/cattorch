@@ -186,7 +186,7 @@ class OperatorRegistry:
     def register_adapter(self, adapter: PublicModuleAdapter) -> None:
         """Register one scoped public adapter on this export-owned registry."""
         if not isinstance(adapter, PublicModuleAdapter):
-            raise TypeError("adapter must be a cattorch.experimental.ModuleAdapter")
+            raise TypeError("adapter must be a cattorch.ModuleAdapter")
         self._module_adapters[adapter.module_type] = adapter.factory
 
     def adapt_model(
@@ -235,7 +235,7 @@ class OperatorRegistry:
             # this export-owned registry so concurrent exports cannot leak
             # template handles into one another.
             from cattorch.markers import apply_export_forward, marked_moe
-            from cattorch.moe import (
+            from cattorch.experts import (
                 ExpertFamily, SparseMoE, _BankedSparseMoE, _specialize_sparse_swiglu,
             )
 
@@ -429,7 +429,7 @@ def _observe_stacked_swiglu(_func, args, _kwargs, _result):
     value, router, gate, up, down, top_k, normalize = args[:7]
     if not all(isinstance(item, torch.Tensor) for item in (value, router, gate, up, down)):
         return ()
-    from cattorch.moe import RoutingScores, select_routes
+    from cattorch.experts import RoutingScores, select_routes
 
     flat = value.detach().reshape(-1, value.shape[-1])
     probabilities = torch.softmax(
@@ -466,7 +466,7 @@ def _observe_expert_family(_func, args, _kwargs, _result):
     value, selection, combination, banks, handle, top_k, normalize, _ = args[:8]
     if not isinstance(value, torch.Tensor):
         return ()
-    from cattorch.moe import RoutingScores, select_routes
+    from cattorch.experts import RoutingScores, select_routes
     ids, _weights = select_routes(
         RoutingScores(selection, combination, bool(normalize)), int(top_k),
     )
@@ -483,7 +483,7 @@ def _observe_routed_experts(_func, args, _kwargs, _result):
 
 
 def _observe_routed_family(value, ids, banks, handle):
-    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES
+    from cattorch.experts import _ACTIVE_EXPERT_FAMILIES
     family = _ACTIVE_EXPERT_FAMILIES.get().get(int(handle))
     if family is None:
         return ()

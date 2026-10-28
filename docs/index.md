@@ -36,12 +36,14 @@ connecting it to the rest of a project.
   broadcasts of exported sprites, versioned for 1.x.
 - [Code generation and JSON size](code-generation.md): trade sprite size for
   speed.
-- [Experimental programs and sparse MoE](programs-and-moe.md): multiple
-  methods, persistent state, and mixture-of-experts models.
+- [Programs and sparse MoE](programs-and-moe.md): multiple methods,
+  persistent state, and mixture-of-experts models.
 - [Markers](markers.md): declare entry points, state, MoE routing, and
-  export-only methods with decorators on your own classes (experimental).
+  export-only methods with decorators on your own classes.
 - [Custom kernels and operations](custom-kernels.md): write Scratch kernels
   and declare new operations (experimental).
+- [Stability](stability.md): what cattorch 1.x keeps compatible, and what's
+  experimental.
 - [Glossary](glossary.md): cattorch and Scratch terms used in these guides.
 
 ## Contribute

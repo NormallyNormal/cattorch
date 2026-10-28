@@ -42,7 +42,7 @@ from cattorch.benchmark import (  # noqa: E402
     _stage_target,
     _write_project,
 )
-from cattorch.experimental import stacked_swiglu_moe_adapter  # noqa: E402
+from cattorch.experimental import stacked_swiglu_moe_adapter
 from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
 from cattorch.util.scratch.dsl import Program, append, call, clear  # noqa: E402
 

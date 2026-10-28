@@ -17,18 +17,11 @@ from cattorch import (
     transpile,
     verify,
 )
-from cattorch.experimental import (
-    EntryPoint,
-    ExportProgram,
-    Input,
-    ModuleAdapter,
-    Output,
-    ProgramCall,
-    State,
-    StateInput,
-    StateUpdate,
-    analyze,
+from cattorch import (
+    EntryPoint, ExportProgram, Input, ModuleAdapter, Output, ProgramCall, State,
+    StateInput, StateUpdate,
 )
+from cattorch.experimental import analyze
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.operator_registry import default_registry
 from cattorch.util.scratch.emulator import ScratchEmulator

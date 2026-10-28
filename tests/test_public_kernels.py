@@ -10,10 +10,8 @@ import torch
 import torch.nn as nn
 
 from cattorch import GenerationProgram, UnsupportedOperationError, transpile, verify
-from cattorch.experimental import (
-    EntryPoint, ExportProgram, Input, Kernel, Output, analyze, build_kernel_benchmark,
-    check_kernel,
-)
+from cattorch import EntryPoint, ExportProgram, Input, Output
+from cattorch.experimental import Kernel, analyze, build_kernel_benchmark, check_kernel
 from cattorch.scratch import (
     add, append, change_var, clear, div, item, mathop, mul, render, repeat, set_var, sub, var,
 )

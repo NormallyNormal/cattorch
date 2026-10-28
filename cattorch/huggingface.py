@@ -135,7 +135,7 @@ class HuggingFaceExperts(torch.nn.Module):
         self.experts = family
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        from cattorch.moe import routed_experts
+        from cattorch.experts import routed_experts
 
         output = routed_experts(hidden_states, top_k_index, top_k_weights, self.experts)
         return output.to(hidden_states.dtype)
@@ -194,7 +194,7 @@ def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFa
 
 
 def _family(module, template, banks, experts, width, dtype, where, name) -> HuggingFaceExperts:
-    from cattorch.moe import ExpertFamily
+    from cattorch.experts import ExpertFamily
 
     # Every template tensor needs a bank; the shared norm and activation state
     # is the same for every expert.

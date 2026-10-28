@@ -184,7 +184,7 @@ def _verify_program(
         status = str(emulator.variables.get("cattorch status", "missing runtime status"))
         output_results = []
         if status == "ok":
-            from cattorch.moe import _expert_family_context
+            from cattorch.experts import _expert_family_context
             with _expert_family_context(registry.expert_families):
                 leaves = replay.run(invocation)
             for binding, expected in zip(entry.returns, leaves):

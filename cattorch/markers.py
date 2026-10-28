@@ -241,7 +241,7 @@ def marked_moe(module: nn.Module, path: str):
     options = marker(type(module), "moe")
     if options is None:
         return None
-    from cattorch.moe import ExpertFamily, SparseMoE
+    from cattorch.experts import ExpertFamily, SparseMoE
     from cattorch.moe_detection import _probe_outputs, _router
 
     where = f"{type(module).__name__} at {path or '<root>'}"

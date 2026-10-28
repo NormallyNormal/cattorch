@@ -245,7 +245,7 @@ class Kernel:
     ``target`` is the operation: an ``OpOverload`` such as
     ``torch.ops.aten.gelu.default`` (a bare ``torch.ops.aten.gelu`` means its
     ``default`` overload), its name ``"aten.gelu.default"``, or an operation
-    declared with ``cattorch.op``. ``emit`` receives a ``KernelContext`` and
+    declared with ``cattorch.experimental.op``. ``emit`` receives a ``KernelContext`` and
     returns the body, a tuple of ``cattorch.scratch`` statements.
 
     ``name`` titles the generated program; it must not include per-layer data.

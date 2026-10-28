@@ -13,10 +13,11 @@ from cattorch import (
     BoundedDimension, CodegenConfig, ProgramResult, QuantizationConfig,
     transpile, verify,
 )
-from cattorch.experimental import (
-    EntryPoint, ExpertFamily, ExportProgram, Input, ModuleAdapter, Output,
-    ProgramCall, SparseMoE, State, StateInput, StateUpdate, analyze,
+from cattorch import (
+    EntryPoint, ExportProgram, Input, ModuleAdapter, Output, ProgramCall, State,
+    StateInput, StateUpdate,
 )
+from cattorch.experimental import ExpertFamily, SparseMoE, analyze
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 

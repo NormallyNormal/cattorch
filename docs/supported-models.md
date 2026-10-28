@@ -7,7 +7,7 @@ and dtypes in `example_inputs`. The Python code can't branch on tensor values.
 Parameters, buffers, and constants are stored in the sprite, and tensor
 arguments become Scratch input lists.
 
-For persistent state and bounded variable-length tensors, use an experimental
+For persistent state, use [`@entrypoint` markers](markers.md) or an
 [`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state).
 
 ## Operations
@@ -88,9 +88,9 @@ requires an even final dimension.
 
 Hand-written mixture-of-experts blocks with a `ModuleList` of experts and a
 linear router are usually recognized automatically. Others are supported
-through the experimental `ExpertFamily` and `SparseMoE` classes, or
-`routed_experts` with your own router code; see
-[experimental programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
+through the [`@moe` marker](markers.md), or the experimental `ExpertFamily`
+and `SparseMoE` classes and `routed_experts` with your own router code; see
+[programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
 Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
 `var`, export when PyTorch can express them in terms of supported

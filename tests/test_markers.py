@@ -10,8 +10,9 @@ import torch
 import torch.nn as nn
 
 from cattorch import GenerationProgram, UnsupportedModelError, transpile, verify
-from cattorch.experimental import (
-    ProgramCall, adapter, entrypoint, example, export_forward, generate, marked_program, moe,
+from cattorch import (
+    ProgramCall, adapter, entrypoint, example, export_forward, generate, marked_program,
+    moe,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
@@ -205,7 +206,7 @@ def test_generate_marker_picks_the_generation_method(tmp_path):
 
 
 def test_adapter_builds_a_scoped_module_adapter(tmp_path):
-    from cattorch.experimental import ExportProgram, EntryPoint, Input, ModuleAdapter, Output
+    from cattorch import ExportProgram, EntryPoint, Input, ModuleAdapter, Output
 
     class ThirdParty(nn.Module):
         def forward(self, value):

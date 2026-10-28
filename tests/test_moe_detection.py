@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cattorch import GenerationProgram, UnsupportedModelError, transpile, verify
-from cattorch.experimental import CustomMoEWarning
+from cattorch import CustomMoEWarning
 from cattorch.operator_registry import default_registry
 
 sys.path.insert(0, str(Path(__file__).parent))

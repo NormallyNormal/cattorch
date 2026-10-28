@@ -51,8 +51,8 @@ covers input layout, connecting other sprites, and saving after a run.
 - Exact inference by default, with optional approximate kernels and smaller
   weight storage.
 - Cached text generation and character, BPE, or SentencePiece tokenizer sprites.
-- Experimental multi-method models, persistent state, and sparse
-  mixture-of-experts models.
+- Multi-method models with persistent state, and sparse mixture-of-experts
+  models.
 - Runnable demo projects, including a prompt-and-continue text generator,
   and a `cattorch` command.
 - Numerical verification and benchmark projects that measure speed in Scratch.

@@ -42,7 +42,8 @@ from cattorch import (  # noqa: E402
     transpile,
     transpile_tokenizer,
 )
-from cattorch.experimental import ModuleAdapter, stacked_swiglu_moe_adapter  # noqa: E402
+from cattorch import ModuleAdapter
+from cattorch.experimental import stacked_swiglu_moe_adapter
 from cattorch.util.scratch.finalize_scratch import finalize_sprite  # noqa: E402
 
 

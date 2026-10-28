@@ -5,11 +5,13 @@
 Functions, configuration classes, and result types are imported from
 `cattorch`. Paths can be strings or `pathlib.Path` objects.
 
-Experimental programs, state, adapters, analysis, and MoE classes are imported
-from `cattorch.experimental`; see
-[experimental programs and sparse MoE](programs-and-moe.md). The experimental
-kernel interface (`Kernel`, `op`, `check_kernel`, `build_kernel_benchmark`,
-and `cattorch.scratch`) is described in
+Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
+`StateInput`, `StateUpdate`, `ProgramCall`), markers, and `ModuleAdapter` are
+described in [programs and sparse MoE](programs-and-moe.md) and
+[markers](markers.md). [Experimental](stability.md) APIs are imported from
+`cattorch.experimental`: the explicit MoE classes, `analyze`, and the kernel
+interface (`Kernel`, `op`, `check_kernel`, `build_kernel_benchmark`, and
+`cattorch.scratch`), described in
 [custom kernels and operations](custom-kernels.md).
 
 ## Model export
@@ -98,11 +100,10 @@ Apply rotary position embeddings (RoPE) to adjacent pairs of features. The
 last dimension of `value` must be even. `cosine` and `sine` must broadcast to
 `value`'s shape without making it larger.
 
-## Markers and new operations
+## Markers and programs
 
 Decorators on your own classes and methods. They only attach metadata, so the
-model runs unchanged in PyTorch; see [markers](markers.md) and
-[custom kernels and operations](custom-kernels.md).
+model runs unchanged in PyTorch; see [markers](markers.md).
 
 | Name | Use |
 |---|---|
@@ -112,10 +113,22 @@ model runs unchanged in PyTorch; see [markers](markers.md) and
 | `moe` | On a class: export it as a sparse mixture of experts with the given `router`, `experts`, `top_k`, `scoring`, `normalize`, `shared`, and `scale`, checked against `forward`. |
 | `generate` | On a method: the method a `GenerationProgram` exports. |
 | `adapter` | On a function: build a `ModuleAdapter` for a class you don't own. |
-| `op` | On an annotated function: declare a new operation, exported whole and lowered by a kernel attached with `@operation.kernel`, or through the function itself. |
+| `marked_program` | `marked_program(model)` returns the export copy and the `ExportProgram` a model's `entrypoint` markers describe. |
 
 Pass `None` as `example_inputs` to `transpile` and `verify` to take the
 interface from `entrypoint` or `example` markers.
+
+The classes markers compile to can also be used directly:
+
+| Name | Use |
+|---|---|
+| `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entrypoints-and-state). |
+| `ProgramCall` | One call in `verify(model, program, result, calls=...)`. |
+| `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
+| `CustomMoEWarning` | Warned when a hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
+
+`op`, for declaring a new operation, is [experimental](stability.md); see
+[custom kernels and operations](custom-kernels.md).
 
 ## Tokenizer export
 
@@ -322,8 +335,8 @@ See [code generation](code-generation.md) before turning on `compact_schema` or
 An `ExportProgram` export returns a `ProgramResult`: the `ArtifactResult`
 fields plus `EntryPointResult` and `StateResult` records. Verifying a program
 returns a `ProgramVerifyResult`, with one `ProgramCallVerifyResult` per call.
-These result types are imported from `cattorch`; the classes that define
-programs and calls come from `cattorch.experimental`.
+These result types, and the classes that define programs and calls, are
+imported from `cattorch`.
 
 Each `ProgramCallVerifyResult` has `entrypoint`, `passed`, `outputs`, `states`,
 and the Scratch `status`. A call whose status isn't `"ok"` fails, and doesn't

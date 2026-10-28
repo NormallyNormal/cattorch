@@ -14,9 +14,15 @@ from cattorch.quantization import (
 )
 from cattorch.codegen import CodegenConfig
 from cattorch.ops import rotary_embedding
-from cattorch.custom_ops import op
-from cattorch.markers import adapter, entrypoint, example, export_forward, generate, moe
-from cattorch.program import GenerationProgram
+from cattorch.adapters import AdapterContext, ModuleAdapter
+from cattorch.moe_detection import CustomMoEWarning
+from cattorch.markers import (
+    adapter, entrypoint, example, export_forward, generate, marked_program, moe,
+)
+from cattorch.program import (
+    EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall, State,
+    StateInput, StateUpdate,
+)
 from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
 from cattorch.results import (
     ArtifactResult, BoundedDimension, EntryPointResult, ProgramCallVerifyResult, ProgramResult,
@@ -48,8 +54,10 @@ __all__ = [
     "FastConfig", "FastLayerConfig", "GenerationProgram", "BoundedDimension",
     "StorageConfig", "QuantizationConfig", "QuantizationReport",
     "TensorQuantizationReport",
-    "CodegenConfig", "rotary_embedding", "op",
-    "adapter", "entrypoint", "example", "export_forward", "generate", "moe",
+    "CodegenConfig", "rotary_embedding",
+    "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",
+    "EntryPoint", "ExportProgram", "Input", "Output", "ProgramCall", "State", "StateInput",
+    "StateUpdate", "AdapterContext", "ModuleAdapter", "CustomMoEWarning",
     "CattorchError", "UnsupportedModelError", "UnsupportedOperationError",
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",

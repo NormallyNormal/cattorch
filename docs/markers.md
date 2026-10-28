@@ -21,7 +21,7 @@ becomes persistent state:
 import torch
 from torch import nn
 from cattorch import entrypoint, transpile, verify
-from cattorch.experimental import ProgramCall
+from cattorch import ProgramCall
 
 class Tally(nn.Module):
     def __init__(self):

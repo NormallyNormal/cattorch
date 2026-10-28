@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from cattorch import entrypoint, transpile, verify
-from cattorch.experimental import ProgramCall
+from cattorch import ProgramCall
 
 
 class Called(nn.Module):

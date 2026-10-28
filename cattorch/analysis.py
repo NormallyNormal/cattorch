@@ -16,7 +16,7 @@ from cattorch.fast import FastConfig
 from cattorch.frontend import capture_model, keep_operations
 from cattorch.kernel_api import active_kernel_targets, validate_kernels
 from cattorch.graph import _prepare_graph
-from cattorch.moe import (
+from cattorch.experts import (
     ExpertFamily, SparseMoE, StackedSwiGLUMoE, _BankedSparseMoE, _expert_family_context,
 )
 from cattorch.operator_registry import default_registry

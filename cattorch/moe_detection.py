@@ -109,7 +109,7 @@ def detect_custom_moe(module: nn.Module, path: str) -> nn.Module | None:
     Raises ``UnsupportedModelError`` for a candidate that matches no routing
     configuration and can't be traced as it is.
     """
-    from cattorch.moe import ExpertFamily, SparseMoE
+    from cattorch.experts import ExpertFamily, SparseMoE
 
     parts = _candidate_parts(module)
     if parts is None:

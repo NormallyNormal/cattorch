@@ -468,9 +468,7 @@ def test_training_mode_model_exports_in_evaluation_mode(tmp_path):
 
 def test_example_kwargs_rejections(tmp_path):
     from cattorch import QuantizationConfig
-    from cattorch.experimental import (
-        EntryPoint, ExportProgram, GenerationProgram, Input, Output,
-    )
+    from cattorch import EntryPoint, ExportProgram, GenerationProgram, Input, Output
     model = KeywordMask().eval()
     x, mask = torch.randn(2, 4), torch.ones(1, 4)
     program = ExportProgram(entrypoints=(

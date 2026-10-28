@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from cattorch import UnsupportedModelError, transpile, verify
 from cattorch.huggingface import HuggingFaceExperts
-from cattorch.moe import _expert_family_context
+from cattorch.experts import _expert_family_context
 from cattorch.operator_registry import default_registry
 
 transformers = pytest.importorskip("transformers")

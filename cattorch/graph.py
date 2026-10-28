@@ -855,7 +855,7 @@ def _prepare_graph(
     fast = optimization == "fast"
     fast_config = fast_config or FastConfig()
     registry = _registry or default_registry()
-    from cattorch.moe import _expert_family_context
+    from cattorch.experts import _expert_family_context
     with _expert_family_context(registry.expert_families):
         captured = _captured or capture_model(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,

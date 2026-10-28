@@ -1,10 +1,11 @@
-# Experimental programs and sparse MoE
+# Programs and sparse MoE
 
 [Documentation home](index.md)
 
 `ExportProgram` puts several model methods, and state that persists between
-calls, into one sprite. Everything in this guide is experimental and may
-change. For a model with just a `forward` method and no state, use the
+calls, into one sprite. Programs and adapters are stable; the
+[mixture-of-experts classes](#mixture-of-experts) and `analyze` are
+[experimental](stability.md). For a model with just a `forward` method and no state, use the
 [ordinary export](getting-started.md) instead.
 
 [Markers](markers.md) declare the same things with decorators on your own
@@ -14,12 +15,12 @@ and `SparseMoE`. The classes here remain for code you can't decorate.
 
 ## Named entrypoints and state
 
-Import the interface types from `cattorch.experimental`:
+Import the interface types from `cattorch`:
 
 ```python
 import torch
 import cattorch
-from cattorch.experimental import (
+from cattorch import (
     EntryPoint, ExportProgram, Input, Output, State, StateInput, StateUpdate,
 )
 
@@ -82,7 +83,7 @@ can use it, with these limits, all checked at export:
 To test a sequence of calls, pass `ProgramCall` values to `verify()`:
 
 ```python
-from cattorch.experimental import ProgramCall
+from cattorch import ProgramCall
 
 check = cattorch.verify(
     model,
@@ -109,7 +110,7 @@ To check support and estimated size without writing a sprite, call
 export, for example to turn a third-party block into supported operations:
 
 ```python
-from cattorch.experimental import ModuleAdapter
+from cattorch import ModuleAdapter
 
 adapter = ModuleAdapter(ThirdPartyBlock, convert_block)
 result = cattorch.transpile(model, program, "model.sprite3", adapters=(adapter,))
@@ -121,6 +122,10 @@ that export, and apply to child modules before their parents. A module used in
 several places is replaced once, and every use gets the same replacement.
 
 ## Mixture of experts
+
+These classes are experimental, imported from `cattorch.experimental`, and may
+change in any release; [`@moe`](markers.md) and automatic detection cover most
+models.
 
 `ExpertFamily` holds a set of experts with identical structure. `SparseMoE`
 sends each token to its top-k experts and combines their outputs. In Scratch,

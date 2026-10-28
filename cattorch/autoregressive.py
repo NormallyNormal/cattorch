@@ -285,7 +285,7 @@ def prepare_sequence_model(model: torch.nn.Module, registry=None) -> torch.nn.Mo
 # ── Tracing and pairing ──────────────────────────────────────────────────────
 
 def _capture(model, length: int, example_kwargs) -> CapturedGraph:
-    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
+    from cattorch.experts import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
     from cattorch.operator_registry import default_registry
 
     tokens = torch.zeros(1, length, dtype=torch.long)
@@ -297,7 +297,7 @@ def _capture(model, length: int, example_kwargs) -> CapturedGraph:
 
 def _explain_context_failure(model, length: int, example_kwargs, error) -> None:
     """Name ``max_context`` when ``forward`` itself fails at that length."""
-    from cattorch.moe import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
+    from cattorch.experts import _ACTIVE_EXPERT_FAMILIES, _expert_family_context
     from cattorch.operator_registry import default_registry
 
     families = _ACTIVE_EXPERT_FAMILIES.get() or default_registry().expert_families
@@ -1567,7 +1567,7 @@ def build_generation_step(
     ``registry`` is the one that made that copy. Returns the verified, reset
     step module.
     """
-    from cattorch.moe import _expert_family_context
+    from cattorch.experts import _expert_family_context
     from cattorch.operator_registry import default_registry
 
     registry = registry or default_registry().clone()

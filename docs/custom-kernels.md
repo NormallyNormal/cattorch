@@ -8,9 +8,9 @@ simpler operations, which is often slower; `TranspileResult.fallback_operations`
 lists those. You can write a kernel for such an operation, replace a built-in
 one, or declare an operation of your own.
 
-`Kernel`, `check_kernel`, and `build_kernel_benchmark` come from
-`cattorch.experimental`, the statements from `cattorch.scratch`, and `op` from
-`cattorch`. The kernel interface may change before 1.0.
+`Kernel`, `check_kernel`, `build_kernel_benchmark`, and `op` come from
+`cattorch.experimental`, and the statements from `cattorch.scratch`. The kernel
+interface is [experimental](stability.md): it may change in any release.
 
 ## Write a kernel
 
@@ -109,7 +109,7 @@ operation's schema.
 
 ```python
 from torch import Tensor
-from cattorch import op
+from cattorch.experimental import op
 
 @op
 def squash(x: Tensor, alpha: float = 1.0) -> Tensor:

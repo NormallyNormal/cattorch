@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cattorch import BoundedDimension, UnsupportedModelError, entrypoint, transpile, verify
-from cattorch.experimental import ProgramCall
+from cattorch import ProgramCall
 
 
 class Lambda(nn.Module):

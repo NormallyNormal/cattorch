@@ -201,6 +201,13 @@
 - Plain model sprites set `cattorch status` and broadcast
   `cattorch init complete` and `cattorch forward complete` when those blocks
   finish, as generation and program sprites do.
+- Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
+  `StateInput`, `StateUpdate`, `ProgramCall`), `marked_program`,
+  `ModuleAdapter`, `AdapterContext`, and `CustomMoEWarning` are stable and
+  imported from `cattorch`. Importing them from `cattorch.experimental` still
+  works with a `DeprecationWarning`. [Stability](docs/stability.md) lists what
+  1.x keeps compatible; the kernel interface, `op`, the explicit MoE classes,
+  and `analyze` stay experimental.
 
 ## Performance
 
@@ -210,6 +217,9 @@
 
 ## Fixes
 
+- `@cattorch.moe` stopped working once anything imported
+  `cattorch.experimental`, because the module holding the MoE classes had the
+  same name and replaced the marker. That module is now `cattorch.experts`.
 - With a variable-length input or append state, three cases gave wrong values:
   - adding a fixed `[1, features]` tensor to the variable-length rows;
   - transposing across the variable axis while it had one item in the trace;
@@ -265,6 +275,9 @@
 
 ## Breaking changes
 
+- `op` moved back to `cattorch.experimental`, next to the kernel interface it
+  uses. Only names outside `cattorch.experimental` are stable; see
+  [stability](docs/stability.md).
 - Tokenizer sprites read and write the `cattorch text` variable and the
   `cattorch token ids` list, instead of the `input` and `output` variables and
   the `token_ids` list, so every public name starts with `cattorch `. The
