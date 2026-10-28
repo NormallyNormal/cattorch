@@ -52,6 +52,9 @@ line-length = 100
 select = ["E9", "F63", "F7", "F82"]
 
 [tool.pytest.ini_options]
+markers = [
+    "vm: runs exported sprites in the official Scratch VM (needs Node.js and npm ci in benchmarks/)",
+]
 filterwarnings = [
     "error:the model has modules in training mode:UserWarning",
 ]

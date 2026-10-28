@@ -187,6 +187,12 @@
   any integer indices.
 - `torch.sort`, `argsort`, `msort`, `kthvalue`, `median`, `cummax`, `cummin`,
   and `torch.isin`.
+- CI runs a set of exported sprites in the official Scratch VM and compares
+  them with PyTorch: an MLP, a CNN, a transformer layer, every weight storage
+  format, a variable-length input, a stateful program, and cached generation
+  with its tokenizer. `benchmarks/run_project_vm.cjs` takes `--list`,
+  `--var`, `--broadcast`, `--no-flag` and `--out` to drive a project's
+  bridges.
 
 ## Performance
 

@@ -64,6 +64,36 @@ jobs:
       - name: Check typed public modules
         run: mypy --follow-imports=skip --ignore-missing-imports cattorch/results.py cattorch/errors.py cattorch/codegen.py cattorch/storage.py cattorch/quantization.py cattorch/fast.py cattorch/tokenizer.py cattorch/verify.py cattorch/frontend.py cattorch/operator_registry.py cattorch/kernel_api.py cattorch/custom_ops.py cattorch/scratch.py cattorch/kernel_testing.py cattorch/markers.py cattorch/dynamic.py cattorch/util/instruction/row_loop.py cattorch/project.py cattorch/cli.py
 
+  # Exported sprites in the official Scratch VM, compared with PyTorch.
+  scratch-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: benchmarks/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+          npm ci --prefix benchmarks
+
+      - name: Run sprites in scratch-vm
+        env:
+          CATTORCH_REQUIRE_VM: "1"
+        run: pytest tests/test_real_vm.py -v -n auto
+
   package:
     runs-on: ubuntu-latest
     steps:
