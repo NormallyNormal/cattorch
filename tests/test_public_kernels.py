@@ -75,7 +75,8 @@ def test_a_kernel_replaces_a_builtin_kernel_for_one_export(tmp_path):
 def test_approximate_kernels_apply_only_in_fast_mode(tmp_path):
     rough = Kernel(torch.ops.aten.mish, _pointwise(lambda x: mul(x, 0.6)), approximate=True)
     model, value = nn.Mish().eval(), torch.randn(2, 4)
-    exact = transpile(model, value, tmp_path / "exact", kernels=[rough])
+    with pytest.warns(UserWarning, match="runs only with optimization='fast'"):
+        exact = transpile(model, value, tmp_path / "exact", kernels=[rough])
     assert exact.fallback_operations == (("aten.mish.default", 1),)
     assert exact.approximate_operations == ()
     fast = transpile(model, value, tmp_path / "fast", kernels=[rough], optimization="fast")

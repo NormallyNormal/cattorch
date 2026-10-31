@@ -231,6 +231,21 @@
 
 ## Fixes
 
+- A kernel passed in `kernels=` now always runs. Before, fusions skipped it
+  without a word: a Linear with its activation, scalar or residual, `silu(a) *
+  b`, arithmetic chains, token plus position embeddings, rotary embeddings,
+  causal attention, and large stored matmuls. In fast mode, the built-in
+  approximate GELU, softmax and layer norm won over an exact kernel. On a
+  variable-length input, a kernel for a reduction was replaced by the
+  built-in one, and kernels for softmax, layer norm and mean ran on the
+  traced size instead of once per item. A user embedding or Linear kernel on
+  a tied table read the library's interleaved layout.
+- A kernel's validator gets the same context as its `emit`, including
+  `dynamic_axis` and stored values, and a user Linear kernel gets the call's
+  own arguments, without the library's extra slots.
+- `Kernel` rejects targets that name no single tensor operation, such as
+  `torch.ops.aten.add` (whose `default` adds two numbers) or `torch.relu`, and
+  an export warns about a passed kernel it never used.
 - Combined-QKV attention (one projection split into Q, K and V) gave wrong
   output with a batch of more than one, or when Q, K or V was also returned
   or used elsewhere.

@@ -177,3 +177,197 @@ def test_functional_linear_with_a_vector_weight_or_broadcast_bias(tmp_path, weig
 
     torch.manual_seed(0)
     _check(Linear(), torch.randn(2, 5), tmp_path / "linear")
+
+
+# ── Kernels passed to an export ──────────────────────────────────────────────
+
+from cattorch.experimental import Kernel  # noqa: E402
+from cattorch.scratch import append, clear, repeat  # noqa: E402
+
+
+def _sevens(target, calls, **options):
+    """A kernel that fills its output with 7s, so using it makes verify fail."""
+    def emit(ctx):
+        calls.append(ctx)
+        return (clear(ctx.output.list), repeat(ctx.output.numel, (append(ctx.output.list, 7),)))
+    return Kernel(target, emit, **options)
+
+
+class Lambda(nn.Module):
+    def __init__(self, function, **modules):
+        super().__init__()
+        self.function = function
+        self.parts = nn.ModuleDict(modules)
+
+    def forward(self, *values):
+        return self.function(self.parts, *values)
+
+
+def _causal(parts, value):
+    scores = parts["q"](value) @ parts["k"](value).transpose(-1, -2) / math.sqrt(8)
+    length = value.shape[-2]
+    scores = scores.masked_fill(torch.triu(torch.ones(length, length, dtype=torch.bool), 1), float("-inf"))
+    return torch.softmax(scores, -1) @ parts["v"](value)
+
+
+class Rotary(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("cos", torch.randn(3, 4))
+        self.register_buffer("sin", torch.randn(3, 4))
+
+    def forward(self, value):
+        return value * self.cos + torch.cat((-value[..., 2:], value[..., :2]), -1) * self.sin
+
+
+_X = torch.randn(2, 4)
+_FUSED = {
+    "linear epilogue": (
+        lambda: nn.Sequential(nn.Linear(4, 4), nn.ReLU()), (_X,), torch.ops.aten.linear.default),
+    "activation epilogue": (
+        lambda: nn.Sequential(nn.Linear(4, 4), nn.ReLU()), (_X,), torch.ops.aten.relu.default),
+    "residual": (
+        lambda: Lambda(lambda parts, x: x + parts["linear"](x), linear=nn.Linear(4, 4)),
+        (_X,), torch.ops.aten.linear.default),
+    "arithmetic chain": (
+        lambda: Lambda(lambda parts, x: torch.relu(x * 2 + 1)), (_X,), torch.ops.aten.mul.Tensor),
+    "silu times": (
+        lambda: Lambda(lambda parts, a, b: F.silu(a) * b), (_X, _X.clone()), torch.ops.aten.silu.default),
+    "embedding add": (
+        lambda: Lambda(
+            lambda parts, t: parts["token"](t) + parts["position"](torch.arange(t.shape[-1])),
+            token=nn.Embedding(10, 4), position=nn.Embedding(6, 4),
+        ),
+        (torch.tensor([[1, 2, 3]]),), torch.ops.aten.embedding.default),
+    "causal softmax": (
+        lambda: Lambda(_causal, q=nn.Linear(8, 8), k=nn.Linear(8, 8), v=nn.Linear(8, 8)),
+        (torch.randn(1, 4, 8),), torch.ops.aten.softmax.int),
+    "causal matmul": (
+        lambda: Lambda(_causal, q=nn.Linear(8, 8), k=nn.Linear(8, 8), v=nn.Linear(8, 8)),
+        (torch.randn(1, 4, 8),), torch.ops.aten.matmul.default),
+    "rotary": (Rotary, (torch.randn(3, 4),), torch.ops.aten.mul.Tensor),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_FUSED))
+def test_a_fusion_never_skips_a_passed_kernel(tmp_path, case):
+    make, inputs, target = _FUSED[case]
+    model = make().eval()
+    calls = []
+    result = transpile(model, inputs, tmp_path / "fused", kernels=[_sevens(target, calls)])
+    assert calls
+    assert not verify(model, inputs, result).passed
+
+
+@pytest.mark.parametrize("target", ["aten.gelu.default", "aten.layer_norm.default"])
+def test_an_exact_kernel_replaces_the_approximate_one_in_fast_mode(tmp_path, target):
+    model = nn.Sequential(nn.LayerNorm(4), nn.GELU()).eval()
+    calls = []
+    transpile(model, _X, tmp_path / "fast", optimization="fast", kernels=[_sevens(target, calls)])
+    assert calls
+
+
+def _plain_linear(ctx):
+    """``x @ weight.T``, reading the weight in PyTorch's row order."""
+    from cattorch.scratch import add, change_var, item, mul, set_var, var
+
+    source, weight = ctx.inputs["input"], ctx.inputs["weight"]
+    columns, inner = weight.shape
+    row_start, weight_index, index, total = (
+        ctx.temp_var(name) for name in ("row start", "weight index", "index", "total")
+    )
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(row_start, 0),
+        repeat(source.numel // inner, (
+            set_var(weight_index, 1),
+            repeat(columns, (
+                set_var(total, 0),
+                set_var(index, 1),
+                repeat(inner, (
+                    change_var(total, mul(
+                        item(source.list, add(var(row_start), var(index))),
+                        item(weight.list, var(weight_index)),
+                    )),
+                    change_var(index, 1),
+                    change_var(weight_index, 1),
+                )),
+                append(out, var(total)),
+            )),
+            change_var(row_start, inner),
+        )),
+    )
+
+
+@pytest.mark.parametrize("target", ["embedding", "linear"])
+def test_a_correct_kernel_on_a_tied_table(tmp_path, target):
+    from cattorch.operator_registry import default_registry
+
+    if target == "embedding":
+        # The built-in kernel, passed as the user's own.
+        builtin = default_registry().kernel(
+            "aten.embedding.default", fast=False, config=FastConfig(),
+        ).kernel
+        kernel = Kernel(torch.ops.aten.embedding.default, builtin.emit)
+    else:
+        kernel = Kernel(torch.ops.aten.linear.default, _plain_linear)
+    torch.manual_seed(0)
+    model = Tied().eval()
+    tokens = torch.tensor([[7, 3]])
+    result = transpile(model, tokens, tmp_path / "tied", kernels=[kernel])
+    assert verify(model, tokens, result).passed
+
+
+def test_a_kernel_on_a_variable_length_input(tmp_path):
+    from cattorch import UnsupportedModelError
+
+    softmax = Lambda(lambda parts, x: torch.softmax(x, -1)).eval()
+    calls = []
+    builtin = Kernel(torch.ops.aten.softmax.int, _softmax_rows(calls))
+    transpile(softmax, torch.randn(3, 4), tmp_path / "softmax", kernels=[builtin],
+              dynamic={0: (1, 6)})
+    # It runs once per item, so it sees one item.
+    assert calls and all(ctx.inputs["self"].shape[0] == 1 for ctx in calls)
+
+    total = Lambda(lambda parts, x: x.sum(0)).eval()
+    with pytest.raises(UnsupportedModelError, match="can't be split into items"):
+        transpile(total, torch.randn(3, 4), tmp_path / "sum", dynamic={0: (1, 6)},
+                  kernels=[_sevens(torch.ops.aten.sum.dim_IntList, [])])
+
+
+def _softmax_rows(calls):
+    from cattorch.util.instruction.optimized_normalization import SOFTMAX_KERNELS
+
+    def emit(ctx):
+        calls.append(ctx)
+        return SOFTMAX_KERNELS[0].emit(ctx)
+    return emit
+
+
+def test_a_validator_sees_what_emit_sees(tmp_path):
+    seen = []
+
+    def validator(ctx):
+        seen.append((ctx.inputs["self"].dynamic_axis, ctx.inputs["self"].static))
+
+    from cattorch.util.instruction.optimized_elementwise import elementwise_kernel
+
+    model = Lambda(lambda parts, x: torch.relu(x)).eval()
+    relu = elementwise_kernel("aten.relu.default").emit
+    transpile(model, torch.randn(3, 4), tmp_path / "relu", dynamic={0: (1, 6)},
+              kernels=[Kernel(torch.ops.aten.relu.default, relu, validator=validator)])
+    assert seen and all(axis == 0 for axis, _ in seen)
+
+
+def test_kernel_targets_must_name_one_tensor_operation():
+    with pytest.raises(ValueError, match="aten.add.Tensor"):
+        Kernel(torch.ops.aten.add, lambda ctx: ())
+    with pytest.raises(TypeError, match="operation"):
+        Kernel(torch.relu, lambda ctx: ())
+
+
+def test_an_unused_kernel_warns(tmp_path):
+    with pytest.warns(UserWarning, match="aten.gelu.default was not used"):
+        transpile(nn.ReLU().eval(), _X, tmp_path / "relu",
+                  kernels=[_sevens(torch.ops.aten.gelu.default, [])])

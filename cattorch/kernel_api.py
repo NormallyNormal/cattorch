@@ -40,6 +40,9 @@ Rules for kernel authors:
 from __future__ import annotations
 
 import math
+import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
@@ -186,19 +189,34 @@ class KernelContext:
         return context
 
     @classmethod
-    def from_node(cls, node: torch.fx.Node, operator=None) -> KernelContext:
-        """Build a context from an FX node, for validators before lowering."""
+    def from_node(
+        cls, node: torch.fx.Node, operator=None, *, dynamic_axes=None, resolve_weight=None,
+        names: tuple[str, ...] | None = None,
+    ) -> KernelContext:
+        """Build a context from an FX node, for validators before lowering.
+
+        ``dynamic_axes`` maps node names to their variable-length axis, and
+        ``resolve_weight`` returns a node's stored tensor, so the context
+        matches the one ``emit`` gets.
+        """
+        dynamic_axes = dynamic_axes or {}
         arguments = []
+        values = {}
         for arg in node.args:
             if arg is None:
                 arguments.append(Argument("_none", torch.Size([])))
             elif hasattr(arg, "name"):
                 value = arg.meta.get("val") if hasattr(arg, "meta") else None
+                stored = resolve_weight(arg.name) if resolve_weight is not None else None
+                stored = stored if isinstance(stored, torch.Tensor) else None
+                if stored is not None:
+                    values[arg.name] = stored
                 arguments.append(Argument(
                     arg.name,
                     getattr(value, "shape", torch.Size([])),
                     dtype=getattr(value, "dtype", None),
-                    static=arg.op == "get_attr",
+                    static=arg.op == "get_attr" or stored is not None,
+                    dynamic_axis=dynamic_axes.get(arg.name),
                 ))
             else:
                 arguments.append(Argument(f"C_{arg}", torch.Size([]), value=arg))
@@ -208,7 +226,12 @@ class KernelContext:
             getattr(value, "shape", torch.Size([])),
             dtype=getattr(value, "dtype", None),
         )
-        return cls.from_arguments(node.target, output, tuple(arguments), operator)
+        context = cls.from_arguments(node.target, output, tuple(arguments), operator, names=names)
+        for name, info in list(context.inputs.items()):
+            stored = values.get(context.sources.get(name, ""))
+            if stored is not None:
+                context.inputs[name] = replace(info, value=stored)
+        return context
 
     @property
     def output(self) -> TensorInfo:
@@ -255,6 +278,55 @@ class KernelContext:
         return name
 
 
+def _single_overload(packet: torch._ops.OpOverloadPacket) -> torch._ops.OpOverload:
+    """A packet's ``default`` overload, if it takes tensors.
+
+    ``torch.ops.aten.add`` has no tensor ``default``: its ``default`` adds two
+    Python numbers, so the model's ``add.Tensor`` would never match.
+    """
+    def takes_tensors(name):
+        schema = getattr(packet, name)._schema
+        return not schema.is_mutable and any(
+            "Tensor" in str(argument.type) for argument in schema.arguments
+        )
+
+    if "default" in packet.overloads() and takes_tensors("default"):
+        return packet.default
+    overloads = [
+        name for name in packet.overloads() if "out" not in name and takes_tensors(name)
+    ]
+    choices = " or ".join(f"torch.ops.{packet}.{name}" for name in overloads[:3])
+    raise ValueError(
+        f"{packet} doesn't name one tensor operation; pass an overload such as {choices}"
+    )
+
+
+# The kernels an export's instructions ran, while ``warn_unused_kernels`` records.
+_KERNELS_USED: ContextVar[set[int] | None] = ContextVar("cattorch_kernels_used", default=None)
+
+
+@contextmanager
+def warn_unused_kernels(kernels, *, fast: bool):
+    """Warn, after the export succeeds, about each of ``kernels`` it never ran."""
+    used: set[int] = set()
+    token = _KERNELS_USED.set(used)
+    try:
+        yield
+    finally:
+        _KERNELS_USED.reset(token)
+    for kernel in kernels:
+        if id(kernel) in used:
+            continue
+        if kernel.approximate and not fast:
+            reason = "an approximate kernel runs only with optimization='fast'"
+        else:
+            reason = f"the model has no {kernel.target_name} call for it to lower"
+        warnings.warn(
+            f"the kernel passed for {kernel.target_name} was not used: {reason}",
+            UserWarning, stacklevel=4,
+        )
+
+
 @dataclass(frozen=True)
 class Kernel:
     """A Scratch lowering for one operation.
@@ -286,7 +358,12 @@ class Kernel:
     def __post_init__(self) -> None:
         target = getattr(self.target, "operator", self.target)
         if isinstance(target, torch._ops.OpOverloadPacket):
-            target = target.default
+            target = _single_overload(target)
+        if not isinstance(target, (torch._ops.OpOverload, str)):
+            raise TypeError(
+                "kernel target must be an operation such as torch.ops.aten.gelu.default, "
+                f"its name \"aten.gelu.default\", or a cattorch.op; got {target!r}"
+            )
         object.__setattr__(self, "target", target)
         if not callable(self.emit):
             raise TypeError("kernel emit must be callable")
@@ -349,6 +426,9 @@ class _KernelInstruction:
             self.kernel.target_name, output, args, self._operator(),
             names=self.kernel.arguments,
         )
+        used = _KERNELS_USED.get()
+        if used is not None:
+            used.add(id(self.kernel))
         self.temporary_sizes: dict[str, int] = {}
 
     @classmethod
@@ -380,10 +460,15 @@ class _KernelInstruction:
         ).compile()
 
     @classmethod
-    def validate_node(cls, node: torch.fx.Node) -> str | None:
+    def validate_node(
+        cls, node: torch.fx.Node, *, dynamic_axes=None, resolve_weight=None,
+    ) -> str | None:
         if cls.kernel.validator is None:
             return None
-        return cls.kernel.validator(KernelContext.from_node(node, cls._operator()))
+        return cls.kernel.validator(KernelContext.from_node(
+            node, cls._operator(), dynamic_axes=dynamic_axes, resolve_weight=resolve_weight,
+            names=cls.kernel.arguments,
+        ))
 
 
 def active_kernel_targets(kernels, *, fast: bool, config: FastConfig) -> frozenset[str]:

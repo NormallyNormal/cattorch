@@ -85,6 +85,8 @@ class OperatorRegistry:
         self._module_adapters: dict[type[torch.nn.Module], PrivateModuleAdapter] = {}
         self._expert_families: dict[int, object] = {}
         self._next_expert_family = 0
+        # Targets given an approximate kernel through ``register_kernel``.
+        self._approximate_targets: set[str] = set()
 
     def for_export(self, *, adapters=(), kernels=()) -> "OperatorRegistry":
         """A copy with an export's adapters and kernels registered."""
@@ -99,6 +101,7 @@ class OperatorRegistry:
         result = OperatorRegistry()
         result._operations = self._operations.copy()
         result._module_adapters = self._module_adapters.copy()
+        result._approximate_targets = set(self._approximate_targets)
         return result
 
     @property
@@ -138,8 +141,15 @@ class OperatorRegistry:
             rule = OperationRule(target=kernel.target_name)
         instruction = kernel.instruction_class()
         if not kernel.approximate:
-            rule = replace(rule, exact_kernel=instruction)
+            # An exact kernel also replaces the built-in approximate one, so
+            # fast mode runs it too, unless an approximate kernel was passed.
+            fast_kernel = (
+                rule.fast_kernel if kernel.target_name in self._approximate_targets else None
+            )
+            rule = replace(rule, exact_kernel=instruction, fast_kernel=fast_kernel,
+                           fast_flag=rule.fast_flag if fast_kernel else None)
         else:
+            self._approximate_targets.add(kernel.target_name)
             rule = replace(
                 rule, fast_kernel=instruction,
                 fast_flag=cast(Literal["activations", "layer_norm", "softmax"] | None,
@@ -150,13 +160,31 @@ class OperatorRegistry:
     def operation(self, target: str) -> OperationRule | None:
         return self._operations.get(target)
 
+    def replaced_targets(self, *, fast: bool, config: FastConfig) -> frozenset[str]:
+        """Operations whose kernel here isn't the library's own, such as a
+        kernel passed to an export."""
+        default = _DEFAULT_REGISTRY
+        return frozenset(
+            target for target in self._operations
+            if self.kernel(target, fast=fast, config=config)
+            is not default.kernel(target, fast=fast, config=config)
+        )
+
     def kernel(
         self, target: str, *, fast: bool, config: FastConfig,
     ) -> KernelFactory | None:
         rule = self.operation(target)
         return None if rule is None else rule.kernel(fast=fast, config=config)
 
-    def validate(self, node: torch.fx.Node, *, fast: bool, config: FastConfig) -> str | None:
+    def validate(
+        self, node: torch.fx.Node, *, fast: bool, config: FastConfig,
+        dynamic_axes=None, resolve_weight=None,
+    ) -> str | None:
+        """A reason ``node`` can't be lowered, or ``None``.
+
+        ``dynamic_axes`` and ``resolve_weight`` give a kernel's validator the
+        same facts its ``emit`` gets: variable-length axes and stored values.
+        """
         rule = self.operation(str(node.target))
         if rule is None:
             return None
@@ -166,7 +194,9 @@ class OperatorRegistry:
         # A context kernel validates only when it is the one that will run.
         selected = rule.kernel(fast=fast, config=config)
         validate_node = getattr(selected, "validate_node", None)
-        return None if validate_node is None else validate_node(node)
+        return None if validate_node is None else validate_node(
+            node, dynamic_axes=dynamic_axes, resolve_weight=resolve_weight,
+        )
 
     def observe(
         self, target: str, func: object, args: tuple, kwargs: dict, result: object,

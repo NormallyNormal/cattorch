@@ -52,7 +52,14 @@ assert verify(model, example, result).passed
 
 `kernels=` applies to one export, including `GenerationProgram` and
 `ExportProgram` exports and `analyze`. A kernel for an operation cattorch
-already lowers replaces the built-in kernel for that export only.
+already lowers replaces the built-in kernel for that export only, in fast
+mode too unless you also pass an approximate one. cattorch then compiles every
+call of that operation with your kernel: it doesn't fuse the operation into a
+neighbor, as it otherwise does with a Linear and the activation after it,
+attention, or a chain of arithmetic, so a replaced operation may run slower.
+Name the target as one overload, such as `torch.ops.aten.add.Tensor`; a name
+like `torch.ops.aten.add` with no tensor `default` is rejected. If the model
+never calls the operation, the export warns that the kernel went unused.
 
 ### The context
 
@@ -64,8 +71,8 @@ already lowers replaces the built-in kernel for that export only.
   `None`; `shape` is then the traced shape, and `length(info.list)` gives the
   actual number of items. A kernel passed to an export runs once per item
   when the operation treats items independently. Where it can't, as on an
-  `@entrypoint` buffer that grows, the export fails instead of running the
-  kernel on the traced size. Find the names in the schema, for example with
+  `@entrypoint` buffer that grows or a sum over the items, the export fails
+  instead of running the kernel on the traced size. Find the names in the schema, for example with
   `print(torch.ops.aten.mish.default._schema)`.
 - `ctx.scalars` holds the other arguments, with the schema's defaults filled
   in.
@@ -96,7 +103,8 @@ Scratch lists are indexed from 1, its trigonometry uses degrees, and
 
 ### Validators and approximate kernels
 
-`Kernel(validator=...)` receives the same context and returns `None` to
+`Kernel(validator=...)` receives the same context, before any code is
+generated, and returns `None` to
 accept the call or a reason to reject it. The reason is raised as
 `UnsupportedOperationError`, so a kernel can refuse shapes it doesn't handle.
 

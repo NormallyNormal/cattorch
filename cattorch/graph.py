@@ -298,6 +298,9 @@ class _GraphInfo:
     approximate_fusions: tuple[str, ...] = ()
     # Nodes whose one-row kernel runs once per row of a runtime extent.
     row_loops: frozenset[str] = frozenset()
+    # Operations running a kernel passed to the export; the compiler's own
+    # special lowerings leave them alone.
+    protected: frozenset[str] = frozenset()
     # Fixed items along a node's runtime axis beyond the runtime length.
     dynamic_offsets: dict[str, int] = field(default_factory=dict)
 
@@ -713,16 +716,26 @@ def _drop_identity_permutes(graph) -> None:
             graph.erase_node(node)
 
 
-def _normalize_graph(graph) -> None:
+# Operations ``_fuse_rotate_half`` replaces with one kernel.
+_ROTARY_PARTS = frozenset({
+    "aten.add.Tensor", "aten.mul.Tensor", "aten.neg.default", "aten.cat.default",
+    "aten.slice.Tensor",
+})
+
+
+def _normalize_graph(graph, protected=frozenset()) -> None:
     """Rewrites every captured graph gets before analysis.
 
     The traces at other lengths get them too, so their nodes line up.
+    ``protected`` operations run a kernel passed to the export, so no rewrite
+    may consume them.
     """
     _drop_empty_cat_inputs(graph)
     _normalize_linear_shapes(graph)
     _drop_identity_permutes(graph)
     _broadcast_matmul_batches(graph)
-    _fuse_rotate_half(graph)
+    if not protected & _ROTARY_PARTS:
+        _fuse_rotate_half(graph)
 
 
 _RUNTIME_END = 2**63 - 1
@@ -730,6 +743,7 @@ _RUNTIME_END = 2**63 - 1
 
 def _length_literals(
     model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend, items=2,
+    protected=frozenset(),
 ):
     """Literal arguments that change when each dynamic input has ``items`` items.
 
@@ -760,7 +774,7 @@ def _length_literals(
         )
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
-    _normalize_graph(longer.graph)
+    _normalize_graph(longer.graph, protected)
     first, second = list(captured.graph.nodes), list(longer.graph.nodes)
     if len(first) != len(second) or any(
         (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
@@ -1150,6 +1164,26 @@ def _follow_runtime_axis(
         if axis in removed:
             raise UnsupportedModelError("cannot squeeze the runtime extent")
         axis -= sum(value < axis for value in removed)
+    elif _user_kernel(registry, target, fast, fast_config):
+        # A user's kernel may handle only the traced item: it runs once per
+        # item, if the operation treats items independently.
+        unsplittable = (
+            f"the kernel passed for {target} gets a variable-length input "
+            "that can't be split into items; read the length from "
+            "ctx.inputs[...].dynamic_axis, or export without the kernel"
+        )
+        if target in _RUNTIME_ELEMENTWISE:
+            if offset or any(
+                math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
+                for value in dynamic_parents
+            ):
+                raise UnsupportedModelError(unsplittable)
+        else:
+            separable = _row_separable_axis(node, dynamic_axes, dynamic_units)
+            if separable is None:
+                raise UnsupportedModelError(unsplittable)
+            axis, unit = separable
+        row_loops.add(node.name)
     elif target in {
         "aten.conv1d.default", "aten.conv2d.default",
         "aten.max_pool1d.default", "aten.max_pool2d.default",
@@ -1221,18 +1255,6 @@ def _follow_runtime_axis(
                 )
             node.target = runtime.runtime_slice.default
             node.args, node.kwargs = (parent, dimension, first, last), {}
-    elif target in _RUNTIME_ELEMENTWISE and _user_kernel(registry, target, fast, fast_config):
-        # A user's kernel for it may handle only the traced row.
-        if offset or any(
-            math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
-            for value in dynamic_parents
-        ):
-            raise UnsupportedModelError(
-                f"the kernel passed for {target} gets a variable-length input "
-                "that can't be split into items; read the length from "
-                "ctx.inputs[...].dynamic_axis, or export without the kernel"
-            )
-        row_loops.add(node.name)
     elif target in _RUNTIME_ELEMENTWISE and not (
         # These kernels size their rows from the list's length.
         target == "aten.linear.default" and dynamic_parents == [node.args[0]]
@@ -1317,6 +1339,7 @@ def _propagate_runtime_axes(
         with _expert_family_context(registry.expert_families):
             length_literals = _length_literals(
                 model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend,
+                protected=registry.replaced_targets(fast=fast, config=fast_config),
             )
             # A third trace tells how arithmetic constants depend on the length.
             if length_literals and len(dynamic_inputs) == 1 and any(
@@ -1326,6 +1349,7 @@ def _propagate_runtime_axes(
                 third_literals = _length_literals(
                     model, example_inputs, example_kwargs, dynamic_inputs, captured,
                     frontend, items=3,
+                    protected=registry.replaced_targets(fast=fast, config=fast_config),
                 ) or {}
     graph = captured.graph
     import cattorch.ops  # noqa: F401 - registers the runtime operations
@@ -1371,7 +1395,7 @@ def _propagate_runtime_axes(
         input_shape = tuple(_get_shape(parent))
         output_shape = tuple(_get_shape(node))
         offset = dynamic_offsets.get(parent.name, 0)
-        if unit == 1 and _mix_runtime_axis(
+        if unit == 1 and not _user_kernel(registry, target, fast, fast_config) and _mix_runtime_axis(
             node, target, parent, axis, offset, input_shape, output_shape,
             graph=graph, runtime=runtime, dynamic_axes=dynamic_axes,
             dynamic_units=dynamic_units, dynamic_offsets=dynamic_offsets,
@@ -1608,7 +1632,9 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
     return aliases, split_meta
 
 
-def _reject_unsupported_variants(nodes, generated_weights, registry, fast, fast_config) -> None:
+def _reject_unsupported_variants(
+    nodes, generated_weights, registry, fast, fast_config, dynamic_axes, resolve_weight,
+) -> None:
 
     # Reject valid ATen variants whose extra arguments the Scratch kernels do
     # not implement.  Silently discarding these options is much worse than an
@@ -1622,7 +1648,10 @@ def _reject_unsupported_variants(nodes, generated_weights, registry, fast, fast_
         # checked by the ordinary compiler path after those fusions are known.
         detail = (
             None if aten_op in {"aten.matmul.default", "aten.mm.default", "aten.bmm.default"}
-            else registry.validate(node, fast=fast, config=fast_config)
+            else registry.validate(
+                node, fast=fast, config=fast_config, dynamic_axes=dynamic_axes,
+                resolve_weight=resolve_weight,
+            )
         )
         if detail is not None:
             raise _unsupported_operation(node, detail)
@@ -1680,6 +1709,15 @@ class _Fusions:
     causal_value_matmuls: set[str] = field(default_factory=set)
     qkv_linear: dict = field(default_factory=dict)
     qkv_offsets: dict = field(default_factory=dict)
+    #: Operations running a kernel passed to the export, which no fusion
+    #: may absorb.
+    protected: frozenset[str] = frozenset()
+
+    def allows(self, *nodes) -> bool:
+        """Whether a fusion may compile ``nodes`` (``None`` entries skipped)."""
+        return not any(
+            node is not None and str(node.target) in self.protected for node in nodes
+        )
 
 
 def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config):
@@ -1764,7 +1802,7 @@ def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast,
                 break
             chain.append(user)
             current = user
-        if chain:
+        if chain and fusions.allows(node, *chain):
             linear_fusions[node.name] = _LinearEpilogue(current, tuple(epilogue), tuple(chain))
             fused_nodes.update(item.name for item in chain)
 
@@ -1793,8 +1831,11 @@ def _match_swiglu(fusions, nodes):
         gate = node.args[0]
         if not hasattr(gate, "name") or _get_shape(gate) != _get_shape(multiply):
             continue
+        if not fusions.allows(node, multiply):
+            continue
         if (
-            gate.op == "call_function"
+            fusions.allows(gate, other)
+            and gate.op == "call_function"
             and str(gate.target) == "aten.linear.default"
             and other.op == "call_function"
             and str(other.target) == "aten.linear.default"
@@ -1836,6 +1877,8 @@ def _match_embedding_adds(fusions, nodes):
             != math.prod(_get_shape(second.args[1]))
             or _get_shape(first.args[0])[1:] != _get_shape(second.args[0])[1:]
         ):
+            continue
+        if not fusions.allows(node, first, second):
             continue
         embedding_add_fusions[node.name] = (first, second)
         fused_nodes.update((first.name, second.name))
@@ -1902,7 +1945,7 @@ def _match_elementwise_chains(fusions, nodes, row_loops):
                 break
             current = user
 
-        if len(chain) < 2:
+        if len(chain) < 2 or not fusions.allows(*chain):
             continue
         final = chain[-1]
         elementwise_fusions[final.name] = tuple(chain)
@@ -2005,6 +2048,8 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
             continue
         if scale_node is not None and len(scale_node.users) != 1:
             continue
+        if not fusions.allows(qk, transposed_k, mask_node, scale_node):
+            continue
 
         causal_score_fusions[qk.name] = _CausalScore(
             mask_node, q, k, scale, transposed_k, scale_node,
@@ -2020,6 +2065,7 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
                 and str(softmax.target) == "aten.softmax.int"
                 and softmax.args[0] is mask_node
                 and softmax.args[1] in {-1, len(output_shape) - 1}
+                and fusions.allows(softmax)
             ):
                 causal_softmaxes[softmax.name] = length
 
@@ -2031,6 +2077,7 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
             }
             and hasattr(node.args[0], "name")
             and node.args[0].name in causal_softmaxes
+            and fusions.allows(node)
         ):
             left_shape = _get_shape(node.args[0])
             right_shape = _get_shape(node.args[1])
@@ -2134,7 +2181,7 @@ def _match_qkv(fusions, nodes, aliases):
             continue
         # The kernel writes [projection head, sequence, width] for one batch
         # item, and Q, K and V are read in place: nothing else may read them.
-        if math.prod(q_shape[:-3]) != 1:
+        if math.prod(q_shape[:-3]) != 1 or not fusions.allows(linear, split, q, k, v):
             continue
         consumers = {
             by_name[qk_name], q, k, v, fusion.transposed_key, value_matmul,
@@ -2227,7 +2274,8 @@ def _prepare_graph(
         captured = _captured or capture_model(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
-    _normalize_graph(captured.graph)
+    protected = registry.replaced_targets(fast=fast, config=fast_config)
+    _normalize_graph(captured.graph, protected)
     if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
@@ -2255,8 +2303,10 @@ def _prepare_graph(
 
     input_names = _model_input_names(nodes, captured.user_input_names, resolve_weight)
     aliases, split_meta = _aliases_and_splits(nodes, generated_weights, runtime_axes.axes)
-    _reject_unsupported_variants(nodes, generated_weights, registry, fast, fast_config)
-    fusions = _Fusions()
+    _reject_unsupported_variants(
+        nodes, generated_weights, registry, fast, fast_config, runtime_axes.axes, resolve_weight,
+    )
+    fusions = _Fusions(protected=protected)
     _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config)
     _match_swiglu(fusions, nodes)
     _match_embedding_adds(fusions, nodes)
@@ -2277,6 +2327,7 @@ def _prepare_graph(
         generation=_generation_caches(nodes, generation, example_inputs),
         linear_fusions=fusions.linear,
         approximate_fusions=tuple(fusions.approximate),
+        protected=protected,
         row_loops=frozenset(runtime_axes.row_loops),
         paired_swiglu_fusions=fusions.paired_swiglu,
         silu_mul_fusions=fusions.silu_mul,
@@ -2318,6 +2369,9 @@ def _validate_lowering_operations(graph: _GraphInfo) -> None:
         if graph.registry.operation(target) is None:
             raise _unsupported_operation(node)
         if node.name not in graph.causal_value_matmuls:
-            detail = graph.registry.validate(node, fast=graph.fast, config=graph.fast_config)
+            detail = graph.registry.validate(
+                node, fast=graph.fast, config=graph.fast_config,
+                dynamic_axes=graph.dynamic_axes, resolve_weight=graph.resolve_weight,
+            )
             if detail is not None:
                 raise _unsupported_operation(node, detail)

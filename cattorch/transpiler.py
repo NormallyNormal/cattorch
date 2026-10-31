@@ -31,7 +31,9 @@ from cattorch.results import (
 )
 from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
 from cattorch.adapters import ModuleAdapter
-from cattorch.kernel_api import Kernel, active_kernel_targets, validate_kernels
+from cattorch.kernel_api import (
+    Kernel, active_kernel_targets, validate_kernels, warn_unused_kernels,
+)
 from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
@@ -948,6 +950,7 @@ class _Compiler:
             None if node.name in self.graph.causal_value_matmuls
             else self.graph.registry.validate(
                 node, fast=self.graph.fast, config=self.graph.fast_config,
+                dynamic_axes=self.graph.dynamic_axes, resolve_weight=self.graph.resolve_weight,
             )
         )
         if detail is not None:
@@ -1009,15 +1012,13 @@ class _Compiler:
         for position, bound in self._automatic_bindings(node).items():
             input_lists[position] = bound
         node_args = list(node.args)
-        # Capture frontends omit the optional bias for bias-free linear.
-        # Keep the production kernel's tensor slots stable with an empty list.
-        if aten_op == "aten.linear.default" and len(node_args) == 2:
-            node_args.append(None)
-            input_lists.append("_none")
-        # The library Linear kernel has a fourth tensor slot for an
-        # optional fused residual. Unfused calls keep that slot explicitly
-        # empty; this is separate from the optional PyTorch bias argument.
-        if aten_op == "aten.linear.default":
+        # The library Linear kernel takes a bias and then a residual slot
+        # for a fused add, both empty here. A user's kernel gets the call as
+        # traced.
+        if aten_op == "aten.linear.default" and aten_op not in self.graph.protected:
+            if len(node_args) == 2:
+                node_args.append(None)
+                input_lists.append("_none")
             node_args.append(None)
             input_lists.append("_none")
         # GELU's form is keyword-only in the captured graph.
@@ -1064,6 +1065,7 @@ class _Compiler:
 
         if (
             aten_op in MATMUL_OPS
+            and aten_op not in self.graph.protected
             and len(node.args) > 1
             and hasattr(node.args[1], "name")
             and not (
@@ -1097,6 +1099,7 @@ class _Compiler:
         if (
             self.graph.fast
             and aten_op in MATMUL_OPS
+            and aten_op not in self.graph.protected
             and len(node.args) > 1
             and hasattr(node.args[1], "name")
             and self.graph.fast_config.weights.enabled
@@ -1832,7 +1835,7 @@ def transpile(
     kept = active_kernel_targets(
         kernels, fast=optimization == "fast", config=fast_config or FastConfig(),
     )
-    with keep_operations(kept):
+    with keep_operations(kept), warn_unused_kernels(kernels, fast=optimization == "fast"):
         return _transpile_any(
             model, example_inputs, output_path, sig_figs,
             name=name, optimization=optimization, fast_config=fast_config,
