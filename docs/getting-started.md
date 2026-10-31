@@ -136,7 +136,8 @@ Tokenizer sprites have the same locality rule. See
 
 Before saving a project that has run, call `cattorch prepare for save`. It
 clears the decoded weights and working data but keeps the compressed weights,
-so the saved project doesn't store both. The next forward call initializes the
+so the saved project doesn't store both. Input lists and a program's state are
+kept. The next forward call initializes the
 sprite again.
 
 Don't edit the generated sprite's costumes: they store the compressed weights.

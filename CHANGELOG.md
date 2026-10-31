@@ -266,6 +266,24 @@
   with a weight but no bias failed with an `IndexError`.
 - A BatchNorm used more than once, as in a Siamese encoder, normalized with
   the wrong standard deviation after its first use.
+- Sharing identical weights could keep a copy no block read, so another
+  weight's list was left empty and read as zeros. This showed up with
+  quantization or fast-mode low rank as an unexpectedly large error.
+- A Linear followed by BatchNorm1d was folded even when the BatchNorm
+  normalized another axis, as for `(batch, tokens, features)` inputs, giving
+  wrong numbers or an `AssertionError`.
+- Reading a list of more than 200,000 values at positions taken from another
+  such list, as broadcasting and large transposes do, returned zeros past the
+  first 200,000 values. `x[i]` on such an input copied it into a list that
+  lost the same values.
+- `cattorch prepare for save` emptied input lists, which in a program sprite
+  hold its state, so the next call failed until `cattorch reset`.
+- `sig_figs` rounded integer buffers, such as permutations and token offsets.
+- A kernel passed with `kernels=` for an elementwise operation ran on the
+  traced size when its input grew at run time. It now runs once per item, and
+  export fails where it can't.
+- Automatic MoE detection swapped a block that caps how many tokens an
+  expert takes for plain top-k routing, which is wrong once an expert is full.
 
 - `@cattorch.moe` stopped working once anything imported
   `cattorch.experimental`, because the module holding the MoE classes had the

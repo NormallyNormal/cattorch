@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import math
 import logging
 import warnings
 
@@ -84,6 +85,10 @@ def _probe_outputs(module: nn.Module, width: int, dtype: torch.dtype):
     generator = torch.Generator().manual_seed(_PROBE_SEED)
     for shape in ((2, 6, width), (12, width)):
         inputs = [torch.randn(shape, generator=generator, dtype=dtype) for _ in range(2)]
+        # Every token the same: they all pick the same experts, which shows a
+        # block that caps how many tokens an expert takes.
+        tokens = math.prod(shape) // width
+        inputs.append(inputs[0].reshape(tokens, width)[:1].expand(tokens, width).reshape(shape))
         try:
             with torch.no_grad():
                 outputs = [module(value) for value in inputs]

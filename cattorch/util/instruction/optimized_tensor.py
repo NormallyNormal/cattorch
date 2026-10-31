@@ -5,6 +5,7 @@ import math
 import torch
 
 from cattorch.util.instruction.instruction import Instruction
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 from cattorch.util.scratch.dsl import (
     Program,
     add,
@@ -171,12 +172,18 @@ class OptimizedTransposeInstruction(Instruction):
             self.input_order = None
         else:
             self.total = math.prod(input_shape)
-            indices = torch.arange(self.total).reshape(input_shape)
-            self.input_order = (indices.permute(permutation).flatten() + 1).tolist()
+            # An order list longer than one Scratch list would be split, and
+            # reading the input through it then breaks; compute the indices.
+            if self.total > SCRATCH_LIST_LIMIT:
+                self.input_order = None
+            else:
+                indices = torch.arange(self.total).reshape(input_shape)
+                self.input_order = (indices.permute(permutation).flatten() + 1).tolist()
 
     def _dynamic_input_index(self):
         input_shape = list(self.args[0].shape)
-        input_shape[self.args[0].dynamic_axis] = self.runtime_extent
+        if self.args[0].dynamic:
+            input_shape[self.args[0].dynamic_axis] = self.runtime_extent
         output_shape = [input_shape[index] for index in self.permutation]
 
         def product(values):

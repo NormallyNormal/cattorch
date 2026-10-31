@@ -305,3 +305,27 @@ def test_a_buffer_under_two_names_is_one_state(tmp_path):
         emulator.run_procedure("cattorch step")
         expected = eager.step(torch.tensor([1.0, 2.0]))
         assert emulator.lists["cattorch step output"] == expected.tolist()
+
+
+def test_prepare_for_save_keeps_program_state(tmp_path):
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(2))
+
+        @entrypoint(example=lambda: (torch.ones(2),))
+        def add(self, value):
+            self.total += value
+            return self.total * 1
+
+    result = transpile(Counter().eval(), None, tmp_path / "counter")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    for expected in ([1.0, 1.0], None, [2.0, 2.0]):
+        if expected is None:
+            emulator.run_procedure("cattorch prepare for save")
+            assert emulator.lists["cattorch state total"] == [1.0, 1.0]
+            continue
+        emulator.lists["cattorch add value"] = [1.0, 1.0]
+        emulator.run_procedure("cattorch add")
+        assert emulator.variables["cattorch status"] == "ok"
+        assert emulator.lists["cattorch add output"] == expected

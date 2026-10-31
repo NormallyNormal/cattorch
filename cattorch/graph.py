@@ -645,6 +645,43 @@ def _fuse_rotate_half(graph) -> None:
                 graph.erase_node(unused)
 
 
+def _user_kernel(registry, target: str, fast: bool, config) -> bool:
+    """Whether ``target`` lowers through a kernel passed to this export."""
+    from cattorch.builtin_kernels import BUILTIN_KERNELS
+
+    kernel = registry.kernel(target, fast=fast, config=config)
+    context = getattr(kernel, "kernel", None)
+    return context is not None and not any(context is builtin for builtin in BUILTIN_KERNELS)
+
+
+def _drop_identity_permutes(graph) -> None:
+    """Remove ``permute`` calls that keep every dimension in place.
+
+    Decompositions such as ``x[index]`` emit them. Lowered, each would copy
+    its whole input into a new list.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.permute.default":
+            continue
+        if any(user.op == "output" for user in node.users):
+            continue  # outputs are recorded by node name
+        dims = [int(dim) % max(len(_get_shape(node)), 1) for dim in node.args[1]]
+        if dims == list(range(len(dims))):
+            node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+
+
+def _normalize_graph(graph) -> None:
+    """Rewrites every captured graph gets before analysis.
+
+    The traces at other lengths get them too, so their nodes line up.
+    """
+    _drop_empty_cat_inputs(graph)
+    _drop_identity_permutes(graph)
+    _broadcast_matmul_batches(graph)
+    _fuse_rotate_half(graph)
+
+
 _RUNTIME_END = 2**63 - 1
 
 
@@ -680,9 +717,7 @@ def _length_literals(
         )
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
-    _drop_empty_cat_inputs(longer.graph)
-    _broadcast_matmul_batches(longer.graph)
-    _fuse_rotate_half(longer.graph)
+    _normalize_graph(longer.graph)
     first, second = list(captured.graph.nodes), list(longer.graph.nodes)
     if len(first) != len(second) or any(
         (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
@@ -1000,9 +1035,7 @@ def _prepare_graph(
         captured = _captured or capture_model(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
-    _drop_empty_cat_inputs(captured.graph)
-    _broadcast_matmul_batches(captured.graph)
-    _fuse_rotate_half(captured.graph)
+    _normalize_graph(captured.graph)
     if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
@@ -1258,6 +1291,18 @@ def _prepare_graph(
                     )
                 node.target = runtime.runtime_slice.default
                 node.args, node.kwargs = (parent, dimension, first, last), {}
+        elif target in elementwise and _user_kernel(registry, target, fast, fast_config):
+            # A user's kernel for it may handle only the traced row.
+            if offset or any(
+                math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
+                for value in dynamic_parents
+            ):
+                raise UnsupportedModelError(
+                    f"the kernel passed for {target} gets a variable-length input "
+                    "that can't be split into items; read the length from "
+                    "ctx.inputs[...].dynamic_axis, or export without the kernel"
+                )
+            row_loops.add(node.name)
         elif target in elementwise and not (
             # These kernels size their rows from the list's length.
             target == "aten.linear.default" and dynamic_parents == [node.args[0]]

@@ -111,8 +111,11 @@ def _deduplicate_static_tensors(
     winners: dict[tuple[str, int, bytes], tuple[str, bytes]] = {}
     aliases: dict[str, str] = {}
     kept: dict[str, torch.Tensor | None] = {}
+    # A tensor that no block reads, such as one a fast-mode kernel replaced,
+    # can't stand in for the others: its list isn't in the sprite.
+    in_sprite = {entry[0] for entry in sprite.get("lists", {}).values()}
     for key, tensor in static_tensors.items():
-        if not isinstance(tensor, torch.Tensor):
+        if not isinstance(tensor, torch.Tensor) or f"W_{key}" not in in_sprite:
             kept[key] = tensor
             continue
         contiguous = tensor.detach().cpu().contiguous()
@@ -730,12 +733,16 @@ def _remove_unused(sprite):
         elif isinstance(value, str):
             referenced.add(value)
 
+    from cattorch.interface import is_public_data
+
     for section in ("lists", "variables"):
         slots = sprite.get(section, {})
+        # Public names stay even when no block reads them, such as the input
+        # of a model that only uses its shape.
         unused = [
             sid for sid, entry in slots.items()
             if sid not in referenced
-            and not entry[0].startswith("cattorch ")
+            and not entry[0].startswith("cattorch ") and not is_public_data(entry[0])
         ]
         for sid in unused:
             log.info("Removing unused %s: %s", section.rstrip("s"), slots[sid][0])
@@ -1569,14 +1576,19 @@ def _add_prepare_for_save(
     *,
     static_names: set[str],
     compressed: bool,
+    inputs: set[str] = frozenset(),
 ) -> None:
-    """Add a public procedure that drops rebuildable runtime list contents."""
+    """Add a public procedure that drops rebuildable runtime list contents.
+
+    Input lists are kept: they hold the caller's values, and a program's
+    persistent state is passed to its entry points as inputs.
+    """
     from cattorch.util.scratch.dsl import Program, clear
 
     names = [
         shard.name
         for layout in layouts.values()
-        if not layout.name.startswith("_")
+        if not layout.name.startswith("_") and layout.name not in inputs
         and (compressed or layout.name not in static_names)
         for shard in layout.shards
     ]

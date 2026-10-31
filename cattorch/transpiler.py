@@ -2353,6 +2353,7 @@ def _transpile(
             layouts,
             static_names=static_names,
             compressed=storage.compression,
+            inputs=set(graph.input_names.values()),
         )
     if generation is not None:
         _add_procedure_completion_broadcast(
