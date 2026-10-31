@@ -28,7 +28,7 @@ from cattorch.benchmark import (
     _write_project,
 )
 from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name
-from cattorch.util.instruction.optimized import LinearInstruction
+from cattorch.util.instruction import optimized_linear
 from cattorch.util.scratch.dsl import Program, append, call, clear
 
 
@@ -42,9 +42,9 @@ def _compile_variant(source, name: str, threshold: float):
         source, CONTEXT + DECODE_ITERATIONS,
     ).eval()
     prompt = torch.zeros((1, CONTEXT), dtype=torch.long)
-    previous_threshold = LinearInstruction.grouped_min_macs
+    previous_threshold = optimized_linear.GROUPED_MIN_MACS
     try:
-        LinearInstruction.grouped_min_macs = threshold
+        optimized_linear.GROUPED_MIN_MACS = threshold
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / name
             transpile(
@@ -61,7 +61,7 @@ def _compile_variant(source, name: str, threshold: float):
             standalone_size = sprite_path.stat().st_size
             sprite, assets = _load_sprite(sprite_path)
     finally:
-        LinearInstruction.grouped_min_macs = previous_threshold
+        optimized_linear.GROUPED_MIN_MACS = previous_threshold
 
     for entry in sprite.get("lists", {}).values():
         if entry[0] == "cattorch tokens":

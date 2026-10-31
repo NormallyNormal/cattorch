@@ -327,11 +327,11 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
     tmp_path, small_list_limit, monkeypatch,
 ):
     """A layer base may land in either shard of one logical weight bank."""
-    from cattorch.util.instruction.optimized import LinearInstruction
+    from cattorch.util.instruction import optimized_linear
 
     small_list_limit(2_000)
     # Keep the grouped linear layout a full-size model would use.
-    monkeypatch.setattr(LinearInstruction, "grouped_min_macs", 1)
+    monkeypatch.setattr(optimized_linear, "GROUPED_MIN_MACS", 1)
     width = 32  # two matrices contain 2,048 values, just over the lowered cap
 
     class Block(torch.nn.Module):

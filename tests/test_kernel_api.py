@@ -400,3 +400,40 @@ def test_a_user_kernel_on_growing_state_is_rejected(tmp_path):
     relu = Kernel(torch.ops.aten.relu.default, emit, name="relu")
     with pytest.raises(UnsupportedModelError, match="kernel passed for aten.relu"):
         transpile(Memory().eval(), None, tmp_path / "memory", kernels=[relu])
+
+
+def test_a_user_linear_kernel_gets_the_plain_weight(tmp_path):
+    # The library lays a large Linear weight out in four-row groups; a user's
+    # kernel gets the weight as PyTorch stores it, with no layout options.
+    def emit(ctx):
+        source, weight = ctx.inputs["input"], ctx.inputs["weight"]
+        rows, inner = weight.shape
+        column, read, total = ctx.temp_var("column"), ctx.temp_var("read"), ctx.temp_var("total")
+        out = ctx.output.list
+        # Each output sums one weight row, times the input's first value.
+        return (
+            clear(out),
+            set_var(read, 1),
+            repeat(rows, (
+                set_var(total, 0),
+                set_var(column, 1),
+                repeat(inner, (
+                    change_var(total, item(weight.list, var(read))),
+                    change_var(read, 1),
+                    change_var(column, 1),
+                )),
+                append(out, mul(var(total), item(source.list, 1))),
+            )),
+        )
+
+    linear = nn.Linear(256, 256, bias=False).eval()
+    value = torch.randn(1, 256)
+    result = _transpile(
+        linear, value, tmp_path / "linear", storage=StorageConfig(compression=False),
+        _registry=_registry(Kernel("aten.linear.default", emit)),
+    )
+    class Expected(nn.Module):
+        def forward(self, value):
+            return linear.weight.sum(1) * value[:, :1]
+
+    assert verify(Expected().eval(), value, result, atol=1e-3).passed

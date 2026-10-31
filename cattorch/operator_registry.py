@@ -18,12 +18,9 @@ from cattorch.kernel_api import Kernel
 from cattorch.moe_detection import detect_custom_moe
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
 from cattorch.util.instruction.instruction import Instruction
-from cattorch.util.instruction.optimized import (
-    LinearInstruction,
-    OptimizedMatMulInstruction,
-)
 from cattorch.util.instruction.optimized_convolution import CONVOLUTION_KERNELS, POOLING_KERNELS
 from cattorch.util.instruction.optimized_elementwise import FAST_GELU_KERNEL, elementwise_kernel
+from cattorch.util.instruction.optimized_linear import LINEAR_KERNEL, matmul_kernel
 from cattorch.util.instruction.optimized_normalization import (
     BATCH_NORM_KERNEL, FAST_LAYER_NORM_KERNEL, FAST_SOFTMAX_KERNEL, LAYER_NORM_KERNEL,
     LOG_SOFTMAX_KERNELS, MEAN_KERNEL, RMS_NORM_KERNEL, SOFTMAX_KERNELS,
@@ -565,7 +562,7 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
         "cattorch.routed_experts.default": RoutedExpertsInstruction,
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
-        "aten.linear.default": LinearInstruction,
+        "aten.linear.default": LINEAR_KERNEL.instruction_class(),
         **{
             kernel.target_name: kernel.instruction_class()
             for kernel in (*SOFTMAX_KERNELS, *LOG_SOFTMAX_KERNELS)
@@ -591,7 +588,9 @@ def _build_default_registry() -> OperatorRegistry:
             operation: elementwise_kernel(operation).instruction_class()
             for operation in ELEMENTWISE_OPS
         },
-        **{operation: OptimizedMatMulInstruction for operation in MATMUL_OPS},
+        **{
+            operation: matmul_kernel(operation).instruction_class() for operation in MATMUL_OPS
+        },
     }
     validators = {
         "aten.add.Tensor": _validate_add_sub,

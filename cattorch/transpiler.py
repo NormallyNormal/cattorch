@@ -66,6 +66,11 @@ from cattorch.operator_registry import (
 from cattorch.util.instruction.optimized_elementwise import (
     ARITHMETIC_EXPRESSION_KERNEL, PAIRED_LINEAR_SWIGLU_KERNEL, SWIGLU_KERNEL,
 )
+from cattorch.util.instruction.optimized_linear import (
+    CAUSAL_SCORE_KERNEL, CAUSAL_SOFTMAX_KERNEL, CAUSAL_VALUE_MATMUL_KERNEL,
+    FAST_CAUSAL_SOFTMAX_KERNEL, LINEAR_KERNEL, LOW_RANK_MATMUL_KERNEL, QKV_LINEAR_KERNEL,
+    grouped_linear, matmul_kernel, pruned_matmul_blocks, pruned_matmul_kernel,
+)
 from cattorch.util.instruction.generic import INDEX_MAP_KERNEL, index_map
 from cattorch.util.instruction.optimized_tensor import (
     CAT_KERNEL, EMBEDDING_ADD_KERNEL, GETITEM_KERNEL, STRIDED_SLICE_KERNEL,
@@ -366,8 +371,6 @@ class _Compiler:
 
     def _find_grouped_tied_weights(self) -> set[tuple[int, int, torch.dtype]]:
         """Find small Linear weights whose grouped layout can serve embeddings."""
-        from cattorch.util.instruction.optimized import LinearInstruction
-
         embeddings = set()
         linears = set()
         for node in self.graph.nodes:
@@ -383,10 +386,7 @@ class _Compiler:
             identity = self._weight_identity(tensor)
             if target == "aten.embedding.default":
                 embeddings.add(identity)
-            elif (
-                tensor.shape[0] % 4 == 0
-                and LinearInstruction.grouped_min_macs <= tensor.numel()
-            ):
+            elif grouped_linear(*tensor.shape):
                 linears.add(identity)
         return embeddings & linears
 
@@ -417,6 +417,37 @@ class _Compiler:
         if options:
             instruction.options = options
         return instruction
+
+    def _linear_instruction(self, output, args, *, interleaved=False, epilogue=(), fast=False):
+        """The library Linear kernel on ``args``: the input, each weight
+        shard, the bias, and a residual for the epilogue."""
+        return self._kernel_instruction(
+            LINEAR_KERNEL, output, *args,
+            options={"interleaved": interleaved, "epilogue": tuple(epilogue), "fast": fast},
+        )
+
+    @staticmethod
+    def _weight_shards(names, shard_rows, inner):
+        """Arguments for weight lists of ``shard_rows`` whole rows each."""
+        return [
+            Argument(name, torch.Size((rows, inner)), static=name.startswith("W_"))
+            for name, rows in zip(names, shard_rows)
+        ]
+
+    def _linear_arguments(self, args, input_lists, shard_rows):
+        """Linear's arguments after ``_prepare_linear_weight`` laid out its weight.
+
+        ``args`` are the input, weight, bias and residual; ``input_lists``
+        holds one list per weight shard in place of the weight.
+        """
+        source, weight, *rest = args
+        shard_count = len(input_lists) - len(rest) - 1
+        names = input_lists[1:1 + shard_count]
+        if len(names) == 1:
+            shards = [Argument(names[0], weight.shape, static=names[0].startswith("W_"))]
+        else:
+            shards = self._weight_shards(names, shard_rows, weight.shape[-1])
+        return [source, *shards, *rest]
 
     def _instantiate(self, kernel, lowering_target, node, target_list, args):
         """Create a kernel instruction; context kernels also get output info."""
@@ -670,8 +701,7 @@ class _Compiler:
                 value=self.graph.qkv_offsets.get(k.name, 0),
             ),
         ]
-        from cattorch.util.instruction.optimized import CausalScoreInstruction
-        instruction = CausalScoreInstruction(node.target, target_list, *args)
+        instruction = self._kernel_instruction(CAUSAL_SCORE_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
 
         # Mirror the dependency releases of the materialized chain that this
@@ -702,8 +732,7 @@ class _Compiler:
             Argument("C_query_heads", torch.Size([]), value=query_heads),
             Argument("C_kv_heads", torch.Size([]), value=kv_heads),
         ))
-        from cattorch.util.instruction.optimized import QKVLinearInstruction
-        instruction = QKVLinearInstruction(node.target, target_list, *args)
+        instruction = self._kernel_instruction(QKV_LINEAR_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(node)
 
@@ -858,14 +887,10 @@ class _Compiler:
         input_lists, weight_shard_rows, interleaved = self._prepare_linear_weight(
             node, input_lists,
         )
-        args[1] = Argument(input_lists[1], args[1].shape)
-
-        from cattorch.util.instruction.optimized import LinearInstruction
-        instruction = LinearInstruction(
-            node.target, target_list, *args, epilogue=epilogue,
+        instruction = self._linear_instruction(
+            target_list, self._linear_arguments(args, input_lists, weight_shard_rows),
+            interleaved=interleaved, epilogue=epilogue,
             fast=self.graph.fast and self.graph.fast_config.activations,
-            weight_shard_rows=weight_shard_rows,
-            interleaved=interleaved,
         )
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(node)
@@ -1026,13 +1051,15 @@ class _Compiler:
                 )
                 self._emit(instruction, matrix_inputs, target_list)
                 return
-        linear_layout = None
-        if aten_op == "aten.linear.default":
+        kernel = self.graph.registry.kernel(
+            aten_op, fast=self.graph.fast, config=self.graph.fast_config,
+        )
+        library_linear = getattr(kernel, "kernel", None) is LINEAR_KERNEL
+        if library_linear:
             input_lists, weight_shard_rows, interleaved = self._prepare_linear_weight(
                 node, input_lists,
             )
-            args[1] = Argument(input_lists[1], args[1].shape)
-            linear_layout = (weight_shard_rows, interleaved)
+            args = self._linear_arguments(args, input_lists, weight_shard_rows)
         static_rhs = None
         if (
             self.graph.fast
@@ -1047,10 +1074,6 @@ class _Compiler:
 
         if static_rhs is not None:
             from cattorch.fast import prepare_fast_matmul_weights
-            from cattorch.util.instruction.optimized import (
-                FastLowRankMatMulInstruction,
-                FastPrunedMatMulInstruction,
-            )
             factors = prepare_fast_matmul_weights(
                 static_rhs,
                 self.graph.fast_config.weights,
@@ -1062,9 +1085,9 @@ class _Compiler:
                     key = f"fast_{node.name}_factor_{index}"
                     self.static_lists[key] = factor
                     factor_lists.append(f"W_{key}")
-                    factor_args.append(Argument(f"W_{key}", factor.shape))
-                instruction = FastLowRankMatMulInstruction(
-                    node.target, target_list, args[0], *factor_args,
+                    factor_args.append(Argument(f"W_{key}", factor.shape, static=True))
+                instruction = self._kernel_instruction(
+                    LOW_RANK_MATMUL_KERNEL, target_list, args[0], *factor_args,
                 )
                 self._emit(
                     instruction,
@@ -1075,18 +1098,18 @@ class _Compiler:
 
             raw_key = input_lists[1].removeprefix("W_")
             self.static_lists[raw_key] = factors[0]
-            instruction = FastPrunedMatMulInstruction(
-                node.target, target_list, *args,
-                weight=factors[0],
+            pruned = pruned_matmul_blocks(factors[0]) is not None
+            instruction = self._kernel_instruction(
+                (pruned_matmul_kernel if pruned else matmul_kernel)(aten_op), target_list, *args,
             )
         elif node.name in self.graph.causal_softmaxes:
             if self.graph.fast and self.graph.fast_config.softmax:
-                from cattorch.util.instruction.optimized import FastCausalSoftmaxInstruction
-                instruction = FastCausalSoftmaxInstruction(node.target, target_list, *args)
+                instruction = self._kernel_instruction(
+                    FAST_CAUSAL_SOFTMAX_KERNEL, target_list, *args,
+                )
                 self.approximate[aten_op] += 1
             else:
-                from cattorch.util.instruction.optimized import CausalSoftmaxInstruction
-                instruction = CausalSoftmaxInstruction(node.target, target_list, *args)
+                instruction = self._kernel_instruction(CAUSAL_SOFTMAX_KERNEL, target_list, *args)
         elif aten_op == "aten.embedding.default":
             kernel = self.graph.registry.kernel(
                 aten_op,
@@ -1101,31 +1124,18 @@ class _Compiler:
                 "interleaved_weight": self._uses_grouped_tied_weight(node),
             }
         elif node.name in self.graph.causal_value_matmuls:
-            from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
             value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
-            instruction = CausalValueMatMulInstruction(
-                node.target, target_list, *args,
+            instruction = self._kernel_instruction(
+                CAUSAL_VALUE_MATMUL_KERNEL, target_list, *args,
                 Argument("C_value_offset", torch.Size([]), value=value_offset),
             )
         else:
-            kernel = self.graph.registry.kernel(
-                aten_op,
-                fast=self.graph.fast,
-                config=self.graph.fast_config,
-            )
             if kernel is None:
                 raise _unsupported_operation(node)
             if self.graph.fast and rule is not None and kernel is rule.fast_kernel:
                 self.approximate[aten_op] += 1
-            if aten_op == "aten.linear.default" and linear_layout is not None:
-                weight_shard_rows, interleaved = linear_layout
-                instruction = kernel(
-                    lowering_target,
-                    target_list,
-                    *args,
-                    weight_shard_rows=weight_shard_rows,
-                    interleaved=interleaved,
-                )
+            if library_linear:
+                instruction = self._linear_instruction(target_list, args, interleaved=interleaved)
             else:
                 instruction = self._instantiate(
                     kernel, lowering_target, node, target_list, args,
@@ -1336,8 +1346,6 @@ class _Compiler:
         complete output rows (and complete four-row groups), keeping shard
         selection outside every dot-product loop.
         """
-        from cattorch.util.instruction.optimized import LinearInstruction
-
         weight = self.graph.resolve_weight(node.args[1].name)
         if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
             return input_lists, (), False
@@ -1346,10 +1354,7 @@ class _Compiler:
             # low-rank replacement may also rewrite the surrounding graph.
             return input_lists, (), False
         columns, inner = weight.shape
-        grouped = (
-            columns % 4 == 0
-            and inner * columns >= LinearInstruction.grouped_min_macs
-        )
+        grouped = grouped_linear(columns, inner)
         oversized = weight.numel() > SCRATCH_LIST_LIMIT
         if not grouped and not oversized:
             return input_lists, (), False
@@ -1457,16 +1462,10 @@ class _Compiler:
 
     def _large_static_matmul(self, node, target_list, left_arg, rhs):
         """Use row-aligned output-major weights only when sharding dominates."""
-        from cattorch.util.instruction.optimized import LinearInstruction
-
         weight = rhs.T.contiguous()
         columns, inner = weight.shape
         rows_per_shard = SCRATCH_LIST_LIMIT // inner
-        grouped = (
-            columns % 4 == 0
-            and columns * inner >= LinearInstruction.grouped_min_macs
-            and rows_per_shard >= 4
-        )
+        grouped = grouped_linear(columns, inner) and rows_per_shard >= 4
         if grouped:
             rows_per_shard -= rows_per_shard % 4
         if rows_per_shard < 1:
@@ -1495,17 +1494,9 @@ class _Compiler:
             row_counts.append(shard.shape[0])
 
         matrix_inputs = [left_arg.name, *names, "_none", "_none"]
-        instruction_args = (
-            left_arg,
-            Argument(names[0], torch.Size((columns, inner))),
-            Argument("_none", torch.Size([]), value=None),
-            Argument("_none", torch.Size([]), value=None),
-        )
-        instruction = LinearInstruction(
-            node.target,
-            target_list,
-            *instruction_args,
-            weight_shard_rows=tuple(row_counts),
+        empty = Argument("_none", torch.Size([]), value=None)
+        instruction = self._linear_instruction(
+            target_list, (left_arg, *self._weight_shards(names, row_counts, inner), empty, empty),
             interleaved=grouped,
         )
         return instruction, matrix_inputs

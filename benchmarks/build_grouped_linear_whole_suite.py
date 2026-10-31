@@ -19,7 +19,7 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.util.instruction.optimized import LinearInstruction
+from cattorch.util.instruction import optimized_linear
 from cattorch.util.scratch.dsl import append, broadcast_and_wait, clear, repeat, reset_timer  # noqa: E402
 
 
@@ -28,9 +28,9 @@ ITERATIONS = 5
 
 
 def _compile_variant(model, tokens, name: str, threshold: float):
-    previous_threshold = LinearInstruction.grouped_min_macs
+    previous_threshold = optimized_linear.GROUPED_MIN_MACS
     try:
-        LinearInstruction.grouped_min_macs = threshold
+        optimized_linear.GROUPED_MIN_MACS = threshold
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / name
             transpile(
@@ -44,7 +44,7 @@ def _compile_variant(model, tokens, name: str, threshold: float):
             standalone_size = sprite_path.stat().st_size
             sprite, assets = _load_sprite(sprite_path)
     finally:
-        LinearInstruction.grouped_min_macs = previous_threshold
+        optimized_linear.GROUPED_MIN_MACS = previous_threshold
     _set_inputs(sprite, (tokens,))
     sprite["name"] = name
     sprite["visible"] = False

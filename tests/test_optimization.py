@@ -48,7 +48,7 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
-from cattorch.util.instruction.optimized import LinearInstruction
+from cattorch.util.instruction import optimized_linear
 
 
 def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
@@ -523,7 +523,7 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
     sprites = {}
     outputs = {}
     for name, threshold in (("previous", float("inf")), ("grouped", 49_152)):
-        monkeypatch.setattr(LinearInstruction, "grouped_min_macs", threshold)
+        monkeypatch.setattr(optimized_linear, "GROUPED_MIN_MACS", threshold)
         base = tmp_path / name
         transpile(
             model, (value, residual), str(base), optimization="exact",

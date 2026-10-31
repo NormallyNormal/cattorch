@@ -31,7 +31,6 @@ Where things live:
 | `cattorch.transpiler` | Turns graph nodes into instruction programs. |
 | `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
 | `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
-| `cattorch.util.instruction.dispatch`, `cattorch.util.instruction.optimized` | Compatibility re-exports only. Add no new code here. |
 
 A change to an operation should come with:
 
