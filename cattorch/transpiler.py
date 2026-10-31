@@ -71,6 +71,9 @@ from cattorch.util.instruction.optimized_linear import (
     FAST_CAUSAL_SOFTMAX_KERNEL, LINEAR_KERNEL, LOW_RANK_MATMUL_KERNEL, QKV_LINEAR_KERNEL,
     grouped_linear, matmul_kernel, pruned_matmul_blocks, pruned_matmul_kernel,
 )
+from cattorch.util.instruction.optimized_moe import (
+    EXPERT_FAMILY_MOE_KERNEL, ROUTED_EXPERTS_KERNEL,
+)
 from cattorch.util.instruction.generic import INDEX_MAP_KERNEL, index_map
 from cattorch.util.instruction.optimized_tensor import (
     CAT_KERNEL, EMBEDDING_ADD_KERNEL, GETITEM_KERNEL, STRIDED_SLICE_KERNEL,
@@ -921,27 +924,17 @@ class _Compiler:
                 for name, value in zip(input_lists, tensor_nodes)
             ]
             handle = int(node.args[4])
-            from cattorch.util.instruction.optimized_moe import (
-                ExpertFamilyMoEInstruction, RoutedExpertsInstruction,
-            )
-            fast_options = {
+            options = {
+                "family": self.graph.registry.expert_family(handle),
                 "fast_activations": self.graph.fast and self.graph.fast_config.activations,
                 "fast_layer_norm": self.graph.fast and self.graph.fast_config.layer_norm,
             }
             if aten_op == "cattorch.routed_experts.default":
-                instruction = RoutedExpertsInstruction(
-                    node.target, target_list, *args,
-                    family=self.graph.registry.expert_family(handle),
-                    **fast_options,
-                )
+                kernel = ROUTED_EXPERTS_KERNEL
             else:
-                instruction = ExpertFamilyMoEInstruction(
-                    node.target, target_list, *args,
-                    family=self.graph.registry.expert_family(handle),
-                    top_k=int(node.args[5]),
-                    normalize_selected=bool(node.args[6]),
-                    **fast_options,
-                )
+                kernel = EXPERT_FAMILY_MOE_KERNEL
+                options.update(top_k=int(node.args[5]), normalize_selected=bool(node.args[6]))
+            instruction = self._kernel_instruction(kernel, target_list, *args, options=options)
             family = self.graph.registry.expert_family(handle)
             template_state = {}
             template_state.update(dict(
@@ -981,7 +974,7 @@ class _Compiler:
         if aten_op == "aten.linear.default" and len(node_args) == 2:
             node_args.append(None)
             input_lists.append("_none")
-        # The production LinearInstruction has a fourth tensor slot for an
+        # The library Linear kernel has a fourth tensor slot for an
         # optional fused residual. Unfused calls keep that slot explicitly
         # empty; this is separate from the optional PyTorch bias argument.
         if aten_op == "aten.linear.default":
@@ -1120,7 +1113,7 @@ class _Compiler:
                 kernel, lowering_target, node, target_list, args,
             )
             instruction.options = {
-                **(getattr(instruction, "options", None) or {}),
+                **instruction.options,
                 "interleaved_weight": self._uses_grouped_tied_weight(node),
             }
         elif node.name in self.graph.causal_value_matmuls:

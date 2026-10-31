@@ -14,10 +14,9 @@ from cattorch.huggingface import (
     convert_huggingface_experts, is_huggingface_experts, prepare_huggingface_models,
 )
 from cattorch.builtin_kernels import BUILTIN_KERNELS
-from cattorch.kernel_api import Kernel
+from cattorch.kernel_api import Kernel, _KernelInstruction
 from cattorch.moe_detection import detect_custom_moe
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
-from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized_convolution import CONVOLUTION_KERNELS, POOLING_KERNELS
 from cattorch.util.instruction.optimized_elementwise import FAST_GELU_KERNEL, elementwise_kernel
 from cattorch.util.instruction.optimized_linear import LINEAR_KERNEL, matmul_kernel
@@ -26,7 +25,7 @@ from cattorch.util.instruction.optimized_normalization import (
     LOG_SOFTMAX_KERNELS, MEAN_KERNEL, RMS_NORM_KERNEL, SOFTMAX_KERNELS,
 )
 from cattorch.util.instruction.optimized_moe import (
-    ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
+    EXPERT_FAMILY_MOE_KERNEL, ROUTED_EXPERTS_KERNEL, STACKED_SWIGLU_MOE_KERNEL,
 )
 from cattorch.util.instruction.optimized_tensor import (
     EMBEDDING_KERNEL, MASKED_FILL_KERNEL, TRANSPOSE_KERNELS,
@@ -36,8 +35,8 @@ from cattorch.util.instruction.generic import (
 )
 
 
-# An Instruction subclass, or a function that picks one from the arguments.
-KernelFactory = Callable[..., Instruction]
+# A kernel's instruction class, or a function that picks one from the arguments.
+KernelFactory = Callable[..., _KernelInstruction]
 Validator = Callable[[torch.fx.Node, FastConfig, bool], str | None]
 Observation = tuple[torch.Tensor, torch.Tensor, str]
 Observer = Callable[[object, tuple, dict, object], Iterable[Observation]]
@@ -559,9 +558,12 @@ def _observe_routed_family(value, ids, banks, handle):
 def _build_default_registry() -> OperatorRegistry:
     registry = OperatorRegistry()
     exact: dict[str, KernelFactory] = {
-        "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
-        "cattorch.routed_experts.default": RoutedExpertsInstruction,
-        "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (
+                EXPERT_FAMILY_MOE_KERNEL, ROUTED_EXPERTS_KERNEL, STACKED_SWIGLU_MOE_KERNEL,
+            )
+        },
         "aten.linear.default": LINEAR_KERNEL.instruction_class(),
         **{
             kernel.target_name: kernel.instruction_class()

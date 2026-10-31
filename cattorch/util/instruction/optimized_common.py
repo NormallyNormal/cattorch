@@ -1,4 +1,4 @@
-"""Optimized kernels authored with the internal Scratch DSL."""
+"""Building blocks shared by the library's kernels."""
 
 import math
 
@@ -46,7 +46,7 @@ def tanh_gelu_inner(value):
 def _unrolled_dot_statements(
     inner: int,
     *,
-    left_list: str = "T1",
+    left_list: str,
     right_list: str,
     right_index: str,
     right_step: int,
@@ -79,7 +79,7 @@ def _unrolled_dot_statements(
 def _unrolled_offset_dot_statements(
     inner: int,
     *,
-    left_list: str = "T1",
+    left_list: str,
     right_list: str,
     right_offset: str,
     factor: int = 4,
@@ -114,7 +114,8 @@ def _unrolled_copy_statements(
     index: str,
     count: int,
     factor: int = 8,
-    destination: str = "T3",
+    *,
+    destination: str,
 ):
     """Append a contiguous span with the browser-proven lightweight unroll."""
     step = (

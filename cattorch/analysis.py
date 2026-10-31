@@ -6,7 +6,6 @@ import math
 from collections import Counter
 from dataclasses import dataclass, replace
 
-import torch
 from torch import nn
 
 from cattorch.adapters import ModuleAdapter
@@ -119,39 +118,23 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
         model, state_names=frozenset(state.name for state in program.states),
     )
     generic_expert_errors = []
-    from cattorch.util.argument import Argument
-    from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
+    from cattorch.util.instruction.optimized_moe import expert_program
     probed = set()
     for path, module in owned.named_modules():
-        # A SparseMoE's family is probed with its routing; a family used
-        # through ``routed_experts`` takes its routes from the graph, and the
-        # expert program doesn't depend on ``top_k``.
+        # The expert program doesn't depend on how experts are routed.
         if isinstance(module, _BankedSparseMoE):
-            family, top_k, normalize = (
-                module.expert_family, module.top_k, module.normalize_selected,
-            )
+            family = module.expert_family
         elif isinstance(module, ExpertFamily):
-            family, top_k, normalize = module, 1, False
+            family = module
         else:
             continue
         if id(family) in probed:
             continue
         probed.add(id(family))
-        probe_args = [
-            Argument("value", family.example_input.shape),
-            Argument("selection", torch.Size((1, family.expert_count))),
-            Argument("combination", torch.Size((1, family.expert_count))),
-            *(
-                Argument(f"bank_{index}", bank.shape)
-                for index, bank in enumerate(family.unique_banks())
-            ),
-        ]
         try:
-            instruction = ExpertFamilyMoEInstruction(
-                "cattorch.expert_family_moe.default", "output", *probe_args,
-                family=family, top_k=top_k, normalize_selected=normalize,
+            expert_program(
+                family, [f"bank {index}" for index in range(len(family.unique_banks()))],
             )
-            instruction._expert_program()
         except ValueError as error:
             generic_expert_errors.append(
                 f"ExpertFamily at {path or '<root>'}: {error}"

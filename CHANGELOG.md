@@ -9,7 +9,9 @@
   and return statements from the new `cattorch.scratch` module. A validator
   can reject calls, and `approximate=True` kernels apply only in fast mode.
   `check_kernel` compares a kernel with PyTorch in the emulator, and
-  `build_kernel_benchmark` times it in Scratch. See
+  `build_kernel_benchmark` times it in Scratch. `ctx.argument_names` gives
+  the arguments in order, for a kernel that reads them by position. Every
+  built-in kernel is written the same way. See
   [custom kernels and operations](docs/custom-kernels.md).
 - `cattorch.op` declares a new operation from an annotated function. It
   exports whole, with a kernel attached through `@operation.kernel`, or
@@ -229,6 +231,9 @@
 
 ## Fixes
 
+- A custom kernel for `aten.linear` crashed with `TypeError` when the weight
+  was large enough for the library to group or split it. It now gets the
+  weight as PyTorch stores it.
 - Layer sharing merged layers that differ only in a constant, such as an
   attention window or a residual scale, and ran every layer with the first
   layer's value. Such layers are no longer shared.

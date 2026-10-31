@@ -9,8 +9,8 @@ A ``Kernel`` pairs an operator with an ``emit`` function. ``emit`` receives a
 ``KernelContext`` describing the operation by name (shapes, dtypes, static
 flags, scalar arguments) and returns a body of ``cattorch.scratch``
 statements. The context also allocates the lists and variables the body uses.
-``_ContextInstruction`` adapts that to the positional ``Instruction`` protocol,
-so tensor rebinding, sharding and compaction work unchanged.
+``_KernelInstruction`` binds a kernel to one call's arguments for the
+compiler, which renames its ``T`` slots to the call's lists.
 
 Rules for kernel authors:
 
@@ -47,7 +47,6 @@ import torch
 
 from cattorch.fast import FastConfig
 from cattorch.util.argument import Argument
-from cattorch.util.instruction.instruction import Instruction, _tensor_slots
 from cattorch.util.scratch.dsl import Program, Statement
 
 
@@ -308,33 +307,54 @@ class Kernel:
     def program_name(self) -> str:
         return self.name or self.target_name.replace(".", "_")
 
-    def instruction_class(self) -> type[Instruction]:
-        """The registry-facing ``Instruction`` type that runs this kernel."""
+    def instruction_class(self) -> type[_KernelInstruction]:
+        """The registry-facing type that runs this kernel on one call."""
         return type(
             f"{self.program_name}_instruction",
-            (_ContextInstruction,),
+            (_KernelInstruction,),
             {"kernel": self},
         )
 
 
-class _ContextInstruction(Instruction):
-    """Adapts a ``Kernel`` to the positional instruction protocol."""
+def _tensor_slots(args) -> tuple[dict[int, str], str]:
+    """Map argument positions to ``T`` list slots, and return the output slot.
+
+    The transpiler binds every non-constant argument, including explicit
+    ``_none`` placeholders, to consecutive ``T`` lists before the output.
+    """
+    slots: dict[int, str] = {}
+    for position, argument in enumerate(args):
+        if not str(argument.name).startswith("C_"):
+            slots[position] = f"T{len(slots) + 1}"
+    return slots, f"T{len(slots) + 1}"
+
+
+class _KernelInstruction:
+    """A ``Kernel`` bound to one call's arguments.
+
+    ``args`` are positional ``Argument`` values; constants are named ``C_``.
+    ``options`` may be set before ``finalize`` to fill ``KernelContext.options``.
+    """
 
     kernel: Kernel
     # The transpiler passes the output's shape and dtype as an ``Argument``.
     wants_output_info = True
 
+    def __init__(self, torch_name, output: Argument | str, *args: Argument):
+        self.torch_name = torch_name
+        self.output = output
+        self.args = args
+        self.options: dict[str, object] = {}
+        self.context = KernelContext.from_arguments(
+            self.kernel.target_name, output, args, self._operator(),
+            names=self.kernel.arguments,
+        )
+        self.temporary_sizes: dict[str, int] = {}
+
     @classmethod
     def _operator(cls):
         # Resolved late: a custom op may be defined after the kernel is.
         return resolve_operator(cls.kernel.target)
-
-    def prepare(self):
-        self.context = KernelContext.from_arguments(
-            self.kernel.target_name, self.output, self.args, self._operator(),
-            names=self.kernel.arguments,
-        )
-        self.temporary_sizes: dict[str, int] = {}
 
     def transform_weights(self, static_lists):
         """Give each stored-weight input its values."""
@@ -348,7 +368,7 @@ class _ContextInstruction(Instruction):
 
     def finalize(self):
         context = self.context
-        context.options = dict(getattr(self, "options", None) or {})
+        context.options = dict(self.options or {})
         body = tuple(self.kernel.emit(context))
         self.temporary_sizes = dict(context.temporary_sizes)
         return Program(
