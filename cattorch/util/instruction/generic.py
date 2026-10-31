@@ -11,9 +11,8 @@ import math
 
 import torch
 
-from cattorch.util.instruction.instruction import Instruction
+from cattorch.kernel_api import Kernel, KernelContext
 from cattorch.util.scratch.dsl import (
-    Program,
     add,
     append,
     change_var,
@@ -32,26 +31,6 @@ from cattorch.util.scratch.dsl import (
     sub,
     var,
 )
-
-
-def _tensor_slots(args) -> tuple[dict[int, str], str]:
-    """Map argument positions to ``T`` list slots, and return the output slot.
-
-    The transpiler binds every non-constant argument, including explicit
-    ``_none`` placeholders, to consecutive ``T`` lists before the output.
-    """
-    slots = {}
-    for position, argument in enumerate(args):
-        if not str(argument.name).startswith("C_"):
-            slots[position] = f"T{len(slots) + 1}"
-    return slots, f"T{len(slots) + 1}"
-
-
-def _value(args, position, default=None):
-    if position >= len(args):
-        return default
-    value = args[position].value
-    return default if value is None else value
 
 
 def _normalize_dims(dims, rank: int) -> tuple[int, ...]:
@@ -107,111 +86,83 @@ def _reduction_layout(shape, dims):
     return math.prod(kept_shape), math.prod(reduced_shape), bases, offsets
 
 
-class ReductionInstruction(Instruction):
+def _emit_reduction(ctx: KernelContext):
     """Reduce any set of dimensions with sum, mean, prod, max, min, arg*, any, all.
 
     When the reduced dimensions are the trailing ones, each output reads one
     contiguous run and the kernel advances a single index. Otherwise it reads
     through a table of output base offsets and a table of reduced offsets.
     """
-
-    def prepare(self):
-        self.op = str(self.torch_name)
-        self.kind, dims_position, keepdim_position = REDUCTIONS[self.op]
-        shape = tuple(self.args[0].shape)
-        dims = None if dims_position is None else _value(self.args, dims_position)
-        if self.kind in {"argmax", "argmin"} and dims is None:
-            dims = tuple(range(len(shape)))
-        self.dims = _normalize_dims(dims, len(shape))
-        self.slots, self.output_list = _tensor_slots(self.args)
-        self.outputs, self.reduced, bases, offsets = _reduction_layout(shape, self.dims)
-        self.trailing = self.dims == tuple(range(len(shape) - len(self.dims), len(shape)))
-        self.tables = {} if self.trailing else {
-            "_reduce_bases": [base + 1 for base in bases],
-            "_reduce_offsets": offsets,
-        }
-
-    def _read(self):
-        if self.trailing:
-            return item("T1", var("index"))
-        return item("T1", add(var("base"), item("_reduce_offsets", var("position"))))
-
-    def _advance(self):
-        return (change_var("index", 1),) if self.trailing else ()
-
-    def _reduce_body(self):
-        value = self._read()
-        advance = self._advance()
-        step = (change_var("position", 1),)
-        if self.kind in {"sum", "mean"}:
-            return (
-                set_var("acc", 0),
-                set_var("position", 1),
-                repeat(self.reduced, (
-                    change_var("acc", value), *advance, *step,
-                )),
-            )
-        if self.kind == "prod":
-            return (
-                set_var("acc", 1),
-                set_var("position", 1),
-                repeat(self.reduced, (
-                    set_var("acc", mul(var("acc"), value)), *advance, *step,
-                )),
-            )
-        if self.kind in {"any", "all"}:
-            hit, miss = (1, 0) if self.kind == "any" else (0, 1)
-            condition = not_(eq(value, 0)) if self.kind == "any" else eq(value, 0)
-            return (
-                set_var("acc", miss),
-                set_var("position", 1),
-                repeat(self.reduced, (
-                    if_(condition, (set_var("acc", hit),)), *advance, *step,
-                )),
-            )
-        compare = gt if self.kind in {"max", "argmax"} else lt
-        first = (
-            set_var("position", 1),
-            set_var("acc", value),
-            set_var("best", 0),
-            *advance,
-            change_var("position", 1),
+    kind, dims_position, _ = REDUCTIONS[ctx.target]
+    source = ctx.inputs["self"]
+    shape = source.shape
+    dims = None if dims_position is None else ctx.scalars.get("dim")
+    if kind in {"argmax", "argmin"} and dims is None:
+        dims = tuple(range(len(shape)))
+    dims = _normalize_dims(dims, len(shape))
+    outputs, reduced, bases, offsets = _reduction_layout(shape, dims)
+    trailing = dims == tuple(range(len(shape) - len(dims), len(shape)))
+    index, output_index, base, position, acc, best = (
+        ctx.temp_var(name) for name in ("index", "output", "base", "position", "acc", "best")
+    )
+    if trailing:
+        value = item(source.list, var(index))
+        advance = (change_var(index, 1),)
+    else:
+        bases_list = ctx.static_list("_reduce_bases", [start + 1 for start in bases])
+        offsets_list = ctx.static_list("_reduce_offsets", offsets)
+        value = item(source.list, add(var(base), item(offsets_list, var(position))))
+        advance = ()
+    out = ctx.output.list
+    step = (change_var(position, 1),)
+    if kind in {"sum", "mean"}:
+        reduce = (
+            set_var(acc, 0), set_var(position, 1),
+            repeat(reduced, (change_var(acc, value), *advance, *step)),
         )
+    elif kind == "prod":
+        reduce = (
+            set_var(acc, 1), set_var(position, 1),
+            repeat(reduced, (set_var(acc, mul(var(acc), value)), *advance, *step)),
+        )
+    elif kind in {"any", "all"}:
+        hit, miss = (1, 0) if kind == "any" else (0, 1)
+        condition = not_(eq(value, 0)) if kind == "any" else eq(value, 0)
+        reduce = (
+            set_var(acc, miss), set_var(position, 1),
+            repeat(reduced, (if_(condition, (set_var(acc, hit),)), *advance, *step)),
+        )
+    else:
+        compare = gt if kind in {"max", "argmax"} else lt
         # Ties keep the first position, like PyTorch's argmax and argmin.
-        update = (set_var("acc", value), set_var("best", sub(var("position"), 1)))
-        return first + (
-            repeat(self.reduced - 1, (
-                if_(compare(value, var("acc")), update), *advance, *step,
+        update = (set_var(acc, value), set_var(best, sub(var(position), 1)))
+        reduce = (
+            set_var(position, 1), set_var(acc, value), set_var(best, 0),
+            *advance, change_var(position, 1),
+            repeat(reduced - 1, (if_(compare(value, var(acc)), update), *advance, *step)),
+        )
+    result = (
+        div(var(acc), reduced) if kind == "mean"
+        else var(best) if kind in {"argmax", "argmin"} else var(acc)
+    )
+    per_output = (*reduce, append(out, result))
+    if trailing:
+        loop = (set_var(index, 1), repeat(outputs, per_output))
+    else:
+        loop = (
+            set_var(output_index, 1),
+            repeat(outputs, (
+                set_var(base, item(bases_list, var(output_index))),
+                *per_output,
+                change_var(output_index, 1),
             )),
         )
+    return (clear(out), *loop)
 
-    def _result(self):
-        if self.kind == "mean":
-            return div(var("acc"), self.reduced)
-        if self.kind in {"argmax", "argmin"}:
-            return var("best")
-        return var("acc")
 
-    def finalize(self):
-        per_output = self._reduce_body() + (append(self.output_list, self._result()),)
-        if self.trailing:
-            setup = (set_var("index", 1),)
-            body = per_output
-        else:
-            setup = (set_var("output", 1),)
-            body = (
-                set_var("base", item("_reduce_bases", var("output"))),
-                *per_output,
-                change_var("output", 1),
-            )
-        lists = (*self.slots.values(), *self.tables, self.output_list)
-        return Program(
-            "reduction_generic",
-            variables=("index", "output", "base", "position", "acc", "best"),
-            lists=lists,
-            list_values=self.tables,
-            body=(clear(self.output_list), *setup, repeat(self.outputs, body)),
-        ).compile()
+REDUCTION_KERNELS = tuple(
+    Kernel(target, _emit_reduction, name="reduction_generic") for target in REDUCTIONS
+)
 
 
 def index_map(target, input_shape, args, kwargs):
@@ -251,49 +202,38 @@ def index_map(target, input_shape, args, kwargs):
     return [int(value) for value in indices.tolist()], fill
 
 
-class IndexMapInstruction(Instruction):
+def _emit_index_map(ctx: KernelContext):
     """Copy input elements through a static one-based index table.
 
     Covers expand, repeat, flip, roll, constant padding, triangular masks,
-    nearest upsampling, and gathers with static indices. A zero entry writes
-    the operation's fill value.
+    nearest upsampling, and gathers with static indices. ``ctx.options``
+    holds the table, ``indices``, and the ``fill`` value a zero entry writes.
     """
-
-    def __init__(self, torch_name, output, *args, indices, fill):
-        self.indices = indices
-        self.fill = fill
-        super().__init__(torch_name, output, *args)
-
-    def prepare(self):
-        pass
-
-    def finalize(self):
-        source = item("T1", var("mapped"))
-        if self.fill is None:
-            write = (append("T2", item("T1", item("_index_map", var("index")))),)
-        else:
-            write = (
-                set_var("mapped", item("_index_map", var("index"))),
-                if_else(
-                    eq(var("mapped"), 0),
-                    (append("T2", self.fill),),
-                    (append("T2", source),),
-                ),
-            )
-        return Program(
-            "index_map_generic",
-            variables=("index", "mapped"),
-            lists=("T1", "_index_map", "T2"),
-            list_values={"_index_map": self.indices},
-            body=(
-                clear("T2"),
-                set_var("index", 1),
-                repeat(len(self.indices), (*write, change_var("index", 1))),
+    indices, fill = ctx.options["indices"], ctx.options["fill"]
+    source = next(iter(ctx.inputs.values()))
+    index, mapped = ctx.temp_var("index"), ctx.temp_var("mapped")
+    table = ctx.static_list("_index_map", indices)
+    out = ctx.output.list
+    if fill is None:
+        write = (append(out, item(source.list, item(table, var(index)))),)
+    else:
+        write = (
+            set_var(mapped, item(table, var(index))),
+            if_else(
+                eq(var(mapped), 0),
+                (append(out, fill),),
+                (append(out, item(source.list, var(mapped))),),
             ),
-        ).compile()
+        )
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(len(indices), (*write, change_var(index, 1))),
+    )
 
 
-__all__ = [
-    "IndexMapInstruction", "REDUCTIONS", "ReductionInstruction",
-    "index_map",
-]
+# Built for any data-movement operation; the transpiler supplies the table.
+INDEX_MAP_KERNEL = Kernel("cattorch.index_map", _emit_index_map, name="index_map_generic")
+
+
+__all__ = ["INDEX_MAP_KERNEL", "REDUCTIONS", "REDUCTION_KERNELS", "index_map"]

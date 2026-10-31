@@ -40,15 +40,14 @@ Rules for kernel authors:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import torch
 
 from cattorch.fast import FastConfig
 from cattorch.util.argument import Argument
-from cattorch.util.instruction.generic import _tensor_slots
-from cattorch.util.instruction.instruction import Instruction
+from cattorch.util.instruction.instruction import Instruction, _tensor_slots
 from cattorch.util.scratch.dsl import Program, Statement
 
 
@@ -65,6 +64,9 @@ class TensorInfo:
     #: or ``None``. ``shape`` is then the traced shape, and the list's length
     #: gives the actual one.
     dynamic_axis: int | None = None
+    #: A stored weight's values, known at export, or ``None``. Read them to
+    #: specialize the code, for example to skip zero blocks; don't change them.
+    value: torch.Tensor | None = field(default=None, compare=False, repr=False)
 
     @property
     def numel(self) -> int:
@@ -131,6 +133,8 @@ class KernelContext:
         self.list_values: dict[str, list] = {}
         self.temporary_sizes: dict[str, int] = {}
         self.options: dict[str, object] = {}
+        # Each tensor input's list name in the compiler, to find its values.
+        self.sources: dict[str, str] = {}
 
     @classmethod
     def from_arguments(
@@ -144,9 +148,11 @@ class KernelContext:
         scalars: dict[str, object] = {
             name: value for name, value in defaults.items()
         }
+        sources: dict[str, str] = {}
         for position, argument in enumerate(args):
             name = names[position]
             if position in slots and argument.name != "_none":
+                sources[name] = str(argument.name)
                 inputs[name] = TensorInfo(
                     name,
                     slots[position],
@@ -164,9 +170,11 @@ class KernelContext:
             )
         else:
             out = TensorInfo("output", output_slot, ())
-        return cls(
+        context = cls(
             str(target), inputs, scalars, out, tuple(slots.values()),
         )
+        context.sources = sources
+        return context
 
     @classmethod
     def from_node(cls, node: torch.fx.Node, operator=None) -> KernelContext:
@@ -313,6 +321,16 @@ class _ContextInstruction(Instruction):
             self.kernel.target_name, self.output, self.args, self._operator(),
         )
         self.temporary_sizes: dict[str, int] = {}
+
+    def transform_weights(self, static_lists):
+        """Give each stored-weight input its values."""
+        context = self.context
+        for name, info in list(context.inputs.items()):
+            source = context.sources.get(name, "")
+            if info.static and source.startswith("W_"):
+                value = static_lists.get(source.removeprefix("W_"))
+                if isinstance(value, torch.Tensor):
+                    context.inputs[name] = replace(info, value=value)
 
     def finalize(self):
         context = self.context

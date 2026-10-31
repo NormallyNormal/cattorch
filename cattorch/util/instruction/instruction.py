@@ -25,3 +25,16 @@ class Instruction(ABC):
     @abstractmethod
     def finalize(self):
         pass
+
+
+def _tensor_slots(args) -> tuple[dict[int, str], str]:
+    """Map argument positions to ``T`` list slots, and return the output slot.
+
+    The transpiler binds every non-constant argument, including explicit
+    ``_none`` placeholders, to consecutive ``T`` lists before the output.
+    """
+    slots = {}
+    for position, argument in enumerate(args):
+        if not str(argument.name).startswith("C_"):
+            slots[position] = f"T{len(slots) + 1}"
+    return slots, f"T{len(slots) + 1}"

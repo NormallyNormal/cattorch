@@ -41,7 +41,7 @@ from cattorch.util.instruction.optimized_moe import (
     ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
 )
 from cattorch.util.instruction.generic import (
-    IndexMapInstruction, REDUCTIONS, ReductionInstruction,
+    INDEX_MAP_KERNEL, REDUCTION_KERNELS, REDUCTIONS,
 )
 
 
@@ -338,6 +338,11 @@ def _validate_add_sub(node, _config, _fast) -> str | None:
     return None if alpha == 1 else f"The alpha={alpha!r} variant is not supported"
 
 
+_REDUCTION_INSTRUCTIONS = {
+    kernel.target_name: kernel.instruction_class() for kernel in REDUCTION_KERNELS
+}
+
+
 def _mean_kernel(torch_name, output, *args):
     """Use the tuned mean kernel for consecutive dimensions, else the generic one."""
     dims = args[1].value
@@ -345,11 +350,11 @@ def _mean_kernel(torch_name, output, *args):
         dims = (dims,)
     ndim = len(args[0].shape)
     if ndim == 0:
-        return ReductionInstruction(torch_name, output, *args)
+        return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
     normalized = sorted({dim % ndim for dim in dims or range(ndim)})
     if normalized and normalized == list(range(normalized[0], normalized[-1] + 1)):
         return OptimizedMeanInstruction(torch_name, output, *args)
-    return ReductionInstruction(torch_name, output, *args)
+    return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
 
 
 def _validate_bitwise_not(node, _config, _fast) -> str | None:
@@ -569,10 +574,10 @@ def _build_default_registry() -> OperatorRegistry:
         "aten._log_softmax.default": OptimizedLogSoftmaxInstruction,
         "aten.mean.dim": _mean_kernel,
         **{
-            operation: ReductionInstruction
+            operation: _REDUCTION_INSTRUCTIONS[operation]
             for operation in REDUCTIONS if operation != "aten.mean.dim"
         },
-        **{operation: IndexMapInstruction for operation in INDEX_MAP_OPS},
+        **{operation: INDEX_MAP_KERNEL.instruction_class() for operation in INDEX_MAP_OPS},
         "aten.layer_norm.default": OptimizedLayerNormInstruction,
         "aten.rms_norm.default": OptimizedRMSNormInstruction,
         "aten.batch_norm.default": OptimizedBatchNormInstruction,

@@ -63,7 +63,7 @@ from cattorch.util.argument import Argument
 from cattorch.operator_registry import (
     INDEX_MAP_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
 )
-from cattorch.util.instruction.generic import IndexMapInstruction, index_map
+from cattorch.util.instruction.generic import INDEX_MAP_KERNEL, index_map
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
@@ -633,10 +633,10 @@ class _Compiler:
         if len(indices) != math.prod(_get_shape(node)):
             raise _unsupported_operation(node, "unexpected output size")
         input_list = self._resolve_name(source.name)
-        instruction = IndexMapInstruction(
-            node.target, target_list, self._argument(input_list, source),
-            indices=indices, fill=fill,
+        instruction = INDEX_MAP_KERNEL.instruction_class()(
+            INDEX_MAP_KERNEL.target_name, target_list, self._argument(input_list, source),
         )
+        instruction.options = {"indices": indices, "fill": fill}
         self._emit(instruction, [input_list], target_list)
 
     def _compile_causal_score(self, node):
