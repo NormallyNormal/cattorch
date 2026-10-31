@@ -231,6 +231,23 @@
 
 ## Fixes
 
+- Combined-QKV attention (one projection split into Q, K and V) gave wrong
+  output with a batch of more than one, or when Q, K or V was also returned
+  or used elsewhere.
+- A token embedding tied to the output Linear was read in the wrong layout in
+  fast mode with weight options, for very wide tables, and by any third
+  operation reading the table.
+- Fast weight pruning of `x @ W` no longer changes `W` for other operations
+  that read the same buffer.
+- A Linear's residual add that broadcasts the Linear's output gave too few
+  values.
+- In a mixture-of-experts layer, operations on an expert's own parameters
+  (such as `torch.sigmoid(self.gate)` or a slice of it) and a Linear with a
+  computed weight read the first expert's values for every expert.
+- `bool + bool` adds as a logical or, as in PyTorch.
+- Integer powers up to 64 are computed by repeated multiplication, so whole
+  results such as `3 ** 5` are exact.
+- `F.linear` with a vector weight or a one-value bias.
 - A custom kernel for `aten.linear` crashed with `TypeError` when the weight
   was large enough for the library to group or split it. It now gets the
   weight as PyTorch stores it.

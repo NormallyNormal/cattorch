@@ -122,6 +122,13 @@ def _boolean(operation):
     return decomposition
 
 
+def _boolean_add(left, right, *, alpha=1):
+    """``bool + bool`` is a logical or in PyTorch, not a count."""
+    if alpha != 1:
+        return NotImplemented
+    return _boolean("or")(left, right)
+
+
 def _logical(operation):
     def decomposition(left, right):
         left = _aten.ne.Scalar(left, 0)
@@ -1060,6 +1067,7 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.bitwise_and.Tensor: _boolean("and"),
     _aten.bitwise_and.Scalar: _boolean("and"),
     _aten.bitwise_or.Tensor: _boolean("or"),
+    _aten.add.Tensor: _boolean_add,
     _aten.bitwise_or.Scalar: _boolean("or"),
     _aten.bitwise_xor.Tensor: _boolean("xor"),
     _aten.bitwise_xor.Scalar: _boolean("xor"),

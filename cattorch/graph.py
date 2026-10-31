@@ -508,6 +508,46 @@ def _drop_empty_cat_inputs(graph) -> None:
             graph.erase_node(node)
 
 
+def _normalize_linear_shapes(graph) -> None:
+    """Give every ``linear`` a [out, in] weight and an [out] bias.
+
+    ``F.linear`` also takes a vector weight, which gives one value per row,
+    and a bias that broadcasts, such as one value. Those become a one-row
+    weight and a reshape, and a separate add.
+    """
+    linear = torch.ops.aten.linear.default
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not linear:
+            continue
+        source, weight = node.args[0], node.args[1]
+        bias = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
+        weight_shape = tuple(_get_shape(weight))
+        if len(weight_shape) == 2 and (
+            bias is None or tuple(_get_shape(bias)) == (weight_shape[0],)
+        ):
+            continue
+        dtype = node.meta["val"].dtype
+        rows = tuple(_get_shape(source))[:-1]
+        if len(weight_shape) == 1:
+            weight = _insert(
+                graph, node, torch.ops.aten.reshape.default, (weight, [1, weight_shape[0]]),
+                (1, weight_shape[0]), _get_dtype(weight),
+            )
+        product = _insert(
+            graph, node, linear, (source, weight), (*rows, _get_shape(weight)[0]), dtype,
+        )
+        # The last step reuses ``node``: outputs are recorded by node name.
+        if len(weight_shape) == 1 and bias is not None:
+            product = _insert(
+                graph, node, torch.ops.aten.reshape.default, (product, list(rows)), rows, dtype,
+            )
+        if bias is not None:
+            node.target, node.args = torch.ops.aten.add.Tensor, (product, bias)
+        else:
+            node.target, node.args = torch.ops.aten.reshape.default, (product, list(rows))
+        node.kwargs = {}
+
+
 def _broadcast_matmul_batches(graph) -> None:
     """Give both operands of a broadcasting ``matmul`` the same batch dimensions.
 
@@ -679,6 +719,7 @@ def _normalize_graph(graph) -> None:
     The traces at other lengths get them too, so their nodes line up.
     """
     _drop_empty_cat_inputs(graph)
+    _normalize_linear_shapes(graph)
     _drop_identity_permutes(graph)
     _broadcast_matmul_batches(graph)
     _fuse_rotate_half(graph)
@@ -1670,6 +1711,8 @@ def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast,
             if user.name in fused_nodes or user.op != "call_function" or not user.args:
                 break
             target = str(user.target)
+            if target in scalar_ops and (len(user.args) > 2 or user.kwargs):
+                break  # ``alpha=`` or ``rounding_mode=``
             if user.args[0] is current and target in scalar_ops and len(user.args) > 1 and not hasattr(user.args[1], "name"):
                 operand = user.args[1]
                 if not isinstance(operand, (int, float)):
@@ -1687,6 +1730,8 @@ def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast,
                 if (
                     not hasattr(other, "name")
                     or _get_shape(other) != _get_shape(user)
+                    # Nor the Linear's output, which the add may broadcast.
+                    or _get_shape(current) != _get_shape(user)
                     or node_order.get(other.name, -1) >= node_order[node.name]
                     # The linear kernel reads one residual list.
                     or any(operation == "tensor_add" for operation, _ in epilogue)
@@ -1999,6 +2044,19 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
                 causal_value_matmuls.add(node.name)
 
 
+def _only_used_by(node, consumers, aliases, by_name) -> bool:
+    """Whether every user of ``node``, through aliasing views, is in ``consumers``."""
+    for user in node.users:
+        if user in consumers:
+            continue
+        if user.name in aliases and by_name.get(aliases[user.name]) is not None:
+            # A view aliased to ``node``'s list; its own users must qualify.
+            if _only_used_by(user, consumers, aliases, by_name):
+                continue
+        return False
+    return True
+
+
 def _match_qkv(fusions, nodes, aliases):
     causal_score_fusions, causal_softmaxes = fusions.causal_scores, fusions.causal_softmaxes
     causal_value_matmuls, fused_nodes = fusions.causal_value_matmuls, fusions.fused_nodes
@@ -2072,6 +2130,19 @@ def _match_qkv(fusions, nodes, aliases):
             or q_shape[-1] != k_shape[-1] or q_shape[-1] != v_shape[-1]
             or k_shape[-3] != v_shape[-3]
             or _get_shape(linear)[-1] != q_embed + k_embed + v_embed
+        ):
+            continue
+        # The kernel writes [projection head, sequence, width] for one batch
+        # item, and Q, K and V are read in place: nothing else may read them.
+        if math.prod(q_shape[:-3]) != 1:
+            continue
+        consumers = {
+            by_name[qk_name], q, k, v, fusion.transposed_key, value_matmul,
+            q_item, k_item, v_item,
+        }
+        if not all(
+            _only_used_by(node, consumers, aliases, by_name)
+            for node in (q_item, k_item, v_item, q, k, v, fusion.transposed_key)
         ):
             continue
         q_heads = q_shape[-3]

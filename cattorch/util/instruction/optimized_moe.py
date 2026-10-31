@@ -463,6 +463,37 @@ def expert_program(
             return tuple(state_banks[argument.name][1])
         return shapes[argument.name]
 
+    # Nodes whose list is a state bank (a parameter or buffer, or a view of
+    # one): the active expert's values start ``active expert * size`` in.
+    banked = set()
+    copies = {}
+
+    def is_banked(argument):
+        return argument.op == "get_attr" or argument.name in banked
+
+    def materialized(argument):
+        """``argument``'s list; a bank's active-expert slice is copied first."""
+        if not is_banked(argument):
+            return tensor_name(argument)
+        if argument.name not in copies:
+            size = math.prod(tensor_shape(argument))
+            copy = f"_expert {len(declared)}"
+            declared.append(copy)
+            sizes[copy] = size
+            statements.extend((
+                clear(copy),
+                set_var("expert index", 1),
+                repeat(size, (
+                    append(copy, item(
+                        tensor_name(argument),
+                        add(mul(var("active expert"), size), var("expert index")),
+                    )),
+                    change_var("expert index", 1),
+                )),
+            ))
+            copies[argument.name] = copy
+        return copies[argument.name]
+
     def element(argument, index, target_shape=None):
         if hasattr(argument, "op"):
             source = tensor_name(argument)
@@ -494,7 +525,7 @@ def expert_program(
                     list_values[map_name] = (indices + 1).tolist()
                     declared.append(map_name)
                     local = item(map_name, index)
-            if argument.op == "get_attr":
+            if is_banked(argument):
                 local = add(mul(var("active expert"), size), local)
             return item(source, local)
         return argument
@@ -512,6 +543,8 @@ def expert_program(
                 )
             names[node.name] = tensor_name(node.args[0])
             shapes[node.name] = tuple(node.meta["val"].shape)
+            if is_banked(node.args[0]):
+                banked.add(node.name)
             continue
         if target in {
             "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
@@ -525,6 +558,8 @@ def expert_program(
         ):
             names[node.name] = tensor_name(node.args[0])
             shapes[node.name] = tuple(node.meta["val"].shape)
+            if is_banked(node.args[0]):
+                banked.add(node.name)
             continue
         if target in _EXPERT_SPLITS:
             # Each output is lowered at its ``getitem``.
@@ -561,7 +596,7 @@ def expert_program(
                 set_var("expert index", 1),
                 repeat(moved.numel(), (
                     append(output_name, item(
-                        tensor_name(parent), item(map_name, var("expert index")),
+                        materialized(parent), item(map_name, var("expert index")),
                     )),
                     change_var("expert index", 1),
                 )),
@@ -594,7 +629,7 @@ def expert_program(
                 set_var("expert index", 1),
                 repeat(math.prod(output_shape), (
                     set_var("expert clamp value", item(
-                        tensor_name(node.args[0]), var("expert index"),
+                        materialized(node.args[0]), var("expert index"),
                     )),
                     *limits,
                     append(output_name, value),
@@ -606,11 +641,17 @@ def expert_program(
         if target == "aten.linear.default":
             source, weight = node.args[:2]
             bias = node.args[2] if len(node.args) > 2 else None
-            source_name = tensor_name(source)
+            source_name = materialized(source)
             weight_name = tensor_name(weight)
             rows, inner = tensor_shape(weight)
             input_rows = math.prod(tensor_shape(source)) // inner
             bias_name = None if bias is None else tensor_name(bias)
+            # A stored weight or bias is read at the active expert's slice; a
+            # computed one holds only this expert's values.
+            weight_start = mul(var("active expert"), rows * inner) if is_banked(weight) else 0
+            bias_start = (
+                mul(var("active expert"), rows) if bias is not None and is_banked(bias) else 0
+            )
             statements.extend((
                 set_var("expert source base", 1),
                 repeat(input_rows, (
@@ -618,17 +659,12 @@ def expert_program(
                     repeat(rows, (
                         set_var(
                             "expert sum", 0 if bias_name is None else item(
-                                bias_name,
-                                add(
-                                    mul(var("active expert"), rows),
-                                    add(var("expert row"), 1),
-                                ),
+                                bias_name, add(bias_start, add(var("expert row"), 1)),
                             ),
                         ),
                         set_var("expert input index", var("expert source base")),
                         set_var("expert weight index", add(
-                            mul(var("active expert"), rows * inner),
-                            add(mul(var("expert row"), inner), 1),
+                            weight_start, add(mul(var("expert row"), inner), 1),
                         )),
                         repeat(inner, (
                             change_var("expert sum", mul(
@@ -655,7 +691,7 @@ def expert_program(
                     "unsupported operation inside generic ExpertFamily: "
                     f"pow exponent {exponent} (integers from -4 to 4 and ±0.5 work)"
                 )
-            source_name = tensor_name(node.args[0])
+            source_name = materialized(node.args[0])
             element_value = item(source_name, var("expert index"))
             if magnitude == 0.5:
                 power = mathop("sqrt", element_value)
@@ -676,7 +712,7 @@ def expert_program(
             "aten.relu.default", "aten.sigmoid.default", "aten.silu.default",
             "aten.tanh.default", "aten.gelu.default", "aten.neg.default",
         }:
-            source_name = tensor_name(node.args[0])
+            source_name = materialized(node.args[0])
             size = math.prod(output_shape)
             approximate = (
                 node.args[1] if len(node.args) > 1
@@ -754,7 +790,7 @@ def expert_program(
             continue
 
         if target in {"aten.rms_norm.default", "aten.layer_norm.default"}:
-            source = tensor_name(node.args[0])
+            source = materialized(node.args[0])
             size = math.prod(output_shape)
             norm_size = math.prod(node.args[1])
             groups = size // norm_size

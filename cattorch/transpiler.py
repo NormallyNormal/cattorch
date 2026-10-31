@@ -367,31 +367,71 @@ class _Compiler:
         self._compiled_output_lists: tuple[str, ...] = ()
 
     @staticmethod
-    def _weight_identity(tensor: torch.Tensor) -> tuple[int, int, torch.dtype]:
+    def _weight_identity(tensor: torch.Tensor) -> tuple:
         return (
             tensor.untyped_storage().data_ptr(), tensor.storage_offset(), tensor.dtype,
+            tuple(tensor.shape), tensor.stride(),
         )
 
-    def _find_grouped_tied_weights(self) -> set[tuple[int, int, torch.dtype]]:
-        """Find small Linear weights whose grouped layout can serve embeddings."""
-        embeddings = set()
-        linears = set()
-        for node in self.graph.nodes:
+    def _find_grouped_tied_weights(self) -> set[tuple]:
+        """Tables read only by embeddings and by grouped Linears, all built in.
+
+        Such a weight is stored once, in the Linear's four-row interleaved
+        layout (see ``_prepare_linear_weight``), and the embedding kernel reads
+        it that way. Any other reader, or a user's kernel for either
+        operation, needs the plain layout.
+        """
+        from cattorch.operator_registry import default_registry
+
+        graph = self.graph
+        registry, fast, config = graph.registry, graph.fast, graph.fast_config
+        if fast and config.weights.enabled:
+            return set()  # weight pruning owns the Linear's layout
+        linear = registry.kernel("aten.linear.default", fast=fast, config=config)
+        embedding = registry.kernel("aten.embedding.default", fast=fast, config=config)
+        if (
+            getattr(linear, "kernel", None) is not LINEAR_KERNEL
+            or embedding is not default_registry().kernel(
+                "aten.embedding.default", fast=fast, config=config,
+            )
+        ):
+            return set()
+
+        def interleavable(tensor):
+            columns, inner = tensor.shape
+            rows_per_shard = SCRATCH_LIST_LIMIT // inner
+            return (
+                grouped_linear(columns, inner) and rows_per_shard - rows_per_shard % 4 >= 4
+            )
+
+        readers: dict[tuple, set[str]] = {}
+        for node in graph.nodes:
+            if node.op not in {"call_function", "output"}:
+                continue
             target = str(node.target)
-            if target not in {"aten.embedding.default", "aten.linear.default"}:
-                continue
-            weight_index = 0 if target == "aten.embedding.default" else 1
-            if len(node.args) <= weight_index or not hasattr(node.args[weight_index], "name"):
-                continue
-            tensor = self.graph.resolve_weight(node.args[weight_index].name)
-            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
-                continue
-            identity = self._weight_identity(tensor)
-            if target == "aten.embedding.default":
-                embeddings.add(identity)
-            elif grouped_linear(*tensor.shape):
-                linears.add(identity)
-        return embeddings & linears
+            operands = [
+                (position, value) for position, value in enumerate(node.args)
+            ] + [(None, value) for value in node.kwargs.values()]
+            for position, value in operands:
+                for argument in value if isinstance(value, (list, tuple)) else (value,):
+                    if not hasattr(argument, "name"):
+                        continue
+                    tensor = graph.resolve_weight(argument.name)
+                    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
+                        continue
+                    if target == "aten.embedding.default" and position == 0:
+                        kind = "embedding"
+                    elif (
+                        target == "aten.linear.default" and position == 1
+                        and interleavable(tensor)
+                    ):
+                        kind = "linear"
+                    else:
+                        kind = "other"
+                    readers.setdefault(self._weight_identity(tensor), set()).add(kind)
+        return {
+            identity for identity, kinds in readers.items() if kinds == {"embedding", "linear"}
+        }
 
     def _uses_grouped_tied_weight(self, node) -> bool:
         weight_index = 0 if str(node.target) == "aten.embedding.default" else 1
@@ -1089,8 +1129,11 @@ class _Compiler:
                 )
                 return
 
-            raw_key = input_lists[1].removeprefix("W_")
-            self.static_lists[raw_key] = factors[0]
+            # A pruned copy: other operations may read the original.
+            key = f"fast_{node.name}_pruned"
+            self.static_lists[key] = factors[0]
+            input_lists[1] = f"W_{key}"
+            args[1] = Argument(f"W_{key}", factors[0].shape, static=True)
             pruned = pruned_matmul_blocks(factors[0]) is not None
             instruction = self._kernel_instruction(
                 (pruned_matmul_kernel if pruned else matmul_kernel)(aten_op), target_list, *args,

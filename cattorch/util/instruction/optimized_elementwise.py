@@ -334,6 +334,16 @@ class _Elementwise:
             if exponent < 0:
                 result = div(1, result)
             return (set_var("value", direct),), result, None
+        if float(exponent).is_integer() and abs(exponent) <= 64:
+            # Square and multiply: exact for integer results, unlike e^(n ln x).
+            magnitude = int(abs(exponent))
+            setup = [set_var("value", direct), set_var("inner", cached)]
+            for bit in bin(magnitude)[3:]:
+                setup.append(set_var("inner", mul(var("inner"), var("inner"))))
+                if bit == "1":
+                    setup.append(set_var("inner", mul(var("inner"), cached)))
+            result = var("inner") if exponent > 0 else div(1, var("inner"))
+            return tuple(setup), result, None
         if float(exponent).is_integer():
             # |x| ^ n, negated for a negative base and an odd exponent.
             setup = (set_var("value", direct),)
