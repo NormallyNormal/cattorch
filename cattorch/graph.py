@@ -1013,6 +1013,215 @@ def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis
         node.args = tuple(arguments)
 
 
+# Operations whose kernels follow a runtime length on their own, by reading
+# the list's length; pointwise ones also broadcast their other operands.
+_RUNTIME_ELEMENTWISE = {
+    "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor",
+    "aten.neg.default", "aten.relu.default", "aten.sigmoid.default",
+    "aten.tanh.default", "aten.gelu.default", "aten.silu.default",
+    "aten.leaky_relu.default", "aten.elu.default", "aten.pow.Tensor_Scalar",
+    "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
+    "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
+    "aten.mean.dim", "aten.embedding.default",
+} | ELEMENTWISE_OPS
+_RUNTIME_POINTWISE = _RUNTIME_ELEMENTWISE - {
+    "aten.linear.default", "aten.layer_norm.default", "aten.native_layer_norm.default",
+    "aten._softmax.default", "aten.softmax.int", "aten.mean.dim", "aten.embedding.default",
+}
+_SHAPE_ONLY = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
+
+
+def _follow_runtime_axis(
+    node, target, parent, dynamic_parents, axis, unit, offset, input_shape, output_shape, *,
+    dynamic_axes, dynamic_units, row_loops, registry, fast, fast_config, runtime,
+) -> tuple[int, int] | None:
+    """Where an operation puts its input's runtime axis: ``(axis, unit)``.
+
+    ``unit`` is how many items along the axis make one unit of runtime
+    length. Operations that treat items independently are added to
+    ``row_loops``; ones that can't follow the axis raise. ``None`` means the
+    result has no runtime axis.
+    """
+    if target == "aten.transpose.int":
+        left = int(node.args[1]) % len(input_shape)
+        right = int(node.args[2]) % len(input_shape)
+        if axis == left:
+            axis = right
+        elif axis == right:
+            axis = left
+    elif target == "aten.permute.default":
+        permutation = [int(value) % len(input_shape) for value in node.args[1]]
+        axis = permutation.index(axis)
+    elif target == "aten.numpy_T.default":
+        axis = len(input_shape) - axis - 1
+    elif target in {
+        "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
+        "aten.unflatten.int",
+    }:
+        if offset or math.prod(input_shape[:axis]) != 1:
+            # With fixed items along the axis, or items before it, the
+            # view must keep the axis whole, with the same items before
+            # and after it.
+            before = math.prod(input_shape[:axis])
+            after = math.prod(input_shape[axis + 1:])
+            axis = next((
+                position for position, extent in enumerate(output_shape)
+                if extent == input_shape[axis]
+                and math.prod(output_shape[:position]) == before
+                and math.prod(output_shape[position + 1:]) == after
+            ), None)
+            if axis is None or unit != 1:
+                raise UnsupportedModelError(
+                    f"{target} reshapes across a runtime extent that isn't leading"
+                )
+            return axis, unit
+        # One unit of runtime length is the whole traced tensor; a view
+        # keeps it as a contiguous block, on a dimension of its own when
+        # one fits, or folded into the first dimension that holds it.
+        block = math.prod(output_shape)
+        candidates = [
+            position for position, extent in enumerate(output_shape)
+            if extent == 1 and math.prod(output_shape[position + 1:]) == block
+        ]
+        if candidates:
+            axis, unit = candidates[-1], 1
+        else:
+            axis = next(
+                (position for position, extent in enumerate(output_shape) if extent != 1), 0,
+            )
+            unit = output_shape[axis] if output_shape else 1
+    elif target == "aten.unsqueeze.default":
+        inserted = int(node.args[1]) % len(output_shape)
+        if inserted <= axis:
+            axis += 1
+    elif target in {"aten.squeeze.dim", "aten.squeeze.dims", "aten.squeeze.default"}:
+        if target == "aten.squeeze.default":
+            candidates = range(len(input_shape))
+        elif target == "aten.squeeze.dim":
+            candidates = (int(node.args[1]),)
+        else:
+            candidates = tuple(int(value) for value in node.args[1])
+        removed = {
+            value % len(input_shape) for value in candidates
+            if input_shape[value % len(input_shape)] == 1
+        }
+        if axis in removed:
+            raise UnsupportedModelError("cannot squeeze the runtime extent")
+        axis -= sum(value < axis for value in removed)
+    elif target in {
+        "aten.conv1d.default", "aten.conv2d.default",
+        "aten.max_pool1d.default", "aten.max_pool2d.default",
+        "aten.avg_pool1d.default", "aten.avg_pool2d.default",
+        "aten.adaptive_avg_pool2d.default",
+        "aten.batch_norm.default",
+    }:
+        if axis != 0:
+            raise UnsupportedModelError(
+                "convolution and pooling support only a dynamic batch extent"
+            )
+    elif target in {
+        "aten._softmax.default", "aten.softmax.int",
+        "aten._log_softmax.default", "aten.log_softmax.int",
+    }:
+        dimension = int(node.args[1]) % len(input_shape)
+        if axis >= dimension or math.prod(input_shape[dimension + 1:]) != 1:
+            raise UnsupportedModelError(
+                "dynamic softmax requires the runtime extent before a contiguous reduction"
+            )
+    elif target == "aten.mean.dim":
+        raw_dims = node.args[1]
+        dims = {
+            int(value) % len(input_shape)
+            for value in (raw_dims if isinstance(raw_dims, (list, tuple)) else (raw_dims,))
+        }
+        if axis in dims or axis > min(dims):
+            raise UnsupportedModelError(
+                "mean cannot reduce or move a runtime extent into its reduction geometry"
+            )
+        axis -= sum(value < axis for value in dims)
+    elif target in {"aten.layer_norm.default", "aten.native_layer_norm.default"}:
+        normalized_rank = len(node.args[1])
+        if axis >= len(input_shape) - normalized_rank:
+            raise UnsupportedModelError("layer normalization cannot normalize the runtime extent")
+    elif target in MATMUL_OPS:
+        if len(dynamic_parents) > 1:
+            raise UnsupportedModelError(
+                "matmul between two tensors that both vary along the runtime extent, "
+                "as in self-attention over it, gives two runtime dimensions, which "
+                "aren't supported"
+            )
+        if parent is not node.args[0] or axis == len(input_shape) - 1:
+            raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+    elif target in {"cattorch.recurrent_scan.default", "cattorch.recurrent_final.default"}:
+        if len(dynamic_parents) != 1 or parent is not node.args[0] or axis != 0 or unit != 1:
+            raise UnsupportedModelError(
+                "a recurrent layer takes a runtime extent only along its sequence"
+            )
+        if target == "cattorch.recurrent_final.default":
+            # The final state has no runtime extent.
+            return None
+    elif target == "aten.slice.Tensor":
+        dimension = int(node.args[1]) % len(input_shape)
+        start = int(node.args[2]) if len(node.args) > 2 else 0
+        end = node.args[3] if len(node.args) > 3 else None
+        if dimension == axis and (start != 0 or end not in {None, _RUNTIME_END}):
+            raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
+        if output_shape != input_shape:
+            # A fixed slice of another dimension.
+            size = input_shape[dimension]
+            first, last, _ = slice(
+                int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0,
+                min(int(end), size) if end is not None else size,
+            ).indices(size)
+            if (node.args[4] if len(node.args) > 4 else 1) != 1:
+                raise UnsupportedModelError(
+                    "slicing a variable-length tensor with a step isn't supported"
+                )
+            node.target = runtime.runtime_slice.default
+            node.args, node.kwargs = (parent, dimension, first, last), {}
+    elif target in _RUNTIME_ELEMENTWISE and _user_kernel(registry, target, fast, fast_config):
+        # A user's kernel for it may handle only the traced row.
+        if offset or any(
+            math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
+            for value in dynamic_parents
+        ):
+            raise UnsupportedModelError(
+                f"the kernel passed for {target} gets a variable-length input "
+                "that can't be split into items; read the length from "
+                "ctx.inputs[...].dynamic_axis, or export without the kernel"
+            )
+        row_loops.add(node.name)
+    elif target in _RUNTIME_ELEMENTWISE and not (
+        # These kernels size their rows from the list's length.
+        target == "aten.linear.default" and dynamic_parents == [node.args[0]]
+        and axis < len(input_shape) - 1
+        or target == "aten.embedding.default" and dynamic_parents == [node.args[1]]
+    ) and (
+        any(tuple(_get_shape(value)) != output_shape for value in dynamic_parents)
+        # Elementwise kernels size their loop from the first operand.
+        or not (node.args and getattr(node.args[0], "name", None) in dynamic_axes)
+        or (target in _RUNTIME_POINTWISE and any(
+            _broadcasts_along(value, axis, output_shape)
+            for value in node.all_input_nodes if value.name not in dynamic_axes
+        ))
+    ):
+        # Broadcasting the runtime-length operand: the kernel's broadcast
+        # tables describe one row.
+        row_loops.add(node.name)
+    elif target not in _SHAPE_ONLY and target not in _RUNTIME_ELEMENTWISE:
+        # Any other operation that treats rows independently runs its
+        # one-row kernel once per row.
+        axis, unit = _row_separable_axis(node, dynamic_axes, dynamic_units) or (None, 1)
+        if axis is None:
+            raise UnsupportedModelError(
+                f"{target} mixes values across the runtime extent, or doesn't "
+                "keep it as a dimension of its own, so it can't take a "
+                "variable-length input"
+            )
+        row_loops.add(node.name)
+    return axis, unit
+
+
 @dataclass
 class _RuntimeAxes:
     """Where each node's variable-length dimension is, from ``dynamic=`` inputs."""
@@ -1090,20 +1299,6 @@ def _propagate_runtime_axes(
         """The fewest items the runtime axis of ``name`` can hold."""
         return dynamic_bounds[name][1] + dynamic_offsets.get(name, 0)
 
-    shape_only = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
-    elementwise = {
-        "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor",
-        "aten.neg.default", "aten.relu.default", "aten.sigmoid.default",
-        "aten.tanh.default", "aten.gelu.default", "aten.silu.default",
-        "aten.leaky_relu.default", "aten.elu.default", "aten.pow.Tensor_Scalar",
-        "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
-        "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
-        "aten.mean.dim", "aten.embedding.default",
-    } | ELEMENTWISE_OPS
-    pointwise = elementwise - {
-        "aten.linear.default", "aten.layer_norm.default", "aten.native_layer_norm.default",
-        "aten._softmax.default", "aten.softmax.int", "aten.mean.dim", "aten.embedding.default",
-    }
     for node in nodes:
         if node.op != "call_function":
             continue
@@ -1142,184 +1337,15 @@ def _propagate_runtime_axes(
             shortest=shortest, mark=mark,
         ):
             continue
-        if target == "aten.transpose.int":
-            left = int(node.args[1]) % len(input_shape)
-            right = int(node.args[2]) % len(input_shape)
-            if axis == left:
-                axis = right
-            elif axis == right:
-                axis = left
-        elif target == "aten.permute.default":
-            permutation = [int(value) % len(input_shape) for value in node.args[1]]
-            axis = permutation.index(axis)
-        elif target == "aten.numpy_T.default":
-            axis = len(input_shape) - axis - 1
-        elif target in {
-            "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
-            "aten.unflatten.int",
-        }:
-            if offset or math.prod(input_shape[:axis]) != 1:
-                # With fixed items along the axis, or items before it, the
-                # view must keep the axis whole, with the same items before
-                # and after it.
-                before = math.prod(input_shape[:axis])
-                after = math.prod(input_shape[axis + 1:])
-                axis = next((
-                    position for position, extent in enumerate(output_shape)
-                    if extent == input_shape[axis]
-                    and math.prod(output_shape[:position]) == before
-                    and math.prod(output_shape[position + 1:]) == after
-                ), None)
-                if axis is None or unit != 1:
-                    raise UnsupportedModelError(
-                        f"{target} reshapes across a runtime extent that isn't leading"
-                    )
-                mark(node.name, axis, parent.name, offset)
-                continue
-            # One unit of runtime length is the whole traced tensor; a view
-            # keeps it as a contiguous block, on a dimension of its own when
-            # one fits, or folded into the first dimension that holds it.
-            block = math.prod(output_shape)
-            candidates = [
-                position for position, extent in enumerate(output_shape)
-                if extent == 1 and math.prod(output_shape[position + 1:]) == block
-            ]
-            if candidates:
-                axis, unit = candidates[-1], 1
-            else:
-                axis = next(
-                    (position for position, extent in enumerate(output_shape) if extent != 1), 0,
-                )
-                unit = output_shape[axis] if output_shape else 1
-        elif target == "aten.unsqueeze.default":
-            inserted = int(node.args[1]) % len(output_shape)
-            if inserted <= axis:
-                axis += 1
-        elif target in {"aten.squeeze.dim", "aten.squeeze.dims", "aten.squeeze.default"}:
-            if target == "aten.squeeze.default":
-                candidates = range(len(input_shape))
-            elif target == "aten.squeeze.dim":
-                candidates = (int(node.args[1]),)
-            else:
-                candidates = tuple(int(value) for value in node.args[1])
-            removed = {
-                value % len(input_shape) for value in candidates
-                if input_shape[value % len(input_shape)] == 1
-            }
-            if axis in removed:
-                raise UnsupportedModelError("cannot squeeze the runtime extent")
-            axis -= sum(value < axis for value in removed)
-        elif target in {
-            "aten.conv1d.default", "aten.conv2d.default",
-            "aten.max_pool1d.default", "aten.max_pool2d.default",
-            "aten.avg_pool1d.default", "aten.avg_pool2d.default",
-            "aten.adaptive_avg_pool2d.default",
-            "aten.batch_norm.default",
-        }:
-            if axis != 0:
-                raise UnsupportedModelError(
-                    "convolution and pooling support only a dynamic batch extent"
-                )
-        elif target in {
-            "aten._softmax.default", "aten.softmax.int",
-            "aten._log_softmax.default", "aten.log_softmax.int",
-        }:
-            dimension = int(node.args[1]) % len(input_shape)
-            if axis >= dimension or math.prod(input_shape[dimension + 1:]) != 1:
-                raise UnsupportedModelError(
-                    "dynamic softmax requires the runtime extent before a contiguous reduction"
-                )
-        elif target == "aten.mean.dim":
-            raw_dims = node.args[1]
-            dims = {
-                int(value) % len(input_shape)
-                for value in (raw_dims if isinstance(raw_dims, (list, tuple)) else (raw_dims,))
-            }
-            if axis in dims or axis > min(dims):
-                raise UnsupportedModelError(
-                    "mean cannot reduce or move a runtime extent into its reduction geometry"
-                )
-            axis -= sum(value < axis for value in dims)
-        elif target in {"aten.layer_norm.default", "aten.native_layer_norm.default"}:
-            normalized_rank = len(node.args[1])
-            if axis >= len(input_shape) - normalized_rank:
-                raise UnsupportedModelError("layer normalization cannot normalize the runtime extent")
-        elif target in MATMUL_OPS:
-            if len(dynamic_parents) > 1:
-                raise UnsupportedModelError(
-                    "matmul between two tensors that both vary along the runtime extent, "
-                    "as in self-attention over it, gives two runtime dimensions, which "
-                    "aren't supported"
-                )
-            if parent is not node.args[0] or axis == len(input_shape) - 1:
-                raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
-        elif target in {"cattorch.recurrent_scan.default", "cattorch.recurrent_final.default"}:
-            if len(dynamic_parents) != 1 or parent is not node.args[0] or axis != 0 or unit != 1:
-                raise UnsupportedModelError(
-                    "a recurrent layer takes a runtime extent only along its sequence"
-                )
-            if target == "cattorch.recurrent_final.default":
-                # The final state has no runtime extent.
-                continue
-        elif target == "aten.slice.Tensor":
-            dimension = int(node.args[1]) % len(input_shape)
-            start = int(node.args[2]) if len(node.args) > 2 else 0
-            end = node.args[3] if len(node.args) > 3 else None
-            if dimension == axis and (start != 0 or end not in {None, _RUNTIME_END}):
-                raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
-            if output_shape != input_shape:
-                # A fixed slice of another dimension.
-                size = input_shape[dimension]
-                first, last, _ = slice(
-                    int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0,
-                    min(int(end), size) if end is not None else size,
-                ).indices(size)
-                if (node.args[4] if len(node.args) > 4 else 1) != 1:
-                    raise UnsupportedModelError(
-                        "slicing a variable-length tensor with a step isn't supported"
-                    )
-                node.target = runtime.runtime_slice.default
-                node.args, node.kwargs = (parent, dimension, first, last), {}
-        elif target in elementwise and _user_kernel(registry, target, fast, fast_config):
-            # A user's kernel for it may handle only the traced row.
-            if offset or any(
-                math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
-                for value in dynamic_parents
-            ):
-                raise UnsupportedModelError(
-                    f"the kernel passed for {target} gets a variable-length input "
-                    "that can't be split into items; read the length from "
-                    "ctx.inputs[...].dynamic_axis, or export without the kernel"
-                )
-            row_loops.add(node.name)
-        elif target in elementwise and not (
-            # These kernels size their rows from the list's length.
-            target == "aten.linear.default" and dynamic_parents == [node.args[0]]
-            and axis < len(input_shape) - 1
-            or target == "aten.embedding.default" and dynamic_parents == [node.args[1]]
-        ) and (
-            any(tuple(_get_shape(value)) != output_shape for value in dynamic_parents)
-            # Elementwise kernels size their loop from the first operand.
-            or not (node.args and getattr(node.args[0], "name", None) in dynamic_axes)
-            or (target in pointwise and any(
-                _broadcasts_along(value, axis, output_shape)
-                for value in node.all_input_nodes if value.name not in dynamic_axes
-            ))
-        ):
-            # Broadcasting the runtime-length operand: the kernel's broadcast
-            # tables describe one row.
-            row_loops.add(node.name)
-        elif target not in shape_only and target not in elementwise:
-            # Any other operation that treats rows independently runs its
-            # one-row kernel once per row.
-            axis, unit = _row_separable_axis(node, dynamic_axes, dynamic_units) or (None, 1)
-            if axis is None:
-                raise UnsupportedModelError(
-                    f"{target} mixes values across the runtime extent, or doesn't "
-                    "keep it as a dimension of its own, so it can't take a "
-                    "variable-length input"
-                )
-            row_loops.add(node.name)
+        followed = _follow_runtime_axis(
+            node, target, parent, dynamic_parents, axis, unit, offset, input_shape,
+            output_shape, dynamic_axes=dynamic_axes, dynamic_units=dynamic_units,
+            row_loops=row_loops, registry=registry, fast=fast, fast_config=fast_config,
+            runtime=runtime,
+        )
+        if followed is None:
+            continue
+        axis, unit = followed
         if unit != 1 and math.prod(output_shape[:axis]) != 1:
             raise UnsupportedModelError(
                 f"{target} moves a folded runtime extent away from the front"
