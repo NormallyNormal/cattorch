@@ -68,7 +68,10 @@ ROWS = {
 @pytest.mark.parametrize("name", ROWS)
 def test_mixing_along_a_variable_batch(tmp_path, name):
     torch.manual_seed(0)
-    _export(tmp_path, Mixing(ROWS[name]), torch.randn(5, 4), {0: (1, 12)}, (7, 12))
+    # PyTorch's standard deviation of one item is NaN, which Scratch's square
+    # root reads as 0.
+    shortest = 2 if name == "standard deviation" else 1
+    _export(tmp_path, Mixing(ROWS[name]), torch.randn(5, 4), {0: (shortest, 12)}, (7, 12))
 
 
 def test_a_slice_past_the_traced_item_is_rejected(tmp_path):

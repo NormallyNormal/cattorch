@@ -229,6 +229,44 @@
 
 ## Fixes
 
+- Layer sharing merged layers that differ only in a constant, such as an
+  attention window or a residual scale, and ran every layer with the first
+  layer's value. Such layers are no longer shared.
+- With layer sharing, a `cattorch decode` before any prefill wrote the hidden
+  state to `cattorch logits` instead of the logits.
+- A model that reads input-dependent values with `tolist()` or `.numpy()`
+  exported the example's values as constants. It is now rejected, like
+  `.item()`.
+- With `dynamic=`, a broadcast that adds dimensions to the variable-length
+  input, such as `x.unsqueeze(-1) * weight`, gave wrong numbers at every
+  length.
+- The export-time check of variable-length exports compared each length with
+  the error at the shortest one, so a sprite equally wrong everywhere passed,
+  and it never checked lengths past 32. Exact exports must now match at every
+  checked length, including the maximum (up to 1024 items).
+- An `@entrypoint` whose growing buffer also changed its old rows, as in
+  `cat([seen * 0.5, row])` or prepending, exported and then lost the change.
+  It is now rejected.
+- A buffer registered under two names in an `@entrypoint` model was read as a
+  constant through the second name.
+- The emulator kept NaN through arithmetic, where Scratch reads it as 0, so
+  `verify` could pass a sprite that gives different numbers in Scratch.
+- Hugging Face dynamic-NTK RoPE past `max_position_embeddings` exported for
+  generation with wrong logits. Generation now checks shorter prompts too and
+  rejects models whose positions depend on the prompt length.
+- `BPETokenizer` accepted normalizers, pre-tokenizers, `fuse_unk` and
+  `byte_fallback`, then tokenized differently from Hugging Face; it now
+  rejects them. `transpile_tokenizer` exported WordPiece, WordLevel and Unigram
+  tokenizers one character at a time; it now rejects those with
+  multi-character tokens.
+- SentencePiece sprites with `scratch_casefold=True` used the uppercase byte
+  token for a lowercase letter without a vocabulary entry, and encoded a run
+  of unknown characters as one unknown token each.
+- `nn.LayerNorm(bias=False)`, `elementwise_affine=False`, and `F.layer_norm`
+  with a weight but no bias failed with an `IndexError`.
+- A BatchNorm used more than once, as in a Siamese encoder, normalized with
+  the wrong standard deviation after its first use.
+
 - `@cattorch.moe` stopped working once anything imported
   `cattorch.experimental`, because the module holding the MoE classes had the
   same name and replaced the marker. That module is now `cattorch.experts`.

@@ -143,14 +143,13 @@ def test_a_tokenizer_sprite(tmp_path, kind):
     if kind == "characters":
         result = CharTokenizer(char_tokenizer()).save(tmp_path / "chars")
     else:
-        from tokenizers import Tokenizer, models, pre_tokenizers
+        from tokenizers import Tokenizer, models
         from transformers import PreTrainedTokenizerFast
 
         from cattorch import BPETokenizer
 
         vocab = {"a": 0, "b": 1, "ab": 2, "?": 3}
         backend = Tokenizer(models.BPE(vocab=vocab, merges=[("a", "b")], unk_token="?"))
-        backend.pre_tokenizer = pre_tokenizers.Whitespace()
         result = BPETokenizer(
             PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="?"),
         ).save(tmp_path / "bpe")

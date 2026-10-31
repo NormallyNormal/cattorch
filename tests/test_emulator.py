@@ -37,7 +37,8 @@ def _mathop(operator, value):
         ("log", -1, math.nan),
         ("sqrt", -1, math.nan),
         ("floor", math.inf, math.inf),
-        ("floor", math.nan, math.nan),
+        # Scratch reads NaN as 0 before applying the function.
+        ("floor", math.nan, 0),
         ("ceiling", -math.inf, -math.inf),
         ("10 ^", 400, math.inf),
     ],
@@ -48,6 +49,23 @@ def test_mathop_nonfinite_results_match_javascript(operator, value, expected):
         assert math.isnan(result)
     else:
         assert result == expected
+
+
+def test_nan_is_zero_in_arithmetic():
+    # As Scratch's Cast.toNumber: sqrt(-1) + 1 is 1 in Scratch.
+    emulator = ScratchEmulator({"blocks": {
+        "sum": {
+            "opcode": "operator_add", "next": None, "parent": None,
+            "inputs": {"NUM1": [3, "root", [4, ""]], "NUM2": _literal(1)},
+            "fields": {}, "shadow": False, "topLevel": True,
+        },
+        "root": {
+            "opcode": "operator_mathop", "next": None, "parent": "sum",
+            "inputs": {"NUM": _literal(-1)}, "fields": {"OPERATOR": ["sqrt", None]},
+            "shadow": False, "topLevel": False,
+        },
+    }})
+    assert emulator._eval_reporter("sum") == 1
 
 
 def test_mod_by_zero_is_nan():

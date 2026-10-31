@@ -262,12 +262,27 @@ class OptimizedLayerNormInstruction(Instruction):
             else math.prod(self.args[0].shape) // self.norm_size
         )
         self.eps = self.args[4].value if len(self.args) > 4 else 1e-5
-        self.has_weight = self.args[2].value is not None or bool(self.args[2].shape)
-        self.has_bias = self.args[3].value is not None or bool(self.args[3].shape)
+
+        # Trailing absent arguments, such as the bias of LayerNorm(bias=False),
+        # are left out of the call.
+        def present(position):
+            if len(self.args) <= position:
+                return False
+            return self.args[position].value is not None or bool(self.args[position].shape)
+        self.has_weight = present(2)
+        self.has_bias = present(3)
+        # Lists are numbered over the tensor arguments that are there, then
+        # the output.
+        slots = [
+            position for position, argument in enumerate(self.args)
+            if not str(argument.name).startswith("C_")
+        ]
+        self.lists = {position: f"T{index + 1}" for index, position in enumerate(slots)}
+        self.output_list = f"T{len(slots) + 1}"
 
     def finalize(self):
-        weight = item("T2", var("feature")) if self.has_weight else 1
-        bias = item("T3", var("feature")) if self.has_bias else 0
+        weight = item(self.lists[2], var("feature")) if self.has_weight else 1
+        bias = item(self.lists[3], var("feature")) if self.has_bias else 0
         normalized = add(
             mul(
                 mul(sub(item("T1", var("index")), var("mean")), var("inv_std")),
@@ -281,9 +296,9 @@ class OptimizedLayerNormInstruction(Instruction):
                 "index", "feature", "mean", "variance",
                 "inv_std",
             ),
-            lists=("T1", "T2", "T3", "T4"),
+            lists=(*self.lists.values(), self.output_list),
             body=(
-                clear("T4"),
+                clear(self.output_list),
                 set_var("index", 1),
                 repeat(self.groups, (
                     set_var("mean", 0),
@@ -317,7 +332,7 @@ class OptimizedLayerNormInstruction(Instruction):
                     change_var("index", -self.norm_size),
                     set_var("feature", 1),
                     *_static_unrolled_repeat(self.norm_size, (
-                        append("T4", normalized),
+                        append(self.output_list, normalized),
                         change_var("index", 1),
                         change_var("feature", 1),
                     )),
@@ -330,8 +345,8 @@ class FastLayerNormInstruction(OptimizedLayerNormInstruction):
     """One-pass statistics using E[x^2] - E[x]^2."""
 
     def finalize(self):
-        weight = item("T2", var("feature")) if self.has_weight else 1
-        bias = item("T3", var("feature")) if self.has_bias else 0
+        weight = item(self.lists[2], var("feature")) if self.has_weight else 1
+        bias = item(self.lists[3], var("feature")) if self.has_bias else 0
         current = item("T1", var("index"))
         normalized = add(
             mul(mul(sub(current, var("mean")), var("inv_std")), weight),
@@ -340,9 +355,9 @@ class FastLayerNormInstruction(OptimizedLayerNormInstruction):
         return Program(
             "layernorm_fast",
             variables=("index", "feature", "mean", "mean_square", "variance", "inv_std"),
-            lists=("T1", "T2", "T3", "T4"),
+            lists=(*self.lists.values(), self.output_list),
             body=(
-                clear("T4"),
+                clear(self.output_list),
                 set_var("index", 1),
                 repeat(self.groups, (
                     set_var("mean", 0),
@@ -368,7 +383,7 @@ class FastLayerNormInstruction(OptimizedLayerNormInstruction):
                     change_var("index", -self.norm_size),
                     set_var("feature", 1),
                     *_static_unrolled_repeat(self.norm_size, (
-                        append("T4", normalized),
+                        append(self.output_list, normalized),
                         change_var("index", 1),
                         change_var("feature", 1),
                     )),
@@ -444,22 +459,12 @@ class OptimizedBatchNormInstruction(Instruction):
         self.has_weight = self.args[1].value is not None or bool(self.args[1].shape)
         self.has_bias = self.args[2].value is not None or bool(self.args[2].shape)
 
-    def transform_weights(self, static_lists):
-        eps = self.args[7].value
-        var_key = self.args[4].name
-        raw_key = var_key[2:] if var_key.startswith("W_") else var_key
-        # A stored variance becomes its standard deviation at export; one
-        # given as an input is converted in Scratch.
-        self.stored_std = raw_key in static_lists
-        if self.stored_std:
-            static_lists[raw_key] = torch.sqrt(static_lists[raw_key] + eps)
-
     def finalize(self):
+        # The square root is taken in Scratch, once per channel. Rewriting the
+        # stored variance instead would change it for its other readers, such
+        # as a second call of the same BatchNorm.
         variance = item("T5", var("channel"))
-        std = (
-            variance if getattr(self, "stored_std", True)
-            else mathop("sqrt", add(variance, self.args[7].value))
-        )
+        std = mathop("sqrt", add(variance, self.args[7].value))
         result = add(
             mul(
                 div(

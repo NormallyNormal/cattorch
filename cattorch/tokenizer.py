@@ -260,6 +260,17 @@ class BPETokenizer(_TokenizerBase):
             raise ValueError(
                 "raw-text BPETokenizer does not support subword prefixes or suffixes"
             )
+        settings = json.loads(backend.to_str())
+        for stage in ("normalizer", "pre_tokenizer"):
+            if settings.get(stage) is not None:
+                kind = settings[stage].get("type", "unknown")
+                raise ValueError(
+                    f"BPETokenizer doesn't support a {stage.replace('_', '-')} ({kind}); "
+                    "the sprite merges the raw text, so tokens would differ"
+                )
+        for option in ("fuse_unk", "byte_fallback"):
+            if model.get(option):
+                raise ValueError(f"BPETokenizer doesn't support {option}=True")
 
         vocab = self.tokenizer.get_vocab()
         merges: list[tuple[int, int, int]] = []
@@ -662,6 +673,13 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                         "SentencePiece vocabulary contains characters which "
                         "Scratch compares as equal; use a case-folded model"
                     )
+                if piece == comparison_key:
+                    # The model case-folds its input, so the folded form,
+                    # such as the byte for "q" rather than "Q", is the match.
+                    earlier = [character.casefold() for character in characters].index(
+                        comparison_key,
+                    )
+                    characters[earlier], character_ids[earlier] = piece, token_id
                 continue
             seen_characters.add(comparison_key)
             characters.append(piece)
@@ -812,10 +830,13 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                         ),
                         if_else(
                             eq(var("_sp lookup"), 0),
+                            # SentencePiece reads a run of unknown characters
+                            # as one unknown token.
                             (
-                                append(
-                                    "_sp split",
-                                    self.unknown_id,
+                                if_else(
+                                    eq(item("_sp split", length("_sp split")), self.unknown_id),
+                                    (),
+                                    (append("_sp split", self.unknown_id),),
                                 ),
                             ),
                             (
@@ -963,18 +984,25 @@ def transpile_tokenizer(
             scratch_casefold=scratch_casefold,
         ).save(output_path, name=name, codegen=codegen)
 
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return CharTokenizer(tokenizer).save(output_path, name=name, codegen=codegen)
     try:
         from tokenizers import models
-        is_bpe = isinstance(tokenizer.backend_tokenizer.model, models.BPE)
     except ImportError as exc:
-        if hasattr(tokenizer, "backend_tokenizer"):
-            raise ImportError(
-                "Hugging Face tokenizer auto-detection requires the "
-                "'cattorch[tokenizers]' optional dependencies"
-            ) from exc
-        is_bpe = False
-    except AttributeError:
-        is_bpe = False
-
-    cls = BPETokenizer if is_bpe else CharTokenizer
-    return cls(tokenizer).save(output_path, name=name, codegen=codegen)
+        raise ImportError(
+            "Hugging Face tokenizer auto-detection requires the "
+            "'cattorch[tokenizers]' optional dependencies"
+        ) from exc
+    if isinstance(backend.model, models.BPE):
+        return BPETokenizer(tokenizer).save(output_path, name=name, codegen=codegen)
+    special = set(getattr(tokenizer, "all_special_tokens", ()))
+    if any(len(token) != 1 for token in tokenizer.get_vocab() if token not in special):
+        # A WordPiece, WordLevel or Unigram vocabulary of words would be
+        # encoded one character at a time.
+        raise ValueError(
+            f"{type(backend.model).__name__} tokenizers with multi-character tokens "
+            "can't be exported; transpile_tokenizer supports BPE, SentencePiece BPE, "
+            "and tokenizers whose tokens are single characters"
+        )
+    return CharTokenizer(tokenizer).save(output_path, name=name, codegen=codegen)

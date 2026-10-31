@@ -131,6 +131,10 @@ broadcasting pattern, or option. The error names the operation that failed.
   such as `x.float()` on integer token IDs, keep the value unchanged, including
   conversions to `float16`. Conversions to an integer dtype truncate toward zero,
   and conversions to `bool` produce 0 or 1.
+- Scratch reads NaN as 0 whenever it does arithmetic or math with it, so
+  values that are NaN in PyTorch, such as `sqrt` of a negative number, can
+  give different results downstream, and `torch.isnan` is always 0. `verify`
+  runs the sprite with Scratch's rules and reports such differences.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a

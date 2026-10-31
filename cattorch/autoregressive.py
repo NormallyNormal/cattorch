@@ -1522,6 +1522,12 @@ def check_step_equivalence(
     names = plan.long.user_output_names
     with torch.no_grad():
         reference = tensor_output_leaves(adapted(tokens), warn=False)
+        # Shorter prompts too: a model whose positions depend on the prompt
+        # length, such as dynamic NTK RoPE, matches only at the full length.
+        prefixes = {
+            count: tensor_output_leaves(adapted(tokens[:, :count]), warn=False)
+            for count in sorted({1, length // 2, length - 1}) if 0 < count < length
+        }
         step.reset()
         try:
             rows = [step(tokens[:, i:i + 1]) for i in range(length)]
@@ -1553,6 +1559,24 @@ def check_step_equivalence(
                     f"{scale:.3g}, tolerance {rtol:g} relative; max error over all "
                     f"rows {overall:.3g}. The rewrite assumed the model computes each "
                     "token from its own row and earlier tokens only"
+                )
+
+    # The cached step matches the full prompt; check it is the model's answer
+    # for shorter prompts too.
+    for count, shorter in prefixes.items():
+        for name, axis in plan.outputs:
+            leaf = names.index(name)
+            expected = shorter[leaf].narrow(axis.axis, count - 1, 1)
+            actual = rows[count - 1][leaf]
+            scale = float(expected.double().abs().max()) if expected.numel() else 0.0
+            if actual.shape != expected.shape or not torch.allclose(
+                actual.double(), expected.double(), rtol=0, atol=rtol * max(scale, 1e-3),
+                equal_nan=True,
+            ):
+                raise UnsupportedModelError(
+                    f"the model's output for token {count} changes when more tokens "
+                    "follow it, so it can't be generated one token at a time; for "
+                    "example, its positions are scaled by the prompt length"
                 )
 
 

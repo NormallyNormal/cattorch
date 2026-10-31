@@ -331,6 +331,29 @@ class TestBPETokenizerEncode:
             BPETokenizer(tokenizer).save(SPRITE_PATH)
 
 
+class TestBPESettingsTheSpriteCantReproduce:
+
+    def test_rejects_normalizers_and_pre_tokenizers(self):
+        from tokenizers import normalizers
+
+        for stage, value in (
+            ("normalizer", normalizers.NFD()),
+            ("pre_tokenizer", pre_tokenizers.Whitespace()),
+        ):
+            tok = _make_bpe_tokenizer(["hello world", "hello there"])
+            setattr(tok.backend_tokenizer, stage, value)
+            with pytest.raises(ValueError, match="doesn't support a"):
+                BPETokenizer(tok).save(SPRITE_PATH)
+
+    def test_rejects_word_vocabularies(self):
+        vocab = {"[UNK]": 0, "the": 1, "cat": 2}
+        backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        with pytest.raises(ValueError, match="multi-character tokens"):
+            transpile_tokenizer(tok, SPRITE_PATH)
+
+
 class TestBPETokenizerDecode:
 
     def test_basic_decode(self):
@@ -499,6 +522,21 @@ class _ManySplitSentencePieceProcessor:
         return 1
 
 
+class _CasedBytesSentencePieceProcessor(_FakeSentencePieceProcessor):
+    pieces = ("<|pad|>", "<|unk|>", "<0x51>", "<0x71>", "a")
+
+    def is_byte(self, token_id):
+        return token_id in {2, 3}
+
+
+def _tokenize(result, text):
+    with zipfile.ZipFile(result.path) as archive:
+        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator.variables["cattorch text"] = text
+    emulator.run_procedure("cattorch tokenize")
+    return [int(value) for value in emulator.lists["cattorch token ids"]]
+
+
 class TestSentencePieceBPE:
 
     def test_rejects_default_dummy_prefix_sentencepiece(self, tmp_path):
@@ -543,6 +581,19 @@ class TestSentencePieceBPE:
         emulator.variables["cattorch text"] = "AB_ab!"
         emulator.run_procedure("cattorch tokenize")
         assert [int(value) for value in emulator.lists["cattorch token ids"]] == [3, 2, 3, 8]
+
+    def test_casefolded_byte_fallback_uses_the_lowercase_byte(self, tmp_path):
+        # A case-folding model reads "Q" and "q" as "q", byte 0x71.
+        result = SentencePieceBPETokenizer(
+            _CasedBytesSentencePieceProcessor(), scratch_casefold=True,
+        ).save(tmp_path / "bytes")
+        assert _tokenize(result, "qQa") == [3, 3, 4]
+
+    def test_a_run_of_unknown_characters_is_one_unknown_token(self, tmp_path):
+        result = SentencePieceBPETokenizer(
+            _FakeSentencePieceProcessor(), scratch_casefold=True,
+        ).save(tmp_path / "unknown")
+        assert _tokenize(result, "%%a%") == [1, 6, 1]
 
     def test_encode_considers_merges_beyond_vocabulary_length(self, tmp_path):
         result = SentencePieceBPETokenizer(

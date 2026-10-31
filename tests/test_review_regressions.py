@@ -616,3 +616,32 @@ def test_benchmark_input_restore_and_output_read_are_shard_aware():
         1.0,
         2.0,
     ]
+
+
+@pytest.mark.parametrize("optimization", ["exact", "fast"])
+@pytest.mark.parametrize("norm", [
+    lambda: nn.LayerNorm(4, bias=False),
+    lambda: nn.LayerNorm(4, elementwise_affine=False),
+])
+def test_layer_norm_without_bias_or_weight(tmp_path, norm, optimization):
+    model = norm().eval()
+    value = torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "norm", optimization=optimization)
+    assert verify(model, value, result, atol=1e-3).passed
+
+
+def test_a_batch_norm_used_twice(tmp_path):
+    class Twice(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.BatchNorm1d(3)
+            with torch.no_grad():
+                self.norm.running_var.uniform_(0.5, 2.0)
+                self.norm.running_mean.normal_()
+
+        def forward(self, first, second):
+            return self.norm(first) + self.norm(second)
+
+    model = Twice().eval()
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    assert verify(model, inputs, transpile(model, inputs, tmp_path / "twice")).passed
