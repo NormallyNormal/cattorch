@@ -371,3 +371,139 @@ def test_an_unused_kernel_warns(tmp_path):
     with pytest.warns(UserWarning, match="aten.gelu.default was not used"):
         transpile(nn.ReLU().eval(), _X, tmp_path / "relu",
                   kernels=[_sevens(torch.ops.aten.gelu.default, [])])
+
+
+# ── Crashes and misleading errors ────────────────────────────────────────────
+
+_DYNAMIC = {
+    "add itself": lambda parts, a: a + a,
+    "compare a column": lambda parts, a: (a[:, :1] > 0).float(),
+    "silu times": lambda parts, a: F.silu(a) * a,
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DYNAMIC))
+def test_variable_length_elementwise_with_one_value_per_item(tmp_path, case):
+    model = Lambda(_DYNAMIC[case]).eval()
+    value = torch.tensor([[1.0, 2.0], [-1.0, 3.0], [7.0, -2.0]]) if case == "compare a column" \
+        else torch.tensor([1.0, -1.0, 7.0])
+    result = transpile(model, value, tmp_path / "dynamic", dynamic={0: (1, 8)})
+    assert verify(model, value, result).passed
+
+
+def test_variable_length_silu_times_a_parameter(tmp_path):
+    class Scaled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(1, 4))
+
+        def forward(self, x):
+            return F.silu(x) * self.weight
+
+    model, value = Scaled().eval(), torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "scaled", dynamic={0: (1, 8)})
+    assert verify(model, value, result).passed
+
+
+@pytest.mark.parametrize("pool", [
+    lambda: nn.MaxPool1d(1),
+    lambda: nn.MaxPool2d(1, stride=2),
+    lambda: nn.MaxPool1d(2, 2, padding=1, ceil_mode=True),
+])
+def test_max_pooling_with_one_value_per_window(tmp_path, pool):
+    model = pool().eval()
+    value = torch.randn(1, 2, 2) if isinstance(model, nn.MaxPool1d) else torch.randn(1, 2, 4, 4)
+    _check(model, value, tmp_path / "pool")
+
+
+@pytest.mark.parametrize("option", [{"stride": (2,)}, {"padding": (1,)}])
+def test_conv2d_with_a_one_value_tuple(tmp_path, option):
+    torch.manual_seed(0)
+    _check(nn.Conv2d(2, 3, 3, **option), torch.randn(1, 2, 6, 6), tmp_path / "conv")
+
+
+@pytest.mark.parametrize("function", [
+    lambda x: torch.softmax(x.sum(), 0),
+    lambda x: torch.log_softmax(x.sum(), -1),
+    lambda x: x.mean(dim=()),
+    lambda x: x.mean(dim=None, keepdim=True),
+])
+def test_softmax_of_a_scalar_and_mean_over_every_dimension(tmp_path, function):
+    _check(Lambda(lambda parts, x: function(x)), torch.randn(2, 3), tmp_path / "reduce")
+
+
+def test_a_model_that_cannot_run_on_one_item(tmp_path):
+    from cattorch import UnsupportedModelError
+
+    model = Lambda(lambda parts, x: F.max_pool1d(x, 2)).eval()
+    with pytest.raises(UnsupportedModelError, match="can't run on one"):
+        transpile(model, torch.randn(1, 1, 4), tmp_path / "pool", dynamic={0: {2: (2, 6)}})
+
+
+def test_fast_low_rank_matmul_with_a_variable_length_input(tmp_path):
+    class Product(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.randn(32, 4) @ torch.randn(4, 32))
+
+        def forward(self, x):
+            return x @ self.weight
+
+    torch.manual_seed(0)
+    model, value = Product().eval(), torch.randn(3, 32)
+    fast = FastConfig(weights=FastLayerConfig(rank=4))
+    result = transpile(model, value, tmp_path / "low_rank", optimization="fast",
+                       fast_config=fast, dynamic={0: (1, 8)})
+    report = verify(model, value, result, atol=1e-3)
+    assert report.passed, report
+
+
+def test_stored_matmul_wider_than_a_list(tmp_path, small_list_limit):
+    small_list_limit(2_000)
+
+    class Product(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(2_100, 3))
+
+        def forward(self, x):
+            return x @ self.weight
+
+    torch.manual_seed(0)
+    model = Product().eval()
+    value = torch.randn(1, 2_100)
+    result = transpile(model, value, tmp_path / "wide")
+    assert verify(model, value, result, atol=1e-3).passed
+
+
+class GeluExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = nn.Parameter(torch.randn(4, 2))
+        self.second = nn.Parameter(torch.randn(2, 4))
+
+    def forward(self, x):
+        # A low-rank layer, an activation, and a power of zero.
+        return F.gelu((x @ self.first) @ self.second) + x ** 0
+
+
+@pytest.mark.parametrize("expert", [0, 2])
+def test_low_rank_experts(tmp_path, expert):
+    torch.manual_seed(0)
+    family = ExpertFamily.from_modules([GeluExpert() for _ in range(3)], example_input=torch.ones(1, 4))
+    _check(SparseMoE(Fixed(expert), family, top_k=1), torch.randn(3, 4), tmp_path / "moe")
+
+
+def test_fast_mode_reports_approximations_inside_experts(tmp_path):
+    torch.manual_seed(0)
+    family = ExpertFamily.from_modules([GeluExpert() for _ in range(3)], example_input=torch.ones(1, 4))
+    model = SparseMoE(Fixed(1), family, top_k=1).eval()
+    result = transpile(model, torch.randn(3, 4), tmp_path / "moe", optimization="fast")
+    assert ("aten.gelu.default", 1) in result.approximate_operations
+
+
+def test_nan_to_num_replaces_nan_and_infinities(tmp_path):
+    model = Lambda(lambda parts, x: (
+        torch.nan_to_num(torch.log(x)), torch.nan_to_num(x / 0, posinf=5.0, neginf=-5.0),
+    )).eval()
+    _check(model, torch.tensor([[-1.0, 0.5, 2.0, -3.0]]), tmp_path / "nan")

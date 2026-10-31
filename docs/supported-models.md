@@ -133,8 +133,10 @@ broadcasting pattern, or option. The error names the operation that failed.
   and conversions to `bool` produce 0 or 1.
 - Scratch reads NaN as 0 whenever it does arithmetic or math with it, so
   values that are NaN in PyTorch, such as `sqrt` of a negative number, can
-  give different results downstream, and `torch.isnan` is always 0. `verify`
-  runs the sprite with Scratch's rules and reports such differences.
+  give different results downstream, and `torch.isnan` is always 0.
+  `torch.nan_to_num` works with its default `nan=0`; another replacement value
+  is rejected, since Scratch can't tell NaN from 0. `verify` runs the sprite
+  with Scratch's rules and reports such differences.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
@@ -154,7 +156,9 @@ result = cattorch.transpile(model, torch.randn(4, 16), "model.sprite3",
 as the tokens in a `(1, tokens)` input; name a tensor in `example_kwargs` by
 its key. The Scratch input list then takes any whole number of items, and
 the output lists grow with it. `TensorSpec.shape` shows the bounded
-dimension as a `BoundedDimension`.
+dimension as a `BoundedDimension`. cattorch traces the model with one item
+along the dimension, whatever the lower bound, so the model must run on one
+item.
 
 Most operations treat the items independently, as models treat a batch or
 tokens processed one at a time. These operations mix them, and follow the

@@ -89,8 +89,9 @@ class _ConvolutionLayout:
         else:
             self.batches, self.input_channels, self.input_height, self.input_width = input_shape
             kernel_height, kernel_width = weight_shape[2:]
-            stride_height, stride_width = stride
-            padding_height, padding_width = padding
+            # One value applies to both dimensions, as in PyTorch.
+            stride_height, stride_width = stride * 2 if len(stride) == 1 else stride
+            padding_height, padding_width = padding * 2 if len(padding) == 1 else padding
             dilation_height, dilation_width = (
                 (dilation[0], dilation[0]) if len(dilation) == 1 else dilation
             )
@@ -409,7 +410,11 @@ def _emit_pooling(ctx: KernelContext):
     if layout.uniform_count is not None:
         if layout.is_max:
             initialize = (set_var("result", current), change_var("map_index", 1))
-            reduction_body = _static_unrolled_repeat(layout.uniform_count - 1, reduction_step)
+            # A one-element window is its own maximum.
+            reduction_body = (
+                _static_unrolled_repeat(layout.uniform_count - 1, reduction_step)
+                if layout.uniform_count > 1 else ()
+            )
         else:
             initialize = (set_var("result", 0),)
             reduction_body = _static_unrolled_repeat(layout.uniform_count, reduction_step)

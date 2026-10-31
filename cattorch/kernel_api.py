@@ -139,6 +139,9 @@ class KernelContext:
         self.sources: dict[str, str] = {}
         #: The names of the arguments the call passed, in order.
         self.argument_names: tuple[str, ...] = ()
+        # Operations the library's own kernels lowered approximately, for
+        # ``TranspileResult.approximate_operations``.
+        self.approximated: list[str] = []
 
     @classmethod
     def from_arguments(

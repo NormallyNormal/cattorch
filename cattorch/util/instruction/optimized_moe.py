@@ -382,6 +382,8 @@ class ExpertProgram:
     sizes: dict[str, int] = field(default_factory=dict)
     #: Variables only some expert programs need.
     extra_variables: list[str] = field(default_factory=list)
+    #: Operations lowered with fast mode's approximations, once per call.
+    approximated: list[str] = field(default_factory=list)
 
 
 def _expert_state_banks(family, captured, bank_lists):
@@ -452,6 +454,7 @@ def expert_program(
     sizes = {"_expert input": math.prod(shapes[placeholder.name])}
     list_values = {}
     extra_variables = []
+    approximated: list[str] = []
 
     def tensor_name(argument):
         if argument.op == "get_attr":
@@ -682,18 +685,56 @@ def expert_program(
             ))
             continue
 
+        if target in {"aten.matmul.default", "aten.mm.default"} and len(
+            tensor_shape(node.args[1]) if hasattr(node.args[1], "op") else (),
+        ) == 2:
+            # ``x @ W`` with a matrix ``W``, as in a low-rank layer.
+            source, weight = node.args[:2]
+            source_name = materialized(source)
+            weight_name = tensor_name(weight)
+            inner, columns = tensor_shape(weight)
+            input_rows = math.prod(tensor_shape(source)) // inner
+            weight_start = mul(var("active expert"), inner * columns) if is_banked(weight) else 0
+            statements.extend((
+                set_var("expert source base", 1),
+                repeat(input_rows, (
+                    set_var("expert row", 0),
+                    repeat(columns, (
+                        set_var("expert sum", 0),
+                        set_var("expert input index", var("expert source base")),
+                        set_var("expert weight index", add(
+                            weight_start, add(var("expert row"), 1),
+                        )),
+                        repeat(inner, (
+                            change_var("expert sum", mul(
+                                item(source_name, var("expert input index")),
+                                item(weight_name, var("expert weight index")),
+                            )),
+                            change_var("expert input index", 1),
+                            change_var("expert weight index", columns),
+                        )),
+                        append(output_name, var("expert sum")),
+                        change_var("expert row", 1),
+                    )),
+                    change_var("expert source base", inner),
+                )),
+            ))
+            continue
+
         if target == "aten.pow.Tensor_Scalar":
-            # The elementwise kernel's exponents: integers up to 4 and ±0.5.
+            # The elementwise kernel's exact exponents: integers up to 4, and ±0.5.
             exponent = node.args[1]
             magnitude = abs(exponent)
-            if magnitude not in {0.5, 1, 2, 3, 4}:
+            if magnitude not in {0, 0.5, 1, 2, 3, 4}:
                 raise ValueError(
                     "unsupported operation inside generic ExpertFamily: "
                     f"pow exponent {exponent} (integers from -4 to 4 and ±0.5 work)"
                 )
             source_name = materialized(node.args[0])
             element_value = item(source_name, var("expert index"))
-            if magnitude == 0.5:
+            if magnitude == 0:
+                power = 1
+            elif magnitude == 0.5:
                 power = mathop("sqrt", element_value)
             else:
                 power = element_value
@@ -714,6 +755,8 @@ def expert_program(
         }:
             source_name = materialized(node.args[0])
             size = math.prod(output_shape)
+            if target == "aten.gelu.default" and fast_activations:
+                approximated.append(target)
             approximate = (
                 node.args[1] if len(node.args) > 1
                 else node.kwargs.get("approximate", "none")
@@ -812,6 +855,8 @@ def expert_program(
                 set_var("expert mean", 0),
                 set_var("expert variance", 0),
             ]
+            if target == "aten.layer_norm.default" and fast_layer_norm:
+                approximated.append(target)
             if target == "aten.layer_norm.default" and fast_layer_norm:
                 group_body.extend((
                     set_var("expert index", 1),
@@ -917,6 +962,7 @@ def expert_program(
         result = result[0]
     return ExpertProgram(
         tuple(statements), tensor_name(result), declared, list_values, sizes, extra_variables,
+        approximated,
     )
 
 
@@ -1046,6 +1092,7 @@ def _emit_expert_family(ctx: KernelContext, *, routed: bool):
     top_k = ctx.inputs[names[1]].shape[-1] if routed else int(ctx.options["top_k"])
     for name in (*_EXPERT_VARIABLES, *program.extra_variables):
         ctx.temp_var(name)
+    ctx.approximated.extend(program.approximated)
     out = ctx.output.list
     routes = ctx.temp_list("_moe route ids", top_k)
     weights = ctx.temp_list("_moe route weights", top_k)

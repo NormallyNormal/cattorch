@@ -129,6 +129,23 @@ def _boolean_add(left, right, *, alpha=1):
     return _boolean("or")(left, right)
 
 
+def _nan_to_num(value, nan=None, posinf=None, neginf=None):
+    """Scratch can't test for NaN, but its arithmetic reads NaN as 0, so
+    ``x + 0`` replaces NaN with the default 0. Infinities compare normally."""
+    if not value.is_floating_point() or nan not in {None, 0, 0.0}:
+        return NotImplemented
+    info = torch.finfo(value.dtype)
+    result = _aten.add.Tensor(value, 0.0)
+    for infinity, replacement in ((math.inf, posinf), (-math.inf, neginf)):
+        if replacement is None:
+            replacement = info.max if infinity > 0 else info.min
+        result = _aten.where.self(
+            _aten.eq.Scalar(result, infinity),
+            _aten.full_like.default(result, replacement), result,
+        )
+    return result
+
+
 def _logical(operation):
     def decomposition(left, right):
         left = _aten.ne.Scalar(left, 0)
@@ -1068,6 +1085,7 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.bitwise_and.Scalar: _boolean("and"),
     _aten.bitwise_or.Tensor: _boolean("or"),
     _aten.add.Tensor: _boolean_add,
+    _aten.nan_to_num.default: _nan_to_num,
     _aten.bitwise_or.Scalar: _boolean("or"),
     _aten.bitwise_xor.Tensor: _boolean("xor"),
     _aten.bitwise_xor.Scalar: _boolean("xor"),

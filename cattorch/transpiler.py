@@ -806,10 +806,7 @@ class _Compiler:
         target_list = self.scope.get_list_for_node(node)
         self.last_target_list = target_list
         input_lists = [self._resolve_name(gate.name), self._resolve_name(value.name)]
-        args = [
-            Argument(input_lists[0], _get_shape(gate)),
-            Argument(input_lists[1], _get_shape(value)),
-        ]
+        args = [self._argument(input_lists[0], gate), self._argument(input_lists[1], value)]
         instruction = self._kernel_instruction(SWIGLU_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(silu)
@@ -1000,6 +997,8 @@ class _Compiler:
                     first_names[location]
                 ].ndim
             self._emit(instruction, input_lists, target_list)
+            for approximated in instruction.context.approximated:
+                self.approximate[approximated] += 1
             return
         lowering_target = (
             node.target if rule is None or rule.lowering_target is None
@@ -1081,11 +1080,11 @@ class _Compiler:
                 # store quantized weights output-major like linear weights.
                 and (rhs.numel() > SCRATCH_LIST_LIMIT or self.row_aligned_weights)
             ):
-                instruction, matrix_inputs = self._large_static_matmul(
-                    node, target_list, args[0], rhs,
-                )
-                self._emit(instruction, matrix_inputs, target_list)
-                return
+                large = self._large_static_matmul(node, target_list, args[0], rhs)
+                if large is not None:
+                    instruction, matrix_inputs = large
+                    self._emit(instruction, matrix_inputs, target_list)
+                    return
         kernel = self.graph.registry.kernel(
             aten_op, fast=self.graph.fast, config=self.graph.fast_config,
         )
@@ -1122,8 +1121,14 @@ class _Compiler:
                     self.static_lists[key] = factor
                     factor_lists.append(f"W_{key}")
                     factor_args.append(Argument(f"W_{key}", factor.shape, static=True))
+                options = {}
+                if args[0].dynamic_axis is not None:
+                    left = node.args[0]
+                    options["most_rows"] = self.graph.runtime_capacity(
+                        left.name, _get_shape(left),
+                    ) // _get_shape(left)[-1]
                 instruction = self._kernel_instruction(
-                    LOW_RANK_MATMUL_KERNEL, target_list, args[0], *factor_args,
+                    LOW_RANK_MATMUL_KERNEL, target_list, args[0], *factor_args, options=options,
                 )
                 self._emit(
                     instruction,
@@ -1508,9 +1513,9 @@ class _Compiler:
         if grouped:
             rows_per_shard -= rows_per_shard % 4
         if rows_per_shard < 1:
-            raise ValueError(
-                "static matmul reduction dimension exceeds one Scratch list"
-            )
+            # One output row crosses a list boundary; the plain matmul reads
+            # the stored weight through the general sharder instead.
+            return None
 
         names = []
         row_counts = []
@@ -1610,15 +1615,28 @@ class _Compiler:
             raise _unsupported_operation(
                 node, "its kernel can't run once per row of a variable-length input",
             )
+        # Variable-length inputs, found by list name, or by argument for a
+        # fusion, whose inputs (such as the SiLU of a SiLU-times product)
+        # aren't the node's own.
         dynamic = {
             self._resolve_name(arg.name): math.prod(_get_shape(arg))
             for arg in node.all_input_nodes if arg.name in self.graph.dynamic_axes
         }
         tensor_lists = [name for name in input_lists if not name.startswith("C_")]
-        rows = {
-            f"T{position}": dynamic[name]
-            for position, name in enumerate(tensor_lists, 1) if name in dynamic
-        }
+        tensor_args = [
+            argument for argument in instruction.args if not str(argument.name).startswith("C_")
+        ]
+        rows = {}
+        for position, name in enumerate(tensor_lists, 1):
+            argument = tensor_args[position - 1] if position <= len(tensor_args) else None
+            if name in dynamic:
+                rows[f"T{position}"] = dynamic[name]
+            elif getattr(argument, "dynamic_axis", None) is not None:
+                rows[f"T{position}"] = math.prod(argument.shape)
+        if not rows:
+            raise _unsupported_operation(
+                node, "its kernel can't run once per row of a variable-length input",
+            )
         output = f"T{len(tensor_lists) + 1}"
         return row_loop(programs[0], rows, output, math.prod(_get_shape(node))).compile()
 
@@ -1888,7 +1906,18 @@ def _transpile_dynamic(
         # model once per item instead, if items are independent.
         try:
             axes = unit_output_axes(model, flat, kwarg_names, spec, example_kwargs)
-        except UnsupportedModelError:
+        except Exception:  # noqa: BLE001 - the model may not run on one item at all
+            # The graph is traced with one item along the dimension, whatever
+            # the declared minimum.
+            try:
+                with torch.no_grad():
+                    model(*representative[:positional], **traced_kwargs)
+            except Exception as reason:  # noqa: BLE001 - reported to the user
+                raise UnsupportedModelError(
+                    "a variable-length export traces the model with one item along "
+                    f"the dimension, and this model can't run on one "
+                    f"({type(reason).__name__}: {reason})"
+                ) from None
             raise error from None
         input_shapes = [tuple(value.shape) for value in representative]
         result = _transpile(

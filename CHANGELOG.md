@@ -231,6 +231,25 @@
 
 ## Fixes
 
+- Variable-length exports:
+  - Elementwise operations on an input with one value per item, such as a
+    1-D input or a `(T, 1)` column, read only the first item.
+  - `silu(x) * y` failed to export, or crashed with a `(1, D)` parameter.
+  - Fast mode's low-rank matmul sized its loop from the example.
+  - A model that can't run on one item now says so, instead of raising a
+    PyTorch error.
+- Max pooling crashed when every window held one value, as in `MaxPool1d(1)`.
+- `Conv2d` with a one-value tuple, such as `stride=(2,)`, crashed.
+- Softmax of a 0-d tensor and `mean(dim=())` or `mean(dim=None)` crashed.
+- `x @ W` with a stored `W` whose inner dimension is wider than a Scratch
+  list raised an internal error; it now exports as `nn.Linear` does.
+- Fast mode lists the approximations used inside mixture-of-experts layers in
+  `approximate_operations`.
+- Experts take `x @ W`, so low-rank expert layers work as documented, and
+  `x ** 0`.
+- `torch.nan_to_num` replaced nothing. Its default `nan=0` and infinity
+  replacements now work; other `nan` values are rejected, since Scratch can't
+  tell NaN from 0.
 - A kernel passed in `kernels=` now always runs. Before, fusions skipped it
   without a word: a Linear with its activation, scalar or residual, `silu(a) *
   b`, arithmetic chains, token plus position embeddings, rotary embeddings,

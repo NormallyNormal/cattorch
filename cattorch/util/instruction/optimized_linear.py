@@ -454,12 +454,17 @@ def _emit_low_rank_matmul(ctx: KernelContext):
     """Static right side matmul lowered as two smaller dense matmuls."""
     source, first, second = ctx.inputs["input"], ctx.inputs["first"], ctx.inputs["second"]
     left_shape = source.shape
-    rows = math.prod(left_shape[:-1]) if len(left_shape) > 1 else 1
+    traced_rows = math.prod(left_shape[:-1]) if len(left_shape) > 1 else 1
     inner, rank, columns = left_shape[-1], first.shape[1], second.shape[1]
+    # A variable-length input sets the rows when the code runs;
+    # ``ctx.options["most_rows"]`` bounds them.
+    rows = div(length(source.list), inner) if source.dynamic_axis is not None else traced_rows
     for name in ("sum", "left_start", "right_start", "left_index", "right_index"):
         ctx.temp_var(name)
     out = ctx.output.list
-    low_rank = ctx.temp_list("_matmul_low_rank", rows * rank)
+    low_rank = ctx.temp_list(
+        "_matmul_low_rank", ctx.options.get("most_rows", traced_rows) * rank,
+    )
 
     def dot(count, left_list, right_list, right_step, destination):
         return (

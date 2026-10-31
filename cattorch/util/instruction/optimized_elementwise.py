@@ -141,6 +141,9 @@ class _Elementwise:
         argument = self.args[position]
         if not _is_tensor(argument):
             return argument
+        if argument.dynamic_axis is not None and tuple(argument.shape) == tuple(self.output_shape):
+            # One item may trace as one value; the list grows with the length.
+            return item(argument.list, var("index"))
         index, values = _broadcast_index(argument.shape, self.output_shape, map_name)
         if values is not None:
             self.ctx.static_list(map_name, values)

@@ -36,7 +36,8 @@ class _SoftmaxLayout:
 
     def __init__(self, ctx: KernelContext):
         source = ctx.inputs["self"]
-        shape = source.shape
+        # A 0-d tensor is one group of one value.
+        shape = source.shape or (1,)
         dim = ctx.scalars["dim"] % len(shape)
         self.source = source
         self.dim_size = shape[dim]
@@ -162,7 +163,9 @@ def _emit_mean(ctx: KernelContext):
     source = ctx.inputs["self"]
     shape = source.shape
     dims = ctx.scalars["dim"]
-    dims = sorted(dim % len(shape) for dim in ((dims,) if isinstance(dims, int) else dims))
+    dims = (dims,) if isinstance(dims, int) else dims
+    # No dimensions, or ``None``, means every dimension.
+    dims = sorted(dim % len(shape) for dim in (dims or range(len(shape))))
     first = dims[0]
     reduce_size = math.prod(shape[dim] for dim in dims)
     trailing = first + len(dims)
