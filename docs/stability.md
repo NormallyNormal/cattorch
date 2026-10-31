@@ -29,8 +29,8 @@ names, and supported operations. A name that is replaced keeps working, with a
   interface (`Kernel`, `KernelContext`, `TensorInfo`, `check_kernel`,
   `build_kernel_benchmark`, `cattorch.scratch`, and `transpile(kernels=...)`),
   `op`, the explicit mixture-of-experts classes (`ExpertFamily`, `SparseMoE`,
-  `StackedSwiGLUMoE`, `routed_experts`, `select_routes`, `RoutingScores`,
-  `stacked_swiglu_moe_adapter`), and `analyze`. They can change in any release;
+  `StackedSwiGLUMoE`, `routed_experts`, `select_routes`, `RoutingScores`),
+  and `analyze`. They can change in any release;
   the [changelog](../CHANGELOG.md) notes when they do.
 - **Internals:** modules and names not importable from `cattorch` or
   `cattorch.experimental`, and names starting with `_`.

@@ -33,7 +33,7 @@ STABLE = {
 EXPERIMENTAL = {
     "Kernel", "KernelContext", "TensorInfo", "check_kernel", "build_kernel_benchmark",
     "scratch", "op", "Operation", "ExpertFamily", "SparseMoE", "StackedSwiGLUMoE",
-    "routed_experts", "select_routes", "RoutingScores", "stacked_swiglu_moe_adapter",
+    "routed_experts", "select_routes", "RoutingScores",
     "analyze", "AnalysisReport", "EntryPointAnalysis",
 }
 

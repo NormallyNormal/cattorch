@@ -18,7 +18,7 @@ from cattorch.kernel_api import Kernel, KernelContext, TensorInfo
 from cattorch.kernel_testing import check_kernel
 from cattorch.experts import (
     ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, routed_experts,
-    select_routes, stacked_swiglu_moe_adapter,
+    select_routes,
 )
 
 _GRADUATED = frozenset({
@@ -45,5 +45,5 @@ __all__ = [
     "AnalysisReport", "EntryPointAnalysis", "ExpertFamily", "Kernel", "KernelContext",
     "Operation", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE", "TensorInfo", "analyze",
     "build_kernel_benchmark", "check_kernel", "op", "routed_experts", "scratch",
-    "select_routes", "stacked_swiglu_moe_adapter",
+    "select_routes",
 ]

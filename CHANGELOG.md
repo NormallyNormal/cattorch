@@ -290,6 +290,11 @@
 - cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from
   Python 3.10 and PyTorch 2.6. Python 3.10 reached its end of life in
   October 2026.
+- `cattorch.experimental.stacked_swiglu_moe_adapter` is removed. MoE blocks
+  with SwiGLU experts switch to `StackedSwiGLUMoE` by themselves. For a block
+  whose expert weights are stacked into one tensor each, an `@adapter` that
+  returns `StackedSwiGLUMoE` does the same; see
+  [mixture of experts](docs/programs-and-moe.md#mixture-of-experts).
 - `op` moved back to `cattorch.experimental`, next to the kernel interface it
   uses. Only names outside `cattorch.experimental` are stable; see
   [stability](docs/stability.md).
