@@ -25,12 +25,11 @@ import torch
 from cattorch.results import (
     BoundedDimension, ProgramResult, ProjectResult, TokenizerResult, TranspileResult,
 )
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.sprite import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
 from cattorch.util.scratch.dsl import (
     Program,
-    add,
     answer,
     append,
     ask,
@@ -58,6 +57,7 @@ from cattorch.util.scratch.dsl import (
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.remap import remap_ids
+from cattorch.interface import STATUS_VARIABLE
 
 
 _INDEX = "_cattorch bridge index"
@@ -456,7 +456,7 @@ def _program_project(builder, result) -> None:
         lines.append(f"broadcast \"{message}\" and wait")
     _layout(builder, list(dict.fromkeys(shown)))
     builder.note(
-        f"Fill an entry point's input lists, then:\n" + "\n".join(lines)
+        "Fill an entry point's input lists, then:\n" + "\n".join(lines)
         + f"\n\nState is kept inside {name} between calls."
     )
 
@@ -475,14 +475,14 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
             if_(eq(var(_READY), 0), (call("cattorch init"), set_var(_READY, 1))),
             *_copy(tokens, "cattorch tokens"),
             call(f"cattorch {operation}"),
-            set_var(status, var("cattorch status")),
-            if_(eq(var("cattorch status"), "ok"), (
+            set_var(status, var(STATUS_VARIABLE)),
+            if_(eq(var(STATUS_VARIABLE), "ok"), (
                 *_sample("cattorch logits", heat),
                 set_var(next_token, sub(var(_BEST), 1)),
             )),
         ), lists=(tokens, "cattorch tokens", "cattorch logits"),
             variables=(
-                _INDEX, _BEST, _TOTAL, _PICK, _READY, status, next_token, heat, "cattorch status",
+                _INDEX, _BEST, _TOTAL, _PICK, _READY, status, next_token, heat, STATUS_VARIABLE,
             ))
 
     # Decode the weights again after a restart, in case they were re-encoded

@@ -21,7 +21,7 @@ from cattorch.benchmark import (
     _write_project,
 )
 from cattorch.sprite import _add_warp_procedure
-from cattorch.storage import BASE85_ALPHABET
+from cattorch.storage import BASE92_ALPHABET
 from cattorch.util.scratch.dsl import (
     Program,
     add,
@@ -49,6 +49,9 @@ from build_next_optimization_suite import (
     _HighResolutionStageBlocks,
     _sprite_target,
 )
+
+# The earlier codec this suite compares against.
+BASE85_ALPHABET = BASE92_ALPHABET[:85]
 
 
 OUTPUT = Path(__file__).parent / "artifacts" / "costume_codec_suite.sb3"

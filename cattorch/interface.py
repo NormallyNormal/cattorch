@@ -17,6 +17,19 @@ import re
 INTERFACE_VERSION = 1
 VERSION_VARIABLE = "cattorch interface version"
 PUBLIC_PREFIX = "cattorch "
+# Set to ``ok`` when a public block finishes, or to why it didn't run.
+STATUS_VARIABLE = "cattorch status"
+
+
+def input_name(index: int) -> str:
+    """The list for a model's ``index``-th input: ``input``, ``input_1``, ..."""
+    return "input" if index == 0 else f"input_{index}"
+
+
+def output_name(index: int) -> str:
+    """The list for a model's ``index``-th output: ``output``, ``output_1``, ..."""
+    return "output" if index == 0 else f"output_{index}"
+
 
 # Names every kind of export may have. Model inputs and outputs (``input``,
 # ``output``, ``input_1``, ...) and their ``shard N`` parts are public too,
@@ -32,7 +45,7 @@ PUBLIC_PROCEDURES = frozenset({
 })
 PUBLIC_DATA = frozenset({
     VERSION_VARIABLE,
-    "cattorch status", "cattorch initialized",
+    STATUS_VARIABLE, "cattorch initialized",
     # Generation.
     "cattorch tokens", "cattorch logits", "cattorch cache length",
     "cattorch max context", "cattorch top k values", "cattorch top k ids",

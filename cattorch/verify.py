@@ -33,6 +33,7 @@ from cattorch.results import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list, write_logical_list
+from cattorch.interface import STATUS_VARIABLE, input_name, output_name
 
 
 def _normalise_inputs(example_inputs):
@@ -181,7 +182,7 @@ def _verify_program(
                 value.detach().cpu().flatten().tolist(),
             )
         emulator.run_procedure(f"cattorch {entry.name}")
-        status = str(emulator.variables.get("cattorch status", "missing runtime status"))
+        status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
         output_results = []
         if status == "ok":
             from cattorch.experts import _expert_family_context
@@ -292,7 +293,7 @@ def verify(
         project = json.loads(archive.read("sprite.json"))
     emulator = ScratchEmulator(project)
     for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
-        name = "input" if index == 0 else f"input_{index}"
+        name = input_name(index)
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
     emulator.run_procedure("cattorch forward")
 
@@ -314,7 +315,7 @@ def verify(
         expected = model(*inputs, **(example_kwargs or {}))
     leaves = tensor_output_leaves(expected, warn=False)
     output_names = tuple(
-        "output" if index == 0 else f"output_{index}"
+        output_name(index)
         for index in range(len(leaves))
     )
     actual_names = {

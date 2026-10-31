@@ -29,9 +29,8 @@ def small_list_limit(monkeypatch):
         for name, module in list(sys.modules.items()):
             if not name.startswith("cattorch") or module is None:
                 continue
-            for attribute in ("SCRATCH_LIST_LIMIT", "SCRATCH_MAX_LIST_LENGTH"):
-                if hasattr(module, attribute):
-                    monkeypatch.setattr(module, attribute, limit)
+            if hasattr(module, "SCRATCH_LIST_LIMIT"):
+                monkeypatch.setattr(module, "SCRATCH_LIST_LIMIT", limit)
         return limit
 
     return apply

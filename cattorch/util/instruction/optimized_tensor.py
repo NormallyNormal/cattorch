@@ -15,17 +15,13 @@ from cattorch.util.scratch.dsl import (
     div,
     eq,
     for_each,
-    gt,
-    if_,
     if_else,
     item,
     length,
-    lt,
     mathop,
     mod,
     mul,
     repeat,
-    replace,
     set_var,
     sub,
     var,
@@ -36,8 +32,6 @@ from cattorch.util.instruction.optimized_common import (
     _broadcast_index,
     _static_unrolled_repeat,
     _unrolled_copy_statements,
-    _unrolled_dot_statements,
-    _unrolled_offset_dot_statements,
 )
 
 class OptimizedEmbeddingInstruction(Instruction):

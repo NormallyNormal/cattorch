@@ -12,15 +12,12 @@ from cattorch.util.scratch.dsl import (
     change_var,
     clear,
     div,
-    eq,
     gt,
     if_,
     if_else,
     item,
     length,
-    lt,
     mathop,
-    mod,
     mul,
     repeat,
     replace,
@@ -31,11 +28,7 @@ from cattorch.util.scratch.dsl import (
 
 
 from cattorch.util.instruction.optimized_common import (
-    _broadcast_index,
     _static_unrolled_repeat,
-    _unrolled_copy_statements,
-    _unrolled_dot_statements,
-    _unrolled_offset_dot_statements,
 )
 
 class OptimizedSoftmaxInstruction(Instruction):

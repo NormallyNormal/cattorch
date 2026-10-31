@@ -18,6 +18,7 @@ from cattorch.results import _tensor_spec
 from cattorch.operator_registry import (
     ELEMENTWISE_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
 )
+from cattorch.interface import input_name, output_name
 
 log = logging.getLogger(__name__)
 
@@ -344,7 +345,7 @@ class _GraphInfo:
     def output_specs(self):
         return tuple(
             _tensor_spec(
-                "output" if index == 0 else f"output_{index}", shape, dtype,
+                output_name(index), shape, dtype,
                 (self.dynamic_axes[name], self._public_bounds(name))
                 if name in self.dynamic_axes else None,
             )
@@ -1026,7 +1027,6 @@ def _prepare_graph(
     _captured: CapturedGraph | None = None,
 ) -> _GraphInfo:
     """Capture the model, decompose ops, and analyze the graph structure."""
-    use_fusions = optimization in {"exact", "fast"}
     fast = optimization == "fast"
     fast_config = fast_config or FastConfig()
     registry = _registry or default_registry()
@@ -1276,7 +1276,7 @@ def _prepare_graph(
             dimension = int(node.args[1]) % len(input_shape)
             start = int(node.args[2]) if len(node.args) > 2 else 0
             end = node.args[3] if len(node.args) > 3 else None
-            if dimension == axis and (start != 0 or end not in {None, 9223372036854775807}):
+            if dimension == axis and (start != 0 or end not in {None, _RUNTIME_END}):
                 raise UnsupportedModelError("partial slicing of a runtime extent is not supported")
             if output_shape != input_shape:
                 # A fixed slice of another dimension.
@@ -1366,15 +1366,15 @@ def _prepare_graph(
         )
     by_name = {node.name: node for node in nodes}
     outputs = []
-    for index, output_name in enumerate(captured.user_output_names):
-        output_node = by_name.get(output_name) if output_name is not None else None
+    for index, traced_name in enumerate(captured.user_output_names):
+        output_node = by_name.get(traced_name) if traced_name is not None else None
         value = None if output_node is None else output_node.meta.get("val")
         if output_node is None or not hasattr(value, "shape") or not hasattr(value, "dtype"):
             raise UnsupportedModelError(
                 f"model output leaf {index} is not a tensor"
             )
-        outputs.append((output_name, _get_shape(output_node), value.dtype))
-    output_name, output_shape, output_dtype = outputs[0]
+        outputs.append((traced_name, _get_shape(output_node), value.dtype))
+    traced_name, output_shape, output_dtype = outputs[0]
 
     # Materialise compile-time generated tensors as static weights.
     generated_weights = {}
@@ -1400,31 +1400,30 @@ def _prepare_graph(
     # are all static during export. Registered-buffer masks (`bias == 0`),
     # RoPE tables (`torch.outer(arange, inv_freq)`), and similar setup code
     # then never reach Scratch, whatever operations they happen to use.
-    if use_fusions:
-        # Position and cache buffers change at run time: nothing derived from
-        # them is a constant.
-        runtime_state = (
-            _generation_state_names(nodes, state_inputs) if generation is not None else set()
-        )
-        # A zero-element tensor's value is known from its shape alone, so
-        # it and everything computed only from such tensors (an empty sum,
-        # ``mm`` over an empty dimension) fold too.
-        for node in nodes:
-            value = node.meta.get("val")
-            if (
-                node.op in {"placeholder", "call_function", "get_attr"}
-                and isinstance(value, torch.Tensor) and value.numel() == 0
-                and node.name not in generated_weights
-            ):
-                generated_weights[node.name] = torch.zeros(value.shape, dtype=value.dtype)
-        generated_weights.update(fold_static_values(
-            nodes,
-            {
-                name: value for name, value in state_inputs.items()
-                if name not in runtime_state
-            },
-            seed=generated_weights,
-        ))
+    # Position and cache buffers change at run time: nothing derived from
+    # them is a constant.
+    runtime_state = (
+        _generation_state_names(nodes, state_inputs) if generation is not None else set()
+    )
+    # A zero-element tensor's value is known from its shape alone, so
+    # it and everything computed only from such tensors (an empty sum,
+    # ``mm`` over an empty dimension) fold too.
+    for node in nodes:
+        value = node.meta.get("val")
+        if (
+            node.op in {"placeholder", "call_function", "get_attr"}
+            and isinstance(value, torch.Tensor) and value.numel() == 0
+            and node.name not in generated_weights
+        ):
+            generated_weights[node.name] = torch.zeros(value.shape, dtype=value.dtype)
+    generated_weights.update(fold_static_values(
+        nodes,
+        {
+            name: value for name, value in state_inputs.items()
+            if name not in runtime_state
+        },
+        seed=generated_weights,
+    ))
 
     def resolve_weight(arg_name):
         if arg_name in generated_weights:
@@ -1438,7 +1437,7 @@ def _prepare_graph(
         if node.op != 'placeholder':
             continue
         if node.name in user_input_placeholders:
-            name = "input" if input_count == 0 else f"input_{input_count}"
+            name = input_name(input_count)
             input_names[node.name] = name
             input_count += 1
         elif resolve_weight(node.name) is None:
@@ -1562,149 +1561,146 @@ def _prepare_graph(
     linear_fusions = {}
     approximate_fusions: list[str] = []
     fused_nodes = set()
-    if use_fusions:
-        scalar_ops = {
-            "aten.mul.Tensor": "mul", "aten.div.Tensor": "div",
-            "aten.add.Tensor": "add", "aten.sub.Tensor": "sub",
-        }
-        activation_ops = {
-            "aten.relu.default": "relu", "aten.sigmoid.default": "sigmoid",
-            "aten.tanh.default": "tanh", "aten.silu.default": "silu",
-            "aten.gelu.default": "gelu",
-        }
-        for node in nodes:
-            if (
-                node.op != "call_function" or str(node.target) != "aten.linear.default"
-                # A folded linear is never compiled, so it can't carry an epilogue.
-                or node.name in generated_weights
-            ):
-                continue
-            current = node
-            epilogue = []
-            chain = []
-            while len(current.users) == 1:
-                user = next(iter(current.users))
-                if user.name in fused_nodes or user.op != "call_function" or not user.args:
+    scalar_ops = {
+        "aten.mul.Tensor": "mul", "aten.div.Tensor": "div",
+        "aten.add.Tensor": "add", "aten.sub.Tensor": "sub",
+    }
+    activation_ops = {
+        "aten.relu.default": "relu", "aten.sigmoid.default": "sigmoid",
+        "aten.tanh.default": "tanh", "aten.silu.default": "silu",
+        "aten.gelu.default": "gelu",
+    }
+    for node in nodes:
+        if (
+            node.op != "call_function" or str(node.target) != "aten.linear.default"
+            # A folded linear is never compiled, so it can't carry an epilogue.
+            or node.name in generated_weights
+        ):
+            continue
+        current = node
+        epilogue = []
+        chain = []
+        while len(current.users) == 1:
+            user = next(iter(current.users))
+            if user.name in fused_nodes or user.op != "call_function" or not user.args:
+                break
+            target = str(user.target)
+            if user.args[0] is current and target in scalar_ops and len(user.args) > 1 and not hasattr(user.args[1], "name"):
+                operand = user.args[1]
+                if not isinstance(operand, (int, float)):
                     break
-                target = str(user.target)
-                if user.args[0] is current and target in scalar_ops and len(user.args) > 1 and not hasattr(user.args[1], "name"):
-                    operand = user.args[1]
-                    if not isinstance(operand, (int, float)):
-                        break
-                    if target == "aten.div.Tensor" and operand == 0:
-                        break
-                    epilogue.append((scalar_ops[target], operand))
-                elif target == "aten.add.Tensor" and len(user.args) > 1:
-                    if user.args[0] is current:
-                        other = user.args[1]
-                    elif user.args[1] is current:
-                        other = user.args[0]
-                    else:
-                        break
-                    if (
-                        not hasattr(other, "name")
-                        or _get_shape(other) != _get_shape(user)
-                        or node_order.get(other.name, -1) >= node_order[node.name]
-                        # The linear kernel reads one residual list.
-                        or any(operation == "tensor_add" for operation, _ in epilogue)
-                    ):
-                        break
-                    epilogue.append(("tensor_add", other))
-                elif target in activation_ops:
-                    if user.args[0] is not current:
-                        break
-                    # The fused linear epilogue only implements tanh GELU;
-                    # exact GELU runs as its own elementwise kernel.
-                    exact_gelu = (
-                        target == "aten.gelu.default" and _gelu_approximation(user) != "tanh"
-                    )
-                    if exact_gelu and not (fast and fast_config.activations):
-                        break
-                    # Leave SiLU materialization to the broader SiLU-times-
-                    # tensor fusion below when it feeds a single multiply.
-                    if target == "aten.silu.default" and len(user.users) == 1:
-                        next_user = next(iter(user.users))
-                        if str(next_user.target) == "aten.mul.Tensor":
-                            break
-                    epilogue.append((activation_ops[target], None))
-                    if exact_gelu:
-                        approximate_fusions.append(target)
-                    chain.append(user)
-                    current = user
-                    break  # Activations terminate the simple expression epilogue.
+                if target == "aten.div.Tensor" and operand == 0:
+                    break
+                epilogue.append((scalar_ops[target], operand))
+            elif target == "aten.add.Tensor" and len(user.args) > 1:
+                if user.args[0] is current:
+                    other = user.args[1]
+                elif user.args[1] is current:
+                    other = user.args[0]
                 else:
                     break
+                if (
+                    not hasattr(other, "name")
+                    or _get_shape(other) != _get_shape(user)
+                    or node_order.get(other.name, -1) >= node_order[node.name]
+                    # The linear kernel reads one residual list.
+                    or any(operation == "tensor_add" for operation, _ in epilogue)
+                ):
+                    break
+                epilogue.append(("tensor_add", other))
+            elif target in activation_ops:
+                if user.args[0] is not current:
+                    break
+                # The fused linear epilogue only implements tanh GELU;
+                # exact GELU runs as its own elementwise kernel.
+                exact_gelu = (
+                    target == "aten.gelu.default" and _gelu_approximation(user) != "tanh"
+                )
+                if exact_gelu and not (fast and fast_config.activations):
+                    break
+                # Leave SiLU materialization to the broader SiLU-times-
+                # tensor fusion below when it feeds a single multiply.
+                if target == "aten.silu.default" and len(user.users) == 1:
+                    next_user = next(iter(user.users))
+                    if str(next_user.target) == "aten.mul.Tensor":
+                        break
+                epilogue.append((activation_ops[target], None))
+                if exact_gelu:
+                    approximate_fusions.append(target)
                 chain.append(user)
                 current = user
-            if chain:
-                linear_fusions[node.name] = (current, tuple(epilogue), tuple(chain))
-                fused_nodes.update(item.name for item in chain)
+                break  # Activations terminate the simple expression epilogue.
+            else:
+                break
+            chain.append(user)
+            current = user
+        if chain:
+            linear_fusions[node.name] = (current, tuple(epilogue), tuple(chain))
+            fused_nodes.update(item.name for item in chain)
 
     paired_swiglu_fusions = {}
     silu_mul_fusions = {}
-    if use_fusions:
-        for node in nodes:
-            if node.op != "call_function" or str(node.target) != "aten.silu.default":
-                continue
-            if len(node.users) != 1:
-                continue
-            multiply = next(iter(node.users))
-            if multiply.op != "call_function" or str(multiply.target) != "aten.mul.Tensor":
-                continue
-            if multiply.args[0] is node:
-                other = multiply.args[1]
-            elif multiply.args[1] is node:
-                other = multiply.args[0]
-            else:
-                continue
-            if not hasattr(other, "name") or _get_shape(other) != _get_shape(multiply):
-                continue
-            gate = node.args[0]
-            if not hasattr(gate, "name") or _get_shape(gate) != _get_shape(multiply):
-                continue
-            if (
-                gate.op == "call_function"
-                and str(gate.target) == "aten.linear.default"
-                and other.op == "call_function"
-                and str(other.target) == "aten.linear.default"
-                and gate.args[0] is other.args[0]
-                and len(gate.users) == 1
-                and len(other.users) == 1
-            ):
-                paired_swiglu_fusions[multiply.name] = (node, gate, other)
-                fused_nodes.update((node.name, gate.name, other.name))
-            else:
-                silu_mul_fusions[multiply.name] = (node, gate, other)
-                fused_nodes.add(node.name)
+    for node in nodes:
+        if node.op != "call_function" or str(node.target) != "aten.silu.default":
+            continue
+        if len(node.users) != 1:
+            continue
+        multiply = next(iter(node.users))
+        if multiply.op != "call_function" or str(multiply.target) != "aten.mul.Tensor":
+            continue
+        if multiply.args[0] is node:
+            other = multiply.args[1]
+        elif multiply.args[1] is node:
+            other = multiply.args[0]
+        else:
+            continue
+        if not hasattr(other, "name") or _get_shape(other) != _get_shape(multiply):
+            continue
+        gate = node.args[0]
+        if not hasattr(gate, "name") or _get_shape(gate) != _get_shape(multiply):
+            continue
+        if (
+            gate.op == "call_function"
+            and str(gate.target) == "aten.linear.default"
+            and other.op == "call_function"
+            and str(other.target) == "aten.linear.default"
+            and gate.args[0] is other.args[0]
+            and len(gate.users) == 1
+            and len(other.users) == 1
+        ):
+            paired_swiglu_fusions[multiply.name] = (node, gate, other)
+            fused_nodes.update((node.name, gate.name, other.name))
+        else:
+            silu_mul_fusions[multiply.name] = (node, gate, other)
+            fused_nodes.add(node.name)
 
     embedding_add_fusions = {}
-    if use_fusions:
-        for node in nodes:
-            if (
-                node.op != "call_function"
-                or str(node.target) != "aten.add.Tensor"
-                or len(node.args) < 2
-            ):
-                continue
-            first, second = node.args[:2]
-            if not all(
-                hasattr(value, "name")
-                and value.op == "call_function"
-                and str(value.target) == "aten.embedding.default"
-                and len(value.users) == 1
-                for value in (first, second)
-            ):
-                continue
-            if (
-                math.prod(_get_shape(first)) != math.prod(_get_shape(node))
-                or math.prod(_get_shape(second)) != math.prod(_get_shape(node))
-                or math.prod(_get_shape(first.args[1]))
-                != math.prod(_get_shape(second.args[1]))
-                or _get_shape(first.args[0])[1:] != _get_shape(second.args[0])[1:]
-            ):
-                continue
-            embedding_add_fusions[node.name] = (first, second)
-            fused_nodes.update((first.name, second.name))
+    for node in nodes:
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.add.Tensor"
+            or len(node.args) < 2
+        ):
+            continue
+        first, second = node.args[:2]
+        if not all(
+            hasattr(value, "name")
+            and value.op == "call_function"
+            and str(value.target) == "aten.embedding.default"
+            and len(value.users) == 1
+            for value in (first, second)
+        ):
+            continue
+        if (
+            math.prod(_get_shape(first)) != math.prod(_get_shape(node))
+            or math.prod(_get_shape(second)) != math.prod(_get_shape(node))
+            or math.prod(_get_shape(first.args[1]))
+            != math.prod(_get_shape(second.args[1]))
+            or _get_shape(first.args[0])[1:] != _get_shape(second.args[0])[1:]
+        ):
+            continue
+        embedding_add_fusions[node.name] = (first, second)
+        fused_nodes.update((first.name, second.name))
 
     # Collapse straight-line, same-shape arithmetic into one traversal.  This
     # is deliberately conservative: broadcasting still uses the regular
@@ -1712,64 +1708,63 @@ def _prepare_graph(
     # The fusion is keyed by its final node so branched operands have already
     # been materialized when the compiler emits it.
     elementwise_fusions = {}
-    if use_fusions:
-        arithmetic_ops = {
-            "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
-            "aten.div.Tensor", "aten.neg.default",
-        }
-        claimed = (
-            set(fused_nodes)
-            | set(linear_fusions)
-            | set(paired_swiglu_fusions)
-            | set(silu_mul_fusions)
-            | set(embedding_add_fusions)
-        )
-        for root in nodes:
-            if (
-                root.name in claimed
-                or root.op != "call_function"
-                or str(root.target) not in arithmetic_ops
-                or root.kwargs
-            ):
-                continue
-            shape = _get_shape(root)
-            if not shape:
-                continue
-            chain = []
-            current = root
-            while (
-                current.name not in claimed
-                # A row-looped step broadcasts over the runtime extent.
-                and current.name not in row_loops
-                and current.op == "call_function"
-                and str(current.target) in arithmetic_ops
-                and not current.kwargs
-                and _get_shape(current) == shape
-            ):
-                tensor_args = [arg for arg in current.args if hasattr(arg, "name")]
-                scalar_args = [arg for arg in current.args if not hasattr(arg, "name")]
-                target = str(current.target)
-                expected_args = 1 if target == "aten.neg.default" else 2
-                if len(current.args) != expected_args:
-                    break
-                if any(_get_shape(arg) != shape for arg in tensor_args):
-                    break
-                if any(not isinstance(arg, (int, float)) for arg in scalar_args):
-                    break
-                chain.append(current)
-                if len(current.users) != 1:
-                    break
-                user = next(iter(current.users))
-                if current not in user.args:
-                    break
-                current = user
+    arithmetic_ops = {
+        "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
+        "aten.div.Tensor", "aten.neg.default",
+    }
+    claimed = (
+        set(fused_nodes)
+        | set(linear_fusions)
+        | set(paired_swiglu_fusions)
+        | set(silu_mul_fusions)
+        | set(embedding_add_fusions)
+    )
+    for root in nodes:
+        if (
+            root.name in claimed
+            or root.op != "call_function"
+            or str(root.target) not in arithmetic_ops
+            or root.kwargs
+        ):
+            continue
+        shape = _get_shape(root)
+        if not shape:
+            continue
+        chain = []
+        current = root
+        while (
+            current.name not in claimed
+            # A row-looped step broadcasts over the runtime extent.
+            and current.name not in row_loops
+            and current.op == "call_function"
+            and str(current.target) in arithmetic_ops
+            and not current.kwargs
+            and _get_shape(current) == shape
+        ):
+            tensor_args = [arg for arg in current.args if hasattr(arg, "name")]
+            scalar_args = [arg for arg in current.args if not hasattr(arg, "name")]
+            target = str(current.target)
+            expected_args = 1 if target == "aten.neg.default" else 2
+            if len(current.args) != expected_args:
+                break
+            if any(_get_shape(arg) != shape for arg in tensor_args):
+                break
+            if any(not isinstance(arg, (int, float)) for arg in scalar_args):
+                break
+            chain.append(current)
+            if len(current.users) != 1:
+                break
+            user = next(iter(current.users))
+            if current not in user.args:
+                break
+            current = user
 
-            if len(chain) < 2:
-                continue
-            final = chain[-1]
-            elementwise_fusions[final.name] = tuple(chain)
-            claimed.update(item.name for item in chain)
-            fused_nodes.update(item.name for item in chain[:-1])
+        if len(chain) < 2:
+            continue
+        final = chain[-1]
+        elementwise_fusions[final.name] = tuple(chain)
+        claimed.update(item.name for item in chain)
+        fused_nodes.update(item.name for item in chain[:-1])
 
     # Recognize the standard exact causal-attention chain.  The specialized
     # score kernel consumes K before its final transpose, folds the scalar
@@ -1780,214 +1775,213 @@ def _prepare_graph(
     causal_value_matmuls = set()
     qkv_linear_fusions = {}
     qkv_offsets = {}
-    if use_fusions:
-        def static_tensor(candidate):
-            if not hasattr(candidate, "name"):
-                return None
-            name = candidate.name
-            while name in aliases:
-                name = aliases[name]
-            value = resolve_weight(name)
-            return value if isinstance(value, torch.Tensor) else None
+    def static_tensor(candidate):
+        if not hasattr(candidate, "name"):
+            return None
+        name = candidate.name
+        while name in aliases:
+            name = aliases[name]
+        value = resolve_weight(name)
+        return value if isinstance(value, torch.Tensor) else None
 
-        for mask_node in nodes:
-            if (
-                mask_node.op != "call_function"
-                or str(mask_node.target) != "aten.masked_fill.Scalar"
-                or len(mask_node.args) < 3
-                or mask_node.args[2] != float("-inf")
-            ):
-                continue
-            score_value = mask_node.args[0]
-            mask = static_tensor(mask_node.args[1])
-            output_shape = _get_shape(mask_node)
-            if (
-                mask is None or mask.dtype != torch.bool or mask.ndim != 2
-                or len(output_shape) < 3
-                or output_shape[-1] != output_shape[-2]
-                or tuple(mask.shape) != tuple(output_shape[-2:])
-            ):
-                continue
-            length = output_shape[-1]
-            expected_mask = torch.triu(
-                torch.ones((length, length), dtype=torch.bool, device=mask.device),
-                diagonal=1,
-            )
-            if not torch.equal(mask, expected_mask):
-                continue
+    for mask_node in nodes:
+        if (
+            mask_node.op != "call_function"
+            or str(mask_node.target) != "aten.masked_fill.Scalar"
+            or len(mask_node.args) < 3
+            or mask_node.args[2] != float("-inf")
+        ):
+            continue
+        score_value = mask_node.args[0]
+        mask = static_tensor(mask_node.args[1])
+        output_shape = _get_shape(mask_node)
+        if (
+            mask is None or mask.dtype != torch.bool or mask.ndim != 2
+            or len(output_shape) < 3
+            or output_shape[-1] != output_shape[-2]
+            or tuple(mask.shape) != tuple(output_shape[-2:])
+        ):
+            continue
+        length = output_shape[-1]
+        expected_mask = torch.triu(
+            torch.ones((length, length), dtype=torch.bool, device=mask.device),
+            diagonal=1,
+        )
+        if not torch.equal(mask, expected_mask):
+            continue
 
-            scale = 1.0
-            scale_node = None
-            if hasattr(score_value, "name") and score_value.op == "call_function":
-                target = str(score_value.target)
-                if (
-                    target in {"aten.mul.Tensor", "aten.div.Tensor"}
-                    and len(score_value.args) > 1
-                    and not hasattr(score_value.args[1], "name")
-                ):
-                    operand = score_value.args[1]
-                    if not isinstance(operand, (int, float)) or operand == 0:
-                        continue
-                    scale = float(operand) if target == "aten.mul.Tensor" else 1.0 / float(operand)
-                    scale_node = score_value
-                    score_value = score_value.args[0]
+        scale = 1.0
+        scale_node = None
+        if hasattr(score_value, "name") and score_value.op == "call_function":
+            target = str(score_value.target)
             if (
-                not hasattr(score_value, "name")
-                or score_value.op != "call_function"
-                or str(score_value.target) not in {
-                    "aten.matmul.default", "aten.mm.default", "aten.bmm.default",
-                }
-                or len(score_value.users) != 1
+                target in {"aten.mul.Tensor", "aten.div.Tensor"}
+                and len(score_value.args) > 1
+                and not hasattr(score_value.args[1], "name")
             ):
-                continue
-            qk = score_value
-            q, transposed_k = qk.args[:2]
-            if (
-                not hasattr(q, "name") or not hasattr(transposed_k, "name")
-                or transposed_k.op != "call_function"
-                or str(transposed_k.target) != "aten.transpose.int"
-                or len(transposed_k.users) != 1
-            ):
-                continue
-            k = transposed_k.args[0]
-            k_shape = _get_shape(k)
-            q_shape = _get_shape(q)
-            if (
-                len(q_shape) < 3 or len(k_shape) != len(q_shape)
-                or q_shape[:-3] != k_shape[:-3]
-                or q_shape[-1] != k_shape[-1]
-                or q_shape[-2] != length or k_shape[-2] != length
-                or k_shape[-3] < 1 or q_shape[-3] % k_shape[-3] != 0
-                or _get_shape(qk)[-2:] != torch.Size((length, length))
-            ):
-                continue
-            ndim = len(k_shape)
-            dim0 = transposed_k.args[1] % ndim
-            dim1 = transposed_k.args[2] % ndim
-            if {dim0, dim1} != {ndim - 2, ndim - 1}:
-                continue
-            if scale_node is not None and len(scale_node.users) != 1:
-                continue
+                operand = score_value.args[1]
+                if not isinstance(operand, (int, float)) or operand == 0:
+                    continue
+                scale = float(operand) if target == "aten.mul.Tensor" else 1.0 / float(operand)
+                scale_node = score_value
+                score_value = score_value.args[0]
+        if (
+            not hasattr(score_value, "name")
+            or score_value.op != "call_function"
+            or str(score_value.target) not in {
+                "aten.matmul.default", "aten.mm.default", "aten.bmm.default",
+            }
+            or len(score_value.users) != 1
+        ):
+            continue
+        qk = score_value
+        q, transposed_k = qk.args[:2]
+        if (
+            not hasattr(q, "name") or not hasattr(transposed_k, "name")
+            or transposed_k.op != "call_function"
+            or str(transposed_k.target) != "aten.transpose.int"
+            or len(transposed_k.users) != 1
+        ):
+            continue
+        k = transposed_k.args[0]
+        k_shape = _get_shape(k)
+        q_shape = _get_shape(q)
+        if (
+            len(q_shape) < 3 or len(k_shape) != len(q_shape)
+            or q_shape[:-3] != k_shape[:-3]
+            or q_shape[-1] != k_shape[-1]
+            or q_shape[-2] != length or k_shape[-2] != length
+            or k_shape[-3] < 1 or q_shape[-3] % k_shape[-3] != 0
+            or _get_shape(qk)[-2:] != torch.Size((length, length))
+        ):
+            continue
+        ndim = len(k_shape)
+        dim0 = transposed_k.args[1] % ndim
+        dim1 = transposed_k.args[2] % ndim
+        if {dim0, dim1} != {ndim - 2, ndim - 1}:
+            continue
+        if scale_node is not None and len(scale_node.users) != 1:
+            continue
 
-            causal_score_fusions[qk.name] = (
-                mask_node, q, k, scale, transposed_k, scale_node,
-            )
-            fused_nodes.add(mask_node.name)
-            fused_nodes.add(transposed_k.name)
-            if scale_node is not None:
-                fused_nodes.add(scale_node.name)
+        causal_score_fusions[qk.name] = (
+            mask_node, q, k, scale, transposed_k, scale_node,
+        )
+        fused_nodes.add(mask_node.name)
+        fused_nodes.add(transposed_k.name)
+        if scale_node is not None:
+            fused_nodes.add(scale_node.name)
 
-            for softmax in mask_node.users:
-                if (
-                    softmax.op == "call_function"
-                    and str(softmax.target) == "aten.softmax.int"
-                    and softmax.args[0] is mask_node
-                    and softmax.args[1] in {-1, len(output_shape) - 1}
-                ):
-                    causal_softmaxes[softmax.name] = length
-
-        for node in nodes:
+        for softmax in mask_node.users:
             if (
-                node.op == "call_function"
-                and str(node.target) in {
-                    "aten.matmul.default", "aten.mm.default", "aten.bmm.default",
-                }
-                and hasattr(node.args[0], "name")
-                and node.args[0].name in causal_softmaxes
+                softmax.op == "call_function"
+                and str(softmax.target) == "aten.softmax.int"
+                and softmax.args[0] is mask_node
+                and softmax.args[1] in {-1, len(output_shape) - 1}
             ):
-                left_shape = _get_shape(node.args[0])
-                right_shape = _get_shape(node.args[1])
-                if (
-                    len(left_shape) >= 3 and len(right_shape) == len(left_shape)
-                    and left_shape[:-3] == right_shape[:-3]
-                    and right_shape[-3] >= 1
-                    and left_shape[-3] % right_shape[-3] == 0
-                    and left_shape[-1] == right_shape[-2]
-                ):
-                    causal_value_matmuls.add(node.name)
+                causal_softmaxes[softmax.name] = length
 
-        # Collapse the canonical combined-QKV split/view/transposes into one
-        # projection whose output is [Q head-major, K head-major, V head-major].
-        # The causal kernels use offsets into that shared list.
-        by_name = {node.name: node for node in nodes}
+    for node in nodes:
+        if (
+            node.op == "call_function"
+            and str(node.target) in {
+                "aten.matmul.default", "aten.mm.default", "aten.bmm.default",
+            }
+            and hasattr(node.args[0], "name")
+            and node.args[0].name in causal_softmaxes
+        ):
+            left_shape = _get_shape(node.args[0])
+            right_shape = _get_shape(node.args[1])
+            if (
+                len(left_shape) >= 3 and len(right_shape) == len(left_shape)
+                and left_shape[:-3] == right_shape[:-3]
+                and right_shape[-3] >= 1
+                and left_shape[-3] % right_shape[-3] == 0
+                and left_shape[-1] == right_shape[-2]
+            ):
+                causal_value_matmuls.add(node.name)
 
-        def alias_source(candidate):
-            while hasattr(candidate, "name") and candidate.name in aliases:
-                candidate = by_name.get(aliases[candidate.name], candidate)
-                if candidate.name not in aliases:
-                    break
-            return candidate
+    # Collapse the canonical combined-QKV split/view/transposes into one
+    # projection whose output is [Q head-major, K head-major, V head-major].
+    # The causal kernels use offsets into that shared list.
+    by_name = {node.name: node for node in nodes}
 
-        for qk_name, fusion in causal_score_fusions.items():
-            mask_node, q, k, _, _, _ = fusion
-            # Reordered QKV emission adds outer-loop dispatch.  Official-VM
-            # A/B runs show the removed copies pay for that only once the
-            # sequence is moderately long.
-            if _get_shape(q)[-2] < 16:
-                continue
-            q_item = alias_source(q.args[0]) if str(q.target) == "aten.transpose.int" else None
-            k_item = alias_source(k.args[0]) if str(k.target) == "aten.transpose.int" else None
-            if (
-                q_item is None or k_item is None
-                or q_item.target is not operator.getitem
-                or k_item.target is not operator.getitem
-                or q_item.args[1] != 0 or k_item.args[1] != 1
-                or q_item.args[0] is not k_item.args[0]
-            ):
-                continue
-            split = q_item.args[0]
-            softmax = next(
-                (candidate for candidate in mask_node.users if candidate.name in causal_softmaxes),
-                None,
-            )
-            value_matmul = next(
-                (
-                    candidate for candidate in nodes
-                    if candidate.name in causal_value_matmuls
-                    and softmax is not None and candidate.args[0] is softmax
-                ),
-                None,
-            )
-            if value_matmul is None:
-                continue
-            v = value_matmul.args[1]
-            if not hasattr(v, "name") or str(v.target) != "aten.transpose.int":
-                continue
-            v_item = alias_source(v.args[0])
-            if (
-                v_item.target is not operator.getitem
-                or v_item.args[1] != 2
-                or v_item.args[0] is not split
-            ):
-                continue
-            linear_name = aliases.get(split.name)
-            linear = by_name.get(linear_name)
-            q_shape = _get_shape(q)
-            k_shape = _get_shape(k)
-            v_shape = _get_shape(v)
-            q_embed = q_shape[-3] * q_shape[-1]
-            k_embed = k_shape[-3] * k_shape[-1]
-            v_embed = v_shape[-3] * v_shape[-1]
-            if (
-                linear is None or str(linear.target) != "aten.linear.default"
-                or len(linear.users) != 1
-                or q_shape[-1] != k_shape[-1] or q_shape[-1] != v_shape[-1]
-                or k_shape[-3] != v_shape[-3]
-                or _get_shape(linear)[-1] != q_embed + k_embed + v_embed
-            ):
-                continue
-            q_heads = q_shape[-3]
-            kv_heads = k_shape[-3]
-            q_size = math.prod(q_shape)
-            k_size = math.prod(k_shape)
-            qkv_linear_fusions[linear.name] = (
-                q_heads, kv_heads, q, k, v, q_item, k_item, v_item,
-            )
-            qkv_offsets.update({q.name: 0, k.name: q_size, v.name: q_size + k_size})
-            aliases[q.name] = linear.name
-            aliases[k.name] = linear.name
-            aliases[v.name] = linear.name
-            fused_nodes.update((q_item.name, k_item.name, v_item.name))
+    def alias_source(candidate):
+        while hasattr(candidate, "name") and candidate.name in aliases:
+            candidate = by_name.get(aliases[candidate.name], candidate)
+            if candidate.name not in aliases:
+                break
+        return candidate
+
+    for qk_name, fusion in causal_score_fusions.items():
+        mask_node, q, k, _, _, _ = fusion
+        # Reordered QKV emission adds outer-loop dispatch.  Official-VM
+        # A/B runs show the removed copies pay for that only once the
+        # sequence is moderately long.
+        if _get_shape(q)[-2] < 16:
+            continue
+        q_item = alias_source(q.args[0]) if str(q.target) == "aten.transpose.int" else None
+        k_item = alias_source(k.args[0]) if str(k.target) == "aten.transpose.int" else None
+        if (
+            q_item is None or k_item is None
+            or q_item.target is not operator.getitem
+            or k_item.target is not operator.getitem
+            or q_item.args[1] != 0 or k_item.args[1] != 1
+            or q_item.args[0] is not k_item.args[0]
+        ):
+            continue
+        split = q_item.args[0]
+        softmax = next(
+            (candidate for candidate in mask_node.users if candidate.name in causal_softmaxes),
+            None,
+        )
+        value_matmul = next(
+            (
+                candidate for candidate in nodes
+                if candidate.name in causal_value_matmuls
+                and softmax is not None and candidate.args[0] is softmax
+            ),
+            None,
+        )
+        if value_matmul is None:
+            continue
+        v = value_matmul.args[1]
+        if not hasattr(v, "name") or str(v.target) != "aten.transpose.int":
+            continue
+        v_item = alias_source(v.args[0])
+        if (
+            v_item.target is not operator.getitem
+            or v_item.args[1] != 2
+            or v_item.args[0] is not split
+        ):
+            continue
+        linear_name = aliases.get(split.name)
+        linear = by_name.get(linear_name)
+        q_shape = _get_shape(q)
+        k_shape = _get_shape(k)
+        v_shape = _get_shape(v)
+        q_embed = q_shape[-3] * q_shape[-1]
+        k_embed = k_shape[-3] * k_shape[-1]
+        v_embed = v_shape[-3] * v_shape[-1]
+        if (
+            linear is None or str(linear.target) != "aten.linear.default"
+            or len(linear.users) != 1
+            or q_shape[-1] != k_shape[-1] or q_shape[-1] != v_shape[-1]
+            or k_shape[-3] != v_shape[-3]
+            or _get_shape(linear)[-1] != q_embed + k_embed + v_embed
+        ):
+            continue
+        q_heads = q_shape[-3]
+        kv_heads = k_shape[-3]
+        q_size = math.prod(q_shape)
+        k_size = math.prod(k_shape)
+        qkv_linear_fusions[linear.name] = (
+            q_heads, kv_heads, q, k, v, q_item, k_item, v_item,
+        )
+        qkv_offsets.update({q.name: 0, k.name: q_size, v.name: q_size + k_size})
+        aliases[q.name] = linear.name
+        aliases[k.name] = linear.name
+        aliases[v.name] = linear.name
+        fused_nodes.update((q_item.name, k_item.name, v_item.name))
 
     generation_score_caches = {}
     generation_value_caches = {}

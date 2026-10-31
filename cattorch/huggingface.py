@@ -48,11 +48,6 @@ def _configure(model: torch.nn.Module) -> None:
         model.set_attn_implementation(target)
         change = f", attention {current} -> {target}"
     log.info("prepared %s for export: use_cache=False%s", type(model).__name__, change)
-    _configure_experts(model)
-
-
-def _configure_experts(model: torch.nn.Module) -> None:
-    """Experts are replaced module by module; see ``convert_huggingface_experts``."""
 
 
 # ── Experts ──────────────────────────────────────────────────────────────────

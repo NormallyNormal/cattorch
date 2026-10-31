@@ -22,9 +22,7 @@ from typing import Sequence
 from cattorch.codegen import CodegenConfig
 from cattorch.results import TokenizerResult
 from cattorch.sprite import (
-    _merge_variables_by_name,
     _add_warp_procedure,
-    _merge_lists_by_name,
     _merge_variables_by_name,
     _procedure_mutation,
 )
@@ -472,8 +470,6 @@ def _build_character_tokenizer_sprite(
     }
     _add_warp_procedure(sprite, "cattorch tokenize", tokenize, x=320, y=0)
     _add_warp_procedure(sprite, "cattorch detokenize", detokenize, x=320, y=320)
-    _merge_variables_by_name(sprite, set(variables))
-    _merge_lists_by_name(sprite, set(lists))
     _add_top_level_call(sprite, "cattorch tokenize", x=0, y=0)
     _add_top_level_call(sprite, "cattorch detokenize", x=0, y=100)
     return sprite
@@ -908,8 +904,6 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         }
         _add_warp_procedure(sprite, "cattorch tokenize", tokenize, x=320, y=0)
         _add_warp_procedure(sprite, "cattorch detokenize", detokenize, x=320, y=360)
-        _merge_variables_by_name(sprite, set(variables))
-        _merge_lists_by_name(sprite, set(lists))
         _add_top_level_call(sprite, "cattorch tokenize", x=0, y=0)
         _add_top_level_call(sprite, "cattorch detokenize", x=0, y=100)
         return sprite

@@ -21,6 +21,7 @@ from torch import nn
 
 from cattorch.adapters import AdapterContext, ModuleAdapter
 from cattorch.errors import UnsupportedModelError
+from cattorch.interface import output_name
 
 MARKER = "__cattorch__"
 
@@ -463,7 +464,7 @@ def marked_program(model: nn.Module):
                     stacklevel=3,
                 )
         output_names = options["outputs"] or tuple(
-            "output" if index == 0 else f"output_{index}" for index in range(len(outputs))
+            output_name(index) for index in range(len(outputs))
         )
         if len(output_names) != len(outputs):
             raise UnsupportedModelError(

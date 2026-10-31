@@ -15,7 +15,6 @@ attention, ``use_cache=False``) and the registered adapters.
 from __future__ import annotations
 
 import operator
-import copy
 from dataclasses import dataclass
 from math import prod
 from types import MappingProxyType

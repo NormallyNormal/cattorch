@@ -33,6 +33,7 @@ from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.interface import (
     logical_list_chunks, read_logical_list, write_sprite_list,
 )
+from cattorch.interface import input_name
 
 
 LEGACY_TIMINGS = "cattorch legacy timings"
@@ -60,7 +61,7 @@ def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
 def _set_inputs(sprite: dict, example_inputs: tuple[torch.Tensor, ...]) -> None:
     for index, tensor in enumerate(example_inputs):
         write_sprite_list(
-            sprite, "input" if index == 0 else f"input_{index}",
+            sprite, input_name(index),
             tensor.detach().cpu().flatten().tolist(),
         )
 
@@ -73,7 +74,7 @@ def _add_input_restore_procedure(
     from cattorch.util.scratch.dsl import Program, append, clear, for_each, item, length, var
 
     values = {
-        "input" if index == 0 else f"input_{index}": tensor.detach().cpu().flatten().tolist()
+        input_name(index): tensor.detach().cpu().flatten().tolist()
         for index, tensor in enumerate(example_inputs)
     }
     body = []

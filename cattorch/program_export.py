@@ -30,8 +30,8 @@ from cattorch.program_runtime import (
 from cattorch.results import (
     EntryPointResult, ProgramResult, StateResult, TensorSpec,
 )
-from cattorch.quantization import QuantizationConfig, quantize_model
-from cattorch.interface import final_data_name
+from cattorch.quantization import quantize_model
+from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
@@ -201,7 +201,7 @@ def _build_entry_wrapper(
     program: ExportProgram,
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
     states = {state.name: state for state in program.states}
-    status = "cattorch status"
+    status = STATUS_VARIABLE
     internal = f"_cattorch {entrypoint.name} compute"
     completion = f"cattorch {entrypoint.name} complete"
     public_outputs = []
@@ -503,7 +503,7 @@ def transpile_program(
             )
             _namespace_entry_procedures(sprite, entrypoint.name)
             for index, binding in enumerate(entrypoint.arguments):
-                old = "input" if index == 0 else f"input_{index}"
+                old = input_name(index)
                 new = (
                     _input_list(entrypoint.name, binding.name)
                     if isinstance(binding, Input) else _state_list(binding.name)
@@ -514,7 +514,7 @@ def transpile_program(
                     interface_capacities.get(new, 0), spec.max_numel or 0,
                 )
             for index in range(len(entrypoint.returns)):
-                old = "output" if index == 0 else f"output_{index}"
+                old = output_name(index)
                 _rename_list(sprite, old, _temporary_return(entrypoint.name, index))
                 interface_capacities[_temporary_return(entrypoint.name, index)] = (
                     sub_result.outputs[index].max_numel or 0
@@ -587,8 +587,8 @@ def transpile_program(
     lifecycle_variables = {
         f"cattorch reset {index}" for index, _state in enumerate(program.states)
     }
-    reset_body = [set_var("cattorch status", "ok")]
-    lifecycle_variables.add("cattorch status")
+    reset_body = [set_var(STATUS_VARIABLE, "ok")]
+    lifecycle_variables.add(STATUS_VARIABLE)
     for index, state in enumerate(program.states):
         reset_body.extend(_copy_list(
             f"_cattorch initial state {state.name}",
@@ -630,7 +630,7 @@ def transpile_program(
         y=480,
     )
     _merge_lists_by_name(combined, lifecycle_lists)
-    _merge_variables_by_name(combined, lifecycle_variables | {"cattorch status"})
+    _merge_variables_by_name(combined, lifecycle_variables | {STATUS_VARIABLE})
 
     program_capacities = dict(interface_capacities)
     program_capacities.update({
@@ -650,7 +650,7 @@ def transpile_program(
         if len(layout.shards) > 1
     )
 
-    public_data_names = {"cattorch status"}
+    public_data_names = {STATUS_VARIABLE}
     for entrypoint in entry_results:
         public_data_names.update(value.list_name for value in entrypoint.inputs)
         public_data_names.update(value.list_name for value in entrypoint.outputs)

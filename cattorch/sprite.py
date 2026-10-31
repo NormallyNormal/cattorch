@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import logging
 import math
@@ -25,13 +24,9 @@ from cattorch.storage import (
     _float_bytes,
     _quantized_bytes,
 )
-from cattorch.util.scratch.block_combiner import combine
-from cattorch.util.scratch.block_manager import BlockManager
-from cattorch.util.scratch.interface import (
-    rename_list as _rename_list, refresh_data_display_name as _refresh_data_display_name,
-)
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, ListLayout
+from cattorch.interface import STATUS_VARIABLE
 
 if TYPE_CHECKING:
     from cattorch.transpiler import _Compiler
@@ -897,7 +892,11 @@ def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> 
     # Lifecycle wrapping gives the sprite several legitimate top-level roots,
     # whereas the ordinary block combiner expects one computation chain.  A
     # procedure is independent, so merge it directly after uniquifying every
-    # generated ID; repeated list display names are unified afterward.
+    # generated ID, then share data the sprite already has by display name.
+    declared = {
+        section: {entry[0] for entry in data.get(section, {}).values()}
+        for section in ("variables", "lists")
+    }
     mapping = {
         identifier: f"{identifier}_{suffix}"
         for section in ("blocks", "variables", "lists", "broadcasts")
@@ -921,6 +920,8 @@ def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> 
             broadcast_remap[identifier] = winner
     if broadcast_remap:
         sprite["blocks"] = remap_ids(sprite["blocks"], broadcast_remap)
+    _merge_variables_by_name(sprite, declared["variables"])
+    _merge_lists_by_name(sprite, declared["lists"])
     return sprite
 
 
@@ -976,7 +977,7 @@ def _add_procedure_completion_broadcast(
         status_id = next(
             identifier
             for identifier, entry in sprite.get("variables", {}).items()
-            if entry[0] == "cattorch status"
+            if entry[0] == STATUS_VARIABLE
         )
         status_block = f"cattorch_completion_status_{uuid.uuid4().hex[:8]}"
         blocks[terminal]["next"] = status_block
@@ -984,7 +985,7 @@ def _add_procedure_completion_broadcast(
             "opcode": "data_setvariableto", "next": notification,
             "parent": terminal,
             "inputs": {"VALUE": [1, [10, status]]},
-            "fields": {"VARIABLE": ["cattorch status", status_id]},
+            "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
             "shadow": False, "topLevel": False,
         }
         notification_parent = status_block
@@ -1021,7 +1022,7 @@ def _remove_completion_broadcast(sprite: dict, message: str) -> None:
         parent = block.get("parent")
         if parent is not None and blocks[parent].get("fields", {}).get(
             "VARIABLE", [None],
-        )[0] == "cattorch status":
+        )[0] == STATUS_VARIABLE:
             last, parent = parent, blocks[parent].get("parent")
         if parent is not None:
             blocks[parent]["next"] = None
@@ -1602,7 +1603,6 @@ def _add_prepare_for_save(
     _add_warp_procedure(
         sprite, "cattorch prepare for save", program, x=640, y=640,
     )
-    _merge_lists_by_name(sprite, set(names))
 
     blocks = sprite["blocks"]
     definition = _find_procedure_definition(sprite, "cattorch prepare for save")
@@ -1924,12 +1924,12 @@ def _wrap_generation_lifecycle(
     invalid_decode = (
         clear("output"),
         *(clear(name) for name in top_k_lists),
-        set_var("cattorch status", "decode requires exactly one token"),
+        set_var(STATUS_VARIABLE, "decode requires exactly one token"),
     )
     token_variables = (valid_tokens, token, "_cattorch token index")
     decode = Program(
         "generation_decode",
-        variables=("cattorch status", *token_variables),
+        variables=(STATUS_VARIABLE, *token_variables),
         lists=("input", "output", *top_k_lists),
         body=(
             if_else(
@@ -1941,7 +1941,7 @@ def _wrap_generation_lifecycle(
                         (call("cattorch forward"),),
                         (
                             clear("output"), *(clear(name) for name in top_k_lists),
-                            set_var("cattorch status", invalid_token),
+                            set_var(STATUS_VARIABLE, invalid_token),
                         ),
                     ),
                 ),
@@ -1978,7 +1978,7 @@ def _wrap_generation_lifecycle(
                 clear("input"),
         )
         prefill_variables = (
-            "prefill index", "cattorch project output", "cattorch status", *token_variables,
+            "prefill index", "cattorch project output", STATUS_VARIABLE, *token_variables,
         )
     else:
         valid_prefill = (
@@ -1988,20 +1988,20 @@ def _wrap_generation_lifecycle(
                 clear("input"),
             )),
         )
-        prefill_variables = ("prefill index", "cattorch status", *token_variables)
+        prefill_variables = ("prefill index", STATUS_VARIABLE, *token_variables)
     prefill_body = (
         *copy_and_reset,
         *check_tokens("cattorch prefill buffer"),
         if_else(
             eq(length("cattorch prefill buffer"), 0),
-            (set_var("cattorch status", "prefill requires at least one token"),),
+            (set_var(STATUS_VARIABLE, "prefill requires at least one token"),),
             (if_else(
                 gt(length("cattorch prefill buffer"), max_context),
-                (set_var("cattorch status", "prefill exceeds maximum context"),),
+                (set_var(STATUS_VARIABLE, "prefill exceeds maximum context"),),
                 (if_else(
                     eq(var(valid_tokens), 1),
                     valid_prefill,
-                    (set_var("cattorch status", invalid_token),),
+                    (set_var(STATUS_VARIABLE, invalid_token),),
                 ),),
             ),),
         ),
@@ -2013,9 +2013,7 @@ def _wrap_generation_lifecycle(
         body=prefill_body,
     )
     sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
-    _merge_variables_by_name(sprite, set(token_variables))
     if hidden_prefill:
-        _merge_variables_by_name(sprite, {"cattorch project output"})
         # Only prefill clears it, so a decode before any prefill must find 1.
         for entry in sprite["variables"].values():
             if entry[0] == "cattorch project output":
@@ -2040,7 +2038,7 @@ def _wrap_generation_lifecycle(
     status_id = f"{prefix}_status"
     cache_length_id = f"{prefix}_cache_length"
     max_context_id = f"{prefix}_max_context"
-    sprite.setdefault("variables", {})[status_id] = ["cattorch status", "ok"]
+    sprite.setdefault("variables", {})[status_id] = [STATUS_VARIABLE, "ok"]
     sprite["variables"][cache_length_id] = ["cattorch cache length", 0]
     sprite["variables"][max_context_id] = ["cattorch max context", max_context]
 
@@ -2085,14 +2083,14 @@ def _wrap_generation_lifecycle(
     blocks[success] = {
         "opcode": "data_setvariableto", "next": old_root, "parent": guard,
         "inputs": {"VALUE": [1, [10, "ok"]]},
-        "fields": {"VARIABLE": ["cattorch status", status_id]},
+        "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[old_root]["parent"] = success
     blocks[failure] = {
         "opcode": "data_setvariableto", "next": clear_output, "parent": guard,
         "inputs": {"VALUE": [1, [10, "maximum context exceeded"]]},
-        "fields": {"VARIABLE": ["cattorch status", status_id]},
+        "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[clear_output] = {
@@ -2185,7 +2183,7 @@ def _wrap_generation_lifecycle(
     blocks[reset_status] = {
         "opcode": "data_setvariableto", "next": reset_length, "parent": reset_def,
         "inputs": {"VALUE": [1, [10, "ok"]]},
-        "fields": {"VARIABLE": ["cattorch status", status_id]},
+        "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[reset_length] = {
@@ -2195,5 +2193,5 @@ def _wrap_generation_lifecycle(
         "shadow": False, "topLevel": False,
     }
     blocks[reset_root]["parent"] = reset_length
-    _merge_variables_by_name(sprite, {"cattorch status"})
+    _merge_variables_by_name(sprite, {STATUS_VARIABLE})
     return sprite

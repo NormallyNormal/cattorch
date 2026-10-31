@@ -12,7 +12,7 @@ from cattorch.util.instruction.optimized_common import _static_unrolled_repeat
 from cattorch.util.instruction.optimized_elementwise import _erfc_statements
 from cattorch.util.scratch.dsl import (
     Program, add, append, change_var, clear, div, eq, gt, if_, index_of, item,
-    if_else, length, lt, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
+    if_else, lt, mathop, mod, mul, not_, repeat, replace, set_var, sub, var,
 )
 
 

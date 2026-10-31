@@ -23,7 +23,6 @@ from cattorch.util.scratch.dsl import (
     delete,
     div,
     eq,
-    gt,
     if_,
     if_else,
     item,
@@ -53,10 +52,6 @@ BASE92_ALPHABET = "".join(
     chr(code) for code in range(33, 127) if chr(code) not in {'"', "\\"}
 )
 assert len(BASE92_ALPHABET) == 92 and len(set(BASE92_ALPHABET)) == 92
-
-# Retained as a source-level compatibility alias. New payloads and generated
-# sprites use the complete Base92 alphabet.
-BASE85_ALPHABET = BASE92_ALPHABET[:85]
 
 
 @dataclass(frozen=True)
@@ -108,7 +103,6 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
 
 def encode_values(values, precision: Literal["float32", "float16"]) -> str:
     """Encode numeric values with the Scratch costume-name Base92 codec."""
-    code = ">f" if precision == "float32" else ">e"
     return _encode_bytes(_float_bytes(values, precision))
 
 
@@ -505,10 +499,9 @@ def _decoded_value(precision):
                 ),
             ),
         ),
-        if_else(
+        if_(
             eq(var("decode sign"), 1),
             (set_var("decode value", mul(-1, var("decode value"))),),
-            (set_var("decode value", var("decode value")),),
         ),
     )
     return classify
@@ -556,7 +549,7 @@ def _emit_byte(byte, spec: EncodedList):
     return (
         set_var("decode bits", add(mul(var("decode bits"), 256), byte)),
         change_var("decode byte count", 1),
-        if_else(
+        if_(
             eq(var("decode byte count"), byte_count),
             (
                 *_decoded_value(spec.precision),
@@ -564,7 +557,6 @@ def _emit_byte(byte, spec: EncodedList):
                 set_var("decode bits", 0),
                 set_var("decode byte count", 0),
             ),
-            (set_var("decode value", var("decode value")),),
         ),
     )
 

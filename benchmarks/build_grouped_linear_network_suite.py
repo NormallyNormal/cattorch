@@ -24,7 +24,6 @@ from cattorch.benchmark import (
     _StageBlocks,
     _add_broadcast_entry,
     _load_sprite,
-    _set_inputs,
     _stage_target,
     _write_project,
 )

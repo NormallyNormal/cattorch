@@ -29,12 +29,12 @@ from cattorch.codegen import CodegenConfig
 from cattorch.storage import BASE92_ALPHABET
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.scratch.ids import compact_sprite_ids
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 log = logging.getLogger(__name__)
 
 SCRATCH_ONLINE_JSON_LIMIT = 5_000_000
 SCRATCH_ONLINE_JSON_WARN_SIZE = 4_000_000
-SCRATCH_MAX_LIST_LENGTH = 200_000
 
 SPRITE_ASSET_DIR = TEMPLATE_DIR / "sprite"
 
@@ -302,10 +302,10 @@ def finalize_sprite(
     # Check list sizes before writing
     for sid, entry in sprite.get("lists", {}).items():
         name, contents = entry[0], entry[1]
-        if len(contents) > SCRATCH_MAX_LIST_LENGTH:
+        if len(contents) > SCRATCH_LIST_LIMIT:
             raise ValueError(
                 f"list \"{name}\" has {len(contents):,} items, "
-                f"which exceeds Scratch's limit of {SCRATCH_MAX_LIST_LENGTH:,}"
+                f"which exceeds Scratch's limit of {SCRATCH_LIST_LIMIT:,}"
             )
 
     # Write into a temp dir then zip

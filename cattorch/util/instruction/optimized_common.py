@@ -4,28 +4,14 @@ import math
 
 import torch
 
-from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.scratch.dsl import (
-    Program,
     add,
     append,
     change_var,
-    clear,
-    div,
-    eq,
-    gt,
-    if_,
-    if_else,
     item,
-    length,
-    lt,
-    mathop,
     mod,
     mul,
-    repeat,
     static_unrolled_repeat,
-    replace,
-    set_var,
     sub,
     var,
 )

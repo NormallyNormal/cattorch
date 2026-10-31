@@ -27,7 +27,7 @@ from cattorch.graph import (
 )
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
-    TensorSpec, TranspileResult, _tensor_spec as boundary_spec, fallback_warning,
+    TranspileResult, _tensor_spec as boundary_spec, fallback_warning,
 )
 from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
 from cattorch.adapters import ModuleAdapter
@@ -53,17 +53,15 @@ from cattorch.sprite import (
     _merge_lists_by_name,
     _merge_variables_by_name,
     _remove_unused,
-    _rename_list,
     _share_repeated_transformer_layers,
     _static_storage_group_size,
     _static_storage_shard_limits,
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
-from cattorch.interface import final_data_name
+from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
-from cattorch.util.instruction import Instruction
 from cattorch.operator_registry import (
     INDEX_MAP_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
 )
@@ -73,7 +71,9 @@ from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.ids import uniquify_data_ids
-from cattorch.util.scratch.interface import rename_procedure as _rename_procedure
+from cattorch.util.scratch.interface import (
+    rename_list as _rename_list, rename_procedure as _rename_procedure,
+)
 from cattorch.util.scratch.dsl import (
     Program, add, call, clear, delete, div, eq, gt, if_, length, mul, not_,
     repeat, set_var, sub, unroll_factor_limit, var,
@@ -165,13 +165,13 @@ def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> No
         _, minimum, _ = graph.dynamic_bounds[node.name]
         checks.extend((
             if_(gt(mod(length(name), width), 0), (
-                set_var("cattorch status", f"invalid dynamic length: {name}"),
+                set_var(STATUS_VARIABLE, f"invalid dynamic length: {name}"),
             )),
             if_(lt(length(name), width * max(minimum, 1)), (
-                set_var("cattorch status", f"too few items: {name}"),
+                set_var(STATUS_VARIABLE, f"too few items: {name}"),
             )),
             if_(gt(length(name), graph.runtime_capacity(node.name, shape)), (
-                set_var("cattorch status", f"dynamic capacity exceeded: {name}"),
+                set_var(STATUS_VARIABLE, f"dynamic capacity exceeded: {name}"),
             )),
         ))
     if not checks:
@@ -180,13 +180,13 @@ def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> No
     _rename_procedure(sprite, "cattorch forward", internal)
     wrapper = Program(
         "checked_forward",
-        variables=("cattorch status",),
+        variables=(STATUS_VARIABLE,),
         lists=tuple(dict.fromkeys((*graph.input_names.values(), *output_names))),
         body=(
-            set_var("cattorch status", "ok"),
+            set_var(STATUS_VARIABLE, "ok"),
             *checks,
             if_else(
-                eq(var("cattorch status"), "ok"),
+                eq(var(STATUS_VARIABLE), "ok"),
                 (call(internal),),
                 (
                     *(clear(name) for name in output_names),
@@ -196,8 +196,6 @@ def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> No
         ),
     )
     _add_warp_procedure(sprite, "cattorch forward", wrapper, x=640, y=960)
-    _merge_variables_by_name(sprite, {"cattorch status"})
-    _merge_lists_by_name(sprite, set(graph.input_names.values()) | set(output_names))
 
 
 def _token_vocabulary(graph: _GraphInfo) -> int | None:
@@ -268,7 +266,7 @@ def _wrap_transactional_generation_step(
     ordered = sorted(cache_widths.items())
     first_cache, first_width = ordered[0]
     old_tokens = "_cattorch old cache tokens"
-    variables = {"_cattorch transaction ok", old_tokens, "cattorch status"}
+    variables = {"_cattorch transaction ok", old_tokens, STATUS_VARIABLE}
     body = [
         set_var("_cattorch transaction ok", 1),
         set_var(old_tokens, div(length(first_cache), first_width)),
@@ -292,8 +290,8 @@ def _wrap_transactional_generation_step(
     rollback.extend((
         clear("output"),
         if_(
-            eq(var("cattorch status"), "ok"),
-            (set_var("cattorch status", "cache transaction failed"),),
+            eq(var(STATUS_VARIABLE), "ok"),
+            (set_var(STATUS_VARIABLE, "cache transaction failed"),),
         ),
     ))
     if top_k:
@@ -489,8 +487,8 @@ class _Compiler:
         """Copy input/static alias outputs into a distinct writable output list."""
         result = []
         seen: set[str] = set()
-        for output_name, output_shape, _output_dtype in self.graph.outputs:
-            source = output_name
+        for graph_output, output_shape, _output_dtype in self.graph.outputs:
+            source = graph_output
             while source in self.graph.aliases:
                 source = self.graph.aliases[source]
             if source in self.scope.assignments:
@@ -504,7 +502,7 @@ class _Compiler:
                 needs_copy = True
             else:
                 raise UnsupportedModelError(
-                    f"unable to materialize exported output node {output_name!r}"
+                    f"unable to materialize exported output node {graph_output!r}"
                 )
 
             if needs_copy:
@@ -515,7 +513,7 @@ class _Compiler:
                 args = (
                     Argument(
                         source_list, output_shape,
-                        dynamic_axis=self.graph.dynamic_axes.get(output_name),
+                        dynamic_axis=self.graph.dynamic_axes.get(graph_output),
                     ),
                     Argument("C_chunk_size", torch.Size([]), value=size),
                     Argument("C_num_rows", torch.Size([]), value=1),
@@ -1974,7 +1972,6 @@ def _transpile_any(
             raise ValueError(
                 f"model has no callable generation method {example_inputs.method!r}"
             )
-        from cattorch.program_runtime import MethodModule
         generation_program = example_inputs
         registry = _registry_with(kernels, adapters)
         return _transpile_automatic_generation(
@@ -2255,7 +2252,7 @@ def _transpile(
     # 4. Name the output list and clean up
     output_lists = compiler.output_lists
     output_names = tuple(
-        "output" if index == 0 else f"output_{index}"
+        output_name(index)
         for index in range(len(output_lists))
     )
     for old_name, public_name in zip(output_lists, output_names):
@@ -2368,7 +2365,7 @@ def _transpile(
             top_k=generation.top_k is not None,
         )
         # The step wrapper declares its own copy of the status variable.
-        _merge_variables_by_name(sprite, {"cattorch status"})
+        _merge_variables_by_name(sprite, {STATUS_VARIABLE})
         generation_lists = {
             "input", "output", "cattorch prefill buffer",
         }
@@ -2466,8 +2463,8 @@ def _transpile(
         # public block finishes. Program entry points get theirs from the
         # program.
         variables = sprite.setdefault("variables", {})
-        if not any(entry[0] == "cattorch status" for entry in variables.values()):
-            variables["cattorch_status"] = ["cattorch status", ""]
+        if not any(entry[0] == STATUS_VARIABLE for entry in variables.values()):
+            variables["cattorch_status"] = [STATUS_VARIABLE, ""]
         for procedure in ("cattorch init", "cattorch forward"):
             _add_procedure_completion_broadcast(
                 sprite, procedure, f"{procedure} complete", status="ok",
@@ -2514,7 +2511,7 @@ def _transpile(
             (
                 "cattorch tokens"
                 if generation is not None and _generation_public_interface
-                else ("input" if index == 0 else f"input_{index}")
+                else (input_name(index))
             ),
             tuple(value.shape),
             value.dtype,

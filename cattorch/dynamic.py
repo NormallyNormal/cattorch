@@ -7,6 +7,7 @@ import math
 import torch
 
 from cattorch.errors import UnsupportedModelError
+from cattorch.interface import STATUS_VARIABLE, input_name, output_name
 
 
 def normalize_dynamic(dynamic, flat_inputs, kwarg_names) -> dict[int, tuple[str, int, int, int]]:
@@ -48,7 +49,7 @@ def normalize_dynamic(dynamic, flat_inputs, kwarg_names) -> dict[int, tuple[str,
             or not 1 <= bounds[0] <= bounds[1]
         ):
             raise ValueError(f"dynamic bounds for {key!r} must be (minimum, maximum) with 1 <= minimum <= maximum")
-        name = "input" if index == 0 else f"input_{index}"
+        name = input_name(index)
         result[index] = (name, bounds[0], bounds[1], axis)
     if len(result) > 1:
         raise UnsupportedModelError(
@@ -308,8 +309,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
 
     from cattorch.results import BoundedDimension, TensorSpec
     from cattorch.sprite import (
-        _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
-        _remove_completion_broadcast,
+        _add_warp_procedure, _remove_completion_broadcast,
     )
     from cattorch.util.scratch.dsl import (
         Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
@@ -326,7 +326,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         raise UnsupportedModelError("a dynamic export's inputs and outputs must fit in one list each")
 
     unit, position = "_cattorch unit", "_cattorch unit item"
-    public_input = "input" if index == 0 else f"input_{index}"
+    public_input = input_name(index)
     private_input = f"_cattorch unit {public_input}"
     rename_procedure(sprite, "cattorch forward", "_cattorch forward unit")
     # The new forward reports completion once, after every unit.
@@ -335,7 +335,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     input_size = math.prod(input_shapes[index])
     outputs = []
     for position_index, shape in enumerate(output_shapes):
-        public = "output" if position_index == 0 else f"output_{position_index}"
+        public = output_name(position_index)
         private = f"_cattorch unit {public}"
         rename_list(sprite, public, private)
         outputs.append((public, private, math.prod(shape)))
@@ -355,7 +355,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         )),
     )
     # Whole items within the bounds, as an exported forward checks them.
-    status = "cattorch status"
+    status = STATUS_VARIABLE
     body = [
         *(clear(public) for public, _, _ in outputs),
         set_var(status, "ok"),
@@ -373,16 +373,11 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     ]
     program = Program(
         "forward_by_unit",
-        variables=(unit, position, "_cattorch units", "cattorch status"),
+        variables=(unit, position, "_cattorch units", STATUS_VARIABLE),
         lists=(public_input, private_input, *(entry for pair in outputs for entry in pair[:2])),
         body=tuple(body),
     )
     sprite = _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
-    # The wrapper declared the lists again; use one list per name.
-    _merge_lists_by_name(sprite, {public_input, private_input, *(
-        entry for pair in outputs for entry in pair[:2]
-    )})
-    _merge_variables_by_name(sprite, {"cattorch status"})
     data = json.dumps(sprite, separators=(",", ":"))
     members["sprite.json"] = data.encode()
     with zipfile.ZipFile(result.path, "w", zipfile.ZIP_DEFLATED) as archive:

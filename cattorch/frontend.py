@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 import contextlib
 import functools
