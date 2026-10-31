@@ -96,6 +96,15 @@ class OperatorRegistry:
         self._expert_families: dict[int, object] = {}
         self._next_expert_family = 0
 
+    def for_export(self, *, adapters=(), kernels=()) -> "OperatorRegistry":
+        """A copy with an export's adapters and kernels registered."""
+        registry = self.clone()
+        for adapter in adapters:
+            registry.register_adapter(adapter)
+        for kernel in kernels:
+            registry.register_kernel(kernel)
+        return registry
+
     def clone(self) -> OperatorRegistry:
         result = OperatorRegistry()
         result._operations = self._operations.copy()

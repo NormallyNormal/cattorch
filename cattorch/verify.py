@@ -113,9 +113,7 @@ def _verify_program(
     path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
     project = read_json(path)
     emulator = ScratchEmulator(project)
-    registry = default_registry().clone()
-    for adapter in adapters:
-        registry.register_adapter(adapter)
+    registry = default_registry().for_export(adapters=adapters)
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )

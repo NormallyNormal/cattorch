@@ -1881,12 +1881,7 @@ def _transpile_dynamic(
 
 
 def _registry_with(kernels, adapters=()) -> OperatorRegistry:
-    registry = default_registry().clone()
-    for adapter in adapters:
-        registry.register_adapter(adapter)
-    for kernel in kernels:
-        registry.register_kernel(kernel)
-    return registry
+    return default_registry().for_export(adapters=adapters, kernels=kernels)
 
 
 def _transpile_any(

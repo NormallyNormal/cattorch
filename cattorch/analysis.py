@@ -114,11 +114,7 @@ def analyze(
 
 
 def _analyze(model, program, adapters, storage, optimization, kernels) -> AnalysisReport:
-    registry = default_registry().clone()
-    for adapter in adapters:
-        registry.register_adapter(adapter)
-    for kernel in kernels:
-        registry.register_kernel(kernel)
+    registry = default_registry().for_export(adapters=adapters, kernels=kernels)
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )

@@ -17,7 +17,7 @@ from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.graph_transforms import fold_eval_batch_norms
-from cattorch.operator_registry import OperatorRegistry, default_registry
+from cattorch.operator_registry import default_registry
 from cattorch.program import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, StateInput, StateUpdate,
 )
@@ -378,11 +378,7 @@ def transpile_program(
         output_path = Path(f"{output_path}.sprite3")
     sprite_name = output_path.stem if name is None else name
     codegen = codegen or CodegenConfig()
-    registry: OperatorRegistry = default_registry().clone()
-    for adapter in adapters:
-        registry.register_adapter(adapter)
-    for kernel in kernels:
-        registry.register_kernel(kernel)
+    registry = default_registry().for_export(adapters=adapters, kernels=kernels)
 
     states = {state.name: state for state in program.states}
     calls = tuple(calibration_calls or ())

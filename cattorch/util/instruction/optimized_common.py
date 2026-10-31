@@ -8,13 +8,39 @@ from cattorch.util.scratch.dsl import (
     add,
     append,
     change_var,
+    div,
     item,
+    mathop,
     mod,
     mul,
     static_unrolled_repeat,
     sub,
     var,
 )
+
+
+# Activation formulas shared by the elementwise, linear-epilogue and expert
+# kernels, so their results agree exactly.
+
+def sigmoid_of(value):
+    """``1 / (1 + e^-x)``."""
+    return div(1, add(1, mathop("e ^", mul(-1, value))))
+
+
+def tanh_of(value):
+    """``2 / (1 + e^-2x) - 1``, which doesn't overflow for large ``x``."""
+    return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+
+
+def quick_gelu_of(value):
+    """Fast mode's GELU: ``x * sigmoid(1.702 x)``."""
+    return mul(value, div(1, add(1, mathop("e ^", mul(-1.702, value)))))
+
+
+def tanh_gelu_inner(value):
+    """``sqrt(2 / pi) * (x + 0.044715 x^3)``; tanh GELU is
+    ``0.5 x (1 + tanh(inner))``."""
+    return mul(0.7978845608028654, add(value, mul(0.044715, mul(mul(value, value), value))))
 
 
 def _unrolled_dot_statements(

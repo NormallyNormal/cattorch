@@ -18,6 +18,8 @@ from cattorch.util.instruction.optimized_common import (
     _broadcast_index,
     _static_unrolled_repeat,
     _unrolled_offset_dot_statements,
+    sigmoid_of,
+    tanh_of,
 )
 from cattorch.scratch import (
     add,
@@ -672,12 +674,12 @@ _GATES = {"gru": 3, "lstm": 4, "rnn_tanh": 1, "rnn_relu": 1}
 
 
 def _sigmoid(value):
-    return div(1, add(1, mathop("e ^", mul(-1, value))))
+    return sigmoid_of(value)
 
 
 def _tanh(value):
     # Matches the elementwise tanh kernel.
-    return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+    return tanh_of(value)
 
 
 def _emit_recurrent_scan(ctx: KernelContext):

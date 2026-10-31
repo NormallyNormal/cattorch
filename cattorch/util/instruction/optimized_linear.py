@@ -30,6 +30,10 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.instruction.optimized_common import (
     _unrolled_dot_statements,
     _unrolled_offset_dot_statements,
+    quick_gelu_of,
+    sigmoid_of,
+    tanh_gelu_inner,
+    tanh_of,
 )
 
 class LinearInstruction(Instruction):
@@ -133,44 +137,25 @@ class LinearInstruction(Instruction):
                         result = var("value")
                     terminal_activation = "relu"
                 elif operation == "sigmoid":
-                    result = div(1, add(1, mathop("e ^", mul(-1, result))))
+                    result = sigmoid_of(result)
                 elif operation == "tanh":
-                    result = add(
-                        div(2, add(1, mathop("e ^", mul(-2, result)))), -1,
-                    )
+                    result = tanh_of(result)
                 elif operation == "silu":
                     if result != var(sum_name):
                         setup.append(set_var("value", result))
                         result = var("value")
                     result = mul(
                         result,
-                        div(1, add(1, mathop("e ^", mul(-1, result)))),
+                        sigmoid_of(result),
                     )
                 elif operation == "gelu":
                     setup.append(set_var("value", result))
                     result = var("value")
                     if self.fast:
-                        result = mul(
-                            result,
-                            div(1, add(1, mathop("e ^", mul(-1.702, result)))),
-                        )
+                        result = quick_gelu_of(result)
                     else:
-                        inner = mul(
-                            0.7978845608028654,
-                            add(result, mul(0.044715, mul(mul(result, result), result))),
-                        )
-                        setup.append(set_var("inner", inner))
-                        tanh_inner = add(
-                            div(
-                                2,
-                                add(
-                                    1,
-                                    mathop("e ^", mul(-2, var("inner"))),
-                                ),
-                            ),
-                            -1,
-                        )
-                        result = mul(mul(0.5, result), add(1, tanh_inner))
+                        setup.append(set_var("inner", tanh_gelu_inner(result)))
+                        result = mul(mul(0.5, result), add(1, tanh_of(var("inner"))))
                 elif operation == "tensor_add":
                     result = add(result, item(self.residual_list, var("output_index")))
 

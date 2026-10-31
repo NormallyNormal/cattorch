@@ -32,6 +32,10 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.instruction.optimized_common import (
     _broadcast_index,
     _static_unrolled_repeat,
+    quick_gelu_of,
+    sigmoid_of,
+    tanh_gelu_inner,
+    tanh_of,
 )
 
 # Numerical Recipes ``erfcc`` coefficients: fractional error below 1.2e-7
@@ -193,13 +197,11 @@ class OptimizedElementwiseInstruction(Instruction):
         if self.op == "aten.neg.default":
             result = mul(-1, direct)
         elif self.op == "aten.sigmoid.default":
-            result = div(1, add(1, mathop("e ^", mul(-1, direct))))
+            result = sigmoid_of(direct)
         elif self.op == "aten.rsqrt.default":
             result = div(1, mathop("sqrt", direct))
         elif self.op == "aten.tanh.default":
-            result = sub(
-                div(2, add(1, mathop("e ^", mul(-2, direct)))), 1,
-            )
+            result = tanh_of(direct)
         elif self.op == "aten.relu.default":
             output = if_else(
                 gt(direct, 0),
@@ -209,7 +211,7 @@ class OptimizedElementwiseInstruction(Instruction):
             result = None
         elif self.op == "aten.silu.default":
             setup = (set_var("value", direct),)
-            result = mul(cached, div(1, add(1, mathop("e ^", mul(-1, cached)))))
+            result = mul(cached, sigmoid_of(cached))
         elif self.op == "aten.gelu.default" and self._exact_gelu():
             # 0.5 x (1 + erf(x / sqrt(2))), using erfc for accuracy in the
             # negative tail: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
@@ -229,17 +231,9 @@ class OptimizedElementwiseInstruction(Instruction):
         elif self.op == "aten.gelu.default":
             setup = (
                 set_var("value", direct),
-                set_var(
-                    "inner",
-                    mul(
-                        0.7978845608028654,
-                        add(cached, mul(0.044715, mul(mul(cached, cached), cached))),
-                    ),
-                ),
+                set_var("inner", tanh_gelu_inner(cached)),
             )
-            tanh_inner = sub(
-                div(2, add(1, mathop("e ^", mul(-2, var("inner"))))), 1,
-            )
+            tanh_inner = tanh_of(var("inner"))
             result = mul(mul(0.5, cached), add(1, tanh_inner))
         elif self.op == "aten.leaky_relu.default":
             slope = self.args[1].value if len(self.args) > 1 else 0.01
@@ -494,10 +488,7 @@ class FastElementwiseInstruction(OptimizedElementwiseInstruction):
     def _unary(self):
         direct = item("T1", var("index"))
         if self.op == "aten.gelu.default":
-            result = mul(
-                direct,
-                div(1, add(1, mathop("e ^", mul(-1.702, direct)))),
-            )
+            result = quick_gelu_of(direct)
             return (), append("T2", result)
         return super()._unary()
 
@@ -511,7 +502,7 @@ class OptimizedSwiGLUInstruction(Instruction):
     def finalize(self):
         gate = var("gate")
         result = mul(
-            mul(gate, div(1, add(1, mathop("e ^", mul(-1, gate))))),
+            mul(gate, sigmoid_of(gate)),
             item("T2", var("index")),
         )
         iteration = (
@@ -581,7 +572,7 @@ class PairedLinearSwiGLUInstruction(Instruction):
         )
         gate = var("gate sum")
         swiglu = mul(
-            mul(gate, div(1, add(1, mathop("e ^", mul(-1, gate))))),
+            mul(gate, sigmoid_of(gate)),
             var("value sum"),
         )
         projections = []

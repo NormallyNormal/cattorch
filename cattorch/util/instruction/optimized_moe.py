@@ -8,7 +8,9 @@ import operator
 import torch
 
 from cattorch.util.instruction.instruction import Instruction
-from cattorch.util.instruction.optimized_common import _static_unrolled_repeat
+from cattorch.util.instruction.optimized_common import (
+    _static_unrolled_repeat, quick_gelu_of, sigmoid_of, tanh_gelu_inner, tanh_of,
+)
 from cattorch.util.instruction.optimized_elementwise import _erfc_statements
 from cattorch.util.scratch.dsl import (
     Program, add, append, change_var, clear, div, eq, gt, if_, index_of, item,
@@ -439,22 +441,15 @@ class ExpertFamilyMoEInstruction(Instruction):
         if target == "aten.relu.default":
             return div(add(value, mathop("abs", value)), 2)
         if target == "aten.sigmoid.default":
-            return div(1, add(1, mathop("e ^", mul(-1, value))))
+            return sigmoid_of(value)
         if target == "aten.silu.default":
             return div(value, add(1, mathop("e ^", mul(-1, value))))
         if target == "aten.tanh.default":
-            return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+            return tanh_of(value)
         if target == "aten.gelu.default":
             if self.fast_activations:
-                return mul(value, div(
-                    1, add(1, mathop("e ^", mul(-1.702, value))),
-                ))
-            cube = mul(value, mul(value, value))
-            inner = mul(0.7978845608028654, add(value, mul(0.044715, cube)))
-            tanh = sub(div(
-                2, add(1, mathop("e ^", mul(-2, inner))),
-            ), 1)
-            return mul(0.5, mul(value, add(1, tanh)))
+                return quick_gelu_of(value)
+            return mul(0.5, mul(value, add(1, tanh_of(tanh_gelu_inner(value)))))
         if target == "aten.neg.default":
             return mul(-1, value)
         raise ValueError(f"unsupported generic expert activation {target}")
