@@ -551,7 +551,7 @@ _POINTWISE = frozenset({
     "minimum", "where", "sin", "cos", "masked_fill", "square", "sign", "softplus",
     "hardswish", "hardsigmoid", "mish", "nan_to_num", "dropout", "contiguous",
     "clone", "alias", "detach", "detach_", "lift_fresh_copy", "type_as", "copy",
-    "isnan", "isinf", "full_like", "ones_like", "zeros_like", "rotary_embedding",
+    "isnan", "isinf", "full_like", "ones_like", "zeros_like", "rotary_embedding", "rotary_half",
     "_assert_tensor_metadata",
 })
 # Operations that only relabel axes: each input axis survives in the output.

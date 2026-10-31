@@ -103,6 +103,53 @@ def _emit_rotary_embedding(ctx: KernelContext):
     )
 
 
+def _emit_rotary_half(ctx: KernelContext):
+    """Fused exact Hugging Face RoPE, pairing position ``i`` with ``i + half``.
+
+    Each row writes its first half, then its second half, so the output is
+    appended in order.
+    """
+    value, cosine, sine = ctx.inputs["value"], ctx.inputs["cosine"], ctx.inputs["sine"]
+    output_shape = value.shape
+    if not output_shape or output_shape[-1] % 2:
+        raise ValueError("rotary embedding requires an even final dimension")
+    half = output_shape[-1] // 2
+    index = ctx.temp_var("index")
+    out = ctx.output.list
+    first = var(index)
+    second = add(var(index), half)
+    indices = {}
+    for name, tensor in (("cos", cosine), ("sin", sine)):
+        map_name = f"_rope {name} map"
+        low, table = _broadcast_index(tensor.shape, output_shape, map_name, first)
+        high, _ = _broadcast_index(tensor.shape, output_shape, map_name, second)
+        if table is not None:
+            ctx.static_list(map_name, table)
+        indices[name] = (low, high)
+    (cos_low, cos_high), (sin_low, sin_high) = indices["cos"], indices["sin"]
+    low_half = _static_unrolled_repeat(half, (
+        append(out, sub(
+            mul(item(value.list, first), item(cosine.list, cos_low)),
+            mul(item(value.list, second), item(sine.list, sin_low)),
+        )),
+        change_var(index, 1),
+    ))
+    high_half = _static_unrolled_repeat(half, (
+        append(out, add(
+            mul(item(value.list, second), item(cosine.list, cos_high)),
+            mul(item(value.list, first), item(sine.list, sin_high)),
+        )),
+        change_var(index, 1),
+    ))
+    row = (*low_half, change_var(index, -half), *high_half, change_var(index, half))
+    rows = math.prod(output_shape) // output_shape[-1]
+    return (
+        clear(out),
+        set_var(index, 1),
+        *(row if rows == 1 else (repeat(rows, row),)),
+    )
+
+
 def _emit_topk(ctx: KernelContext, *, values: bool):
     """Select the ``k`` largest or smallest entries along one dimension.
 
@@ -1119,6 +1166,12 @@ BUILTIN_KERNELS = (
         "cattorch.rotary_embedding.default",
         _emit_rotary_embedding,
         name="rotary_embedding_fused",
+        validator=_validate_rotary_embedding,
+    ),
+    Kernel(
+        "cattorch.rotary_half.default",
+        _emit_rotary_half,
+        name="rotary_half_fused",
         validator=_validate_rotary_embedding,
     ),
     Kernel(

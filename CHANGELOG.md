@@ -218,6 +218,10 @@
 - `torch.addmm` with a bias vector, which GPT-2's `Conv1D` layers use, runs on
   the linear kernel instead of a separate multiply and add. A two-layer GPT-2
   sprite has about 22% fewer blocks.
+- Hugging Face style RoPE (`x * cos + rotate_half(x) * sin`, as in Llama,
+  Qwen2 and Mistral) runs as one rotary loop instead of slices, negation,
+  `cat` and three elementwise passes. A two-layer Llama sprite has about 14%
+  fewer blocks.
 
 ## Fixes
 

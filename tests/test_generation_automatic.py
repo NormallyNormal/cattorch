@@ -171,6 +171,26 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
     assert counts[True] < counts[False] * 0.8
 
 
+def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
+    import cattorch.graph
+
+    fused = []
+    original = cattorch.graph._fuse_rotate_half
+
+    def counting(graph):
+        original(graph)
+        fused.extend(
+            node for node in graph.nodes if str(node.target) == "cattorch.rotary_half.default"
+        )
+
+    monkeypatch.setattr(cattorch.graph, "_fuse_rotate_half", counting)
+    torch.manual_seed(6)
+    model = RopeLM(layers=1).eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    assert len(fused) == 2  # queries and keys
+    prefill_and_decode(emulator, model, [1, 2, 3], [4])
+
+
 def test_caches_and_position_are_not_static_weights(exported):
     _, _, _, result = exported
     sprite = load_sprite(result.path)

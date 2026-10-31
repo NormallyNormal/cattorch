@@ -84,7 +84,9 @@ sinks and sliding-window layers, exports with or without a `GenerationProgram`.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
 It accepts broadcastable sine/cosine tables that do not expand `value` and
-requires an even final dimension.
+requires an even final dimension. Hugging Face style RoPE,
+`x * cos + rotate_half(x) * sin` with `rotate_half` swapping the two halves of
+the last dimension, is recognized and exported with the same single loop.
 
 Hand-written mixture-of-experts blocks with a `ModuleList` of experts and a
 linear router are usually recognized automatically. Others are supported
