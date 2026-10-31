@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import json
 import math
 import re
 import sys
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +29,7 @@ from cattorch.results import (
     ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult, TranspileResult,
     VerifyResult, MultiOutputVerifyResult,
 )
+from cattorch.util.scratch.archive import read_json
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list, write_logical_list
 from cattorch.interface import STATUS_VARIABLE, input_name, output_name
@@ -112,8 +111,7 @@ def _verify_program(
     rtol: float,
 ) -> ProgramVerifyResult:
     path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
-    with zipfile.ZipFile(path) as archive:
-        project = json.loads(archive.read("sprite.json"))
+    project = read_json(path)
     emulator = ScratchEmulator(project)
     registry = default_registry().clone()
     for adapter in adapters:
@@ -289,8 +287,7 @@ def verify(
         raise TypeError("example_inputs must be a tensor or tuple of tensors")
 
     path = sprite.path if isinstance(sprite, TranspileResult) else Path(sprite)
-    with zipfile.ZipFile(path) as archive:
-        project = json.loads(archive.read("sprite.json"))
+    project = read_json(path)
     emulator = ScratchEmulator(project)
     for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
         name = input_name(index)

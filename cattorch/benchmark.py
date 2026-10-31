@@ -14,7 +14,6 @@ import statistics
 import tempfile
 import uuid
 import warnings
-import zipfile
 from pathlib import Path
 
 import torch
@@ -29,6 +28,7 @@ from cattorch.transpiler import (
     _merge_lists_by_name,
     transpile,
 )
+from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, read_json, write_archive
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.interface import (
     logical_list_chunks, read_logical_list, write_sprite_list,
@@ -48,14 +48,7 @@ STORAGE_VARIANTS = (
 
 
 def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
-    with zipfile.ZipFile(path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
-        assets = {
-            name: archive.read(name)
-            for name in archive.namelist()
-            if name != "sprite.json"
-        }
-    return sprite, assets
+    return read_archive(path)
 
 
 def _set_inputs(sprite: dict, example_inputs: tuple[torch.Tensor, ...]) -> None:
@@ -416,11 +409,7 @@ def _write_project(
     }
     stage_md5ext, stage_bytes = stage_asset
     assets[stage_md5ext] = stage_bytes
-    project_json = json.dumps(project, separators=(",", ":"))
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("project.json", project_json)
-        for name, data in assets.items():
-            archive.writestr(name, data)
+    project_json = write_archive(output_path, project, assets, PROJECT_JSON)
     size_warning = online_json_size_warning(
         len(project_json.encode("utf-8")), f"{description} project JSON",
     )
@@ -949,11 +938,7 @@ def build_paired_benchmark(
 
     source_svg = next((TEMPLATE_DIR / "sprite").glob("*.svg"))
     assets = {**exact_assets, **fast_assets, stage_md5ext: source_svg.read_bytes()}
-    project_json = json.dumps(project, separators=(",", ":"))
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("project.json", project_json)
-        for name, data in assets.items():
-            archive.writestr(name, data)
+    project_json = write_archive(output_path, project, assets, PROJECT_JSON)
     size_warning = online_json_size_warning(
         len(project_json.encode("utf-8")), "Paired benchmark project JSON",
     )
@@ -1068,8 +1053,7 @@ def _analyze_suite(path: str | Path, project: dict, stage: dict, entries: list) 
 
 def analyze_benchmark(path: str | Path) -> dict:
     """Read timing lists from a paired or suite project saved after execution."""
-    with zipfile.ZipFile(path) as archive:
-        project = json.loads(archive.read("project.json"))
+    project = read_json(path, PROJECT_JSON)
     stage = next(target for target in project["targets"] if target["isStage"])
     by_name = {entry[0]: entry[1] for entry in stage.get("lists", {}).values()}
     if STORAGE_SIZES in by_name:

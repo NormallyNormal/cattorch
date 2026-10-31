@@ -13,10 +13,8 @@ prompt-and-continue loop for a text generator with its tokenizer.
 from __future__ import annotations
 
 import hashlib
-import json
 import uuid
 import warnings
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +26,7 @@ from cattorch.results import (
 from cattorch.sprite import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
+from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive
 from cattorch.util.scratch.dsl import (
     Program,
     answer,
@@ -73,10 +72,7 @@ _BACKDROP = (
 
 
 def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
-    with zipfile.ZipFile(path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
-        assets = {name: archive.read(name) for name in archive.namelist() if name != "sprite.json"}
-    return sprite, assets
+    return read_archive(path)
 
 
 def _copy(source: str, target: str) -> tuple:
@@ -354,12 +350,8 @@ class _Builder:
             "extensions": [],
             "meta": {"semver": "3.0.0", "vm": "0.4.0-cattorch", "agent": "cattorch"},
         }
-        text = json.dumps(project, separators=(",", ":"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("project.json", text)
-            for name, data in self.assets.items():
-                archive.writestr(name, data)
+        text = write_archive(path, project, self.assets, PROJECT_JSON)
         warning = online_json_size_warning(len(text.encode("utf-8")), "project JSON")
         return [] if warning is None else [warning]
 

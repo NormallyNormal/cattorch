@@ -304,8 +304,6 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     each unit in, calls it, and appends each unit's outputs.
     """
     import dataclasses
-    import json
-    import zipfile
 
     from cattorch.results import BoundedDimension, TensorSpec
     from cattorch.sprite import (
@@ -315,12 +313,11 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
         gt, if_, item, length, lt, mod, mul, set_var, var,
     )
+    from cattorch.util.scratch.archive import read_archive, write_archive
     from cattorch.util.scratch.interface import rename_list, rename_procedure
 
     ((index, (name, minimum, maximum, axis)),) = spec.items()
-    with zipfile.ZipFile(result.path) as archive:
-        members = {entry: archive.read(entry) for entry in archive.namelist()}
-    sprite = json.loads(members["sprite.json"])
+    sprite, assets = read_archive(result.path)
     names = {entry[0] for entry in sprite.get("lists", {}).values()}
     if any(" shard " in value for value in names if value.startswith(("input", "output"))):
         raise UnsupportedModelError("a dynamic export's inputs and outputs must fit in one list each")
@@ -378,11 +375,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         body=tuple(body),
     )
     sprite = _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
-    data = json.dumps(sprite, separators=(",", ":"))
-    members["sprite.json"] = data.encode()
-    with zipfile.ZipFile(result.path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for entry, content in members.items():
-            archive.writestr(entry, content)
+    data = write_archive(result.path, sprite, assets)
 
     def bounded(spec_value, shape, dim):
         public_shape = list(shape)

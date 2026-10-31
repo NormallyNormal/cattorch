@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import math
 import uuid
-import zipfile
-import json
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,6 +34,7 @@ from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
 )
+from cattorch.util.scratch.archive import read_json
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
     Program, add, append, broadcast_and_wait, call, clear, eq, for_each, gt, if_,
@@ -484,8 +483,7 @@ def transpile_program(
                     f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
                 )
             validate_entry_outputs(program, entrypoint, sub_result.outputs)
-            with zipfile.ZipFile(temporary_path) as archive:
-                sprite = json.loads(archive.read("sprite.json"))
+            sprite = read_json(temporary_path)
 
             storage_names = _namespace_entry_storage(sprite, entrypoint.name)
             payload_names.update(new for old, new in storage_names.items() if not old.startswith("W_"))
