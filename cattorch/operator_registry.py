@@ -20,19 +20,15 @@ from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapt
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized import (
     FastElementwiseInstruction,
-    FastLayerNormInstruction,
-    FastSoftmaxInstruction,
     LinearInstruction,
-    OptimizedBatchNormInstruction,
     OptimizedConvolutionInstruction,
     OptimizedElementwiseInstruction,
-    OptimizedLayerNormInstruction,
-    OptimizedLogSoftmaxInstruction,
     OptimizedMatMulInstruction,
-    OptimizedMeanInstruction,
     OptimizedPoolingInstruction,
-    OptimizedRMSNormInstruction,
-    OptimizedSoftmaxInstruction,
+)
+from cattorch.util.instruction.optimized_normalization import (
+    BATCH_NORM_KERNEL, FAST_LAYER_NORM_KERNEL, FAST_SOFTMAX_KERNEL, LAYER_NORM_KERNEL,
+    LOG_SOFTMAX_KERNELS, MEAN_KERNEL, RMS_NORM_KERNEL, SOFTMAX_KERNELS,
 )
 from cattorch.util.instruction.optimized_moe import (
     ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
@@ -343,6 +339,9 @@ _REDUCTION_INSTRUCTIONS = {
 }
 
 
+_MEAN_INSTRUCTION = MEAN_KERNEL.instruction_class()
+
+
 def _mean_kernel(torch_name, output, *args):
     """Use the tuned mean kernel for consecutive dimensions, else the generic one."""
     dims = args[1].value
@@ -353,7 +352,7 @@ def _mean_kernel(torch_name, output, *args):
         return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
     normalized = sorted({dim % ndim for dim in dims or range(ndim)})
     if normalized and normalized == list(range(normalized[0], normalized[-1] + 1)):
-        return OptimizedMeanInstruction(torch_name, output, *args)
+        return _MEAN_INSTRUCTION(torch_name, output, *args)
     return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
 
 
@@ -569,21 +568,22 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.routed_experts.default": RoutedExpertsInstruction,
         "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
         "aten.linear.default": LinearInstruction,
-        "aten.softmax.int": OptimizedSoftmaxInstruction,
-        "aten.log_softmax.int": OptimizedLogSoftmaxInstruction,
-        "aten._log_softmax.default": OptimizedLogSoftmaxInstruction,
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (*SOFTMAX_KERNELS, *LOG_SOFTMAX_KERNELS)
+        },
         "aten.mean.dim": _mean_kernel,
         **{
             operation: _REDUCTION_INSTRUCTIONS[operation]
             for operation in REDUCTIONS if operation != "aten.mean.dim"
         },
         **{operation: INDEX_MAP_KERNEL.instruction_class() for operation in INDEX_MAP_OPS},
-        "aten.layer_norm.default": OptimizedLayerNormInstruction,
-        "aten.rms_norm.default": OptimizedRMSNormInstruction,
-        "aten.batch_norm.default": OptimizedBatchNormInstruction,
         **{
             kernel.target_name: kernel.instruction_class()
-            for kernel in (EMBEDDING_KERNEL, MASKED_FILL_KERNEL, *TRANSPOSE_KERNELS)
+            for kernel in (
+                LAYER_NORM_KERNEL, RMS_NORM_KERNEL, BATCH_NORM_KERNEL,
+                EMBEDDING_KERNEL, MASKED_FILL_KERNEL, *TRANSPOSE_KERNELS,
+            )
         },
         "aten.conv1d.default": OptimizedConvolutionInstruction,
         "aten.conv2d.default": OptimizedConvolutionInstruction,
@@ -626,8 +626,8 @@ def _build_default_registry() -> OperatorRegistry:
         ],
     ] = {
         "aten.gelu.default": (FastElementwiseInstruction, "activations"),
-        "aten.layer_norm.default": (FastLayerNormInstruction, "layer_norm"),
-        "aten.softmax.int": (FastSoftmaxInstruction, "softmax"),
+        "aten.layer_norm.default": (FAST_LAYER_NORM_KERNEL.instruction_class(), "layer_norm"),
+        "aten.softmax.int": (FAST_SOFTMAX_KERNEL.instruction_class(), "softmax"),
     }
     for target, kernel in exact.items():
         fast_kernel, fast_flag = fast.get(target, (None, None))

@@ -4,9 +4,8 @@ import math
 
 import torch
 
-from cattorch.util.instruction.instruction import Instruction
+from cattorch.kernel_api import Kernel, KernelContext
 from cattorch.util.scratch.dsl import (
-    Program,
     add,
     append,
     change_var,
@@ -25,478 +24,355 @@ from cattorch.util.scratch.dsl import (
     sub,
     var,
 )
+from cattorch.util.instruction.optimized_common import _static_unrolled_repeat
 
 
-from cattorch.util.instruction.optimized_common import (
-    _static_unrolled_repeat,
-)
+class _SoftmaxLayout:
+    """Where each softmax group starts, along ``dim`` of ``source``.
 
-class OptimizedSoftmaxInstruction(Instruction):
-    """Stable softmax specialized for contiguous output groups."""
+    Contiguous groups advance a running index in Scratch, including bounded
+    runtime rows. Only fixed strided reductions need a table of starts.
+    """
 
-    def prepare(self):
-        shape = self.args[0].shape
-        dim = self.args[1].value
-        if dim < 0:
-            dim += len(shape)
+    def __init__(self, ctx: KernelContext):
+        source = ctx.inputs["self"]
+        shape = source.shape
+        dim = ctx.scalars["dim"] % len(shape)
+        self.source = source
         self.dim_size = shape[dim]
         self.stride = math.prod(shape[dim + 1:]) if dim + 1 < len(shape) else 1
-        self.total = length("T1") if self.args[0].dynamic else math.prod(shape)
-        self.num_groups = (
-            div(length("T1"), self.dim_size)
-            if self.args[0].dynamic else self.total // self.dim_size
+        dynamic = source.dynamic_axis is not None
+        self.total = length(source.list) if dynamic else math.prod(shape)
+        self.groups = (
+            div(length(source.list), self.dim_size) if dynamic else self.total // self.dim_size
         )
-        block_size = self.dim_size * self.stride
-        # Contiguous groups advance a running index in Scratch, including
-        # bounded runtime rows. Only fixed strided reductions need a table.
-        self.group_starts = (
-            [
-                base + offset + 1
-                for base in range(0, math.prod(shape), block_size)
-                for offset in range(self.stride)
-            ]
-            if self.stride != 1 else []
-        )
+        block = self.dim_size * self.stride
+        self.starts = [
+            base + offset + 1
+            for base in range(0, math.prod(shape), block)
+            for offset in range(self.stride)
+        ] if self.stride != 1 else []
+        # The group counter is the program's first variable.
+        self.group = ctx.temp_var("group_start" if self.stride == 1 else "group")
 
-    def _after_sum(self):
-        return ()
-
-    def _normalized(self, current):
-        return div(mathop("e ^", sub(current, var("max"))), var("sum"))
-
-    def finalize(self):
-        current = item("T1", var("index"))
-        maximum_scan = ()
-        if self.dim_size > 1:
-            maximum_scan = (
-                change_var("index", self.stride),
-                *_static_unrolled_repeat(self.dim_size - 1, (
-                    if_(gt(current, var("max")), (set_var("max", current),)),
-                    change_var("index", self.stride),
-                )),
-            )
-
-        prefix = (clear("T2"),)
+    def group_loop(self, ctx: KernelContext, out: str, body):
+        """``body(start)`` once per group, after the output is prepared."""
+        prefix = (clear(out),)
         if self.stride != 1:
-            prefix += (repeat(self.total, (append("T2", 0),)),)
-
+            prefix += (repeat(self.total, (append(out, 0),)),)
+        group = self.group
         if self.stride == 1:
-            start = var("group_start")
-            group_setup = (set_var("group_start", 1),)
-            group_finish = (change_var("group_start", self.dim_size),)
-            variables = ("group_start", "index", "max", "sum")
-            lists = ("T1", "T2")
-            list_values = {}
+            start, setup, finish = var(group), (set_var(group, 1),), (change_var(group, self.dim_size),)
         else:
-            start = item("_softmax_starts", var("group"))
-            group_setup = (set_var("group", 1),)
-            group_finish = (change_var("group", 1),)
-            variables = ("group", "index", "max", "sum")
-            lists = ("T1", "T2", "_softmax_starts")
-            list_values = {"_softmax_starts": self.group_starts}
+            starts = ctx.static_list("_softmax_starts", self.starts)
+            start = item(starts, var(group))
+            setup, finish = (set_var(group, 1),), (change_var(group, 1),)
+        return (*prefix, *setup, repeat(self.groups, (*body(start), *finish)))
 
-        body = prefix + group_setup + (
-            repeat(self.num_groups, (
-                set_var("index", start),
-                set_var("max", current),
-                *maximum_scan,
-                set_var("index", start),
-                set_var("sum", 0),
-                *_static_unrolled_repeat(self.dim_size, (
-                    change_var("sum", mathop("e ^", sub(current, var("max")))),
-                    change_var("index", self.stride),
-                )),
-                *self._after_sum(),
-                set_var("index", start),
-                *_static_unrolled_repeat(self.dim_size, (
-                    (
-                        append(
-                            "T2",
-                            self._normalized(current),
-                        )
-                        if self.stride == 1
-                        else replace(
-                            "T2", var("index"),
-                            self._normalized(current),
-                        )
-                    ),
-                    change_var("index", self.stride),
-                )),
-                *group_finish,
+    def write(self, out: str, index: str, value):
+        return append(out, value) if self.stride == 1 else replace(out, var(index), value)
+
+
+def _emit_softmax(ctx: KernelContext, *, log: bool = False):
+    """Stable softmax, or log-softmax ``x - max - ln(sum(exp(x - max)))``."""
+    layout = _SoftmaxLayout(ctx)
+    out = ctx.output.list
+    index, maximum, total = ctx.temp_var("index"), ctx.temp_var("max"), ctx.temp_var("sum")
+    current = item(layout.source.list, var(index))
+    stride, size = layout.stride, layout.dim_size
+    maximum_scan = () if size <= 1 else (
+        change_var(index, stride),
+        *_static_unrolled_repeat(size - 1, (
+            if_(gt(current, var(maximum)), (set_var(maximum, current),)),
+            change_var(index, stride),
+        )),
+    )
+    if log:
+        # ``sum`` becomes the per-group log normalizer.
+        after_sum = (set_var(total, add(var(maximum), mathop("ln", var(total)))),)
+        normalized = sub(current, var(total))
+    else:
+        after_sum = ()
+        normalized = div(mathop("e ^", sub(current, var(maximum))), var(total))
+
+    def body(start):
+        return (
+            set_var(index, start),
+            set_var(maximum, current),
+            *maximum_scan,
+            set_var(index, start),
+            set_var(total, 0),
+            *_static_unrolled_repeat(size, (
+                change_var(total, mathop("e ^", sub(current, var(maximum)))),
+                change_var(index, stride),
+            )),
+            *after_sum,
+            set_var(index, start),
+            *_static_unrolled_repeat(size, (
+                layout.write(out, index, normalized),
+                change_var(index, stride),
             )),
         )
-        return Program(
-            "softmax_optimized",
-            variables=variables,
-            lists=lists,
-            list_values=list_values,
-            body=body,
-        ).compile()
+    return layout.group_loop(ctx, out, body)
 
 
-class OptimizedLogSoftmaxInstruction(OptimizedSoftmaxInstruction):
-    """Stable log-softmax: ``x - max - ln(sum(exp(x - max)))``."""
-
-    def _after_sum(self):
-        # Reuse ``sum`` for the per-group log normalizer.
-        return (set_var("sum", add(var("max"), mathop("ln", var("sum")))),)
-
-    def _normalized(self, current):
-        return sub(current, var("sum"))
-
-
-class FastSoftmaxInstruction(OptimizedSoftmaxInstruction):
+def _emit_fast_softmax(ctx: KernelContext):
     """Two-pass softmax that trades overflow protection for less Scratch work."""
+    layout = _SoftmaxLayout(ctx)
+    out = ctx.output.list
+    index, total, exponential = (
+        ctx.temp_var("index"), ctx.temp_var("sum"), ctx.temp_var("exponential")
+    )
+    current = item(layout.source.list, var(index))
+    stride, size = layout.stride, layout.dim_size
 
-    def finalize(self):
-        current = item("T1", var("index"))
-        stored = item("T2", var("index"))
-        prefix = (clear("T2"),)
-        if self.stride != 1:
-            prefix += (repeat(self.total, (append("T2", 0),)),)
-
-        if self.stride == 1:
-            start = var("group_start")
-            group_setup = (set_var("group_start", 1),)
-            group_finish = (change_var("group_start", self.dim_size),)
-            variables = ("group_start", "index", "sum", "exponential")
-            lists = ("T1", "T2")
-            list_values = {}
-        else:
-            start = item("_softmax_starts", var("group"))
-            group_setup = (set_var("group", 1),)
-            group_finish = (change_var("group", 1),)
-            variables = ("group", "index", "sum", "exponential")
-            lists = ("T1", "T2", "_softmax_starts")
-            list_values = {"_softmax_starts": self.group_starts}
-
-        store_exponential = (
-            append("T2", var("exponential"))
-            if self.stride == 1
-            else replace("T2", var("index"), var("exponential"))
-        )
-        body = prefix + group_setup + (
-            repeat(self.num_groups, (
-                set_var("index", start),
-                set_var("sum", 0),
-                *_static_unrolled_repeat(self.dim_size, (
-                    set_var("exponential", mathop("e ^", current)),
-                    change_var("sum", var("exponential")),
-                    store_exponential,
-                    change_var("index", self.stride),
-                )),
-                set_var("index", start),
-                *_static_unrolled_repeat(self.dim_size, (
-                    replace("T2", var("index"), div(stored, var("sum"))),
-                    change_var("index", self.stride),
-                )),
-                *group_finish,
+    def body(start):
+        return (
+            set_var(index, start),
+            set_var(total, 0),
+            *_static_unrolled_repeat(size, (
+                set_var(exponential, mathop("e ^", current)),
+                change_var(total, var(exponential)),
+                layout.write(out, index, var(exponential)),
+                change_var(index, stride),
+            )),
+            set_var(index, start),
+            *_static_unrolled_repeat(size, (
+                replace(out, var(index), div(item(out, var(index)), var(total))),
+                change_var(index, stride),
             )),
         )
-        return Program(
-            "softmax_fast",
-            variables=variables,
-            lists=lists,
-            list_values=list_values,
-            body=body,
-        ).compile()
+    return layout.group_loop(ctx, out, body)
 
 
-class OptimizedMeanInstruction(Instruction):
-    """Mean reduction with a one-based running start index."""
+def _softmax_kernels(emit, name, targets):
+    return tuple(Kernel(target, emit, name=name) for target in targets)
 
-    def prepare(self):
-        shape = self.args[0].shape
-        dims = self.args[1].value
-        ndim = len(shape)
-        dims = sorted(dim if dim >= 0 else ndim + dim for dim in dims)
-        first = dims[0]
-        self.reduce_size = math.prod(shape[dim] for dim in dims)
-        trailing = first + len(dims)
-        self.inner = math.prod(shape[trailing:]) if trailing < ndim else 1
-        self.outer = (
-            div(length("T1"), self.reduce_size * self.inner)
-            if self.args[0].dynamic
-            else (math.prod(shape[:first]) if first else 1)
-        )
-        self.block_advance = (self.reduce_size - 1) * self.inner
 
-    def finalize(self):
-        return Program(
-            "mean_optimized",
-            variables=("start", "read", "sum"),
-            lists=("T1", "T2"),
-            body=(
-                clear("T2"),
-                set_var("start", 1),
-                repeat(self.outer, (
-                    repeat(self.inner, (
-                        set_var("read", var("start")),
-                        set_var("sum", 0),
-                        *_static_unrolled_repeat(self.reduce_size, (
-                            change_var("sum", item("T1", var("read"))),
-                            change_var("read", self.inner),
-                        )),
-                        append("T2", div(var("sum"), self.reduce_size)),
-                        change_var("start", 1),
-                    )),
-                    change_var("start", self.block_advance),
+SOFTMAX_KERNELS = _softmax_kernels(_emit_softmax, "softmax_optimized", ("aten.softmax.int",))
+LOG_SOFTMAX_KERNELS = tuple(
+    Kernel(target, lambda ctx: _emit_softmax(ctx, log=True), name="softmax_optimized")
+    for target in ("aten.log_softmax.int", "aten._log_softmax.default")
+)
+FAST_SOFTMAX_KERNEL = Kernel("aten.softmax.int", _emit_fast_softmax, name="softmax_fast")
+
+
+def _emit_mean(ctx: KernelContext):
+    """Mean over consecutive dimensions with a one-based running start index."""
+    source = ctx.inputs["self"]
+    shape = source.shape
+    dims = ctx.scalars["dim"]
+    dims = sorted(dim % len(shape) for dim in ((dims,) if isinstance(dims, int) else dims))
+    first = dims[0]
+    reduce_size = math.prod(shape[dim] for dim in dims)
+    trailing = first + len(dims)
+    inner = math.prod(shape[trailing:]) if trailing < len(shape) else 1
+    outer = (
+        div(length(source.list), reduce_size * inner) if source.dynamic_axis is not None
+        else (math.prod(shape[:first]) if first else 1)
+    )
+    start, read, total = ctx.temp_var("start"), ctx.temp_var("read"), ctx.temp_var("sum")
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(start, 1),
+        repeat(outer, (
+            repeat(inner, (
+                set_var(read, var(start)),
+                set_var(total, 0),
+                *_static_unrolled_repeat(reduce_size, (
+                    change_var(total, item(source.list, var(read))),
+                    change_var(read, inner),
                 )),
-            ),
-        ).compile()
+                append(out, div(var(total), reduce_size)),
+                change_var(start, 1),
+            )),
+            change_var(start, (reduce_size - 1) * inner),
+        )),
+    )
 
 
-class OptimizedLayerNormInstruction(Instruction):
-    def prepare(self):
-        self.norm_size = math.prod(self.args[1].value)
+MEAN_KERNEL = Kernel("aten.mean.dim", _emit_mean, name="mean_optimized")
+
+
+class _Normalized:
+    """The rows of a layer or RMS norm, and its optional weight and bias."""
+
+    def __init__(self, ctx: KernelContext):
+        self.source = ctx.inputs["input"]
+        self.size = math.prod(ctx.scalars["normalized_shape"])
         self.groups = (
-            div(length("T1"), self.norm_size)
-            if self.args[0].dynamic
-            else math.prod(self.args[0].shape) // self.norm_size
+            div(length(self.source.list), self.size) if self.source.dynamic_axis is not None
+            else self.source.numel // self.size
         )
-        self.eps = self.args[4].value if len(self.args) > 4 else 1e-5
-
         # Trailing absent arguments, such as the bias of LayerNorm(bias=False),
-        # are left out of the call.
-        def present(position):
-            if len(self.args) <= position:
-                return False
-            return self.args[position].value is not None or bool(self.args[position].shape)
-        self.has_weight = present(2)
-        self.has_bias = present(3)
-        # Lists are numbered over the tensor arguments that are there, then
-        # the output.
-        slots = [
-            position for position, argument in enumerate(self.args)
-            if not str(argument.name).startswith("C_")
-        ]
-        self.lists = {position: f"T{index + 1}" for index, position in enumerate(slots)}
-        self.output_list = f"T{len(slots) + 1}"
-
-    def finalize(self):
-        weight = item(self.lists[2], var("feature")) if self.has_weight else 1
-        bias = item(self.lists[3], var("feature")) if self.has_bias else 0
-        normalized = add(
-            mul(
-                mul(sub(item("T1", var("index")), var("mean")), var("inv_std")),
-                weight,
-            ),
-            bias,
-        )
-        return Program(
-            "layernorm_optimized",
-            variables=(
-                "index", "feature", "mean", "variance",
-                "inv_std",
-            ),
-            lists=(*self.lists.values(), self.output_list),
-            body=(
-                clear(self.output_list),
-                set_var("index", 1),
-                repeat(self.groups, (
-                    set_var("mean", 0),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        change_var("mean", item("T1", var("index"))),
-                        change_var("index", 1),
-                    )),
-                    set_var("mean", div(var("mean"), self.norm_size)),
-                    change_var("index", -self.norm_size),
-                    set_var("variance", 0),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        change_var(
-                            "variance",
-                            mul(
-                                sub(item("T1", var("index")), var("mean")),
-                                sub(item("T1", var("index")), var("mean")),
-                            ),
-                        ),
-                        change_var("index", 1),
-                    )),
-                    set_var(
-                        "inv_std",
-                        div(
-                            1,
-                            mathop(
-                                "sqrt",
-                                add(div(var("variance"), self.norm_size), self.eps),
-                            ),
-                        ),
-                    ),
-                    change_var("index", -self.norm_size),
-                    set_var("feature", 1),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        append(self.output_list, normalized),
-                        change_var("index", 1),
-                        change_var("feature", 1),
-                    )),
-                )),
-            ),
-        ).compile()
+        # are left out of the call; an explicit None takes no list either.
+        self.weight = ctx.inputs.get("weight")
+        self.bias = ctx.inputs.get("bias")
 
 
-class FastLayerNormInstruction(OptimizedLayerNormInstruction):
+def _emit_layer_norm(ctx: KernelContext):
+    norm = _Normalized(ctx)
+    eps = ctx.scalars["eps"]
+    index, feature, mean, variance, inv_std = (
+        ctx.temp_var(name) for name in ("index", "feature", "mean", "variance", "inv_std")
+    )
+    current = item(norm.source.list, var(index))
+    weight = item(norm.weight.list, var(feature)) if norm.weight else 1
+    bias = item(norm.bias.list, var(feature)) if norm.bias else 0
+    out = ctx.output.list
+    size = norm.size
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(norm.groups, (
+            set_var(mean, 0),
+            *_static_unrolled_repeat(size, (change_var(mean, current), change_var(index, 1))),
+            set_var(mean, div(var(mean), size)),
+            change_var(index, -size),
+            set_var(variance, 0),
+            *_static_unrolled_repeat(size, (
+                change_var(variance, mul(sub(current, var(mean)), sub(current, var(mean)))),
+                change_var(index, 1),
+            )),
+            set_var(inv_std, div(1, mathop("sqrt", add(div(var(variance), size), eps)))),
+            change_var(index, -size),
+            set_var(feature, 1),
+            *_static_unrolled_repeat(size, (
+                append(out, add(mul(mul(sub(current, var(mean)), var(inv_std)), weight), bias)),
+                change_var(index, 1),
+                change_var(feature, 1),
+            )),
+        )),
+    )
+
+
+def _emit_fast_layer_norm(ctx: KernelContext):
     """One-pass statistics using E[x^2] - E[x]^2."""
+    norm = _Normalized(ctx)
+    eps = ctx.scalars["eps"]
+    index, feature, mean, mean_square, variance, inv_std = (
+        ctx.temp_var(name)
+        for name in ("index", "feature", "mean", "mean_square", "variance", "inv_std")
+    )
+    current = item(norm.source.list, var(index))
+    weight = item(norm.weight.list, var(feature)) if norm.weight else 1
+    bias = item(norm.bias.list, var(feature)) if norm.bias else 0
+    out = ctx.output.list
+    size = norm.size
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(norm.groups, (
+            set_var(mean, 0),
+            set_var(mean_square, 0),
+            *_static_unrolled_repeat(size, (
+                change_var(mean, current),
+                change_var(mean_square, mul(current, current)),
+                change_var(index, 1),
+            )),
+            set_var(mean, div(var(mean), size)),
+            set_var(variance, sub(div(var(mean_square), size), mul(var(mean), var(mean)))),
+            if_else(
+                gt(var(variance), 0),
+                (set_var(inv_std, div(1, mathop("sqrt", add(var(variance), eps)))),),
+                (set_var(inv_std, div(1, mathop("sqrt", eps))),),
+            ),
+            change_var(index, -size),
+            set_var(feature, 1),
+            *_static_unrolled_repeat(size, (
+                append(out, add(mul(mul(sub(current, var(mean)), var(inv_std)), weight), bias)),
+                change_var(index, 1),
+                change_var(feature, 1),
+            )),
+        )),
+    )
 
-    def finalize(self):
-        weight = item(self.lists[2], var("feature")) if self.has_weight else 1
-        bias = item(self.lists[3], var("feature")) if self.has_bias else 0
-        current = item("T1", var("index"))
-        normalized = add(
-            mul(mul(sub(current, var("mean")), var("inv_std")), weight),
-            bias,
-        )
-        return Program(
-            "layernorm_fast",
-            variables=("index", "feature", "mean", "mean_square", "variance", "inv_std"),
-            lists=(*self.lists.values(), self.output_list),
-            body=(
-                clear(self.output_list),
-                set_var("index", 1),
-                repeat(self.groups, (
-                    set_var("mean", 0),
-                    set_var("mean_square", 0),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        change_var("mean", current),
-                        change_var("mean_square", mul(current, current)),
-                        change_var("index", 1),
-                    )),
-                    set_var("mean", div(var("mean"), self.norm_size)),
-                    set_var(
-                        "variance",
-                        sub(div(var("mean_square"), self.norm_size), mul(var("mean"), var("mean"))),
-                    ),
-                    if_else(
-                        gt(var("variance"), 0),
-                        (set_var(
-                            "inv_std",
-                            div(1, mathop("sqrt", add(var("variance"), self.eps))),
-                        ),),
-                        (set_var("inv_std", div(1, mathop("sqrt", self.eps))),),
-                    ),
-                    change_var("index", -self.norm_size),
-                    set_var("feature", 1),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        append(self.output_list, normalized),
-                        change_var("index", 1),
-                        change_var("feature", 1),
-                    )),
+
+LAYER_NORM_KERNEL = Kernel("aten.layer_norm.default", _emit_layer_norm, name="layernorm_optimized")
+FAST_LAYER_NORM_KERNEL = Kernel(
+    "aten.layer_norm.default", _emit_fast_layer_norm, name="layernorm_fast",
+)
+
+
+def _emit_rms_norm(ctx: KernelContext):
+    norm = _Normalized(ctx)
+    # ``F.rms_norm(x, shape)`` passes neither a weight nor eps.
+    eps = ctx.scalars.get("eps")
+    eps = torch.finfo(torch.float32).eps if eps is None else eps
+    index, feature, total, rms = (ctx.temp_var(name) for name in ("index", "feature", "sum", "rms"))
+    current = item(norm.source.list, var(index))
+    weight = item(norm.weight.list, var(feature)) if norm.weight else 1
+    out = ctx.output.list
+    size = norm.size
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(norm.groups, (
+            set_var(total, 0),
+            *_static_unrolled_repeat(size, (
+                change_var(total, mul(current, current)),
+                change_var(index, 1),
+            )),
+            set_var(rms, mathop("sqrt", add(div(var(total), size), eps))),
+            change_var(index, -size),
+            set_var(feature, 1),
+            *_static_unrolled_repeat(size, (
+                append(out, mul(div(current, var(rms)), weight)),
+                change_var(index, 1),
+                change_var(feature, 1),
+            )),
+        )),
+    )
+
+
+RMS_NORM_KERNEL = Kernel("aten.rms_norm.default", _emit_rms_norm, name="rmsnorm_optimized")
+
+
+def _emit_batch_norm(ctx: KernelContext):
+    """Normalize each channel with its running statistics.
+
+    The square root is taken in Scratch, once per channel. Rewriting the
+    stored variance instead would change it for its other readers, such as a
+    second call of the same BatchNorm.
+    """
+    source = ctx.inputs["input"]
+    weight, bias = ctx.inputs.get("weight"), ctx.inputs.get("bias")
+    mean_list, variance_list = ctx.inputs["running_mean"].list, ctx.inputs["running_var"].list
+    shape = source.shape
+    batches = (
+        div(length(source.list), math.prod(shape[1:])) if source.dynamic_axis is not None
+        else shape[0]
+    )
+    channel, index, mean, std, scale, offset = (
+        ctx.temp_var(name) for name in ("channel", "index", "mean", "std", "scale", "offset")
+    )
+    out = ctx.output.list
+    result = add(mul(div(sub(item(source.list, var(index)), var(mean)), var(std)), var(scale)), var(offset))
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(batches, (
+            set_var(channel, 1),
+            repeat(shape[1], (
+                set_var(mean, item(mean_list, var(channel))),
+                set_var(std, mathop("sqrt", add(item(variance_list, var(channel)), ctx.scalars["eps"]))),
+                set_var(scale, item(weight.list, var(channel)) if weight else 1),
+                set_var(offset, item(bias.list, var(channel)) if bias else 0),
+                *_static_unrolled_repeat(math.prod(shape[2:]), (
+                    append(out, result),
+                    change_var(index, 1),
                 )),
-            ),
-        ).compile()
+                change_var(channel, 1),
+            )),
+        )),
+    )
 
 
-class OptimizedRMSNormInstruction(Instruction):
-    def prepare(self):
-        self.norm_size = math.prod(self.args[1].value)
-        self.groups = (
-            div(length("T1"), self.norm_size)
-            if self.args[0].dynamic
-            else math.prod(self.args[0].shape) // self.norm_size
-        )
-        # ``F.rms_norm(x, shape)`` passes neither a weight nor eps.
-        self.eps = (
-            self.args[3].value
-            if len(self.args) > 3 and self.args[3].value is not None
-            else torch.finfo(torch.float32).eps
-        )
-        self.has_weight = len(self.args) > 2 and (
-            self.args[2].value is not None or bool(self.args[2].shape)
-        )
-
-    def finalize(self):
-        current = item("T1", var("index"))
-        weight = item("T2", var("feature")) if self.has_weight else 1
-        # Without a weight argument at all, the output takes the second slot.
-        out = "T3" if len(self.args) > 2 else "T2"
-        return Program(
-            "rmsnorm_optimized",
-            variables=("index", "feature", "sum", "rms"),
-            lists=("T1", "T2", "T3") if out == "T3" else ("T1", "T2"),
-            body=(
-                clear(out),
-                set_var("index", 1),
-                repeat(self.groups, (
-                    set_var("sum", 0),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        change_var("sum", mul(current, current)),
-                        change_var("index", 1),
-                    )),
-                    set_var(
-                        "rms",
-                        mathop(
-                            "sqrt",
-                            add(div(var("sum"), self.norm_size), self.eps),
-                        ),
-                    ),
-                    change_var("index", -self.norm_size),
-                    set_var("feature", 1),
-                    *_static_unrolled_repeat(self.norm_size, (
-                        append(out, mul(div(current, var("rms")), weight)),
-                        change_var("index", 1),
-                        change_var("feature", 1),
-                    )),
-                )),
-            ),
-        ).compile()
+BATCH_NORM_KERNEL = Kernel("aten.batch_norm.default", _emit_batch_norm, name="batchnorm_optimized")
 
 
-class OptimizedBatchNormInstruction(Instruction):
-    def prepare(self):
-        shape = self.args[0].shape
-        self.batches = (
-            div(length("T1"), math.prod(shape[1:]))
-            if self.args[0].dynamic else shape[0]
-        )
-        self.channels = shape[1]
-        self.spatial = math.prod(shape[2:])
-        self.has_weight = self.args[1].value is not None or bool(self.args[1].shape)
-        self.has_bias = self.args[2].value is not None or bool(self.args[2].shape)
-
-    def finalize(self):
-        # The square root is taken in Scratch, once per channel. Rewriting the
-        # stored variance instead would change it for its other readers, such
-        # as a second call of the same BatchNorm.
-        variance = item("T5", var("channel"))
-        std = mathop("sqrt", add(variance, self.args[7].value))
-        result = add(
-            mul(
-                div(
-                    sub(item("T1", var("index")), var("mean")),
-                    var("std"),
-                ),
-                var("scale"),
-            ),
-            var("offset"),
-        )
-        return Program(
-            "batchnorm_optimized",
-            variables=(
-                "channel", "index",
-                "mean", "std", "scale", "offset",
-            ),
-            lists=("T1", "T2", "T3", "T4", "T5", "T6"),
-            body=(
-                clear("T6"),
-                set_var("index", 1),
-                repeat(self.batches, (
-                    set_var("channel", 1),
-                    repeat(self.channels, (
-                        set_var("mean", item("T4", var("channel"))),
-                        set_var("std", std),
-                        set_var(
-                            "scale",
-                            item("T2", var("channel")) if self.has_weight else 1,
-                        ),
-                        set_var(
-                            "offset",
-                            item("T3", var("channel")) if self.has_bias else 0,
-                        ),
-                        *_static_unrolled_repeat(self.spatial, (
-                            append("T6", result),
-                            change_var("index", 1),
-                        )),
-                        change_var("channel", 1),
-                    )),
-                )),
-            ),
-        ).compile()
+__all__ = [
+    "BATCH_NORM_KERNEL", "FAST_LAYER_NORM_KERNEL", "FAST_SOFTMAX_KERNEL", "LAYER_NORM_KERNEL",
+    "LOG_SOFTMAX_KERNELS", "MEAN_KERNEL", "RMS_NORM_KERNEL", "SOFTMAX_KERNELS",
+]
