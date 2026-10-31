@@ -284,6 +284,28 @@
   export fails where it can't.
 - Automatic MoE detection swapped a block that caps how many tokens an
   expert takes for plain top-k routing, which is wrong once an expert is full.
+- `cumsum` and `cumprod` ran as a decomposition whose size grows with the
+  square of the length: a 1,600-item `cumsum` made 11.8 MB of JSON, and a
+  210,000-item one didn't finish. They now run as one pass.
+- float16 and bfloat16 models, including Hub checkpoints loaded by
+  `cattorch generate --hf`, were rejected for generation with a misleading
+  message. They are exported in float32.
+- The command line printed a traceback for an unsupported operation instead
+  of an error message.
+- Generation models with `-inf` logits, as for banned tokens, were rejected.
+- `build_project` gave a sprite named `cattorch` global lists that collided
+  with its own, and could make two sprites named `Demo`. Such sprites are
+  renamed, like duplicates.
+- Generation sprites had two `cattorch status` variables, so a failed cache
+  transaction never reported its status.
+- Generation sprites accepted token IDs outside the vocabulary, fractions and
+  text, and reported `ok`. They now report an error.
+- A variable-length `cattorch forward` accepted any input length and reported
+  `ok`. It now reports too few items, too many, or a partial item.
+- A variable-length export whose output gives several rows per item, as
+  `x.reshape(-1, 2)` does, crashed.
+- `frontend="export"` leaked raw `torch.export` errors.
+- `transpile` rejected `adapters=` for plain and variable-length exports.
 
 - `@cattorch.moe` stopped working once anything imported
   `cattorch.experimental`, because the module holding the MoE classes had the

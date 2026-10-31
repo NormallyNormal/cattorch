@@ -1870,11 +1870,12 @@ def _wrap_generation_lifecycle(
     hidden_prefill: bool,
     top_k: int | None,
     compact_top_k: bool,
+    vocabulary: int | None = None,
 ) -> dict:
     """Add reset/prefill/decode blocks and guard the cached forward procedure."""
     from cattorch.util.scratch.dsl import (
-        Program, append, call, clear, eq, for_each, gt, if_else, item,
-        length, set_var, sub, var,
+        Program, append, call, clear, eq, for_each, gt, if_, if_else, item,
+        length, lt, not_, round_, set_var, sub, var,
     )
 
     top_k_lists = (_TOP_K_VALUES, _TOP_K_IDS) if top_k is not None else ()
@@ -1901,19 +1902,49 @@ def _wrap_generation_lifecycle(
         sprite, "cattorch reset cache", reset, x=640, y=0,
     )
 
+    # A token that isn't a whole number in the vocabulary would read past the
+    # embedding table and still report ok.
+    valid_tokens = "_cattorch tokens valid"
+    token = "_cattorch token"
+
+    def check_tokens(source):
+        if vocabulary is None:
+            return (set_var(valid_tokens, 1),)
+        return (
+            set_var(valid_tokens, 1),
+            for_each("_cattorch token index", length(source), (
+                set_var(token, item(source, var("_cattorch token index"))),
+                if_(not_(eq(var(token), round_(var(token)))), (set_var(valid_tokens, 0),)),
+                if_(lt(var(token), 0), (set_var(valid_tokens, 0),)),
+                if_(gt(var(token), vocabulary - 1), (set_var(valid_tokens, 0),)),
+            )),
+        )
+
+    invalid_token = f"token ids must be whole numbers from 0 to {(vocabulary or 0) - 1}"
     invalid_decode = (
         clear("output"),
         *(clear(name) for name in top_k_lists),
         set_var("cattorch status", "decode requires exactly one token"),
     )
+    token_variables = (valid_tokens, token, "_cattorch token index")
     decode = Program(
         "generation_decode",
-        variables=("cattorch status",),
+        variables=("cattorch status", *token_variables),
         lists=("input", "output", *top_k_lists),
         body=(
             if_else(
                 eq(length("input"), 1),
-                (call("cattorch forward"),),
+                (
+                    *check_tokens("input"),
+                    if_else(
+                        eq(var(valid_tokens), 1),
+                        (call("cattorch forward"),),
+                        (
+                            clear("output"), *(clear(name) for name in top_k_lists),
+                            set_var("cattorch status", invalid_token),
+                        ),
+                    ),
+                ),
                 invalid_decode,
             ),
         ),
@@ -1946,26 +1977,8 @@ def _wrap_generation_lifecycle(
                 call("cattorch forward"),
                 clear("input"),
         )
-        prefill_body = (*copy_and_reset,
-            if_else(
-                eq(length("cattorch prefill buffer"), 0),
-                (set_var("cattorch status", "prefill requires at least one token"),),
-                (
-                    if_else(
-                        gt(length("cattorch prefill buffer"), max_context),
-                        (
-                            set_var(
-                                "cattorch status",
-                                "prefill exceeds maximum context",
-                            ),
-                        ),
-                        valid_prefill,
-                    ),
-                ),
-            ),
-        )
         prefill_variables = (
-            "prefill index", "cattorch project output", "cattorch status",
+            "prefill index", "cattorch project output", "cattorch status", *token_variables,
         )
     else:
         valid_prefill = (
@@ -1975,25 +1988,24 @@ def _wrap_generation_lifecycle(
                 clear("input"),
             )),
         )
-        prefill_body = (*copy_and_reset,
-            if_else(
-                eq(length("cattorch prefill buffer"), 0),
-                (set_var("cattorch status", "prefill requires at least one token"),),
-                (
-                    if_else(
-                        gt(length("cattorch prefill buffer"), max_context),
-                        (
-                            set_var(
-                                "cattorch status",
-                                "prefill exceeds maximum context",
-                            ),
-                        ),
-                        valid_prefill,
-                    ),
-                ),
-            ),
-        )
-        prefill_variables = ("prefill index", "cattorch status")
+        prefill_variables = ("prefill index", "cattorch status", *token_variables)
+    prefill_body = (
+        *copy_and_reset,
+        *check_tokens("cattorch prefill buffer"),
+        if_else(
+            eq(length("cattorch prefill buffer"), 0),
+            (set_var("cattorch status", "prefill requires at least one token"),),
+            (if_else(
+                gt(length("cattorch prefill buffer"), max_context),
+                (set_var("cattorch status", "prefill exceeds maximum context"),),
+                (if_else(
+                    eq(var(valid_tokens), 1),
+                    valid_prefill,
+                    (set_var("cattorch status", invalid_token),),
+                ),),
+            ),),
+        ),
+    )
     prefill = Program(
         "generation_prefill",
         variables=prefill_variables,
@@ -2001,6 +2013,7 @@ def _wrap_generation_lifecycle(
         body=prefill_body,
     )
     sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
+    _merge_variables_by_name(sprite, set(token_variables))
     if hidden_prefill:
         _merge_variables_by_name(sprite, {"cattorch project output"})
         # Only prefill clears it, so a decode before any prefill must find 1.

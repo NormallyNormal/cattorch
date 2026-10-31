@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import zipfile
 from pathlib import Path
@@ -19,7 +20,7 @@ from cattorch import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 sys.path.insert(0, str(Path(__file__).parent))
-from test_autoregressive import NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
+from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
 from test_optimization import CachedLM  # noqa: E402
 
 TOLERANCE = 1e-4
@@ -225,6 +226,58 @@ def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
     )
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, model, [1, 2, 3], [4])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_reduced_precision_models_export(tmp_path, dtype):
+    # Hub checkpoints load in their saved dtype, usually bfloat16.
+    model = tiny_decoder("llama", layers=1).to(dtype).eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.run_procedure("cattorch prefill")
+    expected = logits_of(model.float(), [1, 2, 3])
+    actual = torch.tensor(emulator.lists["cattorch logits"])
+    torch.testing.assert_close(actual, expected, atol=TOLERANCE, rtol=0)
+
+
+def test_banned_tokens_with_negative_infinity_export(tmp_path):
+    class Banned(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = nano()
+            bias = torch.zeros(VOCAB)
+            bias[[0, 5]] = float("-inf")
+            self.register_buffer("ban", bias)
+
+        def forward(self, tokens):
+            return self.inner(tokens) + self.ban
+
+    model = Banned().eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.run_procedure("cattorch prefill")
+    logits = emulator.lists["cattorch logits"]
+    assert logits[0] == logits[5] == -math.inf
+    assert all(math.isfinite(value) for index, value in enumerate(logits) if index not in (0, 5))
+
+
+def test_token_ids_outside_the_vocabulary_are_rejected(tmp_path):
+    model = nano()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    for tokens in ([1, VOCAB], [1, -1], [1, 2.5], [1, "abc"]):
+        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.run_procedure("cattorch prefill")
+        assert emulator.variables["cattorch status"].startswith("token ids must be"), tokens
+        assert emulator.lists["cattorch logits"] == []
+    emulator.lists["cattorch tokens"] = [VOCAB - 1]
+    emulator.run_procedure("cattorch prefill")
+    assert emulator.variables["cattorch status"] == "ok"
+    emulator.lists["cattorch tokens"] = [VOCAB]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"].startswith("token ids must be")
 
 
 def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):

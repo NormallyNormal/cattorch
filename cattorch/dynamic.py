@@ -312,8 +312,8 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         _remove_completion_broadcast,
     )
     from cattorch.util.scratch.dsl import (
-        Program, add, append, broadcast_and_wait, call, change_var, clear, div, for_each,
-        item, length, mul, set_var, var,
+        Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
+        gt, if_, item, length, lt, mod, mul, set_var, var,
     )
     from cattorch.util.scratch.interface import rename_list, rename_procedure
 
@@ -339,8 +339,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         private = f"_cattorch unit {public}"
         rename_list(sprite, public, private)
         outputs.append((public, private, math.prod(shape)))
-    body = [
-        *(clear(public) for public, _, _ in outputs),
+    run_units = (
         set_var(unit, 0),
         for_each("_cattorch units", div(length(public_input), input_size), (
             clear(private_input),
@@ -354,7 +353,22 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
             ),
             change_var(unit, 1),
         )),
-        set_var("cattorch status", "ok"),
+    )
+    # Whole items within the bounds, as an exported forward checks them.
+    status = "cattorch status"
+    body = [
+        *(clear(public) for public, _, _ in outputs),
+        set_var(status, "ok"),
+        if_(gt(mod(length(public_input), input_size), 0), (
+            set_var(status, f"invalid dynamic length: {public_input}"),
+        )),
+        if_(lt(length(public_input), input_size * max(minimum, 1)), (
+            set_var(status, f"too few items: {public_input}"),
+        )),
+        if_(gt(length(public_input), input_size * maximum), (
+            set_var(status, f"dynamic capacity exceeded: {public_input}"),
+        )),
+        if_(eq(var(status), "ok"), run_units),
         broadcast_and_wait("cattorch forward complete"),
     ]
     program = Program(
@@ -377,7 +391,9 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
 
     def bounded(spec_value, shape, dim):
         public_shape = list(shape)
-        public_shape[dim] = BoundedDimension(name, minimum, maximum)
+        # Each item can give several rows, as reshape(-1, 2) of four features does.
+        rows = shape[dim]
+        public_shape[dim] = BoundedDimension(name, minimum * rows, maximum * rows)
         return TensorSpec(
             list_name=spec_value.list_name, shape=tuple(public_shape), dtype=spec_value.dtype,
             numel=None, max_numel=math.prod(shape) * maximum,

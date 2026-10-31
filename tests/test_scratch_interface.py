@@ -91,6 +91,12 @@ def interface_names(path) -> tuple[dict[str, set[str]], dict]:
 def check(path, expected):
     names, variables = interface_names(path)
     assert variables[interface.VERSION_VARIABLE] == interface.INTERFACE_VERSION
+    with zipfile.ZipFile(path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    for section in ("variables", "lists"):
+        # One slot per name, or a user's block could pick the wrong copy.
+        listed = [entry[0] for entry in sprite[section].values()]
+        assert len(listed) == len(set(listed)), section
     for kind, public in expected.items():
         assert names[kind] == public, kind
 

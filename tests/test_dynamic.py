@@ -258,3 +258,35 @@ def test_length_check_reaches_the_maximum(tmp_path):
     model = Lambda(lambda x: x.sum(0) / min(x.shape[0], 20)).eval()
     with pytest.raises(UnsupportedModelError, match="with 64 items"):
         transpile(model, torch.randn(4, 2), tmp_path / "capped", dynamic={0: (1, 64)})
+
+
+@pytest.mark.parametrize("by_item", [False, True])
+def test_a_wrong_input_length_is_reported(tmp_path, by_item):
+    import json
+    import zipfile
+
+    from cattorch.util.scratch.emulator import ScratchEmulator
+
+    if by_item:  # attention that reorders its batch runs once per item
+        model = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+        example, width = torch.randn(2, 3, 8), 24
+    else:
+        model, example, width = nn.Linear(3, 2), torch.randn(4, 3), 3
+    result = transpile(model.eval(), example, tmp_path / "bounded", dynamic={0: (1, 4)})
+    with zipfile.ZipFile(result.path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    for count, status in (
+        (0, "too few items"), (5 * width, "dynamic capacity exceeded"),
+        (width + 1, "invalid dynamic length"), (2 * width, "ok"),
+    ):
+        emulator = ScratchEmulator(sprite)
+        emulator.lists["input"] = [0.5] * count
+        emulator.run_procedure("cattorch forward")
+        assert emulator.variables["cattorch status"].startswith(status), count
+        assert bool(emulator.lists["output"]) == (status == "ok")
+
+
+def test_each_item_can_give_several_output_rows(tmp_path):
+    model = Lambda(lambda x: x.reshape(-1, 2)).eval()
+    result = _check(tmp_path, model, torch.randn(3, 4), {0: (1, 9)}, (1, 4, 9))
+    assert result.outputs[0].shape[0] == BoundedDimension("input", 2, 18)

@@ -1544,9 +1544,12 @@ def check_step_equivalence(
                     f"{tuple(actual.shape)} but the model gives {tuple(expected.shape)} "
                     f"for token {row}"
                 )
-            error = (actual.double() - expected.double()).abs()
+            # Equal values, such as -inf for a banned token, match exactly.
+            same = actual.double() == expected.double()
+            error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
             largest = float(error.max()) if error.numel() else 0.0
-            scale = float(expected.double().abs().max()) if expected.numel() else 0.0
+            finite = expected.double()[torch.isfinite(expected)].abs()
+            scale = float(finite.max()) if finite.numel() else 0.0
             if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
                     or largest > rtol * max(scale, 1e-3) or largest != largest:
                 overall = max(

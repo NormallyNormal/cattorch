@@ -183,6 +183,7 @@ reaches `cattorch max context`.
 | Decode when the cache is full | Cache unchanged; logits and top-k lists cleared | `maximum context exceeded` |
 | Prefill with no tokens | Cache reset; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
 
 ## Cache behavior
 

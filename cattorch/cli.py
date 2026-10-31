@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from cattorch.errors import UnsupportedModelError
+from cattorch.errors import CattorchError
 
 
 class CommandError(Exception):
@@ -290,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return args.run(args)
-    except (CommandError, UnsupportedModelError, ValueError, TypeError) as error:
+    except (CommandError, CattorchError, ValueError, TypeError) as error:
         print(f"cattorch: error: {error}", file=sys.stderr)
         return 1
 

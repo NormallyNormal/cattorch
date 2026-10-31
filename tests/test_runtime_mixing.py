@@ -160,8 +160,8 @@ def test_self_attention_over_the_extent_is_rejected(tmp_path):
         transpile(layer, torch.randn(1, 5, 8), tmp_path / "encoder", dynamic={0: {1: (1, 8)}})
 
 
-def test_a_running_sum_is_caught_by_the_length_check(tmp_path):
-    with pytest.raises(UnsupportedModelError, match="uses the length itself"):
+def test_a_running_sum_along_the_items_is_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match="mixes values across the runtime extent"):
         transpile(
             Mixing(lambda x: x.cumsum(0)).eval(), torch.randn(5, 4), tmp_path / "running",
             dynamic={0: (1, 8)},

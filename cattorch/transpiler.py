@@ -17,6 +17,7 @@ from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.frontend import Frontend, flat_example_inputs, keep_operations
 from cattorch.graph import (
+    _NOOP_OPS,
     _GenerationSpec,
     _GraphInfo,
     _get_dtype,
@@ -140,6 +141,80 @@ def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
         ):
             query_only.add(node.name)
     return query_only
+
+
+def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> None:
+    """Reject a variable-length input of the wrong length before running.
+
+    ``cattorch forward`` becomes a wrapper that checks each variable-length
+    input holds whole items within its bounds, as program entry points do;
+    otherwise it clears the outputs and reports why in ``cattorch status``.
+    """
+    from cattorch.util.scratch.dsl import broadcast_and_wait, if_else, lt, mod
+
+    checks = []
+    for node in graph.nodes:
+        name = graph.input_names.get(node.name)
+        if name is None or node.name not in graph.dynamic_bounds:
+            continue
+        if name in layouts and len(layouts[name].shards) > 1:
+            continue  # a split list's length isn't one list's length
+        shape = _get_shape(node)
+        axis = graph.dynamic_axes[node.name]
+        width = max(math.prod(shape) // max(shape[axis], 1), 1)
+        _, minimum, _ = graph.dynamic_bounds[node.name]
+        checks.extend((
+            if_(gt(mod(length(name), width), 0), (
+                set_var("cattorch status", f"invalid dynamic length: {name}"),
+            )),
+            if_(lt(length(name), width * max(minimum, 1)), (
+                set_var("cattorch status", f"too few items: {name}"),
+            )),
+            if_(gt(length(name), graph.runtime_capacity(node.name, shape)), (
+                set_var("cattorch status", f"dynamic capacity exceeded: {name}"),
+            )),
+        ))
+    if not checks:
+        return
+    internal = "_cattorch checked forward"
+    _rename_procedure(sprite, "cattorch forward", internal)
+    wrapper = Program(
+        "checked_forward",
+        variables=("cattorch status",),
+        lists=tuple(dict.fromkeys((*graph.input_names.values(), *output_names))),
+        body=(
+            set_var("cattorch status", "ok"),
+            *checks,
+            if_else(
+                eq(var("cattorch status"), "ok"),
+                (call(internal),),
+                (
+                    *(clear(name) for name in output_names),
+                    broadcast_and_wait("cattorch forward complete"),
+                ),
+            ),
+        ),
+    )
+    _add_warp_procedure(sprite, "cattorch forward", wrapper, x=640, y=960)
+    _merge_variables_by_name(sprite, {"cattorch status"})
+    _merge_lists_by_name(sprite, set(graph.input_names.values()) | set(output_names))
+
+
+def _token_vocabulary(graph: _GraphInfo) -> int | None:
+    """Rows of the embedding table the token input is looked up in."""
+    tokens = {name for name, list_name in graph.input_names.items() if list_name == "input"}
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if str(node.target) == "aten.embedding.default" and getattr(
+            node.args[1], "name", None,
+        ) in tokens:
+            return int(_get_shape(node.args[0])[0])
+        if node.all_input_nodes and node.all_input_nodes[0].name in tokens and str(
+            node.target,
+        ) in _NOOP_OPS | {"aten.to.dtype", "aten._to_copy.default"}:
+            tokens.add(node.name)
+    return None
 
 
 def _shared_layer_attention(graph: _GraphInfo) -> str:
@@ -1746,7 +1821,7 @@ def transpile(
 
 def _transpile_dynamic(
     model, example_inputs, output_path, sig_figs, dynamic, *, example_kwargs, kernels,
-    **options,
+    adapters=(), **options,
 ):
     """Trace one row of the dynamic input, export, and check other lengths."""
     from cattorch.dynamic import (
@@ -1771,7 +1846,8 @@ def _transpile_dynamic(
     traced_kwargs.update(zip(kwarg_names, representative[positional:]))
     arguments = dict(
         generation=None, example_kwargs=traced_kwargs or None,
-        _registry=_registry_with(kernels) if kernels else None, **options,
+        _registry=_registry_with(kernels, adapters) if kernels or adapters else None,
+        **options,
     )
     try:
         result = _transpile(
@@ -1901,8 +1977,6 @@ def _transpile_any(
             calibration_sequences=calibration_sequences,
             codegen=codegen, registry=registry,
         )
-    if adapters:
-        raise ValueError("adapters require an ExportProgram or GenerationProgram")
     if calibration_calls is not None:
         raise ValueError("calibration_calls require an ExportProgram")
     if calibration_sequences is not None:
@@ -1914,6 +1988,7 @@ def _transpile_any(
             storage=storage, quantization=quantization,
             calibration_inputs=calibration_inputs, codegen=codegen,
             frontend=frontend, example_kwargs=example_kwargs, kernels=kernels,
+            adapters=adapters,
         )
     return _transpile(
         model, example_inputs, output_path, sig_figs,
@@ -1924,7 +1999,7 @@ def _transpile_any(
         codegen=codegen,
         frontend=frontend,
         example_kwargs=example_kwargs,
-        _registry=_registry_with(kernels) if kernels else None,
+        _registry=_registry_with(kernels, adapters) if kernels or adapters else None,
     )
 
 
@@ -1964,6 +2039,13 @@ def _transpile_automatic_generation(
     ):
         raise ValueError("calibration_inputs can only be used with GPTQ quantization")
     max_context = program.max_context
+    if any(
+        value.is_floating_point() and value.dtype != torch.float32
+        for value in (*model.parameters(), *model.buffers())
+    ):
+        # Scratch computes in doubles either way. In float32 the cached step
+        # can be checked against the model without bfloat16 rounding noise.
+        model = copy.deepcopy(model).float()
     module = model if program.method == "forward" else MethodLeaves(model, program.method)
     prepared = registry.adapt_model(module)
     if optimization == "fast":
@@ -2265,6 +2347,7 @@ def _transpile(
             hidden_prefill=generation.hidden_prefill,
             top_k=generation.top_k,
             compact_top_k=codegen.unrolling != "speed",
+            vocabulary=_token_vocabulary(graph),
         )
         # Kernels declare `cattorch cache length` themselves; unify them with
         # the lifecycle's variable.
@@ -2277,6 +2360,8 @@ def _transpile(
             },
             top_k=generation.top_k is not None,
         )
+        # The step wrapper declares its own copy of the status variable.
+        _merge_variables_by_name(sprite, {"cattorch status"})
         generation_lists = {
             "input", "output", "cattorch prefill buffer",
         }
@@ -2380,6 +2465,7 @@ def _transpile(
             _add_procedure_completion_broadcast(
                 sprite, procedure, f"{procedure} complete", status="ok",
             )
+        _check_input_lengths(sprite, graph, layouts, output_names)
     sprite.setdefault("variables", {}).update({
         "cattorch_storage_compression": [
             "cattorch storage compression",

@@ -121,7 +121,22 @@ def _export_model(model, example_inputs, example_kwargs=None):
 
 
 def _capture_export(model, example_inputs, example_kwargs=None) -> CapturedGraph:
-    exported = _export_model(model, example_inputs, example_kwargs)
+    try:
+        exported = _export_model(model, example_inputs, example_kwargs)
+    except Exception as exc:
+        raise UnsupportedModelError(
+            f"torch.export could not trace this model ({type(exc).__name__}: "
+            f"{str(exc).splitlines()[0] if str(exc) else ''}); a common cause is "
+            "control flow that depends on tensor values. The default frontend='fx' "
+            "supports more models"
+        ) from exc
+    symbolic = (torch.SymInt, torch.SymFloat, torch.SymBool)
+    if any(isinstance(node.meta.get("val"), symbolic) for node in exported.graph.nodes):
+        raise UnsupportedModelError(
+            "torch.export traced a value read from a tensor, such as .item(); "
+            "Scratch can't use it as a number at export. Keep the computation in "
+            "tensor operations"
+        )
     state_inputs: dict[str, torch.Tensor] = {}
     user_inputs: set[str] = set()
     constants = getattr(exported, "constants", {})

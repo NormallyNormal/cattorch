@@ -915,6 +915,40 @@ def _emit_runtime_reduce(ctx: KernelContext):
     )
 
 
+def _emit_scan(ctx: KernelContext, *, product: bool):
+    """Running sum or product along ``dim``, in one pass over the values.
+
+    The output starts as a copy of the input; then each value past the first
+    along ``dim`` is combined with the one ``inner`` places before it.
+    """
+    value = ctx.inputs["self"]
+    if not value.shape:
+        return (clear(ctx.output.list), append(ctx.output.list, item(value.list, 1)))
+    dim = int(ctx.scalars["dim"]) % len(value.shape)
+    outer, extent, inner = _runtime_layout(value, dim)
+    out = ctx.output.list
+    index, position = ctx.temp_var("scan index"), ctx.temp_var("scan position")
+    combine = mul if product else add
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(length(value.list), (
+            append(out, item(value.list, var(index))),
+            change_var(index, 1),
+        )),
+        set_var(position, add(inner, 1)),
+        repeat(outer, (
+            repeat(mul(sub(extent, 1), inner), (
+                replace(out, var(position), combine(
+                    item(out, var(position)), item(out, sub(var(position), inner)),
+                )),
+                change_var(position, 1),
+            )),
+            change_var(position, inner),
+        )),
+    )
+
+
 def _emit_runtime_softmax(ctx: KernelContext):
     """Softmax along a runtime axis: maximum, sum of exponentials, then scale."""
     value = ctx.inputs["value"]
@@ -1163,6 +1197,8 @@ BUILTIN_KERNELS = (
         "aten.scatter.value_reduce", partial(_emit_scatter_reduce, scalar=True),
         name="scatter_reduce", validator=_validate_scatter_reduce,
     ),
+    Kernel("aten.cumsum.default", partial(_emit_scan, product=False), name="cumsum"),
+    Kernel("aten.cumprod.default", partial(_emit_scan, product=True), name="cumprod"),
     Kernel(
         "cattorch.rotary_embedding.default",
         _emit_rotary_embedding,
