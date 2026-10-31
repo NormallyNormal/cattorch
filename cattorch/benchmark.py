@@ -28,6 +28,11 @@ from cattorch.transpiler import (
     _merge_lists_by_name,
     transpile,
 )
+from cattorch.util.scratch.dsl import (
+    Program, append, broadcast_and_wait, change_var, clear, join, repeat, reset_timer, set_var,
+    timer, var,
+)
+from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, read_json, write_archive
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.interface import (
@@ -145,221 +150,98 @@ def _add_broadcast_entry(
     }
 
 
-class _StageBlocks:
-    def __init__(self, broadcast_ids: dict[str, str], list_ids: dict[str, str]):
-        self.broadcast_ids = broadcast_ids
-        self.list_ids = list_ids
-        self.blocks = {}
-        self.counter = 0
+def _stage_blocks(
+    statements,
+    broadcasts: dict[str, str],
+    lists: dict[str, str],
+    variables: dict[str, str] | None = None,
+) -> dict:
+    """Blocks for a green-flag stage script, with the stage's data IDs.
 
-    def _id(self) -> str:
-        self.counter += 1
-        return f"cattorch_benchmark_block_{self.counter}"
+    ``broadcasts`` maps each message to its ID, and ``lists`` and
+    ``variables`` map each name to the ID the stage declares it with.
+    """
+    variables = variables or {}
+    data = Program(
+        "benchmark stage", variables=tuple(variables), lists=tuple(lists),
+        body=tuple(statements), optimize_loops=False, when_flag_clicked=True,
+    ).compile()
+    mapping = {
+        **{f"cattorch_dsl_list_{name}": identifier for name, identifier in lists.items()},
+        **{f"cattorch_dsl_var_{name}": identifier for name, identifier in variables.items()},
+        **{
+            identifier: broadcasts[message]
+            for identifier, message in data["broadcasts"].items()
+        },
+    }
+    return remap_ids(data["blocks"], mapping)
 
-    def _base(self, opcode, parent):
-        return {
-            "opcode": opcode, "next": None, "parent": parent,
-            "inputs": {}, "fields": {}, "shadow": False, "topLevel": False,
-        }
 
-    def _chain(self, specs, parent):
-        first = previous = None
-        for spec in specs:
-            block_id = self._command(spec, parent if previous is None else previous)
-            if previous is not None:
-                self.blocks[previous]["next"] = block_id
-            else:
-                first = block_id
-            previous = block_id
-        return first, previous
+def _timed(label: str) -> object:
+    """``label: <seconds on the timer>``, for a results list."""
+    return join(f"{label}: ", timer())
 
-    def _command(self, spec, parent):
-        kind = spec[0]
-        block_id = self._id()
-        if kind == "clear":
-            name = spec[1]
-            block = self._base("data_deletealloflist", parent)
-            block["fields"]["LIST"] = [name, self.list_ids[name]]
-        elif kind == "reset_timer":
-            block = self._base("sensing_resettimer", parent)
-        elif kind == "broadcast":
-            message = spec[1]
-            block = self._base("event_broadcastandwait", parent)
-            block["inputs"]["BROADCAST_INPUT"] = [
-                1, [11, message, self.broadcast_ids[message]],
+
+def _paired_statements(warmups: int, repeats: int) -> list:
+    """Alternate the exact and fast sprites, recording each forward's time."""
+    exact, fast = "cattorch benchmark exact", "cattorch benchmark fast"
+    statements = [
+        clear(EXACT_TIMINGS), clear(FAST_TIMINGS),
+        repeat(warmups, (broadcast_and_wait(exact), broadcast_and_wait(fast))),
+    ]
+    for index in range(repeats):
+        order = (
+            ((exact, EXACT_TIMINGS), (fast, FAST_TIMINGS)) if index % 2 == 0
+            else ((fast, FAST_TIMINGS), (exact, EXACT_TIMINGS))
+        )
+        for message, timings in order:
+            statements += [reset_timer(), broadcast_and_wait(message), append(timings, timer())]
+    return statements
+
+
+def _suite_statements(cases: list[dict], iterations: int, warmups: int, variants) -> list:
+    """Initialize each case's variants, then time ``iterations`` forwards of each."""
+    statements = [clear(SUITE_RESULTS)]
+    for case in cases:
+        for variant in variants:
+            messages = case[variant]
+            statements.append(broadcast_and_wait(messages["init"]))
+            if warmups:
+                statements.append(repeat(warmups, (broadcast_and_wait(messages["forward"]),)))
+            statements += [
+                reset_timer(),
+                repeat(iterations, (broadcast_and_wait(messages["forward"]),)),
+                append(SUITE_RESULTS, _timed(f"{case['name']} {variant}")),
             ]
-        elif kind == "record":
-            name = spec[1]
-            block = self._base("data_addtolist", parent)
-            block["fields"]["LIST"] = [name, self.list_ids[name]]
-            reporter_id = self._id()
-            block["inputs"]["ITEM"] = [3, reporter_id, [4, 0]]
-            self.blocks[reporter_id] = {
-                **self._base("sensing_timer", block_id),
-            }
-        elif kind == "record_result":
-            name, label = spec[1], spec[2]
-            block = self._base("data_addtolist", parent)
-            block["fields"]["LIST"] = [name, self.list_ids[name]]
-            join_id = self._id()
-            timer_id = self._id()
-            block["inputs"]["ITEM"] = [3, join_id, [10, ""]]
-            self.blocks[join_id] = {
-                **self._base("operator_join", block_id),
-                "inputs": {
-                    "STRING1": [1, [10, f"{label}: "]],
-                    "STRING2": [3, timer_id, [10, ""]],
-                },
-            }
-            self.blocks[timer_id] = {
-                **self._base("sensing_timer", join_id),
-            }
-        elif kind == "set":
-            name, var_id, value = spec[1:]
-            block = self._base("data_setvariableto", parent)
-            block["fields"]["VARIABLE"] = [name, var_id]
-            block["inputs"]["VALUE"] = [1, [4, value]]
-        elif kind == "change_timer":
-            name, var_id = spec[1:]
-            block = self._base("data_changevariableby", parent)
-            block["fields"]["VARIABLE"] = [name, var_id]
-            timer_id = self._id()
-            block["inputs"]["VALUE"] = [3, timer_id, [4, 0]]
-            self.blocks[timer_id] = {**self._base("sensing_timer", block_id)}
-        elif kind == "record_result_var":
-            list_name, label, var_name, var_id = spec[1:]
-            block = self._base("data_addtolist", parent)
-            block["fields"]["LIST"] = [list_name, self.list_ids[list_name]]
-            join_id = self._id()
-            block["inputs"]["ITEM"] = [3, join_id, [10, ""]]
-            self.blocks[join_id] = {
-                **self._base("operator_join", block_id),
-                "inputs": {
-                    "STRING1": [1, [10, f"{label}: "]],
-                    "STRING2": [3, [12, var_name, var_id], [10, ""]],
-                },
-            }
-        elif kind == "repeat":
-            times, body = spec[1], spec[2]
-            block = self._base("control_repeat", parent)
-            block["inputs"]["TIMES"] = [1, [4, times]]
-            self.blocks[block_id] = block
-            substack, _ = self._chain(body, block_id)
-            block["inputs"]["SUBSTACK"] = [2, substack]
-            return block_id
-        else:
-            raise ValueError(kind)
-        self.blocks[block_id] = block
-        return block_id
+    return statements
 
-    def build(self, warmups: int, repeats: int):
-        exact_message = "cattorch benchmark exact"
-        fast_message = "cattorch benchmark fast"
-        specs = [
-            ("clear", EXACT_TIMINGS),
-            ("clear", FAST_TIMINGS),
-            ("repeat", warmups, (
-                ("broadcast", exact_message),
-                ("broadcast", fast_message),
-            )),
-        ]
-        for index in range(repeats):
-            order = (
-                ((exact_message, EXACT_TIMINGS), (fast_message, FAST_TIMINGS))
-                if index % 2 == 0 else
-                ((fast_message, FAST_TIMINGS), (exact_message, EXACT_TIMINGS))
-            )
-            for message, timings in order:
-                specs.extend((
-                    ("reset_timer",),
-                    ("broadcast", message),
-                    ("record", timings),
-                ))
 
-        hat_id = self._id()
-        first, _ = self._chain(tuple(specs), hat_id)
-        self.blocks[hat_id] = {
-            "opcode": "event_whenflagclicked", "next": first, "parent": None,
-            "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-            "x": 0, "y": 0,
-        }
-        return self.blocks
+def _storage_total(case: dict, variant: str) -> str:
+    return f"storage total {case['index']} {variant}"
 
-    def build_suite(
-        self,
-        cases: list[dict],
-        iterations: int,
-        warmups: int,
-        variants: tuple[str, str],
-    ):
-        specs = [("clear", SUITE_RESULTS)]
-        for case in cases:
-            for variant in variants:
-                messages = case[variant]
-                specs.append(("broadcast", messages["init"]))
-                if warmups:
-                    specs.append((
-                        "repeat", warmups,
-                        (("broadcast", messages["forward"]),),
-                    ))
-                specs.extend((
-                    ("reset_timer",),
-                    (
-                        "repeat", iterations,
-                        (("broadcast", messages["forward"]),),
-                    ),
-                    (
-                        "record_result", SUITE_RESULTS,
-                        f"{case['name']} {variant}",
-                    ),
-                ))
 
-        hat_id = self._id()
-        first, _ = self._chain(tuple(specs), hat_id)
-        self.blocks[hat_id] = {
-            "opcode": "event_whenflagclicked", "next": first, "parent": None,
-            "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-            "x": 0, "y": 0,
-        }
-        return self.blocks
-
-    def build_storage(self, cases: list[dict], iterations: int):
-        specs = [("clear", SUITE_RESULTS)]
-        for case in cases:
-            for variant in STORAGE_VARIANTS:
-                messages = case[variant]
-                variable_name = f"storage total {case['index']} {variant}"
-                variable_id = f"cattorch_storage_total_{case['index']}_{variant}"
-                specs.append(("set", variable_name, variable_id, 0))
-                specs.append((
-                    "repeat",
-                    iterations,
-                    (
-                        ("broadcast", messages["prepare"]),
-                        ("reset_timer",),
-                        ("broadcast", messages["init"]),
-                        ("change_timer", variable_name, variable_id),
-                    ),
-                ))
-                specs.append((
-                    "record_result_var", SUITE_RESULTS,
-                    f"{case['name']} {variant} init", variable_name, variable_id,
-                ))
-                specs.extend((
-                    ("broadcast", messages["restore"]),
-                    ("reset_timer",),
-                    ("repeat", iterations, (("broadcast", messages["forward"]),)),
-                    ("record_result", SUITE_RESULTS, f"{case['name']} {variant} forward"),
-                ))
-
-        hat_id = self._id()
-        first, _ = self._chain(tuple(specs), hat_id)
-        self.blocks[hat_id] = {
-            "opcode": "event_whenflagclicked", "next": first, "parent": None,
-            "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-            "x": 0, "y": 0,
-        }
-        return self.blocks
+def _storage_statements(cases: list[dict], iterations: int) -> list:
+    """Time decoding the weights, from saved storage, and then forwards."""
+    statements = [clear(SUITE_RESULTS)]
+    for case in cases:
+        for variant in STORAGE_VARIANTS:
+            messages = case[variant]
+            total = _storage_total(case, variant)
+            statements += [
+                set_var(total, 0),
+                repeat(iterations, (
+                    broadcast_and_wait(messages["prepare"]),
+                    reset_timer(),
+                    broadcast_and_wait(messages["init"]),
+                    change_var(total, timer()),
+                )),
+                append(SUITE_RESULTS, join(f"{case['name']} {variant} init: ", var(total))),
+                broadcast_and_wait(messages["restore"]),
+                reset_timer(),
+                repeat(iterations, (broadcast_and_wait(messages["forward"]),)),
+                append(SUITE_RESULTS, _timed(f"{case['name']} {variant} forward")),
+            ]
+    return statements
 
 
 def _stage_target(
@@ -572,9 +454,12 @@ def _build_suite(
 
     results_id = "cattorch_benchmark_suite_results"
     list_ids = {SUITE_RESULTS: results_id}
-    stage_blocks = _StageBlocks(broadcasts, list_ids).build_suite(
-        controller_cases, iterations, warmups,
-        tuple(variant for variant, _, _ in variants),
+    stage_blocks = _stage_blocks(
+        _suite_statements(
+            controller_cases, iterations, warmups,
+            tuple(variant for variant, _, _ in variants),
+        ),
+        broadcasts, list_ids,
     )
     stage, stage_md5ext, stage_bytes = _stage_target(
         stage_blocks,
@@ -710,8 +595,9 @@ def build_generation_benchmark_suite(
             controller_cases.append(controller)
 
     results_id = "cattorch_generation_benchmark_results"
-    stage_blocks = _StageBlocks(broadcasts, {SUITE_RESULTS: results_id}).build_suite(
-        controller_cases, iterations, 0, ("stateless", "cached"),
+    stage_blocks = _stage_blocks(
+        _suite_statements(controller_cases, iterations, 0, ("stateless", "cached")),
+        broadcasts, {SUITE_RESULTS: results_id},
     )
     stage, stage_md5ext, stage_bytes = _stage_target(
         stage_blocks,
@@ -812,8 +698,14 @@ def build_storage_benchmark_suite(
     results_id = "cattorch_storage_benchmark_results"
     sizes_id = "cattorch_storage_benchmark_sizes"
     list_ids = {SUITE_RESULTS: results_id, STORAGE_SIZES: sizes_id}
-    stage_builder = _StageBlocks(broadcasts, list_ids)
-    stage_blocks = stage_builder.build_storage(controller_cases, iterations)
+    stage_blocks = _stage_blocks(
+        _storage_statements(controller_cases, iterations), broadcasts, list_ids,
+        {
+            _storage_total(case, variant): f"cattorch_storage_total_{case['index']}_{variant}"
+            for case in controller_cases
+            for variant in variants
+        },
+    )
     stage_variables = {
         f"cattorch_storage_total_{case['index']}_{variant}": [
             f"storage total {case['index']} {variant}", 0,
@@ -905,7 +797,7 @@ def build_paired_benchmark(
         EXACT_TIMINGS: "cattorch_benchmark_exact_timings",
         FAST_TIMINGS: "cattorch_benchmark_fast_timings",
     }
-    stage_blocks = _StageBlocks(messages, timing_ids).build(warmups, repeats)
+    stage_blocks = _stage_blocks(_paired_statements(warmups, repeats), messages, timing_ids)
 
     stage_asset_id = hashlib.md5(b"cattorch benchmark stage").hexdigest()
     stage_md5ext = f"{stage_asset_id}.svg"

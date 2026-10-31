@@ -8,7 +8,8 @@ from pathlib import Path
 
 from cattorch.benchmark import (
     SUITE_RESULTS,
-    _StageBlocks,
+    _stage_blocks,
+    _timed,
     _add_broadcast_entry,
     _stage_target,
     _write_project,
@@ -45,6 +46,7 @@ from cattorch.util.scratch.dsl import (
     sub,
     var,
 )
+from cattorch.util.scratch.dsl import broadcast_and_wait, reset_timer  # noqa: E402
 
 
 OUTPUT = Path(__file__).parent / "artifacts" / "mythic_kernel_suite.sb3"
@@ -598,25 +600,18 @@ def main():
         _add_broadcast_entry(sprite, message, broadcasts[message], procedure)
 
     result_id = "cattorch_mythic_kernel_results"
-    builder = _StageBlocks(broadcasts, {SUITE_RESULTS: result_id})
-    specs = [("clear", SUITE_RESULTS)]
+    statements = [clear(SUITE_RESULTS)]
     for procedure, iterations in cases:
         message = f"benchmark {procedure}"
-        specs.extend((
-            ("broadcast", message),
-            ("reset_timer",),
-            ("repeat", iterations, (("broadcast", message),)),
-            ("record_result", SUITE_RESULTS, f"{procedure} x{iterations}"),
-        ))
-    hat = builder._id()
-    first, _ = builder._chain(tuple(specs), hat)
-    builder.blocks[hat] = {
-        "opcode": "event_whenflagclicked", "next": first, "parent": None,
-        "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-        "x": 0, "y": 0,
-    }
+        statements += [
+            broadcast_and_wait(message),
+            reset_timer(),
+            repeat(iterations, (broadcast_and_wait(message),)),
+            append(SUITE_RESULTS, _timed(f"{procedure} x{iterations}")),
+        ]
+    stage_blocks = _stage_blocks(statements, broadcasts, {SUITE_RESULTS: result_id})
     stage, stage_md5ext, stage_bytes = _stage_target(
-        builder.blocks, broadcasts, {result_id: [SUITE_RESULTS, []]},
+        stage_blocks, broadcasts, {result_id: [SUITE_RESULTS, []]},
     )
     monitor = {
         "id": result_id, "mode": "list", "opcode": "data_listcontents",

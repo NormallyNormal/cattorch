@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -232,3 +233,15 @@ def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
     said = [entry["text"] for entry in run_vm(project, tmp_path, answers=["the cat", ""])["said"]]
     text = "".join(CHARACTERS[index] for index in greedy(model, "the cat", 6))
     assert "the cat" + text in said
+
+
+def test_a_benchmark_suite_runs(tmp_path):
+    from cattorch import build_benchmark_suite
+
+    path = build_benchmark_suite(
+        [("first", nn.Linear(3, 2).eval(), torch.randn(2, 3))], tmp_path / "suite.sb3",
+        iterations=2,
+    )
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    results = stage["cattorch benchmark results"]
+    assert [entry.split(":")[0] for entry in results] == ["first exact", "first fast"]

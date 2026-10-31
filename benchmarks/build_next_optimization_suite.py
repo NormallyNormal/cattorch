@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cattorch.benchmark import (
     SUITE_RESULTS,
-    _StageBlocks,
+    _stage_blocks,
     _add_broadcast_entry,
     _stage_target,
     _write_project,
@@ -39,6 +39,7 @@ from cattorch.util.scratch.dsl import (
     sub,
     var,
 )
+from cattorch.util.scratch.dsl import broadcast_and_wait, days_since_2000, join  # noqa: E402
 
 
 OUTPUT = Path(__file__).parent / "artifacts" / "next_optimization_suite.sb3"
@@ -617,57 +618,15 @@ def _prefill_program(name: str, *, cache_only: bool) -> Program:
     )
 
 
-class _HighResolutionStageBlocks(_StageBlocks):
-    def _days_reporter(self, parent: str):
-        identifier = self._id()
-        self.blocks[identifier] = self._base("sensing_dayssince2000", parent)
-        return identifier
+def start_clock(variable: str):
+    """Note the time in a variable; ``days since 2000`` resolves below a millisecond."""
+    return set_var(variable, days_since_2000())
 
-    def _command(self, spec, parent):
-        kind = spec[0]
-        if kind == "set_days":
-            name, var_id = spec[1:]
-            block_id = self._id()
-            block = self._base("data_setvariableto", parent)
-            block["fields"]["VARIABLE"] = [name, var_id]
-            reporter = self._days_reporter(block_id)
-            block["inputs"]["VALUE"] = [3, reporter, [4, 0]]
-            self.blocks[block_id] = block
-            return block_id
-        if kind == "record_days":
-            list_name, label, var_name, var_id = spec[1:]
-            block_id = self._id()
-            block = self._base("data_addtolist", parent)
-            block["fields"]["LIST"] = [list_name, self.list_ids[list_name]]
-            join_id = self._id()
-            multiply_id = self._id()
-            subtract_id = self._id()
-            days_id = self._days_reporter(subtract_id)
-            block["inputs"]["ITEM"] = [3, join_id, [10, ""]]
-            self.blocks[join_id] = {
-                **self._base("operator_join", block_id),
-                "inputs": {
-                    "STRING1": [1, [10, f"{label}: "]],
-                    "STRING2": [3, multiply_id, [10, ""]],
-                },
-            }
-            self.blocks[multiply_id] = {
-                **self._base("operator_multiply", join_id),
-                "inputs": {
-                    "NUM1": [3, subtract_id, [4, 0]],
-                    "NUM2": [1, [4, 86_400]],
-                },
-            }
-            self.blocks[subtract_id] = {
-                **self._base("operator_subtract", multiply_id),
-                "inputs": {
-                    "NUM1": [3, days_id, [4, 0]],
-                    "NUM2": [3, [12, var_name, var_id], [10, ""]],
-                },
-            }
-            self.blocks[block_id] = block
-            return block_id
-        return super()._command(spec, parent)
+
+def record_since(results: str, label: str, variable: str):
+    """Append ``label: <seconds since start_clock(variable)>`` to ``results``."""
+    seconds = mul(sub(days_since_2000(), var(variable)), 86_400)
+    return append(results, join(f"{label}: ", seconds))
 
 
 def _sprite_target(name: str):
@@ -752,25 +711,20 @@ def main():
         _add_broadcast_entry(sprite, message, broadcasts[message], name)
 
     result_id = "cattorch_next_optimization_results"
-    builder = _HighResolutionStageBlocks(broadcasts, {SUITE_RESULTS: result_id})
-    specs = [("clear", SUITE_RESULTS)]
+    statements = [clear(SUITE_RESULTS)]
     for name, iterations in cases:
         message = f"benchmark {name}"
-        specs.extend((
-            ("broadcast", message),
-            ("set_days", START_DAYS, START_DAYS_ID),
-            ("repeat", iterations, (("broadcast", message),)),
-            ("record_days", SUITE_RESULTS, f"{name} x{iterations}", START_DAYS, START_DAYS_ID),
-        ))
-    hat = builder._id()
-    first, _ = builder._chain(tuple(specs), hat)
-    builder.blocks[hat] = {
-        "opcode": "event_whenflagclicked", "next": first, "parent": None,
-        "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-        "x": 0, "y": 0,
-    }
+        statements += [
+            broadcast_and_wait(message),
+            start_clock(START_DAYS),
+            repeat(iterations, (broadcast_and_wait(message),)),
+            record_since(SUITE_RESULTS, f"{name} x{iterations}", START_DAYS),
+        ]
+    stage_blocks = _stage_blocks(
+        statements, broadcasts, {SUITE_RESULTS: result_id}, {START_DAYS: START_DAYS_ID},
+    )
     stage, stage_md5ext, stage_bytes = _stage_target(
-        builder.blocks,
+        stage_blocks,
         broadcasts,
         {result_id: [SUITE_RESULTS, []]},
         {

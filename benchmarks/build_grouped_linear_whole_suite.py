@@ -11,7 +11,8 @@ from build_suite import TinyGPT
 from cattorch import StorageConfig, transpile
 from cattorch.benchmark import (
     SUITE_RESULTS,
-    _StageBlocks,
+    _stage_blocks,
+    _timed,
     _add_broadcast_entry,
     _load_sprite,
     _set_inputs,
@@ -19,6 +20,7 @@ from cattorch.benchmark import (
     _write_project,
 )
 from cattorch.util.instruction.optimized import LinearInstruction
+from cattorch.util.scratch.dsl import append, broadcast_and_wait, clear, repeat, reset_timer  # noqa: E402
 
 
 OUTPUT = Path(__file__).parent / "artifacts" / "grouped_linear_whole_suite.sb3"
@@ -89,25 +91,18 @@ def main():
         controller.append((name, messages))
 
     result_id = "cattorch_grouped_whole_results"
-    builder = _StageBlocks(broadcasts, {SUITE_RESULTS: result_id})
-    specs = [("clear", SUITE_RESULTS)]
+    statements = [clear(SUITE_RESULTS)]
     for name, messages in controller:
-        specs.extend((
-            ("broadcast", messages["init"]),
-            ("broadcast", messages["forward"]),
-            ("reset_timer",),
-            ("repeat", ITERATIONS, (("broadcast", messages["forward"]),)),
-            ("record_result", SUITE_RESULTS, f"{name} forward{ITERATIONS}"),
-        ))
-    hat = builder._id()
-    first, _ = builder._chain(tuple(specs), hat)
-    builder.blocks[hat] = {
-        "opcode": "event_whenflagclicked", "next": first, "parent": None,
-        "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-        "x": 0, "y": 0,
-    }
+        statements += [
+            broadcast_and_wait(messages["init"]),
+            broadcast_and_wait(messages["forward"]),
+            reset_timer(),
+            repeat(ITERATIONS, (broadcast_and_wait(messages["forward"]),)),
+            append(SUITE_RESULTS, _timed(f"{name} forward{ITERATIONS}")),
+        ]
+    stage_blocks = _stage_blocks(statements, broadcasts, {SUITE_RESULTS: result_id})
     stage, stage_md5ext, stage_bytes = _stage_target(
-        builder.blocks,
+        stage_blocks,
         broadcasts,
         {result_id: [SUITE_RESULTS, []]},
         {

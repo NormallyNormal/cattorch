@@ -109,6 +109,16 @@ class CostumeNumber(Expr):
     """
 
 
+@dataclass(frozen=True)
+class Timer(Expr):
+    """Seconds since the timer was last reset."""
+
+
+@dataclass(frozen=True)
+class DaysSince2000(Expr):
+    """Days since 2000-01-01, with sub-millisecond resolution."""
+
+
 def value(expr: Expr | int | float | str) -> Expr:
     return expr if isinstance(expr, Expr) else Literal(expr)
 
@@ -286,6 +296,11 @@ class BroadcastAndWait(Statement):
 
 
 @dataclass(frozen=True)
+class ResetTimer(Statement):
+    pass
+
+
+@dataclass(frozen=True)
 class Ask(Statement):
     question: Expr
 
@@ -386,6 +401,18 @@ def broadcast_and_wait(message: str) -> BroadcastAndWait:
     return BroadcastAndWait(message)
 
 
+def reset_timer() -> ResetTimer:
+    return ResetTimer()
+
+
+def timer() -> Timer:
+    return Timer()
+
+
+def days_since_2000() -> DaysSince2000:
+    return DaysSince2000()
+
+
 def ask(question) -> Ask:
     """Show ``question`` and wait for the user to type an answer."""
     return Ask(value(question))
@@ -447,8 +474,11 @@ class Program:
         variable_values: Mapping[str, int | float | str] | None = None,
         body: Iterable[Statement] = (),
         optimize_loops: bool = True,
+        when_flag_clicked: bool = False,
     ):
         self.name = name
+        # Start the stack with a green-flag hat instead of leaving it loose.
+        self.when_flag_clicked = when_flag_clicked
         self.variables = tuple(variables)
         self.lists = tuple(lists)
         self.list_values = {
@@ -504,6 +534,11 @@ class _Lowerer:
         if self.program.optimize_loops:
             statements = _optimize_index_loops(statements)
         root, _ = self._statements(statements, None)
+        if self.program.when_flag_clicked:
+            hat = self._id()
+            self.blocks[hat] = {**self._base("event_whenflagclicked", None), "next": root}
+            self.blocks[root]["parent"] = hat
+            root = hat
         self.blocks[root]["topLevel"] = True
         self.blocks[root]["x"] = 0
         self.blocks[root]["y"] = 0
@@ -633,6 +668,8 @@ class _Lowerer:
                 1, [11, statement.message, broadcast_id],
             ]
             self.blocks[block_id] = block
+        elif isinstance(statement, ResetTimer):
+            self.blocks[block_id] = self._base("sensing_resettimer", parent)
         elif isinstance(statement, Ask):
             block = self._base("sensing_askandwait", parent)
             self.blocks[block_id] = block
@@ -737,6 +774,10 @@ class _Lowerer:
             block["inputs"]["TO"] = self._expr(expr.high, block_id)
         elif isinstance(expr, Answer):
             self.blocks[block_id] = self._base("sensing_answer", parent)
+        elif isinstance(expr, Timer):
+            self.blocks[block_id] = self._base("sensing_timer", parent)
+        elif isinstance(expr, DaysSince2000):
+            self.blocks[block_id] = self._base("sensing_dayssince2000", parent)
         elif isinstance(expr, CostumeNumber):
             block = self._base("looks_costumenumbername", parent)
             block["fields"]["NUMBER_NAME"] = ["number", None]
@@ -1037,6 +1078,10 @@ def _render_expr(expr: Expr) -> str:
         return "costume_number()"
     if isinstance(expr, Answer):
         return "answer()"
+    if isinstance(expr, Timer):
+        return "timer()"
+    if isinstance(expr, DaysSince2000):
+        return "days_since_2000()"
     raise TypeError(type(expr).__name__)
 
 
@@ -1095,3 +1140,5 @@ def _render_statements(statements: Iterable[Statement], lines: list[str], depth:
             lines.append(f"{indent}ask {_render_expr(statement.question)} and wait")
         elif isinstance(statement, Say):
             lines.append(f"{indent}say {_render_expr(statement.message)}")
+        elif isinstance(statement, ResetTimer):
+            lines.append(f"{indent}reset timer")

@@ -26,9 +26,12 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from build_next_optimization_suite import (
-    _HighResolutionStageBlocks,
+    record_since,
+    start_clock,
     _sprite_target,
 )
+from cattorch.util.scratch.dsl import broadcast_and_wait  # noqa: E402
+from cattorch.benchmark import _stage_blocks  # noqa: E402
 
 
 OUTPUT = Path("/tmp/cattorch_rope_redteam.sb3")
@@ -251,41 +254,26 @@ def main() -> None:
         _add_broadcast_entry(sprite, message, identifier, program.name)
 
     result_id = "cattorch_rope_redteam_results"
-    builder = _HighResolutionStageBlocks(broadcasts, {SUITE_RESULTS: result_id})
-    specs = [("clear", SUITE_RESULTS)]
+    statements = [clear(SUITE_RESULTS)]
     for program in programs:
-        specs.append(("broadcast", f"benchmark {program.name}"))
+        statements.append(broadcast_and_wait(f"benchmark {program.name}"))
     for trial in range(TRIALS):
         ordered = programs[trial:] + programs[:trial]
         for program in ordered:
             message = f"benchmark {program.name}"
-            specs.extend((
-                ("set_days", START_DAYS, START_DAYS_ID),
-                ("repeat", ITERATIONS, (("broadcast", message),)),
-                (
-                    "record_days",
-                    SUITE_RESULTS,
-                    f"{program.name} trial{trial + 1} x{ITERATIONS}",
-                    START_DAYS,
-                    START_DAYS_ID,
+            statements += [
+                start_clock(START_DAYS),
+                repeat(ITERATIONS, (broadcast_and_wait(message),)),
+                record_since(
+                    SUITE_RESULTS, f"{program.name} trial{trial + 1} x{ITERATIONS}", START_DAYS,
                 ),
-            ))
+            ]
+    stage_blocks = _stage_blocks(
+        statements, broadcasts, {SUITE_RESULTS: result_id}, {START_DAYS: START_DAYS_ID},
+    )
 
-    hat = builder._id()
-    first, _ = builder._chain(tuple(specs), hat)
-    builder.blocks[hat] = {
-        "opcode": "event_whenflagclicked",
-        "next": first,
-        "parent": None,
-        "inputs": {},
-        "fields": {},
-        "shadow": False,
-        "topLevel": True,
-        "x": 0,
-        "y": 0,
-    }
     stage, stage_md5ext, stage_bytes = _stage_target(
-        builder.blocks,
+        stage_blocks,
         broadcasts,
         {result_id: [SUITE_RESULTS, []]},
         {

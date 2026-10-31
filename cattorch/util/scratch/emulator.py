@@ -20,6 +20,7 @@ Usage
 """
 
 import math
+import time
 from collections import Counter
 
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
@@ -134,6 +135,8 @@ class ScratchEmulator:
         self.on_ask = None
         self.said: list = []
         self._answer = stage._answer if stage is not None else [""]
+        # One timer per project, as in Scratch: when it was last reset.
+        self._timer_start = stage._timer_start if stage is not None else [time.perf_counter()]
         self._chains: dict = {}
 
         # Variables stored by ID; a sprite shares the stage's dictionaries,
@@ -421,6 +424,13 @@ class ScratchEmulator:
                     raise RuntimeError(f"ask and wait without an answer: {asked}")
                 answer[0] = self.on_ask(asked)
 
+        elif opcode == "sensing_resettimer":
+            started = self._timer_start
+
+            def run():
+                counts[opcode] += 1
+                started[0] = time.perf_counter()
+
         elif opcode in {"looks_say", "looks_think"}:
             message = value_of(inputs["MESSAGE"])
             said = self.said
@@ -596,6 +606,14 @@ class ScratchEmulator:
         if opcode == "sensing_answer":
             answer = self._answer
             return lambda: answer[0]
+
+        if opcode == "sensing_timer":
+            started = self._timer_start
+            return lambda: time.perf_counter() - started[0]
+
+        if opcode == "sensing_dayssince2000":
+            epoch = 946_684_800  # 2000-01-01 in Unix time
+            return lambda: (time.time() - epoch) / 86_400
 
         if opcode == "operator_random":
             low_of = number_of(inputs["FROM"])

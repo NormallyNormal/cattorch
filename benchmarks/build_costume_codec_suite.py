@@ -46,9 +46,12 @@ from cattorch.util.scratch.dsl import (
 from build_next_optimization_suite import (
     START_DAYS,
     START_DAYS_ID,
-    _HighResolutionStageBlocks,
+    record_since,
+    start_clock,
     _sprite_target,
 )
+from cattorch.util.scratch.dsl import broadcast_and_wait  # noqa: E402
+from cattorch.benchmark import _stage_blocks  # noqa: E402
 
 # The earlier codec this suite compares against.
 BASE85_ALPHABET = BASE92_ALPHABET[:85]
@@ -305,25 +308,20 @@ def main() -> None:
         _add_broadcast_entry(sprite, message, broadcasts[message], name)
 
     result_id = "cattorch_costume_codec_results"
-    builder = _HighResolutionStageBlocks(broadcasts, {SUITE_RESULTS: result_id})
-    specs = [("clear", SUITE_RESULTS)]
+    statements = [clear(SUITE_RESULTS)]
     for name, _ in programs:
         message = f"benchmark {name}"
-        specs.extend((
-            ("broadcast", message),
-            ("set_days", START_DAYS, START_DAYS_ID),
-            ("repeat", ITERATIONS, (("broadcast", message),)),
-            ("record_days", SUITE_RESULTS, f"{name} x{ITERATIONS}", START_DAYS, START_DAYS_ID),
-        ))
-    hat = builder._id()
-    first, _ = builder._chain(tuple(specs), hat)
-    builder.blocks[hat] = {
-        "opcode": "event_whenflagclicked", "next": first, "parent": None,
-        "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
-        "x": 0, "y": 0,
-    }
+        statements += [
+            broadcast_and_wait(message),
+            start_clock(START_DAYS),
+            repeat(ITERATIONS, (broadcast_and_wait(message),)),
+            record_since(SUITE_RESULTS, f"{name} x{ITERATIONS}", START_DAYS),
+        ]
+    stage_blocks = _stage_blocks(
+        statements, broadcasts, {SUITE_RESULTS: result_id}, {START_DAYS: START_DAYS_ID},
+    )
     stage, stage_md5ext, stage_bytes = _stage_target(
-        builder.blocks,
+        stage_blocks,
         broadcasts,
         {result_id: [SUITE_RESULTS, []]},
         {
