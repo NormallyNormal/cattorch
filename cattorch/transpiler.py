@@ -84,6 +84,10 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 log = logging.getLogger(__name__)
 
 _LAYER_CACHE_BASE = "cattorch layer cache base"
+_PROJECT_OUTPUT = "cattorch project output"
+# 1 when a shared layer computes past its K/V append: always, except in the
+# final layer for a hidden prefill token.
+_LAYER_TAIL = "cattorch layer tail"
 
 
 def _bank_generation_caches(graph: _GraphInfo) -> bool:
@@ -136,6 +140,46 @@ def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
         ):
             query_only.add(node.name)
     return query_only
+
+
+def _shared_layer_attention(graph: _GraphInfo) -> str:
+    """The cached attention of layer zero, whose code the shared layer runs."""
+    by_name = {node.name: node for node in graph.nodes}
+    return next(
+        name for name in graph.generation.score_caches if _graph_layer(by_name[name]) == 0
+    )
+
+
+def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attention: str) -> None:
+    """Skip what a hidden prefill token never reads in ``attention``'s layer.
+
+    That is the query, which only feeds the attention output, and everything
+    after the attention. Its K/V append still runs. In a shared layer, the
+    work stops at the end of the layer's code and the gate is the layer tail;
+    otherwise it runs to the end of the step.
+    """
+    gate = _LAYER_TAIL if graph.generation.banked_caches else _PROJECT_OUTPUT
+    root_entries = compiler.emitted_roots
+    root_names = [name for name, _ in root_entries]
+    attention_position = root_names.index(attention)
+    if attention_position + 1 < len(root_entries):
+        following = root_entries[attention_position + 1][1]
+        # In a shared layer, a following root of another layer was removed.
+        if following in sprite["blocks"]:
+            _guard_generation_suffix(sprite, following, gate)
+    query_only = _query_only_nodes(graph, attention)
+    position = 0
+    while position < attention_position:
+        if root_names[position] not in query_only:
+            position += 1
+            continue
+        end = position
+        while end < attention_position and root_names[end] in query_only:
+            end += 1
+        _guard_generation_range(
+            sprite, root_entries[position][1], root_entries[end][1], gate,
+        )
+        position = end
 
 
 def _wrap_transactional_generation_step(
@@ -322,12 +366,17 @@ class _Compiler:
         if str(node.target) != "cattorch.cached_attention.default":
             return {}
         if generation.banked_caches:
-            return {
+            options: dict[str, object] = {
                 "cache_stride": generation.cache_widths[generation.score_caches[node.name]],
                 "cache_base_variable": _LAYER_CACHE_BASE,
             }
+            if generation.hidden_prefill_attention is not None:
+                # Every shared layer reads the gate; only the final one sets it
+                # to skip work for hidden prefill tokens.
+                options["hidden_prefill_gate"] = _LAYER_TAIL
+            return options
         if node.name == generation.hidden_prefill_attention:
-            return {"hidden_prefill_last": True}
+            return {"hidden_prefill_gate": _PROJECT_OUTPUT}
         return {}
 
     # ── public ───────────────────────────────────────────────────────────
@@ -2094,7 +2143,14 @@ def _transpile(
     )
     sprite = tensor_adder.apply(sprite, list(graph.input_names.values()))
     if codegen.layer_sharing == "auto":
-        shared = _share_repeated_transformer_layers(sprite, compiler, storage)
+        hidden_layers = (
+            generation is not None and graph.generation.banked_caches
+            and graph.generation.hidden_prefill_attention is not None
+        )
+        shared = _share_repeated_transformer_layers(
+            sprite, compiler, storage,
+            layer_tail=(_LAYER_TAIL, _PROJECT_OUTPUT) if hidden_layers else None,
+        )
         if shared:
             log.info("Factored repeated transformer layers into one shared procedure")
         elif generation is not None and graph.generation.banked_caches:
@@ -2162,32 +2218,32 @@ def _transpile(
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
             hidden_attention = graph.generation.hidden_prefill_attention
-            if (
-                not graph.generation.banked_caches
-                and hidden_attention in root_names
+            if graph.generation.banked_caches:
+                # The shared layer is layer zero's code, gated by the layer
+                # tail variable the calls set.
+                _guard_hidden_layer_tail(sprite, graph, compiler, _shared_layer_attention(graph))
+                # After the layers, only the logits remain.
+                by_name = {node.name: node for node in graph.nodes}
+                last_layer = max(
+                    position for position, name in enumerate(root_names)
+                    if name in by_name and _graph_layer(by_name[name]) is not None
+                )
+                if last_layer + 1 >= len(root_entries):
+                    raise ValueError("hidden prefill requires a compiled output projection")
+                _guard_generation_suffix(
+                    sprite, root_entries[last_layer + 1][1], _PROJECT_OUTPUT,
+                )
+                _merge_variables_by_name(sprite, {_PROJECT_OUTPUT, _LAYER_TAIL})
+            elif (
+                hidden_attention in root_names
                 and root_names.index(hidden_attention) + 1 < len(root_entries)
             ):
                 # Keep the final layer's K/V append, skip its attention output
                 # and everything after it for hidden prompt tokens.
                 for entry in sprite.get("variables", {}).values():
-                    if entry[0] == "cattorch project output":
+                    if entry[0] == _PROJECT_OUTPUT:
                         entry[1] = 1
-                attention_position = root_names.index(hidden_attention)
-                _guard_generation_suffix(sprite, root_entries[attention_position + 1][1])
-                # The final layer's query only feeds that attention output.
-                query_only = _query_only_nodes(graph, hidden_attention)
-                position = 0
-                while position < attention_position:
-                    if root_names[position] not in query_only:
-                        position += 1
-                        continue
-                    end = position
-                    while end < attention_position and root_names[end] in query_only:
-                        end += 1
-                    _guard_generation_range(
-                        sprite, root_entries[position][1], root_entries[end][1],
-                    )
-                    position = end
+                _guard_hidden_layer_tail(sprite, graph, compiler, hidden_attention)
             else:
                 if not compiler.emitted_roots:
                     raise ValueError(

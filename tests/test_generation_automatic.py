@@ -149,15 +149,18 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     )
 
 
-def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, sharing):
     torch.manual_seed(13)
     model = CachedLM(context=16, layers=2).eval()
     counts = {}
     for hidden in (False, True):
         emulator, _ = emulator_for(
-            model, tmp_path, f"unshared_{hidden}", max_context=16,
-            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing="off"),
+            model, tmp_path, f"{sharing}_{hidden}", max_context=16,
+            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing),
         )
+        shared = "_cattorch shared transformer layer" in emulator._procedures
+        assert shared == (sharing == "auto")
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
         emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6, 7, 8]

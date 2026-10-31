@@ -320,13 +320,16 @@ def _program_stack(sprite: dict, program) -> tuple[str, str]:
 
 
 def _share_repeated_transformer_layers(
-    sprite: dict, compiler, storage: StorageConfig,
+    sprite: dict, compiler, storage: StorageConfig, *,
+    layer_tail: tuple[str, str] | None = None,
 ) -> bool:
     """Factor structurally identical ``blocks.N`` slabs into one warp block.
 
     Scratch cannot pass lists to custom blocks. The shared slab therefore uses
     the first layer's activation lists, copies only its final hidden state
     between calls, and selects concatenated weight banks through scalar bases.
+    ``layer_tail`` is ``(gate, final)``: the gate variable is set to 1 before
+    each call, and to the ``final`` variable's value before the last one.
     """
     def reject(reason: str) -> bool:
         log.info("Shared transformer layer skipped: %s", reason)
@@ -586,6 +589,9 @@ def _share_repeated_transformer_layers(
     )
     for layer in layers:
         body.extend(set_var(name, layer * size) for name, size in base_variables)
+        if layer_tail is not None:
+            gate, final = layer_tail
+            body.append(set_var(gate, var(final) if layer == layers[-1] else 1))
         if cache_base is not None:
             body.append(set_var(
                 cache_base,
@@ -613,6 +619,7 @@ def _share_repeated_transformer_layers(
             copy_index,
             *(name for name, _ in base_variables),
             *((cache_base,) if cache_base is not None else ()),
+            *(layer_tail or ()),
         ),
         lists=tuple(dict.fromkeys((input_list, output_list, final_output_list))),
         body=tuple(body),
@@ -639,6 +646,8 @@ def _share_repeated_transformer_layers(
     )
     if cache_base is not None:
         _merge_variables_by_name(sprite, {cache_base})
+    if layer_tail is not None:
+        _merge_variables_by_name(sprite, set(layer_tail))
     return True
 
 
@@ -1621,8 +1630,13 @@ def _guard_generation_output(sprite: dict, output_root: str) -> None:
     blocks[output_root]["parent"] = guard
 
 
-def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
-    """Skip the final attention/MLP suffix after direct K/V cache emission."""
+def _guard_generation_suffix(
+    sprite: dict, suffix_root: str, gate: str = "cattorch project output",
+) -> None:
+    """Skip the final attention/MLP suffix after direct K/V cache emission.
+
+    The suffix runs while the ``gate`` variable is 1.
+    """
     blocks = sprite["blocks"]
     predecessors = [
         identifier
@@ -1634,11 +1648,13 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
             f"expected one final QKV suffix predecessor, got {predecessors}"
         )
     predecessor = predecessors[0]
+    variables = sprite.setdefault("variables", {})
     variable_id = next(
-        identifier
-        for identifier, entry in sprite.get("variables", {}).items()
-        if entry[0] == "cattorch project output"
+        (identifier for identifier, entry in variables.items() if entry[0] == gate), None,
     )
+    if variable_id is None:
+        variable_id = f"cattorch_gate_{uuid.uuid4().hex[:8]}"
+        variables[variable_id] = [gate, 1]
     token = uuid.uuid4().hex[:8]
     guard = f"cattorch_hidden_suffix_{token}_guard"
     condition = f"cattorch_hidden_suffix_{token}_condition"
@@ -1654,11 +1670,7 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     blocks[condition] = {
         "opcode": "operator_equals", "next": None, "parent": guard,
         "inputs": {
-            "OPERAND1": [
-                3,
-                [12, "cattorch project output", variable_id],
-                [10, ""],
-            ],
+            "OPERAND1": [3, [12, gate, variable_id], [10, ""]],
             "OPERAND2": [1, [4, 1]],
         },
         "fields": {}, "shadow": False, "topLevel": False,
@@ -1666,7 +1678,9 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     blocks[suffix_root]["parent"] = guard
 
 
-def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
+def _guard_generation_range(
+    sprite: dict, start: str, stop: str, gate: str = "cattorch project output",
+) -> None:
     """Run the chain from ``start`` up to ``stop`` only for projected tokens.
 
     Hidden prefill tokens never read what this range computes, such as the
@@ -1679,7 +1693,7 @@ def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
     if blocks[last].get("next") != stop:
         raise ValueError("the guarded range does not end at the next operation")
     blocks[last]["next"] = None
-    _guard_generation_suffix(sprite, start)
+    _guard_generation_suffix(sprite, start, gate)
     guard = blocks[start]["parent"]
     blocks[guard]["next"] = stop
     blocks[stop]["parent"] = guard

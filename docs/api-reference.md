@@ -282,7 +282,7 @@ multiplications. See [optimization modes](optimization.md#weight-transforms).
 |---|---:|---|
 | `max_context` | required | Maximum number of tokens the cache holds. The only positional field; the others are keyword-only. |
 | `method` | `"forward"` | Name of the model method that takes token IDs and returns next-token logits for every position. |
-| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. Without layer sharing, the final layer's query, attention output and MLP are skipped too. |
+| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. The final layer's query, attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 
 See [KV-cached generation](generation.md) for model requirements and the

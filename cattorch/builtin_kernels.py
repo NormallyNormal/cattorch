@@ -433,10 +433,11 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
         set_var("heads_on_key", 0),
         repeat(heads, head),
     )
-    if ctx.options.get("hidden_prefill_last"):
+    gate = ctx.options.get("hidden_prefill_gate")
+    if gate:
         # The final layer's attention output only feeds the logits, which a
         # hidden prefill token never reads: keep the cache append, skip the rest.
-        attend = (if_(eq(var(ctx.temp_var("cattorch project output")), 1), attend),)
+        attend = (if_(eq(var(ctx.temp_var(str(gate))), 1), attend),)
     return (
         *append_row(k.list, k_cache.list, key_row),
         *append_row(v.list, v_cache.list, value_row),

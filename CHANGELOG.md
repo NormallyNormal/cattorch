@@ -222,6 +222,10 @@
   Qwen2 and Mistral) runs as one rotary loop instead of slices, negation,
   `cat` and three elementwise passes. A two-layer Llama sprite has about 14%
   fewer blocks.
+- Hidden prefill skips the final layer's query, attention output and MLP for
+  prompt tokens when layers are shared too, not just the output head. A
+  three-layer shared model runs about 18% fewer Scratch operations for an
+  8-token prompt.
 
 ## Fixes
 

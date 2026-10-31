@@ -65,7 +65,8 @@ inside cattorch:
   `FastConfig` flag.
 - `ctx.options` holds facts the compiler decides after the operation is
   known, such as the row stride and base variable of banked generation caches,
-  or that this is the final layer during hidden prefill. It is empty in
+  or the variable that lets the final layer skip its attention during hidden
+  prefill. It is empty in
   validators. An option that differs between repeated layers prevents layer
   sharing, so pass one only when it is identical for them.
 - A tensor input that the compiler binds to a persistent named list, such as a
