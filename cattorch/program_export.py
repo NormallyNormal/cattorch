@@ -6,7 +6,6 @@ import math
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import torch
 from torch import nn
@@ -34,13 +33,12 @@ from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
 )
-from cattorch.util.scratch.archive import read_json
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
     Program, add, append, broadcast_and_wait, call, clear, eq, for_each, gt, if_,
     item, length, lt, mod, set_var, var,
 )
-from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.interface import (
     rename_list as _rename_list, rename_variable as _rename_variable,
     rename_procedure as _rename_procedure, refresh_data_display_name,
@@ -424,147 +422,158 @@ def transpile_program(
     sharded_names: set[str] = set()
     interface_capacities: dict[str, int] = {}
     payload_names: set[str] = set()
-    with TemporaryDirectory(prefix="cattorch-program-") as directory:
-        from cattorch.transpiler import _transpile
+    # Each entry point's sprite stays in memory; only the program is
+    # finalized and written.
+    entry_sprites: list[dict] = []
 
-        for position, entrypoint in enumerate(program.entrypoints):
-            if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
-                raise ValueError(
-                    f"model has no callable method {entrypoint.method!r} for "
-                    f"entrypoint {entrypoint.name!r}"
-                )
-            args, dynamic_inputs = entry_examples(program, entrypoint)
-            wrapper = MethodModule(prepared_model, entrypoint.method)
-            temporary_path = Path(directory) / f"entry_{position}.sprite3"
-            sub_codegen = replace(
-                codegen,
-                compact_internal_names=False,
-                compact_schema=False,
-                id_namespace=None,
-            )
-            def capture(arguments, dynamic):
-                return _transpile(
-                    wrapper,
-                    tuple(arguments),
-                    temporary_path,
-                    sig_figs,
-                    name=sprite_name,
-                    optimization=optimization,
-                    fast_config=fast_config,
-                    storage=resolved_storage,
-                    quantization=quantization,
-                    calibration_inputs=None,
-                    codegen=sub_codegen,
-                    frontend="fx",
-                    _registry=registry,
-                    _prepared_model=True,
-                    _prepared_quantization_report=quantization_report,
-                    _dynamic_inputs=dynamic,
-                    _defer_interface_sharding=True,
-                )
+    def keep_entry(sprite, output_path, **_options) -> FinalizedSprite:
+        entry_sprites.append(sprite)
+        return FinalizedSprite(
+            path=Path(output_path), archive_bytes=0, expanded_json_bytes=0, asset_id="",
+            warnings=(),
+        )
 
-            try:
-                sub_result = capture(args, dynamic_inputs)
-            except UnsupportedModelError as error:
-                sub_result = _entry_by_item(
-                    error, entrypoint, wrapper, args, dynamic_inputs, capture,
-                )
-                sub_warnings.append(
-                    f"entry point {entrypoint.name!r} runs once per item of its "
-                    "variable-length input, because its operations can't take a "
-                    "variable length directly"
-                )
-            if len(sub_result.inputs) != len(entrypoint.arguments):
-                raise UnsupportedModelError(
-                    f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
-                )
-            validate_entry_outputs(program, entrypoint, sub_result.outputs)
-            sprite = read_json(temporary_path)
+    from cattorch.transpiler import _transpile
 
-            storage_names = _namespace_entry_storage(sprite, entrypoint.name)
-            payload_names.update(new for old, new in storage_names.items() if not old.startswith("W_"))
+    for position, entrypoint in enumerate(program.entrypoints):
+        if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
+            raise ValueError(
+                f"model has no callable method {entrypoint.method!r} for "
+                f"entrypoint {entrypoint.name!r}"
+            )
+        args, dynamic_inputs = entry_examples(program, entrypoint)
+        wrapper = MethodModule(prepared_model, entrypoint.method)
+        sub_codegen = replace(
+            codegen,
+            compact_internal_names=False,
+            compact_schema=False,
+            id_namespace=None,
+        )
+        def capture(arguments, dynamic, edit=None):
+            return _transpile(
+                wrapper,
+                tuple(arguments),
+                output_path,
+                sig_figs,
+                name=sprite_name,
+                optimization=optimization,
+                fast_config=fast_config,
+                storage=resolved_storage,
+                quantization=quantization,
+                calibration_inputs=None,
+                codegen=sub_codegen,
+                frontend="fx",
+                _registry=registry,
+                _prepared_model=True,
+                _prepared_quantization_report=quantization_report,
+                _dynamic_inputs=dynamic,
+                _defer_interface_sharding=True,
+                _edit_sprite=edit,
+                _finalize=keep_entry,
+            )
 
-            internal = f"_cattorch {entrypoint.name} compute"
-            _rename_procedure(sprite, "cattorch forward", internal)
-            _rename_procedure(sprite, "cattorch init", f"_cattorch {entrypoint.name} init")
-            _rename_procedure(
-                sprite, "cattorch prepare for save",
-                f"_cattorch {entrypoint.name} prepare for save",
+        try:
+            sub_result = capture(args, dynamic_inputs)
+        except UnsupportedModelError as error:
+            sub_result = _entry_by_item(
+                error, entrypoint, wrapper, args, dynamic_inputs, capture,
             )
-            _rename_variable(
-                sprite, "cattorch initialized",
-                f"_cattorch {entrypoint.name} initialized",
+            sub_warnings.append(
+                f"entry point {entrypoint.name!r} runs once per item of its "
+                "variable-length input, because its operations can't take a "
+                "variable length directly"
             )
-            _namespace_entry_procedures(sprite, entrypoint.name)
-            for index, binding in enumerate(entrypoint.arguments):
-                old = input_name(index)
-                new = (
-                    _input_list(entrypoint.name, binding.name)
-                    if isinstance(binding, Input) else _state_list(binding.name)
-                )
-                _rename_list(sprite, old, new)
-                spec = sub_result.inputs[index]
-                interface_capacities[new] = max(
-                    interface_capacities.get(new, 0), spec.max_numel or 0,
-                )
-            for index in range(len(entrypoint.returns)):
-                old = output_name(index)
-                _rename_list(sprite, old, _temporary_return(entrypoint.name, index))
-                interface_capacities[_temporary_return(entrypoint.name, index)] = (
-                    sub_result.outputs[index].max_numel or 0
-                )
+        if len(sub_result.inputs) != len(entrypoint.arguments):
+            raise UnsupportedModelError(
+                f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
+            )
+        validate_entry_outputs(program, entrypoint, sub_result.outputs)
+        sprite = entry_sprites.pop()
 
-            combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
-            wrapper_program, output_specs = _build_entry_wrapper(
-                entrypoint, sub_result, program,
+        storage_names = _namespace_entry_storage(sprite, entrypoint.name)
+        payload_names.update(new for old, new in storage_names.items() if not old.startswith("W_"))
+
+        internal = f"_cattorch {entrypoint.name} compute"
+        _rename_procedure(sprite, "cattorch forward", internal)
+        _rename_procedure(sprite, "cattorch init", f"_cattorch {entrypoint.name} init")
+        _rename_procedure(
+            sprite, "cattorch prepare for save",
+            f"_cattorch {entrypoint.name} prepare for save",
+        )
+        _rename_variable(
+            sprite, "cattorch initialized",
+            f"_cattorch {entrypoint.name} initialized",
+        )
+        _namespace_entry_procedures(sprite, entrypoint.name)
+        for index, binding in enumerate(entrypoint.arguments):
+            old = input_name(index)
+            new = (
+                _input_list(entrypoint.name, binding.name)
+                if isinstance(binding, Input) else _state_list(binding.name)
             )
-            for spec in output_specs:
-                interface_capacities[spec.list_name] = max(
-                    interface_capacities.get(spec.list_name, 0), spec.max_numel or 0,
-                )
-            combined = _add_warp_procedure(
-                combined,
-                f"cattorch {entrypoint.name}",
-                wrapper_program,
-                x=640,
-                y=160 + 160 * position,
+            _rename_list(sprite, old, new)
+            spec = sub_result.inputs[index]
+            interface_capacities[new] = max(
+                interface_capacities.get(new, 0), spec.max_numel or 0,
             )
-            _merge_lists_by_name(
-                combined,
-                set(wrapper_program.lists),
+        for index in range(len(entrypoint.returns)):
+            old = output_name(index)
+            _rename_list(sprite, old, _temporary_return(entrypoint.name, index))
+            interface_capacities[_temporary_return(entrypoint.name, index)] = (
+                sub_result.outputs[index].max_numel or 0
             )
-            _merge_variables_by_name(combined, set(wrapper_program.variables))
-            public_inputs = tuple(
-                TensorSpec(
-                    list_name=_input_list(entrypoint.name, binding.name),
-                    shape=spec.shape,
-                    dtype=spec.dtype,
-                    numel=spec.numel,
-                )
-                for binding, spec in zip(entrypoint.arguments, sub_result.inputs)
-                if isinstance(binding, Input)
+
+        combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
+        wrapper_program, output_specs = _build_entry_wrapper(
+            entrypoint, sub_result, program,
+        )
+        for spec in output_specs:
+            interface_capacities[spec.list_name] = max(
+                interface_capacities.get(spec.list_name, 0), spec.max_numel or 0,
             )
-            entry_results.append(EntryPointResult(
-                name=entrypoint.name,
-                procedure=f"cattorch {entrypoint.name}",
-                completion_broadcast=f"cattorch {entrypoint.name} complete",
-                inputs=public_inputs,
-                outputs=output_specs,
-                state_inputs=tuple(
-                    binding.name for binding in entrypoint.arguments
-                    if isinstance(binding, StateInput)
-                ),
-                state_updates=tuple(
-                    binding.name for binding in entrypoint.returns
-                    if isinstance(binding, StateUpdate)
-                ),
-            ))
-            sub_warnings.extend(
-                warning for warning in sub_result.warnings
-                if warning.startswith("GPTQ fallback")
+        combined = _add_warp_procedure(
+            combined,
+            f"cattorch {entrypoint.name}",
+            wrapper_program,
+            x=640,
+            y=160 + 160 * position,
+        )
+        _merge_lists_by_name(
+            combined,
+            set(wrapper_program.lists),
+        )
+        _merge_variables_by_name(combined, set(wrapper_program.variables))
+        public_inputs = tuple(
+            TensorSpec(
+                list_name=_input_list(entrypoint.name, binding.name),
+                shape=spec.shape,
+                dtype=spec.dtype,
+                numel=spec.numel,
             )
-            sharded_names.update(storage_names.get(name, name) for name in sub_result.sharded_lists)
-            quantization_report = sub_result.quantization
+            for binding, spec in zip(entrypoint.arguments, sub_result.inputs)
+            if isinstance(binding, Input)
+        )
+        entry_results.append(EntryPointResult(
+            name=entrypoint.name,
+            procedure=f"cattorch {entrypoint.name}",
+            completion_broadcast=f"cattorch {entrypoint.name} complete",
+            inputs=public_inputs,
+            outputs=output_specs,
+            state_inputs=tuple(
+                binding.name for binding in entrypoint.arguments
+                if isinstance(binding, StateInput)
+            ),
+            state_updates=tuple(
+                binding.name for binding in entrypoint.returns
+                if isinstance(binding, StateUpdate)
+            ),
+        ))
+        sub_warnings.extend(
+            warning for warning in sub_result.warnings
+            if warning.startswith("GPTQ fallback")
+        )
+        sharded_names.update(storage_names.get(name, name) for name in sub_result.sharded_lists)
+        quantization_report = sub_result.quantization
 
     assert combined is not None
     _deduplicate_program_payloads(combined, payload_names)
@@ -716,7 +725,7 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
     The input must be its only variable-length one, with no append state,
     the method must update no state, and its items must be independent.
     """
-    from cattorch.dynamic import loop_over_units, unit_output_axes
+    from cattorch.dynamic import per_unit_result, run_per_unit, unit_output_axes
 
     if len(dynamic_inputs) != 1 or any(
         isinstance(binding, StateUpdate) for binding in entrypoint.returns
@@ -733,10 +742,12 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
         axes = unit_output_axes(wrapper, examples, [], spec, None)
     except UnsupportedModelError:
         raise error from None
-    result = capture(args, None)
-    return loop_over_units(
-        result, spec, axes, [tuple(value.shape) for value in args],
-        [tuple(value.shape) for value in result.outputs],
+    input_shapes = [tuple(value.shape) for value in args]
+    result = capture(
+        args, None, lambda sprite: run_per_unit(sprite, spec, input_shapes, len(axes)),
+    )
+    return per_unit_result(
+        result, spec, axes, input_shapes, [tuple(value.shape) for value in result.outputs],
     )
 
 

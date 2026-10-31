@@ -295,29 +295,23 @@ def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> l
     return axes
 
 
-def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
+def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     """Make ``cattorch forward`` run the one-unit forward once per unit.
 
-    ``result`` is a fixed export for one unit. Its forward becomes the
-    internal ``_cattorch forward unit``, reading the dynamic input and writing
-    the outputs through internal lists, and a new ``cattorch forward`` copies
-    each unit in, calls it, and appends each unit's outputs.
+    ``sprite`` is a fixed export for one unit, before it is finalized. Its
+    forward becomes the internal ``_cattorch forward unit``, reading the
+    dynamic input and writing the outputs through internal lists, and a new
+    ``cattorch forward`` copies each unit in, calls it, and appends each
+    unit's outputs. The sprite is changed in place and returned.
     """
-    import dataclasses
-
-    from cattorch.results import BoundedDimension, TensorSpec
-    from cattorch.sprite import (
-        _add_warp_procedure, _remove_completion_broadcast,
-    )
+    from cattorch.sprite import _add_warp_procedure, _remove_completion_broadcast
     from cattorch.util.scratch.dsl import (
         Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
         gt, if_, item, length, lt, mod, mul, set_var, var,
     )
-    from cattorch.util.scratch.archive import read_archive, write_archive
     from cattorch.util.scratch.interface import rename_list, rename_procedure
 
-    ((index, (name, minimum, maximum, axis)),) = spec.items()
-    sprite, assets = read_archive(result.path)
+    ((index, (_, minimum, maximum, _)),) = spec.items()
     names = {entry[0] for entry in sprite.get("lists", {}).values()}
     if any(" shard " in value for value in names if value.startswith(("input", "output"))):
         raise UnsupportedModelError("a dynamic export's inputs and outputs must fit in one list each")
@@ -331,11 +325,11 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     rename_list(sprite, public_input, private_input)
     input_size = math.prod(input_shapes[index])
     outputs = []
-    for position_index, shape in enumerate(output_shapes):
+    for position_index in range(output_count):
         public = output_name(position_index)
         private = f"_cattorch unit {public}"
         rename_list(sprite, public, private)
-        outputs.append((public, private, math.prod(shape)))
+        outputs.append((public, private))
     run_units = (
         set_var(unit, 0),
         for_each("_cattorch units", div(length(public_input), input_size), (
@@ -346,7 +340,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
             call("_cattorch forward unit"),
             *(
                 for_each(position, length(private), (append(public, item(private, var(position))),))
-                for public, private, _ in outputs
+                for public, private in outputs
             ),
             change_var(unit, 1),
         )),
@@ -354,7 +348,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     # Whole items within the bounds, as an exported forward checks them.
     status = STATUS_VARIABLE
     body = [
-        *(clear(public) for public, _, _ in outputs),
+        *(clear(public) for public, _ in outputs),
         set_var(status, "ok"),
         if_(gt(mod(length(public_input), input_size), 0), (
             set_var(status, f"invalid dynamic length: {public_input}"),
@@ -371,11 +365,19 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
     program = Program(
         "forward_by_unit",
         variables=(unit, position, "_cattorch units", STATUS_VARIABLE),
-        lists=(public_input, private_input, *(entry for pair in outputs for entry in pair[:2])),
+        lists=(public_input, private_input, *(entry for pair in outputs for entry in pair)),
         body=tuple(body),
     )
-    sprite = _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
-    data = write_archive(result.path, sprite, assets)
+    return _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
+
+
+def per_unit_result(result, spec, output_axes, input_shapes, output_shapes):
+    """``result`` of ``run_per_unit``'s export, with the dynamic dimension bounded."""
+    import dataclasses
+
+    from cattorch.results import BoundedDimension, TensorSpec
+
+    ((index, (name, minimum, maximum, axis)),) = spec.items()
 
     def bounded(spec_value, shape, dim):
         public_shape = list(shape)
@@ -400,9 +402,6 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         inputs=inputs,
         output=specs[0],
         additional_outputs=tuple(specs[1:]),
-        archive_bytes=result.path.stat().st_size,
-        expanded_json_bytes=len(data.encode()),
-        block_count=len(sprite["blocks"]),
         warnings=result.warnings + (
             "the dynamic dimension runs the model once per item, because its "
             "operations can't take a variable length directly",

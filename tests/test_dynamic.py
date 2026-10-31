@@ -290,3 +290,20 @@ def test_each_item_can_give_several_output_rows(tmp_path):
     model = Lambda(lambda x: x.reshape(-1, 2)).eval()
     result = _check(tmp_path, model, torch.randn(3, 4), {0: (1, 9)}, (1, 4, 9))
     assert result.outputs[0].shape[0] == BoundedDimension("input", 2, 18)
+
+
+def test_running_once_per_item_is_built_before_finalizing(tmp_path):
+    from cattorch import CodegenConfig
+    from cattorch.util.scratch.archive import read_json
+
+    # Attention that reorders its batch runs once per item.
+    layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True).eval()
+    result = transpile(
+        layer, torch.randn(2, 3, 8), tmp_path / "items", dynamic={0: (1, 4)},
+        codegen=CodegenConfig(compact_internal_names=True),
+    )
+    sprite = read_json(result.path)
+    names = [entry[0] for section in ("variables", "lists") for entry in sprite[section].values()]
+    # The per-item wrapper's own names are compacted with the rest.
+    assert not any(name.startswith("_cattorch unit") for name in names)
+    assert verify(layer, torch.randn(3, 3, 8), result).passed

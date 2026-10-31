@@ -7,7 +7,7 @@ import warnings
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import torch
 
@@ -67,7 +67,7 @@ from cattorch.util.instruction.generic import IndexMapInstruction, index_map
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
-from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.ids import uniquify_data_ids
 from cattorch.util.scratch.interface import (
     rename_list as _rename_list, rename_procedure as _rename_procedure,
@@ -1828,8 +1828,8 @@ def _transpile_dynamic(
 ):
     """Trace one row of the dynamic input, export, and check other lengths."""
     from cattorch.dynamic import (
-        at_length, check_lengths, exact_export, loop_over_units, normalize_dynamic,
-        unit_output_axes,
+        at_length, check_lengths, exact_export, normalize_dynamic, per_unit_result,
+        run_per_unit, unit_output_axes,
     )
     from cattorch.verify import verify
 
@@ -1864,12 +1864,13 @@ def _transpile_dynamic(
             axes = unit_output_axes(model, flat, kwarg_names, spec, example_kwargs)
         except UnsupportedModelError:
             raise error from None
+        input_shapes = [tuple(value.shape) for value in representative]
         result = _transpile(
             model, tuple(representative[:positional]), output_path, sig_figs, **arguments,
+            _edit_sprite=lambda sprite: run_per_unit(sprite, spec, input_shapes, len(axes)),
         )
-        result = loop_over_units(
-            result, spec, axes,
-            [tuple(value.shape) for value in representative],
+        result = per_unit_result(
+            result, spec, axes, input_shapes,
             [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
         )
     exact = exact_export(
@@ -2111,6 +2112,8 @@ def _transpile(
     _prepared_quantization_report=None,
     _dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
     _defer_interface_sharding: bool = False,
+    _edit_sprite: Callable[[dict], dict] | None = None,
+    _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
 ) -> TranspileResult:
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
@@ -2493,7 +2496,11 @@ def _transpile(
     log.info("Dynamic lists: %s", list(compiler.dynamic_lists))
     log.info("Static lists: %s", list(compiler.static_lists.keys()))
 
-    finalized = finalize_sprite(
+    # A caller's last changes, such as running the forward once per item,
+    # come before finalization, so it sees the sprite whole.
+    if _edit_sprite is not None:
+        sprite = _edit_sprite(sprite)
+    finalized = _finalize(
         sprite, output_path, sprite_name=sprite_name, codegen=codegen,
         # A program finishes its entry points' interface itself.
         public_interface=not _defer_interface_sharding,
