@@ -1,9 +1,5 @@
 """Compatibility facade for cattorch's domain-specific production kernels."""
 
-from cattorch.util.instruction.optimized_convolution import (
-    OptimizedConvolutionInstruction,
-    OptimizedPoolingInstruction,
-)
 from cattorch.util.instruction.optimized_linear import (
     CausalScoreInstruction,
     CausalSoftmaxInstruction,
@@ -24,8 +20,6 @@ __all__ = [
     "FastLowRankMatMulInstruction",
     "FastPrunedMatMulInstruction",
     "LinearInstruction",
-    "OptimizedConvolutionInstruction",
     "OptimizedMatMulInstruction",
-    "OptimizedPoolingInstruction",
     "QKVLinearInstruction",
 ]

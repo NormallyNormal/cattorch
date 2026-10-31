@@ -31,6 +31,7 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.instruction.optimized_common import (
     _broadcast_index,
     _static_unrolled_repeat,
+    argument_at,
     quick_gelu_of,
     sigmoid_of,
     tanh_gelu_inner,
@@ -58,14 +59,6 @@ def _erfc_statements(value, target: str):
             "e ^", sub(polynomial, mul(magnitude, magnitude)),
         ))),
     )
-
-
-def _argument(ctx: KernelContext, position: int, default=None):
-    """The tensor or value passed at ``position``, or ``default`` if absent."""
-    if position >= len(ctx.argument_names):
-        return default
-    name = ctx.argument_names[position]
-    return ctx.inputs[name] if name in ctx.inputs else ctx.scalars.get(name)
 
 
 def _is_tensor(value) -> bool:
@@ -122,7 +115,7 @@ class _Elementwise:
     def __init__(self, ctx: KernelContext):
         self.ctx = ctx
         self.op = ctx.target
-        self.args = [_argument(ctx, position) for position in range(len(ctx.argument_names))]
+        self.args = [argument_at(ctx, position) for position in range(len(ctx.argument_names))]
         tensors = [argument for argument in self.args if _is_tensor(argument)]
         if self._is_nary():
             self.output_shape = torch.broadcast_shapes(*(tensor.shape for tensor in tensors))
@@ -247,7 +240,7 @@ class _Elementwise:
         elif op == "aten.silu.default":
             setup = (set_var("value", direct),)
             result = mul(cached, sigmoid_of(cached))
-        elif op == "aten.gelu.default" and _argument(self.ctx, 1, "none") != "tanh":
+        elif op == "aten.gelu.default" and argument_at(self.ctx, 1, "none") != "tanh":
             # 0.5 x (1 + erf(x / sqrt(2))), using erfc for accuracy in the
             # negative tail: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
             setup = (
@@ -266,12 +259,12 @@ class _Elementwise:
             )
             result = mul(mul(0.5, cached), add(1, tanh_of(var("inner"))))
         elif op == "aten.leaky_relu.default":
-            output = choose(gt(direct, 0), direct, mul(direct, _argument(self.ctx, 1, 0.01)))
+            output = choose(gt(direct, 0), direct, mul(direct, argument_at(self.ctx, 1, 0.01)))
         elif op == "aten.elu.default":
             # scale * x, or scale * alpha * (exp(input_scale * x) - 1); SELU
             # and CELU use the scale arguments.
             alpha, scale, input_scale = (
-                _argument(self.ctx, position, 1.0) for position in (1, 2, 3)
+                argument_at(self.ctx, position, 1.0) for position in (1, 2, 3)
             )
             exponent = direct if input_scale == 1 else mul(input_scale, direct)
             output = choose(

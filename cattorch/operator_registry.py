@@ -20,10 +20,9 @@ from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapt
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized import (
     LinearInstruction,
-    OptimizedConvolutionInstruction,
     OptimizedMatMulInstruction,
-    OptimizedPoolingInstruction,
 )
+from cattorch.util.instruction.optimized_convolution import CONVOLUTION_KERNELS, POOLING_KERNELS
 from cattorch.util.instruction.optimized_elementwise import FAST_GELU_KERNEL, elementwise_kernel
 from cattorch.util.instruction.optimized_normalization import (
     BATCH_NORM_KERNEL, FAST_LAYER_NORM_KERNEL, FAST_SOFTMAX_KERNEL, LAYER_NORM_KERNEL,
@@ -584,13 +583,10 @@ def _build_default_registry() -> OperatorRegistry:
                 EMBEDDING_KERNEL, MASKED_FILL_KERNEL, *TRANSPOSE_KERNELS,
             )
         },
-        "aten.conv1d.default": OptimizedConvolutionInstruction,
-        "aten.conv2d.default": OptimizedConvolutionInstruction,
-        "aten.max_pool1d.default": OptimizedPoolingInstruction,
-        "aten.max_pool2d.default": OptimizedPoolingInstruction,
-        "aten.avg_pool1d.default": OptimizedPoolingInstruction,
-        "aten.avg_pool2d.default": OptimizedPoolingInstruction,
-        "aten.adaptive_avg_pool2d.default": OptimizedPoolingInstruction,
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (*CONVOLUTION_KERNELS, *POOLING_KERNELS)
+        },
         **{
             operation: elementwise_kernel(operation).instruction_class()
             for operation in ELEMENTWISE_OPS

@@ -133,6 +133,17 @@ def _static_unrolled_repeat(count: int, step, factor: int = 4):
     ),)
 
 
+def argument_at(ctx, position: int, default=None):
+    """The tensor or value a kernel's call passed at ``position``.
+
+    ``default`` if the call passed fewer arguments.
+    """
+    if position >= len(ctx.argument_names):
+        return default
+    name = ctx.argument_names[position]
+    return ctx.inputs[name] if name in ctx.inputs else ctx.scalars.get(name)
+
+
 def _broadcast_index(shape, output_shape, map_name: str, index=None):
     """Return a cheap exact flat index and any required export-time map."""
     index = var("index") if index is None else index
