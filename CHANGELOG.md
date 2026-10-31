@@ -363,6 +363,13 @@
 - `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
   failed during export.
 
+## Deprecations
+
+- `transpile(..., frontend="export")` is deprecated and will be removed in
+  2.0. It supports a subset of what the default `frontend="fx"` does, without
+  its decompositions and pattern recognition. It now warns with a
+  `DeprecationWarning`.
+
 ## Breaking changes
 
 - cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from

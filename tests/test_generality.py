@@ -405,9 +405,10 @@ def test_tensor_keyword_with_export_frontend(tmp_path):
     x, mask = torch.randn(2, 4), torch.ones(1, 4)
     kwargs = {"mask": mask}
     model = KeywordMask().eval()
-    result = transpile(
-        model, (x,), tmp_path / "model", example_kwargs=kwargs, frontend="export",
-    )
+    with pytest.warns(DeprecationWarning):
+        result = transpile(
+            model, (x,), tmp_path / "model", example_kwargs=kwargs, frontend="export",
+        )
     assert verify(model, (x,), result, example_kwargs=kwargs).passed
 
 

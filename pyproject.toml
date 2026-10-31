@@ -56,4 +56,6 @@ markers = [
 ]
 filterwarnings = [
     "error:the model has modules in training mode:UserWarning",
+    # Tests that compare the two frontends; test_frontend checks the warning.
+    "ignore:frontend='export' is deprecated:DeprecationWarning",
 ]

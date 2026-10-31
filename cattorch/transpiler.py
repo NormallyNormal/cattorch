@@ -1760,9 +1760,9 @@ def transpile(
         Expanded-JSON budget, loop-unrolling, compact-ID, and optional
         structural-compaction policy.
     frontend:
-        How the model is traced. ``"fx"`` (default) uses FX tracing;
-        ``"export"`` uses ``torch.export`` and is kept temporarily for
-        comparison. Programs require ``"fx"``.
+        How the model is traced. ``"fx"`` (default) uses FX tracing.
+        ``"export"`` uses ``torch.export``; it is deprecated, supports fewer
+        operations, and will be removed in 2.0. Programs require ``"fx"``.
     adapters:
         Scoped module adapters for an ``ExportProgram`` or
         ``GenerationProgram``. They apply to an export-owned model copy.
@@ -1802,6 +1802,13 @@ def transpile(
         sig_figs=sig_figs, frontend=frontend, adapters=adapters,
         example_kwargs=example_kwargs,
     )
+    if frontend == "export":
+        warnings.warn(
+            "frontend='export' is deprecated and will be removed in cattorch 2.0; "
+            "the default frontend='fx' supports every model it does, and more",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     kernels = validate_kernels(kernels)
     kept = active_kernel_targets(
         kernels, fast=optimization == "fast", config=fast_config or FastConfig(),

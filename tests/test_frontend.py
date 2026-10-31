@@ -48,7 +48,8 @@ def test_frontends_have_equivalent_public_interfaces(tmp_path):
     model = StatefulModel().eval()
     inputs = (torch.randn(2, 4), torch.randn(2, 4))
     fx = transpile(model, inputs, tmp_path / "fx", frontend="fx")
-    exported = transpile(model, inputs, tmp_path / "export", frontend="export")
+    with pytest.warns(DeprecationWarning, match="frontend='export' is deprecated"):
+        exported = transpile(model, inputs, tmp_path / "export", frontend="export")
 
     assert fx.inputs == exported.inputs
     assert fx.output == exported.output
