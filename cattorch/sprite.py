@@ -1622,66 +1622,30 @@ def _add_prepare_for_save(
     blocks[old_root]["parent"] = reset
 
 
-def _guard_generation_output(sprite: dict, output_root: str) -> None:
-    """Make the final projection conditional for hidden-only prompt tokens."""
-    blocks = sprite["blocks"]
-    predecessors = [
-        bid for bid, block in blocks.items() if block.get("next") == output_root
-    ]
-    if len(predecessors) != 1:
-        raise ValueError(
-            f"expected one predecessor for output projection, got {predecessors}"
-        )
-    predecessor = predecessors[0]
-    suffix = uuid.uuid4().hex[:8]
-    guard = f"cattorch_hidden_prefill_{suffix}_guard"
-    condition = f"cattorch_hidden_prefill_{suffix}_condition"
-    variable_id = f"cattorch_hidden_prefill_{suffix}_project_output"
-    sprite.setdefault("variables", {})[variable_id] = [
-        "cattorch project output", 1,
-    ]
-    blocks[predecessor]["next"] = guard
-    blocks[guard] = {
-        "opcode": "control_if", "next": None, "parent": predecessor,
-        "inputs": {
-            "CONDITION": [2, condition],
-            "SUBSTACK": [2, output_root],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[condition] = {
-        "opcode": "operator_equals", "next": None, "parent": guard,
-        "inputs": {
-            "OPERAND1": [
-                3,
-                [12, "cattorch project output", variable_id],
-                [10, ""],
-            ],
-            "OPERAND2": [1, [4, 1]],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[output_root]["parent"] = guard
-
-
-def _guard_generation_suffix(
-    sprite: dict, suffix_root: str, gate: str = "cattorch project output",
+def _gate_chain(
+    sprite: dict, start: str, gate: str = "cattorch project output", stop: str | None = None,
 ) -> None:
-    """Skip the final attention/MLP suffix after direct K/V cache emission.
+    """Run the command chain from ``start`` only while the ``gate`` variable is 1.
 
-    The suffix runs while the ``gate`` variable is 1.
+    The chain runs to its end, or up to ``stop``, which then follows the new
+    ``if`` block. Hidden prefill uses it to skip what a prompt token's logits
+    alone need, such as the final layer's attention output and the output
+    projection. The gate variable is created, set to 1, if the sprite has none.
     """
     blocks = sprite["blocks"]
     predecessors = [
-        identifier
-        for identifier, block in blocks.items()
-        if block.get("next") == suffix_root
+        identifier for identifier, block in blocks.items() if block.get("next") == start
     ]
     if len(predecessors) != 1:
-        raise ValueError(
-            f"expected one final QKV suffix predecessor, got {predecessors}"
-        )
+        raise ValueError(f"expected one block before the gated chain, got {predecessors}")
     predecessor = predecessors[0]
+    last = start
+    while blocks[last].get("next") not in (stop, None):
+        last = blocks[last]["next"]
+    if blocks[last].get("next") != stop:
+        raise ValueError("the gated chain does not end at the given block")
+    blocks[last]["next"] = None
+
     variables = sprite.setdefault("variables", {})
     variable_id = next(
         (identifier for identifier, entry in variables.items() if entry[0] == gate), None,
@@ -1690,15 +1654,12 @@ def _guard_generation_suffix(
         variable_id = f"cattorch_gate_{uuid.uuid4().hex[:8]}"
         variables[variable_id] = [gate, 1]
     token = uuid.uuid4().hex[:8]
-    guard = f"cattorch_hidden_suffix_{token}_guard"
-    condition = f"cattorch_hidden_suffix_{token}_condition"
+    guard = f"cattorch_gate_{token}_if"
+    condition = f"cattorch_gate_{token}_condition"
     blocks[predecessor]["next"] = guard
     blocks[guard] = {
-        "opcode": "control_if", "next": None, "parent": predecessor,
-        "inputs": {
-            "CONDITION": [2, condition],
-            "SUBSTACK": [2, suffix_root],
-        },
+        "opcode": "control_if", "next": stop, "parent": predecessor,
+        "inputs": {"CONDITION": [2, condition], "SUBSTACK": [2, start]},
         "fields": {}, "shadow": False, "topLevel": False,
     }
     blocks[condition] = {
@@ -1709,28 +1670,9 @@ def _guard_generation_suffix(
         },
         "fields": {}, "shadow": False, "topLevel": False,
     }
-    blocks[suffix_root]["parent"] = guard
-
-
-def _guard_generation_range(
-    sprite: dict, start: str, stop: str, gate: str = "cattorch project output",
-) -> None:
-    """Run the chain from ``start`` up to ``stop`` only for projected tokens.
-
-    Hidden prefill tokens never read what this range computes, such as the
-    final layer's query projection.
-    """
-    blocks = sprite["blocks"]
-    last = start
-    while blocks[last].get("next") not in (stop, None):
-        last = blocks[last]["next"]
-    if blocks[last].get("next") != stop:
-        raise ValueError("the guarded range does not end at the next operation")
-    blocks[last]["next"] = None
-    _guard_generation_suffix(sprite, start, gate)
-    guard = blocks[start]["parent"]
-    blocks[guard]["next"] = stop
-    blocks[stop]["parent"] = guard
+    blocks[start]["parent"] = guard
+    if stop is not None:
+        blocks[stop]["parent"] = guard
 
 
 _TOP_K_VALUES = "cattorch top k values"

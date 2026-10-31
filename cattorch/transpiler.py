@@ -44,9 +44,7 @@ from cattorch.sprite import (
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
-    _guard_generation_output,
-    _guard_generation_range,
-    _guard_generation_suffix,
+    _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
     _graph_layer,
@@ -239,7 +237,7 @@ def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attentio
         following = root_entries[attention_position + 1][1]
         # In a shared layer, a following root of another layer was removed.
         if following in sprite["blocks"]:
-            _guard_generation_suffix(sprite, following, gate)
+            _gate_chain(sprite, following, gate)
     query_only = _query_only_nodes(graph, attention)
     position = 0
     while position < attention_position:
@@ -249,9 +247,7 @@ def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attentio
         end = position
         while end < attention_position and root_names[end] in query_only:
             end += 1
-        _guard_generation_range(
-            sprite, root_entries[position][1], root_entries[end][1], gate,
-        )
+        _gate_chain(sprite, root_entries[position][1], gate, stop=root_entries[end][1])
         position = end
 
 
@@ -2323,7 +2319,7 @@ def _transpile(
                 )
                 if last_layer + 1 >= len(root_entries):
                     raise ValueError("hidden prefill requires a compiled output projection")
-                _guard_generation_suffix(
+                _gate_chain(
                     sprite, root_entries[last_layer + 1][1], _PROJECT_OUTPUT,
                 )
                 _merge_variables_by_name(sprite, {_PROJECT_OUTPUT, _LAYER_TAIL})
@@ -2342,7 +2338,7 @@ def _transpile(
                     raise ValueError(
                         "hidden prefill requires a compiled output projection"
                     )
-                _guard_generation_output(sprite, compiler.emitted_roots[-1][1])
+                _gate_chain(sprite, compiler.emitted_roots[-1][1])
         first_cache = graph.generation.first_cache
         assert first_cache is not None
         sprite = _wrap_generation_lifecycle(
