@@ -63,6 +63,9 @@ from cattorch.util.argument import Argument
 from cattorch.operator_registry import (
     INDEX_MAP_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
 )
+from cattorch.util.instruction.optimized_elementwise import (
+    ARITHMETIC_EXPRESSION_KERNEL, PAIRED_LINEAR_SWIGLU_KERNEL, SWIGLU_KERNEL,
+)
 from cattorch.util.instruction.generic import INDEX_MAP_KERNEL, index_map
 from cattorch.util.instruction.optimized_tensor import (
     CAT_KERNEL, EMBEDDING_ADD_KERNEL, GETITEM_KERNEL, STRIDED_SLICE_KERNEL,
@@ -733,8 +736,7 @@ class _Compiler:
             Argument(input_lists[0], _get_shape(gate)),
             Argument(input_lists[1], _get_shape(value)),
         ]
-        from cattorch.util.instruction.optimized import OptimizedSwiGLUInstruction
-        instruction = OptimizedSwiGLUInstruction(node.target, target_list, *args)
+        instruction = self._kernel_instruction(SWIGLU_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(silu)
         self.scope.release_dependencies(node)
@@ -761,11 +763,17 @@ class _Compiler:
         input_lists, shard_rows = self._prepare_paired_linear_weights(
             node, gate, value, input_lists,
         )
-        args[1] = Argument(input_lists[1], args[1].shape)
-        args[3] = Argument(input_lists[2], args[3].shape)
-        from cattorch.util.instruction.optimized import PairedLinearSwiGLUInstruction
-        instruction = PairedLinearSwiGLUInstruction(
-            node.target, target_list, *args, shard_rows=shard_rows,
+        # The kernel takes the input, each shard's gate and value weights,
+        # then both biases, in the order of ``input_lists``.
+        if len(shard_rows) > 1:
+            inner = args[1].shape[-1]
+            shapes = [torch.Size([rows, inner]) for rows in shard_rows for _ in "gv"]
+        else:
+            shapes = [args[1].shape, args[3].shape]
+        weights = [Argument(name, shape) for name, shape in zip(input_lists[1:-2], shapes)]
+        instruction = self._kernel_instruction(
+            PAIRED_LINEAR_SWIGLU_KERNEL, target_list, args[0], *weights, args[2], args[4],
+            options={"shard_rows": shard_rows},
         )
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(gate)
@@ -778,51 +786,34 @@ class _Compiler:
         target_list = self.scope.get_list_for_node(node)
         self.last_target_list = target_list
 
-        from cattorch.util.scratch.dsl import add, div, item, mul, sub, var
-
-        operations = {
-            "aten.add.Tensor": add,
-            "aten.sub.Tensor": sub,
-            "aten.mul.Tensor": mul,
-            "aten.div.Tensor": div,
-        }
         external_nodes = []
         external_slots = {}
-        expressions = {}
+        steps = {}
 
-        def operand_expression(operand):
-            if not hasattr(operand, "name"):
-                return operand
-            if operand.name in expressions:
-                return expressions[operand.name]
-            if operand.name not in external_slots:
-                external_slots[operand.name] = len(external_nodes) + 1
-                external_nodes.append(operand)
-            return item(f"T{external_slots[operand.name]}", var("index"))
+        def operand(value):
+            if not hasattr(value, "name"):
+                return ("constant", value)
+            if value.name in steps:
+                return ("step", steps[value.name])
+            if value.name not in external_slots:
+                external_slots[value.name] = len(external_nodes)
+                external_nodes.append(value)
+            return ("input", external_slots[value.name])
 
+        chain_steps = []
         for fused_node in chain:
-            target = str(fused_node.target)
-            if target == "aten.neg.default":
-                expression = mul(-1, operand_expression(fused_node.args[0]))
-            else:
-                expression = operations[target](
-                    operand_expression(fused_node.args[0]),
-                    operand_expression(fused_node.args[1]),
-                )
-            expressions[fused_node.name] = expression
+            arguments = fused_node.args[:1] if str(fused_node.target) == "aten.neg.default" else fused_node.args[:2]
+            chain_steps.append((str(fused_node.target), tuple(operand(value) for value in arguments)))
+            steps[fused_node.name] = len(chain_steps) - 1
 
         input_lists = [self._resolve_name(value.name) for value in external_nodes]
         args = [
             self._argument(name, value)
             for name, value in zip(input_lists, external_nodes)
         ]
-        from cattorch.util.instruction.optimized import FusedArithmeticInstruction
-        instruction = FusedArithmeticInstruction(
-            node.target,
-            target_list,
-            *args,
-            expression=expressions[node.name],
-            size=math.prod(_get_shape(node)),
+        instruction = self._kernel_instruction(
+            ARITHMETIC_EXPRESSION_KERNEL, target_list, *args,
+            options={"steps": tuple(chain_steps), "size": math.prod(_get_shape(node))},
         )
         self._emit(instruction, input_lists, target_list)
         for fused_node in chain:

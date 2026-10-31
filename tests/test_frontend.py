@@ -15,7 +15,7 @@ from cattorch import UnsupportedModelError, UnsupportedOperationError, transpile
 from cattorch.frontend import capture_model
 from cattorch.operator_registry import OperationRule, default_registry
 from cattorch.transpiler import _transpile
-from cattorch.util.instruction.optimized import OptimizedElementwiseInstruction
+from cattorch.util.instruction.optimized_elementwise import elementwise_kernel
 
 
 class StatefulModel(nn.Module):
@@ -163,7 +163,7 @@ def test_private_registry_supports_module_adapters_and_semantic_ops(tmp_path):
     registry.register_module_adapter(AdaptedNeg, lambda _module: OpaqueNeg())
     registry.register_operation(OperationRule(
         target="cattorch_test.neg.default",
-        exact_kernel=OptimizedElementwiseInstruction,
+        exact_kernel=elementwise_kernel("aten.neg.default").instruction_class(),
         lowering_target=torch.ops.aten.neg.default,
     ))
     model = AdaptedNeg().eval()

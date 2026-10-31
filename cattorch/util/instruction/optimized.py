@@ -4,13 +4,6 @@ from cattorch.util.instruction.optimized_convolution import (
     OptimizedConvolutionInstruction,
     OptimizedPoolingInstruction,
 )
-from cattorch.util.instruction.optimized_elementwise import (
-    FastElementwiseInstruction,
-    FusedArithmeticInstruction,
-    OptimizedElementwiseInstruction,
-    OptimizedSwiGLUInstruction,
-    PairedLinearSwiGLUInstruction,
-)
 from cattorch.util.instruction.optimized_linear import (
     CausalScoreInstruction,
     CausalSoftmaxInstruction,
@@ -28,16 +21,11 @@ __all__ = [
     "CausalSoftmaxInstruction",
     "CausalValueMatMulInstruction",
     "FastCausalSoftmaxInstruction",
-    "FastElementwiseInstruction",
     "FastLowRankMatMulInstruction",
     "FastPrunedMatMulInstruction",
-    "FusedArithmeticInstruction",
     "LinearInstruction",
     "OptimizedConvolutionInstruction",
-    "OptimizedElementwiseInstruction",
     "OptimizedMatMulInstruction",
     "OptimizedPoolingInstruction",
-    "OptimizedSwiGLUInstruction",
-    "PairedLinearSwiGLUInstruction",
     "QKVLinearInstruction",
 ]

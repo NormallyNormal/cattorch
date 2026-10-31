@@ -4,9 +4,8 @@ import math
 
 import torch
 
-from cattorch.util.instruction.instruction import Instruction
+from cattorch.kernel_api import Kernel, KernelContext, TensorInfo
 from cattorch.util.scratch.dsl import (
-    Program,
     add,
     append,
     change_var,
@@ -61,273 +60,250 @@ def _erfc_statements(value, target: str):
     )
 
 
-class OptimizedElementwiseInstruction(Instruction):
-    """One-based, shape-specialized elementwise kernels.
+def _argument(ctx: KernelContext, position: int, default=None):
+    """The tensor or value passed at ``position``, or ``default`` if absent."""
+    if position >= len(ctx.argument_names):
+        return default
+    name = ctx.argument_names[position]
+    return ctx.inputs[name] if name in ctx.inputs else ctx.scalars.get(name)
 
-    The old lowering repeatedly converted a zero-based loop index to Scratch's
-    one-based list index. Equal-shape binary tensors also pay for a modulo that
-    is only needed by the limited broadcasting fallback. This lowering avoids
-    both costs and caches list values only when an expression reuses them.
+
+def _is_tensor(value) -> bool:
+    return isinstance(value, TensorInfo)
+
+
+_BINARY = {
+    "aten.add.Tensor": add,
+    "aten.sub.Tensor": sub,
+    "aten.mul.Tensor": mul,
+    "aten.div.Tensor": div,
+}
+
+# Binary operations whose result is chosen by a condition. Each maps to
+# ``(condition(left, right), value_if_true, value_if_false)`` where the values
+# are "left", "right", or a constant.
+_SELECT = {
+    "aten.eq.Tensor": (eq, 1, 0), "aten.eq.Scalar": (eq, 1, 0),
+    "aten.ne.Tensor": (eq, 0, 1), "aten.ne.Scalar": (eq, 0, 1),
+    "aten.gt.Tensor": (gt, 1, 0), "aten.gt.Scalar": (gt, 1, 0),
+    "aten.lt.Tensor": (lt, 1, 0), "aten.lt.Scalar": (lt, 1, 0),
+    "aten.ge.Tensor": (lt, 0, 1), "aten.ge.Scalar": (lt, 0, 1),
+    "aten.le.Tensor": (gt, 0, 1), "aten.le.Scalar": (gt, 0, 1),
+    "aten.maximum.default": (gt, "left", "right"),
+    "aten.minimum.default": (lt, "left", "right"),
+}
+_WHERE = frozenset({
+    "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
+    "aten.where.Scalar",
+})
+_MATHOP = {
+    "aten.exp.default": "e ^",
+    "aten.log.default": "ln",
+    "aten.log10.default": "log",
+    "aten.sqrt.default": "sqrt",
+    "aten.abs.default": "abs",
+    "aten.floor.default": "floor",
+    "aten.ceil.default": "ceiling",
+}
+_CLAMP = frozenset({
+    "aten.clamp.default", "aten.clamp_min.default", "aten.clamp_max.default",
+    "aten.hardtanh.default", "aten.relu6.default",
+})
+
+
+class _Elementwise:
+    """One-based, shape-specialized elementwise lowering.
+
+    Equal-shape binary tensors index both lists directly, without the modulo
+    that broadcasting needs, and list values are cached in a variable only
+    when an expression reuses them.
     """
 
-    _BINARY = {
-        "aten.add.Tensor": add,
-        "aten.sub.Tensor": sub,
-        "aten.mul.Tensor": mul,
-        "aten.div.Tensor": div,
-    }
-
-    # Binary operations whose result is chosen by a condition. Each maps to
-    # ``(condition(left, right), value_if_true, value_if_false)`` where the
-    # values are "left", "right", or a constant.
-    _SELECT = {
-        "aten.eq.Tensor": (eq, 1, 0), "aten.eq.Scalar": (eq, 1, 0),
-        "aten.ne.Tensor": (eq, 0, 1), "aten.ne.Scalar": (eq, 0, 1),
-        "aten.gt.Tensor": (gt, 1, 0), "aten.gt.Scalar": (gt, 1, 0),
-        "aten.lt.Tensor": (lt, 1, 0), "aten.lt.Scalar": (lt, 1, 0),
-        "aten.ge.Tensor": (lt, 0, 1), "aten.ge.Scalar": (lt, 0, 1),
-        "aten.le.Tensor": (gt, 0, 1), "aten.le.Scalar": (gt, 0, 1),
-        "aten.maximum.default": (gt, "left", "right"),
-        "aten.minimum.default": (lt, "left", "right"),
-    }
-    _WHERE = frozenset({
-        "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
-        "aten.where.Scalar",
-    })
-
-    def prepare(self):
-        self.op = str(self.torch_name)
-        # Tensor list slots are numbered over every non-constant argument,
-        # including explicit ``_none`` placeholders, followed by the output.
-        self.slots = {}
-        for position, argument in enumerate(self.args):
-            if not str(argument.name).startswith("C_"):
-                self.slots[position] = f"T{len(self.slots) + 1}"
-        self.output_list = f"T{len(self.slots) + 1}"
-        tensor_shapes = [
-            self.args[position].shape for position in self.slots
-            if self.args[position].name != "_none"
-        ]
+    def __init__(self, ctx: KernelContext):
+        self.ctx = ctx
+        self.op = ctx.target
+        self.args = [_argument(ctx, position) for position in range(len(ctx.argument_names))]
+        tensors = [argument for argument in self.args if _is_tensor(argument)]
         if self._is_nary():
-            self.output_shape = torch.broadcast_shapes(*tensor_shapes)
+            self.output_shape = torch.broadcast_shapes(*(tensor.shape for tensor in tensors))
         else:
             self.output_shape = self.args[0].shape
         self.size = math.prod(self.output_shape)
-        dynamic = [position for position in self.slots if self.args[position].dynamic]
+        dynamic = [tensor for tensor in tensors if tensor.dynamic_axis is not None]
         if dynamic:
             # The output repeats this many values for each one of the runtime
             # input, when broadcasting adds dimensions to it.
-            position = dynamic[0]
-            per_value = self.size // max(math.prod(self.args[position].shape), 1)
-            self.size = length(self.slots[position])
+            per_value = self.size // max(math.prod(dynamic[0].shape), 1)
+            self.size = length(dynamic[0].list)
             if per_value != 1:
                 self.size = mul(self.size, per_value)
-        self.broadcast_lists = {}
 
     def _is_nary(self):
-        return (
-            self.op in self._WHERE
-            or ((self.op in self._BINARY or self.op in self._SELECT)
-                and self.args[1].value is None)
+        return self.op in _WHERE or (
+            (self.op in _BINARY or self.op in _SELECT) and _is_tensor(self.args[1])
         )
 
-    def _operand(self, position, map_name):
+    def operand(self, position, map_name):
         """Expression for argument ``position`` at the current output index."""
         argument = self.args[position]
-        if position not in self.slots:
-            return argument.value
+        if not _is_tensor(argument):
+            return argument
         index, values = _broadcast_index(argument.shape, self.output_shape, map_name)
         if values is not None:
-            self.broadcast_lists[map_name] = values
-        return item(self.slots[position], index)
+            self.ctx.static_list(map_name, values)
+        return item(argument.list, index)
+
+    def emit(self, *, fast: bool = False):
+        ctx, op = self.ctx, self.op
+        if op in _BINARY:
+            ctx.temp_var("index")
+            expression = self._binary()
+            out = ctx.output.list
+            iteration = (append(out, expression), change_var("index", 1))
+        else:
+            for name in ("index", "value", "inner"):
+                ctx.temp_var(name)
+            if op in _SELECT:
+                setup, output = self._select()
+            elif op in _WHERE:
+                setup, output = self._where()
+            elif fast and op == "aten.gelu.default":
+                setup, output = (), append(
+                    ctx.output.list, quick_gelu_of(item(self.args[0].list, var("index"))),
+                )
+            else:
+                setup, output = self._unary()
+            out = ctx.output.list
+            iteration = (*setup, output, change_var("index", 1))
+
+        if not isinstance(self.size, int):
+            traversal = (set_var("index", 1), repeat(self.size, iteration))
+        elif op in {"aten.gelu.default", "aten.erf.default"}:
+            # GELU's large reporter tree regressed when unrolled, but the
+            # palette-hidden official loop still removes one index mutation.
+            traversal = (for_each("index", self.size, iteration[:-1]),)
+        else:
+            lightweight = op in _BINARY or op in {
+                "aten.neg.default", "aten.relu.default", "aten.leaky_relu.default",
+            }
+            traversal = (
+                set_var("index", 1),
+                *_static_unrolled_repeat(self.size, iteration, factor=8 if lightweight else 4),
+            )
+        return (clear(out), *traversal)
 
     def _select(self):
-        condition, if_true, if_false = self._SELECT[self.op]
-        left = self._operand(0, "_left_broadcast_map")
-        right = self._operand(1, "_right_broadcast_map")
+        condition, if_true, if_false = _SELECT[self.op]
+        left = self.operand(0, "_left_broadcast_map")
+        right = self.operand(1, "_right_broadcast_map")
         choices = {"left": left, "right": right}
+        out = self.ctx.output.list
         return (), if_else(
             condition(left, right),
-            (append(self.output_list, choices.get(if_true, if_true)),),
-            (append(self.output_list, choices.get(if_false, if_false)),),
+            (append(out, choices.get(if_true, if_true)),),
+            (append(out, choices.get(if_false, if_false)),),
         )
 
     def _where(self):
-        condition = self._operand(0, "_condition_broadcast_map")
-        left = self._operand(1, "_left_broadcast_map")
-        right = self._operand(2, "_right_broadcast_map")
-        return (), if_else(
-            eq(condition, 0),
-            (append(self.output_list, right),),
-            (append(self.output_list, left),),
-        )
+        condition = self.operand(0, "_condition_broadcast_map")
+        left = self.operand(1, "_left_broadcast_map")
+        right = self.operand(2, "_right_broadcast_map")
+        out = self.ctx.output.list
+        return (), if_else(eq(condition, 0), (append(out, right),), (append(out, left),))
 
-    def _binary_expr(self):
-        operation = self._BINARY[self.op]
-        if self.args[1].value is not None:
-            left = item("T1", var("index"))
-            return operation(left, self.args[1].value), ("T1", "T2")
-        if self.args[0].value is not None:
+    def _binary(self):
+        operation = _BINARY[self.op]
+        left, right = self.args[0], self.args[1]
+        if not _is_tensor(right):
+            return operation(item(left.list, var("index")), right)
+        if not _is_tensor(left):
             # A constant left operand, as in ``1 - x``.
-            right = self._operand(1, "_right_broadcast_map")
-            lists = (*self.slots.values(), *self.broadcast_lists, self.output_list)
-            return operation(self.args[0].value, right), lists
-
-        left_index, left_map = _broadcast_index(
-            self.args[0].shape, self.output_shape, "_left_broadcast_map",
-        )
-        right_index, right_map = _broadcast_index(
-            self.args[1].shape, self.output_shape, "_right_broadcast_map",
-        )
-        if left_map is not None:
-            self.broadcast_lists["_left_broadcast_map"] = left_map
-        if right_map is not None:
-            self.broadcast_lists["_right_broadcast_map"] = right_map
-        lists = ("T1", "T2", *self.broadcast_lists, "T3")
+            return operation(left, self.operand(1, "_right_broadcast_map"))
         return operation(
-            item("T1", left_index), item("T2", right_index),
-        ), lists
+            self.operand(0, "_left_broadcast_map"), self.operand(1, "_right_broadcast_map"),
+        )
 
     def _unary(self):
-        direct = item("T1", var("index"))
+        op = self.op
+        out = self.ctx.output.list
+        direct = item(self.args[0].list, var("index"))
         cached = var("value")
         setup = ()
         output = None
 
-        if self.op == "aten.neg.default":
+        def choose(condition, if_true, if_false):
+            return if_else(condition, (append(out, if_true),), (append(out, if_false),))
+
+        if op == "aten.neg.default":
             result = mul(-1, direct)
-        elif self.op == "aten.sigmoid.default":
+        elif op == "aten.sigmoid.default":
             result = sigmoid_of(direct)
-        elif self.op == "aten.rsqrt.default":
+        elif op == "aten.rsqrt.default":
             result = div(1, mathop("sqrt", direct))
-        elif self.op == "aten.tanh.default":
+        elif op == "aten.tanh.default":
             result = tanh_of(direct)
-        elif self.op == "aten.relu.default":
-            output = if_else(
-                gt(direct, 0),
-                (append("T2", direct),),
-                (append("T2", 0),),
-            )
-            result = None
-        elif self.op == "aten.silu.default":
+        elif op == "aten.relu.default":
+            output = choose(gt(direct, 0), direct, 0)
+        elif op == "aten.silu.default":
             setup = (set_var("value", direct),)
             result = mul(cached, sigmoid_of(cached))
-        elif self.op == "aten.gelu.default" and self._exact_gelu():
+        elif op == "aten.gelu.default" and _argument(self.ctx, 1, "none") != "tanh":
             # 0.5 x (1 + erf(x / sqrt(2))), using erfc for accuracy in the
             # negative tail: 1 + erf(z) is 2 - erfc(|z|) or erfc(|z|).
             setup = (
                 set_var("value", direct),
                 *_erfc_statements(mul(cached, 0.7071067811865476), "inner"),
             )
-            output = if_else(
+            output = choose(
                 lt(cached, 0),
-                (append(self.output_list, mul(mul(0.5, cached), var("inner"))),),
-                (append(
-                    self.output_list,
-                    mul(cached, sub(1, mul(0.5, var("inner")))),
-                ),),
+                mul(mul(0.5, cached), var("inner")),
+                mul(cached, sub(1, mul(0.5, var("inner")))),
             )
-            result = None
-        elif self.op == "aten.gelu.default":
+        elif op == "aten.gelu.default":
             setup = (
                 set_var("value", direct),
                 set_var("inner", tanh_gelu_inner(cached)),
             )
-            tanh_inner = tanh_of(var("inner"))
-            result = mul(mul(0.5, cached), add(1, tanh_inner))
-        elif self.op == "aten.leaky_relu.default":
-            slope = self.args[1].value if len(self.args) > 1 else 0.01
-            output = if_else(
-                gt(direct, 0),
-                (append("T2", direct),),
-                (append("T2", mul(direct, slope)),),
-            )
-            result = None
-        elif self.op == "aten.elu.default":
+            result = mul(mul(0.5, cached), add(1, tanh_of(var("inner"))))
+        elif op == "aten.leaky_relu.default":
+            output = choose(gt(direct, 0), direct, mul(direct, _argument(self.ctx, 1, 0.01)))
+        elif op == "aten.elu.default":
             # scale * x, or scale * alpha * (exp(input_scale * x) - 1); SELU
             # and CELU use the scale arguments.
             alpha, scale, input_scale = (
-                self.args[index].value if len(self.args) > index else 1.0
-                for index in (1, 2, 3)
+                _argument(self.ctx, position, 1.0) for position in (1, 2, 3)
             )
             exponent = direct if input_scale == 1 else mul(input_scale, direct)
-            output = if_else(
+            output = choose(
                 gt(direct, 0),
-                (append("T2", direct if scale == 1 else mul(scale, direct)),),
-                (append("T2", mul(alpha * scale, add(mathop("e ^", exponent), -1))),),
+                direct if scale == 1 else mul(scale, direct),
+                mul(alpha * scale, add(mathop("e ^", exponent), -1)),
             )
-            result = None
-        elif self.op == "aten.pow.Tensor_Scalar":
-            exponent = self.args[1].value
-            if exponent == 0:
-                result = 1
-            elif exponent == 0.5:
-                result = mathop("sqrt", direct)
-            elif exponent == -0.5:
-                result = div(1, mathop("sqrt", direct))
-            elif float(exponent).is_integer() and 1 <= abs(exponent) <= 4:
-                setup = (set_var("value", direct),)
-                result = cached
-                for _ in range(int(abs(exponent)) - 1):
-                    result = mul(result, cached)
-                if exponent < 0:
-                    result = div(1, result)
-            elif float(exponent).is_integer():
-                # |x| ^ n, negated for a negative base and an odd exponent.
-                setup = (set_var("value", direct),)
-                magnitude = mathop("e ^", mul(exponent, mathop("ln", mathop("abs", cached))))
-                if int(exponent) % 2:
-                    output = if_else(
-                        lt(cached, 0),
-                        (append(self.output_list, mul(-1, magnitude)),),
-                        (append(self.output_list, magnitude),),
-                    )
-                    result = None
-                else:
-                    result = magnitude
-            else:
-                # A negative base gives NaN through ln, as in PyTorch.
-                result = mathop("e ^", mul(exponent, mathop("ln", direct)))
-        elif self.op in self._MATHOP:
-            result = mathop(self._MATHOP[self.op], direct)
-        elif self.op in {"aten.sin.default", "aten.cos.default", "aten.tan.default"}:
+        elif op == "aten.pow.Tensor_Scalar":
+            setup, result, output = self._power(direct, cached, choose)
+        elif op in _MATHOP:
+            result = mathop(_MATHOP[op], direct)
+        elif op in {"aten.sin.default", "aten.cos.default", "aten.tan.default"}:
             # Scratch's trigonometry takes degrees.
-            name = self.op.split(".")[1]
-            result = mathop(name, mul(direct, 57.29577951308232))
-        elif self.op in {"aten.asin.default", "aten.acos.default", "aten.atan.default"}:
+            result = mathop(op.split(".")[1], mul(direct, 57.29577951308232))
+        elif op in {"aten.asin.default", "aten.acos.default", "aten.atan.default"}:
             # ... and returns them.
-            name = self.op.split(".")[1]
-            result = mul(mathop(name, direct), 0.017453292519943295)
-        elif self.op == "aten.exp2.default":
+            result = mul(mathop(op.split(".")[1], direct), 0.017453292519943295)
+        elif op == "aten.exp2.default":
             result = mathop("e ^", mul(direct, 0.6931471805599453))
-        elif self.op == "aten.log2.default":
+        elif op == "aten.log2.default":
             result = mul(mathop("ln", direct), 1.4426950408889634)
-        elif self.op == "aten.erfc.default":
+        elif op == "aten.erfc.default":
             setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
-            output = if_else(
-                lt(cached, 0),
-                (append(self.output_list, sub(2, var("inner"))),),
-                (append(self.output_list, var("inner")),),
-            )
-            result = None
-        elif self.op == "aten.reciprocal.default":
+            output = choose(lt(cached, 0), sub(2, var("inner")), var("inner"))
+        elif op == "aten.reciprocal.default":
             result = div(1, direct)
-        elif self.op == "aten.erf.default":
+        elif op == "aten.erf.default":
             setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
-            output = if_else(
-                lt(cached, 0),
-                (append(self.output_list, sub(var("inner"), 1)),),
-                (append(self.output_list, sub(1, var("inner"))),),
-            )
-            result = None
-        elif self.op in {"aten.logical_not.default", "aten.bitwise_not.default"}:
-            output = if_else(
-                eq(direct, 0),
-                (append(self.output_list, 1),),
-                (append(self.output_list, 0),),
-            )
-            result = None
-        elif self.op in self._CLAMP:
+            output = choose(lt(cached, 0), sub(var("inner"), 1), sub(1, var("inner")))
+        elif op in {"aten.logical_not.default", "aten.bitwise_not.default"}:
+            output = choose(eq(direct, 0), 1, 0)
+        elif op in _CLAMP:
             low, high = self._clamp_bounds()
             setup = (set_var("value", direct),)
             if low is not None:
@@ -335,32 +311,48 @@ class OptimizedElementwiseInstruction(Instruction):
             if high is not None:
                 setup += (if_(gt(cached, high), (set_var("value", high),)),)
             result = cached
-        elif self.op == "aten.to.dtype":
-            output = self._cast(direct)
-            result = None
+        elif op == "aten.to.dtype":
+            # Only value-changing conversions reach the kernel; graph analysis
+            # aliases conversions to floating point and same-dtype ones.
+            if self.args[1] == torch.bool:
+                output = choose(eq(direct, 0), 0, 1)
+            else:
+                # Integer conversion truncates toward zero like PyTorch.
+                output = choose(lt(direct, 0), mathop("ceiling", direct), mathop("floor", direct))
         else:
-            raise NotImplementedError(self.op)
+            raise NotImplementedError(op)
 
         if output is None:
-            output = append(self.output_list, result)
+            output = append(out, result)
         return setup, output
 
-    _MATHOP = {
-        "aten.exp.default": "e ^",
-        "aten.log.default": "ln",
-        "aten.log10.default": "log",
-        "aten.sqrt.default": "sqrt",
-        "aten.abs.default": "abs",
-        "aten.floor.default": "floor",
-        "aten.ceil.default": "ceiling",
-    }
-    _CLAMP = frozenset({
-        "aten.clamp.default", "aten.clamp_min.default", "aten.clamp_max.default",
-        "aten.hardtanh.default", "aten.relu6.default",
-    })
+    def _power(self, direct, cached, choose):
+        exponent = self.args[1]
+        if exponent == 0:
+            return (), 1, None
+        if exponent == 0.5:
+            return (), mathop("sqrt", direct), None
+        if exponent == -0.5:
+            return (), div(1, mathop("sqrt", direct)), None
+        if float(exponent).is_integer() and 1 <= abs(exponent) <= 4:
+            result = cached
+            for _ in range(int(abs(exponent)) - 1):
+                result = mul(result, cached)
+            if exponent < 0:
+                result = div(1, result)
+            return (set_var("value", direct),), result, None
+        if float(exponent).is_integer():
+            # |x| ^ n, negated for a negative base and an odd exponent.
+            setup = (set_var("value", direct),)
+            magnitude = mathop("e ^", mul(exponent, mathop("ln", mathop("abs", cached))))
+            if int(exponent) % 2:
+                return setup, None, choose(lt(cached, 0), mul(-1, magnitude), magnitude)
+            return setup, magnitude, None
+        # A negative base gives NaN through ln, as in PyTorch.
+        return (), mathop("e ^", mul(exponent, mathop("ln", direct))), None
 
     def _clamp_bounds(self):
-        values = [argument.value for argument in self.args[1:]]
+        values = self.args[1:]
         if self.op == "aten.clamp_min.default":
             return values[0], None
         if self.op == "aten.clamp_max.default":
@@ -372,268 +364,172 @@ class OptimizedElementwiseInstruction(Instruction):
         values = values + [None, None][len(values):]
         return values[0], values[1]
 
-    def _cast(self, direct):
-        # Only value-changing conversions reach the kernel; graph analysis
-        # aliases conversions to floating point and same-dtype conversions.
-        target = self.args[1].value
-        if target == torch.bool:
-            return if_else(
-                eq(direct, 0),
-                (append(self.output_list, 0),),
-                (append(self.output_list, 1),),
-            )
-        # Integer conversion truncates toward zero like PyTorch.
-        return if_else(
-            lt(direct, 0),
-            (append(self.output_list, mathop("ceiling", direct)),),
-            (append(self.output_list, mathop("floor", direct)),),
-        )
 
-    def _exact_gelu(self):
-        approximate = self.args[1].value if len(self.args) > 1 else "none"
-        return approximate != "tanh"
-
-    def finalize(self):
-        if self.op in self._BINARY:
-            expression, lists = self._binary_expr()
-            output_name = lists[-1]
-            variables = ("index",)
-            iteration = (append(output_name, expression), change_var("index", 1))
-        else:
-            if self.op in self._SELECT:
-                setup, output = self._select()
-            elif self.op in self._WHERE:
-                setup, output = self._where()
-            else:
-                setup, output = self._unary()
-            output_name = self.output_list
-            lists = (*self.slots.values(), *self.broadcast_lists, output_name)
-            variables = ("index", "value", "inner")
-            iteration = (*setup, output, change_var("index", 1))
-
-        if not isinstance(self.size, int):
-            traversal = (
-                set_var("index", 1),
-                repeat(self.size, iteration),
-            )
-        elif self.op in {"aten.gelu.default", "aten.erf.default"}:
-            # GELU's large reporter tree regressed when unrolled, but the
-            # palette-hidden official loop still removes one index mutation.
-            traversal = (for_each("index", self.size, iteration[:-1]),)
-        else:
-            lightweight = self.op in self._BINARY or self.op in {
-                "aten.neg.default", "aten.relu.default", "aten.leaky_relu.default",
-            }
-            traversal = (
-                set_var("index", 1),
-                *_static_unrolled_repeat(
-                    self.size,
-                    iteration,
-                    factor=8 if lightweight else 4,
-                ),
-            )
-
-        return Program(
-            "elementwise_optimized",
-            variables=variables,
-            lists=lists,
-            list_values=self.broadcast_lists,
-            body=(
-                clear(output_name),
-                *traversal,
-            ),
-        ).compile()
+def _emit_elementwise(ctx: KernelContext):
+    return _Elementwise(ctx).emit()
 
 
-class FusedArithmeticInstruction(Instruction):
-    """Evaluate a same-shape arithmetic expression in one list traversal."""
-
-    def __init__(self, torch_name, output, *args, expression, size):
-        self.expression = expression
-        self.size = size
-        super().__init__(torch_name, output, *args)
-
-    def prepare(self):
-        pass
-
-    def finalize(self):
-        destination = f"T{len(self.args) + 1}"
-        lists = tuple(f"T{index}" for index in range(1, len(self.args) + 2))
-        traversal = (
-            (repeat(length("T1"), (
-                append(destination, self.expression),
-                change_var("index", 1),
-            )),)
-            if self.args[0].dynamic
-            else _static_unrolled_repeat(self.size, (
-                append(destination, self.expression),
-                change_var("index", 1),
-            ), factor=8)
-        )
-        return Program(
-            "arithmetic_expression_fused",
-            variables=("index",),
-            lists=lists,
-            body=(
-                clear(destination),
-                set_var("index", 1),
-                *traversal,
-            ),
-        ).compile()
-
-
-class FastElementwiseInstruction(OptimizedElementwiseInstruction):
+def _emit_fast_elementwise(ctx: KernelContext):
     """Approximate nonlinearities that avoid expensive transcendental work."""
-
-    def _unary(self):
-        direct = item("T1", var("index"))
-        if self.op == "aten.gelu.default":
-            result = quick_gelu_of(direct)
-            return (), append("T2", result)
-        return super()._unary()
+    return _Elementwise(ctx).emit(fast=True)
 
 
-class OptimizedSwiGLUInstruction(Instruction):
+def elementwise_kernel(target: str) -> Kernel:
+    """The exact elementwise kernel for ``target``."""
+    return Kernel(target, _emit_elementwise, name="elementwise_optimized")
+
+
+FAST_GELU_KERNEL = Kernel("aten.gelu.default", _emit_fast_elementwise, name="elementwise_optimized")
+
+
+def _arithmetic_value(ctx: KernelContext, values, operand):
+    kind, value = operand
+    if kind == "input":
+        return item(ctx.inputs[ctx.argument_names[value]].list, var("index"))
+    if kind == "step":
+        return values[value]
+    return value
+
+
+def _emit_arithmetic_expression(ctx: KernelContext):
+    """Evaluate a same-shape arithmetic chain in one list traversal.
+
+    ``ctx.options["steps"]`` lists ``(target, operands)`` in order; each
+    operand is ``("input", position)``, ``("step", index)`` of an earlier
+    step, or ``("constant", value)``. The last step is the result, of
+    ``ctx.options["size"]`` values.
+    """
+    index = ctx.temp_var("index")
+    values = []
+    for target, operands in ctx.options["steps"]:
+        resolved = [_arithmetic_value(ctx, values, operand) for operand in operands]
+        values.append(
+            mul(-1, resolved[0]) if target == "aten.neg.default"
+            else _BINARY[target](*resolved)
+        )
+    out = ctx.output.list
+    first = ctx.inputs[ctx.argument_names[0]]
+    step = (append(out, values[-1]), change_var(index, 1))
+    traversal = (
+        (repeat(length(first.list), step),) if first.dynamic_axis is not None
+        else _static_unrolled_repeat(ctx.options["size"], step, factor=8)
+    )
+    return (clear(out), set_var(index, 1), *traversal)
+
+
+ARITHMETIC_EXPRESSION_KERNEL = Kernel(
+    "cattorch.arithmetic_expression", _emit_arithmetic_expression,
+    name="arithmetic_expression_fused",
+)
+
+
+def _emit_swiglu(ctx: KernelContext):
     """Fuse ``silu(gate) * value`` into one exact elementwise traversal."""
-
-    def prepare(self):
-        self.size = length("T1") if self.args[0].dynamic else math.prod(self.args[0].shape)
-
-    def finalize(self):
-        gate = var("gate")
-        result = mul(
-            mul(gate, sigmoid_of(gate)),
-            item("T2", var("index")),
-        )
-        iteration = (
-            set_var("gate", item("T1", var("index"))),
-            append("T3", result),
-            change_var("index", 1),
-        )
-        return Program(
-            "swiglu_optimized",
-            variables=("index", "gate"),
-            lists=("T1", "T2", "T3"),
-            body=(
-                clear("T3"),
-                set_var("index", 1),
-                *(
-                    (repeat(self.size, iteration),)
-                    if self.args[0].dynamic
-                    else _static_unrolled_repeat(self.size, iteration, factor=4)
-                ),
-            ),
-        ).compile()
+    gate_input, value = ctx.inputs["gate"], ctx.inputs["value"]
+    index, gate = ctx.temp_var("index"), ctx.temp_var("gate")
+    out = ctx.output.list
+    iteration = (
+        set_var(gate, item(gate_input.list, var(index))),
+        append(out, mul(mul(var(gate), sigmoid_of(var(gate))), item(value.list, var(index)))),
+        change_var(index, 1),
+    )
+    dynamic = gate_input.dynamic_axis is not None
+    return (
+        clear(out),
+        set_var(index, 1),
+        *(
+            (repeat(length(gate_input.list), iteration),) if dynamic
+            else _static_unrolled_repeat(gate_input.numel, iteration, factor=4)
+        ),
+    )
 
 
-class PairedLinearSwiGLUInstruction(Instruction):
-    """Fuse two same-input Linear projections and their SwiGLU epilogue."""
+SWIGLU_KERNEL = Kernel(
+    "cattorch.swiglu", _emit_swiglu, name="swiglu_optimized", arguments=("gate", "value"),
+)
 
-    def __init__(self, torch_name, output, *args, shard_rows=()):
-        self.shard_rows = tuple(shard_rows)
-        super().__init__(torch_name, output, *args)
 
-    def prepare(self):
-        input_shape = self.args[0].shape
-        gate_shape = self.args[1].shape
-        value_shape = self.args[3].shape
-        if gate_shape != value_shape or len(gate_shape) != 2:
+def _emit_paired_linear_swiglu(ctx: KernelContext):
+    """Fuse two same-input Linear projections and their SwiGLU epilogue.
+
+    The arguments are the input, then each shard's gate and value weights,
+    then the gate and value biases. ``ctx.options["shard_rows"]`` gives each
+    shard's rows; without it there is one shard.
+    """
+    names = ctx.argument_names
+    source = ctx.inputs[names[0]]
+    pairs = [
+        (ctx.inputs[names[position]], ctx.inputs[names[position + 1]])
+        for position in range(1, len(names) - 2, 2)
+    ]
+    gate_bias, value_bias = ctx.inputs.get(names[-2]), ctx.inputs.get(names[-1])
+    for gate_weight, value_weight in pairs:
+        if gate_weight.shape != value_weight.shape or len(gate_weight.shape) != 2:
             raise ValueError("paired SwiGLU weights must have the same matrix shape")
-        self.rows = (
-            div(length("T1"), input_shape[-1])
-            if self.args[0].dynamic
-            else (math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1)
+    shard_rows = tuple(ctx.options.get("shard_rows") or (pairs[0][0].shape[0],))
+    if len(shard_rows) != len(pairs):
+        raise ValueError("paired SwiGLU shards must cover every hidden row")
+    input_shape = source.shape
+    inner = input_shape[-1]
+    rows = (
+        div(length(source.list), inner) if source.dynamic_axis is not None
+        else (math.prod(input_shape[:-1]) if len(input_shape) > 1 else 1)
+    )
+    (row_start, input_index, gate_offset, value_offset, output_index,
+     input_value, gate_sum, value_sum) = (
+        ctx.temp_var(name) for name in (
+            "row start", "input index", "gate offset", "value offset",
+            "output index", "input value", "gate sum", "value sum",
         )
-        self.inner = input_shape[-1]
-        self.hidden = gate_shape[0]
-        if not self.shard_rows:
-            self.shard_rows = (self.hidden,)
-        if sum(self.shard_rows) != self.hidden:
-            raise ValueError("paired SwiGLU shards must cover every hidden row")
-        shard_count = len(self.shard_rows)
-        self.weight_lists = tuple(
-            (f"T{2 + 2 * index}", f"T{3 + 2 * index}")
-            for index in range(shard_count)
+    )
+    out = ctx.output.list
+    gate_initial = item(gate_bias.list, var(output_index)) if gate_bias else 0
+    value_initial = item(value_bias.list, var(output_index)) if value_bias else 0
+    gate = var(gate_sum)
+    swiglu = mul(mul(gate, sigmoid_of(gate)), var(value_sum))
+    projections = []
+    for (gate_weight, value_weight), count in zip(pairs, shard_rows):
+        step = (
+            set_var(input_value, item(source.list, var(input_index))),
+            change_var(gate_sum, mul(
+                var(input_value), item(gate_weight.list, add(var(gate_offset), var(input_index))),
+            )),
+            change_var(value_sum, mul(
+                var(input_value), item(value_weight.list, add(var(value_offset), var(input_index))),
+            )),
+            change_var(input_index, 1),
         )
-        self.gate_bias_list = f"T{2 + 2 * shard_count}"
-        self.value_bias_list = f"T{3 + 2 * shard_count}"
-        self.output_list = f"T{4 + 2 * shard_count}"
-        self.gate_bias = self.args[2].value is not None or bool(self.args[2].shape)
-        self.value_bias = self.args[4].value is not None or bool(self.args[4].shape)
+        projections.extend((
+            set_var(gate_offset, sub(1, var(row_start))),
+            set_var(value_offset, sub(1, var(row_start))),
+            repeat(count, (
+                set_var(gate_sum, gate_initial),
+                set_var(value_sum, value_initial),
+                set_var(input_index, var(row_start)),
+                *_static_unrolled_repeat(inner, step, factor=4),
+                append(out, swiglu),
+                change_var(gate_offset, inner),
+                change_var(value_offset, inner),
+                change_var(output_index, 1),
+            )),
+        ))
+    return (
+        clear(out),
+        set_var(row_start, 1),
+        repeat(rows, (
+            set_var(output_index, 1),
+            *projections,
+            change_var(row_start, inner),
+        )),
+    )
 
-    def finalize(self):
-        gate_initial = (
-            item(self.gate_bias_list, var("output index"))
-            if self.gate_bias else 0
-        )
-        value_initial = (
-            item(self.value_bias_list, var("output index"))
-            if self.value_bias else 0
-        )
-        gate = var("gate sum")
-        swiglu = mul(
-            mul(gate, sigmoid_of(gate)),
-            var("value sum"),
-        )
-        projections = []
-        for (gate_weight, value_weight), shard_rows in zip(
-            self.weight_lists, self.shard_rows,
-        ):
-            step = (
-                set_var("input value", item("T1", var("input index"))),
-                change_var(
-                    "gate sum",
-                    mul(
-                        var("input value"),
-                        item(
-                            gate_weight,
-                            add(var("gate offset"), var("input index")),
-                        ),
-                    ),
-                ),
-                change_var(
-                    "value sum",
-                    mul(
-                        var("input value"),
-                        item(
-                            value_weight,
-                            add(var("value offset"), var("input index")),
-                        ),
-                    ),
-                ),
-                change_var("input index", 1),
-            )
-            projections.extend((
-                set_var("gate offset", sub(1, var("row start"))),
-                set_var("value offset", sub(1, var("row start"))),
-                repeat(shard_rows, (
-                    set_var("gate sum", gate_initial),
-                    set_var("value sum", value_initial),
-                    set_var("input index", var("row start")),
-                    *_static_unrolled_repeat(self.inner, step, factor=4),
-                    append(self.output_list, swiglu),
-                    change_var("gate offset", self.inner),
-                    change_var("value offset", self.inner),
-                    change_var("output index", 1),
-                )),
-            ))
 
-        return Program(
-            "swiglu_paired_linear",
-            variables=(
-                "row start", "input index", "gate offset", "value offset",
-                "output index", "input value", "gate sum", "value sum",
-            ),
-            lists=tuple(
-                f"T{index}" for index in range(1, 2 * len(self.shard_rows) + 5)
-            ),
-            body=(
-                clear(self.output_list),
-                set_var("row start", 1),
-                repeat(self.rows, (
-                    set_var("output index", 1),
-                    *projections,
-                    change_var("row start", self.inner),
-                )),
-            ),
-        ).compile()
+PAIRED_LINEAR_SWIGLU_KERNEL = Kernel(
+    "cattorch.paired_linear_swiglu", _emit_paired_linear_swiglu, name="swiglu_paired_linear",
+)
+
+
+__all__ = [
+    "ARITHMETIC_EXPRESSION_KERNEL", "FAST_GELU_KERNEL", "PAIRED_LINEAR_SWIGLU_KERNEL",
+    "SWIGLU_KERNEL", "elementwise_kernel",
+]

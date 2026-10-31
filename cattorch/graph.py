@@ -648,11 +648,12 @@ def _fuse_rotate_half(graph) -> None:
 
 def _user_kernel(registry, target: str, fast: bool, config) -> bool:
     """Whether ``target`` lowers through a kernel passed to this export."""
-    from cattorch.builtin_kernels import BUILTIN_KERNELS
+    from cattorch.operator_registry import default_registry
 
     kernel = registry.kernel(target, fast=fast, config=config)
-    context = getattr(kernel, "kernel", None)
-    return context is not None and not any(context is builtin for builtin in BUILTIN_KERNELS)
+    if getattr(kernel, "kernel", None) is None:
+        return False
+    return kernel is not default_registry().kernel(target, fast=fast, config=config)
 
 
 def _drop_identity_permutes(graph) -> None:

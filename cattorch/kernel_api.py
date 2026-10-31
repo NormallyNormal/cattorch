@@ -135,6 +135,8 @@ class KernelContext:
         self.options: dict[str, object] = {}
         # Each tensor input's list name in the compiler, to find its values.
         self.sources: dict[str, str] = {}
+        #: The names of the arguments the call passed, in order.
+        self.argument_names: tuple[str, ...] = ()
 
     @classmethod
     def from_arguments(
@@ -142,11 +144,14 @@ class KernelContext:
         operator=None, names: tuple[str, ...] | None = None,
     ) -> KernelContext:
         operator = resolve_operator(target) if operator is None else operator
+        argument_names: list[str]
+        defaults: dict[str, object]
         if names:
             # A kernel the compiler builds itself names its arguments.
-            names, defaults = [*names, *(f"arg{i}" for i in range(len(names), len(args)))], {}
+            argument_names = [*names, *(f"arg{i}" for i in range(len(names), len(args)))]
+            defaults = {}
         else:
-            names, defaults = _schema_names(operator, len(args))
+            argument_names, defaults = _schema_names(operator, len(args))
         slots, output_slot = _tensor_slots(args)
         inputs: dict[str, TensorInfo] = {}
         scalars: dict[str, object] = {
@@ -154,7 +159,7 @@ class KernelContext:
         }
         sources: dict[str, str] = {}
         for position, argument in enumerate(args):
-            name = names[position]
+            name = argument_names[position]
             if position in slots and argument.name != "_none":
                 sources[name] = str(argument.name)
                 inputs[name] = TensorInfo(
@@ -178,6 +183,7 @@ class KernelContext:
             str(target), inputs, scalars, out, tuple(slots.values()),
         )
         context.sources = sources
+        context.argument_names = tuple(argument_names[:len(args)])
         return context
 
     @classmethod

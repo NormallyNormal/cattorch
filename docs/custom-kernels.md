@@ -69,6 +69,9 @@ already lowers replaces the built-in kernel for that export only.
   `print(torch.ops.aten.mish.default._schema)`.
 - `ctx.scalars` holds the other arguments, with the schema's defaults filled
   in.
+- `ctx.argument_names` names the arguments the call passed, in order, for a
+  kernel that reads them by position. Each is a key of `ctx.inputs` or
+  `ctx.scalars`.
 - `ctx.output` is the result tensor. Fill its `list` from empty.
 - `ctx.temp_var(name)` declares a variable, and `ctx.temp_list(name, length)`
   a scratch list of up to `length` items. `ctx.static_list(name, values)`

@@ -19,13 +19,12 @@ from cattorch.moe_detection import detect_custom_moe
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
 from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.instruction.optimized import (
-    FastElementwiseInstruction,
     LinearInstruction,
     OptimizedConvolutionInstruction,
-    OptimizedElementwiseInstruction,
     OptimizedMatMulInstruction,
     OptimizedPoolingInstruction,
 )
+from cattorch.util.instruction.optimized_elementwise import FAST_GELU_KERNEL, elementwise_kernel
 from cattorch.util.instruction.optimized_normalization import (
     BATCH_NORM_KERNEL, FAST_LAYER_NORM_KERNEL, FAST_SOFTMAX_KERNEL, LAYER_NORM_KERNEL,
     LOG_SOFTMAX_KERNELS, MEAN_KERNEL, RMS_NORM_KERNEL, SOFTMAX_KERNELS,
@@ -592,7 +591,10 @@ def _build_default_registry() -> OperatorRegistry:
         "aten.avg_pool1d.default": OptimizedPoolingInstruction,
         "aten.avg_pool2d.default": OptimizedPoolingInstruction,
         "aten.adaptive_avg_pool2d.default": OptimizedPoolingInstruction,
-        **{operation: OptimizedElementwiseInstruction for operation in ELEMENTWISE_OPS},
+        **{
+            operation: elementwise_kernel(operation).instruction_class()
+            for operation in ELEMENTWISE_OPS
+        },
         **{operation: OptimizedMatMulInstruction for operation in MATMUL_OPS},
     }
     validators = {
@@ -625,7 +627,7 @@ def _build_default_registry() -> OperatorRegistry:
             Literal["activations", "layer_norm", "softmax"] | None,
         ],
     ] = {
-        "aten.gelu.default": (FastElementwiseInstruction, "activations"),
+        "aten.gelu.default": (FAST_GELU_KERNEL.instruction_class(), "activations"),
         "aten.layer_norm.default": (FAST_LAYER_NORM_KERNEL.instruction_class(), "layer_norm"),
         "aten.softmax.int": (FAST_SOFTMAX_KERNEL.instruction_class(), "softmax"),
     }
