@@ -7,7 +7,7 @@ import math
 import operator
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 
@@ -279,14 +279,14 @@ class _GraphInfo:
     fast: bool
     fast_config: FastConfig
     generation: _GenerationInfo
-    linear_fusions: dict
+    linear_fusions: dict[str, "_LinearEpilogue"]
     paired_swiglu_fusions: dict
     silu_mul_fusions: dict
     embedding_add_fusions: dict
     elementwise_fusions: dict
-    qkv_linear_fusions: dict
+    qkv_linear_fusions: dict[str, "_QKVProjection"]
     qkv_offsets: dict[str, int]
-    causal_score_fusions: dict
+    causal_score_fusions: dict[str, "_CausalScore"]
     causal_softmaxes: dict
     causal_value_matmuls: set[str]
     fused_nodes: set[str]
@@ -1013,39 +1013,28 @@ def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis
         node.args = tuple(arguments)
 
 
-def _prepare_graph(
-    model,
-    example_inputs,
-    *,
-    optimization: Literal["exact", "fast"] = "exact",
-    fast_config: FastConfig | None = None,
-    generation: _GenerationSpec | None = None,
-    frontend: Frontend = "fx",
-    _registry: OperatorRegistry | None = None,
-    dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
-    example_kwargs: dict | None = None,
-    _captured: CapturedGraph | None = None,
-) -> _GraphInfo:
-    """Capture the model, decompose ops, and analyze the graph structure."""
-    fast = optimization == "fast"
-    fast_config = fast_config or FastConfig()
-    registry = _registry or default_registry()
+@dataclass
+class _RuntimeAxes:
+    """Where each node's variable-length dimension is, from ``dynamic=`` inputs."""
+
+    axes: dict[str, int]
+    bounds: dict[str, tuple[str, int, int]]
+    offsets: dict[str, int]
+    row_loops: set[str]
+
+
+def _propagate_runtime_axes(
+    captured, nodes, dynamic_inputs, *, model, example_inputs, example_kwargs, frontend,
+    registry, fast, fast_config,
+) -> _RuntimeAxes:
+    """Follow each variable-length input through the graph.
+
+    Operations that mix values along the runtime axis are rewritten to
+    runtime kernels, ones that treat items independently are marked to run
+    once per item, and the rest are rejected.
+    """
     from cattorch.experts import _expert_family_context
-    with _expert_family_context(registry.expert_families):
-        captured = _captured or capture_model(
-            model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
-        )
-    _normalize_graph(captured.graph)
-    if generation is not None:
-        # The wrapper tracks the length, so the step module's position
-        # increment has nothing to lower.
-        for node in list(captured.graph.nodes):
-            if (
-                node.op == "call_function"
-                and str(node.target) == _ADVANCE_POSITION
-            ):
-                captured.graph.erase_node(node)
-    nodes = list(captured.graph.nodes)
+
     dynamic_inputs = dynamic_inputs or {}
     placeholders = [
         node for node in nodes
@@ -1353,12 +1342,11 @@ def _prepare_graph(
                 "an output keeps the runtime extent folded into another dimension; "
                 "reshape it back so the extent has a dimension of its own"
             )
-    node_order = {node.name: index for index, node in enumerate(nodes)}
-    state_inputs = captured.state_inputs
-    user_input_placeholders = captured.user_input_names
+    return _RuntimeAxes(dynamic_axes, dynamic_bounds, dynamic_offsets, row_loops)
 
-    def resolve_state(arg_name):
-        return state_inputs.get(arg_name)
+
+def _tensor_outputs(captured, nodes) -> list:
+    """``(node name, shape, dtype)`` of each model output, which must be tensors."""
 
     if not captured.user_output_names:
         raise UnsupportedModelError(
@@ -1374,7 +1362,11 @@ def _prepare_graph(
                 f"model output leaf {index} is not a tensor"
             )
         outputs.append((traced_name, _get_shape(output_node), value.dtype))
-    traced_name, output_shape, output_dtype = outputs[0]
+    return outputs
+
+
+def _static_values(nodes, state_inputs, generation) -> dict:
+    """Values known at export: generated tensors, and everything folded from them."""
 
     # Materialise compile-time generated tensors as static weights.
     generated_weights = {}
@@ -1424,11 +1416,11 @@ def _prepare_graph(
         },
         seed=generated_weights,
     ))
+    return generated_weights
 
-    def resolve_weight(arg_name):
-        if arg_name in generated_weights:
-            return generated_weights[arg_name]
-        return resolve_state(arg_name)
+
+def _model_input_names(nodes, user_input_placeholders, resolve_weight) -> dict[str, str]:
+    """The Scratch list of each model input; every other placeholder is a weight."""
 
     # Identify model inputs (placeholders not in state_dict)
     input_names = {}
@@ -1445,6 +1437,11 @@ def _prepare_graph(
                 f"unable to resolve exported parameter or buffer {node.name!r} "
                 "from the PyTorch export signature"
             )
+    return input_names
+
+
+def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, dict]:
+    """Nodes that read another node's list unchanged, and how splits divide it."""
 
     # Build alias map for no-op shape ops and splits
     aliases = {}
@@ -1540,6 +1537,10 @@ def _prepare_graph(
             split_meta[node.name] = (input_shape, split_size, dim)
             log.info("Split: %s -> %s (split_size=%s, dim=%s)",
                      node.name, source, split_size, dim)
+    return aliases, split_meta
+
+
+def _reject_unsupported_variants(nodes, generated_weights, registry, fast, fast_config) -> None:
 
     # Reject valid ATen variants whose extra arguments the Scratch kernels do
     # not implement.  Silently discarding these options is much worse than an
@@ -1558,9 +1559,66 @@ def _prepare_graph(
         if detail is not None:
             raise _unsupported_operation(node, detail)
 
-    linear_fusions = {}
-    approximate_fusions: list[str] = []
-    fused_nodes = set()
+
+class _LinearEpilogue(NamedTuple):
+    """A linear and the operations after it that its kernel applies."""
+
+    final: torch.fx.Node  # the last fused node, whose list holds the result
+    epilogue: tuple  # ``(operation, operand)`` steps, in order
+    chain: tuple  # the fused nodes after the linear
+
+
+class _CausalScore(NamedTuple):
+    """``q @ k.T``, scaled and masked with ``-inf`` above the diagonal."""
+
+    mask: torch.fx.Node  # the ``masked_fill``, whose list holds the scores
+    query: torch.fx.Node
+    key: torch.fx.Node  # before its transpose
+    scale: float
+    transposed_key: torch.fx.Node
+    scale_node: torch.fx.Node | None
+
+
+class _QKVProjection(NamedTuple):
+    """A combined QKV linear whose output is read as Q, K and V in place."""
+
+    query_heads: int
+    kv_heads: int
+    query: torch.fx.Node
+    key: torch.fx.Node
+    value: torch.fx.Node
+    query_item: torch.fx.Node
+    key_item: torch.fx.Node
+    value_item: torch.fx.Node
+
+
+@dataclass
+class _Fusions:
+    """Operations compiled together, filled in by the ``_match_*`` functions.
+
+    ``fused_nodes`` holds the nodes a fusion emits as part of another, so the
+    compiler skips them.
+    """
+
+    fused_nodes: set[str] = field(default_factory=set)
+    approximate: list[str] = field(default_factory=list)
+    linear: dict = field(default_factory=dict)
+    paired_swiglu: dict = field(default_factory=dict)
+    silu_mul: dict = field(default_factory=dict)
+    embedding_add: dict = field(default_factory=dict)
+    elementwise: dict = field(default_factory=dict)
+    causal_scores: dict = field(default_factory=dict)
+    causal_softmaxes: dict = field(default_factory=dict)
+    causal_value_matmuls: set[str] = field(default_factory=set)
+    qkv_linear: dict = field(default_factory=dict)
+    qkv_offsets: dict = field(default_factory=dict)
+
+
+def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config):
+    """A linear followed by scalar arithmetic, a residual add or an activation."""
+    linear_fusions, approximate_fusions = fusions.linear, fusions.approximate
+    fused_nodes = fusions.fused_nodes
+
     scalar_ops = {
         "aten.mul.Tensor": "mul", "aten.div.Tensor": "div",
         "aten.add.Tensor": "add", "aten.sub.Tensor": "sub",
@@ -1635,11 +1693,15 @@ def _prepare_graph(
             chain.append(user)
             current = user
         if chain:
-            linear_fusions[node.name] = (current, tuple(epilogue), tuple(chain))
+            linear_fusions[node.name] = _LinearEpilogue(current, tuple(epilogue), tuple(chain))
             fused_nodes.update(item.name for item in chain)
 
-    paired_swiglu_fusions = {}
-    silu_mul_fusions = {}
+
+def _match_swiglu(fusions, nodes):
+    """``silu(a) * b``, and the paired form where ``a`` and ``b`` are linears of one input."""
+    paired_swiglu_fusions, silu_mul_fusions = fusions.paired_swiglu, fusions.silu_mul
+    fused_nodes = fusions.fused_nodes
+
     for node in nodes:
         if node.op != "call_function" or str(node.target) != "aten.silu.default":
             continue
@@ -1674,7 +1736,11 @@ def _prepare_graph(
             silu_mul_fusions[multiply.name] = (node, gate, other)
             fused_nodes.add(node.name)
 
-    embedding_add_fusions = {}
+
+def _match_embedding_adds(fusions, nodes):
+    """Two embedding lookups added together, such as token and position."""
+    embedding_add_fusions, fused_nodes = fusions.embedding_add, fusions.fused_nodes
+
     for node in nodes:
         if (
             node.op != "call_function"
@@ -1702,12 +1768,17 @@ def _prepare_graph(
         embedding_add_fusions[node.name] = (first, second)
         fused_nodes.update((first.name, second.name))
 
+
+def _match_elementwise_chains(fusions, nodes, row_loops):
+    elementwise_fusions, fused_nodes = fusions.elementwise, fusions.fused_nodes
+    linear_fusions, paired_swiglu_fusions = fusions.linear, fusions.paired_swiglu
+    silu_mul_fusions, embedding_add_fusions = fusions.silu_mul, fusions.embedding_add
+
     # Collapse straight-line, same-shape arithmetic into one traversal.  This
     # is deliberately conservative: broadcasting still uses the regular
     # elementwise kernel, and a value with another consumer terminates a chain.
     # The fusion is keyed by its final node so branched operands have already
     # been materialized when the compiler emits it.
-    elementwise_fusions = {}
     arithmetic_ops = {
         "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
         "aten.div.Tensor", "aten.neg.default",
@@ -1766,15 +1837,15 @@ def _prepare_graph(
         claimed.update(item.name for item in chain)
         fused_nodes.update(item.name for item in chain[:-1])
 
+
+def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
+    causal_score_fusions, causal_softmaxes = fusions.causal_scores, fusions.causal_softmaxes
+    causal_value_matmuls, fused_nodes = fusions.causal_value_matmuls, fusions.fused_nodes
+
     # Recognize the standard exact causal-attention chain.  The specialized
     # score kernel consumes K before its final transpose, folds the scalar
     # scale and -inf mask, and exposes enough metadata for softmax and A@V to
     # skip the known upper triangle as well.
-    causal_score_fusions = {}
-    causal_softmaxes = {}
-    causal_value_matmuls = set()
-    qkv_linear_fusions = {}
-    qkv_offsets = {}
     def static_tensor(candidate):
         if not hasattr(candidate, "name"):
             return None
@@ -1863,7 +1934,7 @@ def _prepare_graph(
         if scale_node is not None and len(scale_node.users) != 1:
             continue
 
-        causal_score_fusions[qk.name] = (
+        causal_score_fusions[qk.name] = _CausalScore(
             mask_node, q, k, scale, transposed_k, scale_node,
         )
         fused_nodes.add(mask_node.name)
@@ -1900,6 +1971,12 @@ def _prepare_graph(
             ):
                 causal_value_matmuls.add(node.name)
 
+
+def _match_qkv(fusions, nodes, aliases):
+    causal_score_fusions, causal_softmaxes = fusions.causal_scores, fusions.causal_softmaxes
+    causal_value_matmuls, fused_nodes = fusions.causal_value_matmuls, fusions.fused_nodes
+    qkv_linear_fusions, qkv_offsets = fusions.qkv_linear, fusions.qkv_offsets
+
     # Collapse the canonical combined-QKV split/view/transposes into one
     # projection whose output is [Q head-major, K head-major, V head-major].
     # The causal kernels use offsets into that shared list.
@@ -1913,7 +1990,7 @@ def _prepare_graph(
         return candidate
 
     for qk_name, fusion in causal_score_fusions.items():
-        mask_node, q, k, _, _, _ = fusion
+        mask_node, q, k = fusion.mask, fusion.query, fusion.key
         # Reordered QKV emission adds outer-loop dispatch.  Official-VM
         # A/B runs show the removed copies pay for that only once the
         # sequence is moderately long.
@@ -1974,7 +2051,7 @@ def _prepare_graph(
         kv_heads = k_shape[-3]
         q_size = math.prod(q_shape)
         k_size = math.prod(k_shape)
-        qkv_linear_fusions[linear.name] = (
+        qkv_linear_fusions[linear.name] = _QKVProjection(
             q_heads, kv_heads, q, k, v, q_item, k_item, v_item,
         )
         qkv_offsets.update({q.name: 0, k.name: q_size, v.name: q_size + k_size})
@@ -1982,6 +2059,10 @@ def _prepare_graph(
         aliases[k.name] = linear.name
         aliases[v.name] = linear.name
         fused_nodes.update((q_item.name, k_item.name, v_item.name))
+
+
+def _generation_caches(nodes, generation, example_inputs) -> _GenerationInfo:
+    """Name one K and one V cache per cached attention block, in graph order."""
 
     generation_score_caches = {}
     generation_value_caches = {}
@@ -2011,7 +2092,80 @@ def _prepare_graph(
             )
         if generation.hidden_prefill:
             generation_hidden_prefill_attention = next(reversed(generation_score_caches))
+    return _GenerationInfo(
+        score_caches=generation_score_caches,
+        value_caches=generation_value_caches,
+        cache_widths=generation_cache_widths,
+        first_cache=generation_first_cache,
+        hidden_prefill_attention=generation_hidden_prefill_attention,
+    )
 
+
+def _prepare_graph(
+    model,
+    example_inputs,
+    *,
+    optimization: Literal["exact", "fast"] = "exact",
+    fast_config: FastConfig | None = None,
+    generation: _GenerationSpec | None = None,
+    frontend: Frontend = "fx",
+    _registry: OperatorRegistry | None = None,
+    dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
+    example_kwargs: dict | None = None,
+    _captured: CapturedGraph | None = None,
+) -> _GraphInfo:
+    """Capture the model, decompose ops, and analyze the graph structure.
+
+    The passes run in order: capture and normalize the graph, follow
+    variable-length axes (which can rewrite nodes), collect outputs, fold
+    static values, name inputs, record aliases, validate, match fusions,
+    then name generation caches.
+    """
+    fast = optimization == "fast"
+    fast_config = fast_config or FastConfig()
+    registry = _registry or default_registry()
+    from cattorch.experts import _expert_family_context
+    with _expert_family_context(registry.expert_families):
+        captured = _captured or capture_model(
+            model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
+        )
+    _normalize_graph(captured.graph)
+    if generation is not None:
+        # The wrapper tracks the length, so the step module's position
+        # increment has nothing to lower.
+        for node in list(captured.graph.nodes):
+            if (
+                node.op == "call_function"
+                and str(node.target) == _ADVANCE_POSITION
+            ):
+                captured.graph.erase_node(node)
+    runtime_axes = _propagate_runtime_axes(
+        captured, list(captured.graph.nodes), dynamic_inputs or {},
+        model=model, example_inputs=example_inputs, example_kwargs=example_kwargs,
+        frontend=frontend, registry=registry, fast=fast, fast_config=fast_config,
+    )
+    nodes = list(captured.graph.nodes)
+    node_order = {node.name: index for index, node in enumerate(nodes)}
+    state_inputs = captured.state_inputs
+    outputs = _tensor_outputs(captured, nodes)
+    generated_weights = _static_values(nodes, state_inputs, generation)
+
+    def resolve_weight(arg_name):
+        if arg_name in generated_weights:
+            return generated_weights[arg_name]
+        return state_inputs.get(arg_name)
+
+    input_names = _model_input_names(nodes, captured.user_input_names, resolve_weight)
+    aliases, split_meta = _aliases_and_splits(nodes, generated_weights, runtime_axes.axes)
+    _reject_unsupported_variants(nodes, generated_weights, registry, fast, fast_config)
+    fusions = _Fusions()
+    _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config)
+    _match_swiglu(fusions, nodes)
+    _match_embedding_adds(fusions, nodes)
+    _match_elementwise_chains(fusions, nodes, runtime_axes.row_loops)
+    _match_causal_attention(fusions, nodes, aliases, resolve_weight)
+    # Rewrites aliases so Q, K and V read the shared projection.
+    _match_qkv(fusions, nodes, aliases)
     graph = _GraphInfo(
         nodes=nodes,
         resolve_weight=resolve_weight,
@@ -2022,30 +2176,24 @@ def _prepare_graph(
         generated_weights=generated_weights,
         fast=fast,
         fast_config=fast_config,
-        generation=_GenerationInfo(
-            score_caches=generation_score_caches,
-            value_caches=generation_value_caches,
-            cache_widths=generation_cache_widths,
-            first_cache=generation_first_cache,
-            hidden_prefill_attention=generation_hidden_prefill_attention,
-        ),
-        linear_fusions=linear_fusions,
-        approximate_fusions=tuple(approximate_fusions),
-        row_loops=frozenset(row_loops),
-        paired_swiglu_fusions=paired_swiglu_fusions,
-        silu_mul_fusions=silu_mul_fusions,
-        embedding_add_fusions=embedding_add_fusions,
-        elementwise_fusions=elementwise_fusions,
-        qkv_linear_fusions=qkv_linear_fusions,
-        qkv_offsets=qkv_offsets,
-        causal_score_fusions=causal_score_fusions,
-        causal_softmaxes=causal_softmaxes,
-        causal_value_matmuls=causal_value_matmuls,
-        fused_nodes=fused_nodes,
+        generation=_generation_caches(nodes, generation, example_inputs),
+        linear_fusions=fusions.linear,
+        approximate_fusions=tuple(fusions.approximate),
+        row_loops=frozenset(runtime_axes.row_loops),
+        paired_swiglu_fusions=fusions.paired_swiglu,
+        silu_mul_fusions=fusions.silu_mul,
+        embedding_add_fusions=fusions.embedding_add,
+        elementwise_fusions=fusions.elementwise,
+        qkv_linear_fusions=fusions.qkv_linear,
+        qkv_offsets=fusions.qkv_offsets,
+        causal_score_fusions=fusions.causal_scores,
+        causal_softmaxes=fusions.causal_softmaxes,
+        causal_value_matmuls=fusions.causal_value_matmuls,
+        fused_nodes=fusions.fused_nodes,
         registry=registry,
-        dynamic_axes=dynamic_axes,
-        dynamic_bounds=dynamic_bounds,
-        dynamic_offsets=dynamic_offsets,
+        dynamic_axes=runtime_axes.axes,
+        dynamic_bounds=runtime_axes.bounds,
+        dynamic_offsets=runtime_axes.offsets,
     )
     _validate_lowering_operations(graph)
     return graph

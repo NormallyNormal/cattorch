@@ -644,9 +644,9 @@ class _Compiler:
         self._emit(instruction, [input_list], target_list)
 
     def _compile_causal_score(self, node):
-        final_node, q, k, scale, transposed_k, scale_node = (
-            self.graph.causal_score_fusions[node.name]
-        )
+        fusion = self.graph.causal_score_fusions[node.name]
+        final_node, q, k = fusion.mask, fusion.query, fusion.key
+        scale, transposed_k, scale_node = fusion.scale, fusion.transposed_key, fusion.scale_node
         target_list = self.scope.get_list_for_node(final_node)
         self.last_target_list = target_list
         input_lists = [self._resolve_name(q.name), self._resolve_name(k.name)]
@@ -676,7 +676,8 @@ class _Compiler:
         self.scope.release_dependencies(final_node)
 
     def _compile_qkv_linear(self, node):
-        query_heads, kv_heads, *_ = self.graph.qkv_linear_fusions[node.name]
+        projection = self.graph.qkv_linear_fusions[node.name]
+        query_heads, kv_heads = projection.query_heads, projection.kv_heads
         target_list = self.scope.get_list_for_node(node)
         self.last_target_list = target_list
         node_args = list(node.args)
@@ -825,7 +826,8 @@ class _Compiler:
             self.scope.release_dependencies(fused_node)
 
     def _compile_fused_linear(self, node):
-        final_node, epilogue, chain = self.graph.linear_fusions[node.name]
+        fusion = self.graph.linear_fusions[node.name]
+        final_node, epilogue, chain = fusion.final, fusion.epilogue, fusion.chain
         target_list = self.scope.get_list_for_node(final_node)
         self.last_target_list = target_list
 
