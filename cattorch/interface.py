@@ -12,6 +12,8 @@ version it implements in the ``cattorch interface version`` variable.
 
 from __future__ import annotations
 
+import re
+
 INTERFACE_VERSION = 1
 VERSION_VARIABLE = "cattorch interface version"
 PUBLIC_PREFIX = "cattorch "
@@ -66,7 +68,7 @@ def is_public_data(name: str, extra: frozenset[str] = frozenset()) -> bool:
     base = name.split(" shard ", 1)[0]
     return (
         base in PUBLIC_DATA or base in extra
-        or base in {"input", "output"} or base.startswith(("input_", "output_"))
+        or re.fullmatch(r"(input|output)(_\d+)?", base) is not None
     )
 
 

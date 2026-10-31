@@ -17,8 +17,6 @@ from typing import Mapping, Sequence
 import torch
 from torch import nn
 
-from cattorch.adapters import ModuleAdapter
-
 
 _ACTIVE_EXPERT_FAMILIES: ContextVar[Mapping[int, "ExpertFamily"]] = ContextVar(
     "cattorch_active_expert_families", default={},
@@ -886,8 +884,7 @@ class StackedSwiGLUMoE(nn.Module):
 
     A faster implementation for experts whose gate, up, and down weights are
     stored as stacked tensors. ``SparseMoE`` handles any supported expert
-    structure; use ``stacked_swiglu_moe_adapter`` to convert a compatible
-    module to this class.
+    structure, and specializes exact SwiGLU experts to this class itself.
     """
 
     def __init__(
@@ -937,42 +934,7 @@ class StackedSwiGLUMoE(nn.Module):
         )
 
 
-def stacked_swiglu_moe_adapter(
-    module_type: type[nn.Module],
-    *,
-    top_k: int | None = None,
-    normalize_selected: bool = False,
-) -> ModuleAdapter:
-    """Build an adapter that converts a stacked SwiGLU MoE module.
-
-    Modules of ``module_type`` must have ``router.weight``, ``gate.weight``,
-    ``up.weight``, and ``down.weight``, with expert weights stacked along the
-    first dimension. They are converted to ``StackedSwiGLUMoE`` during export.
-    """
-    def convert(module: nn.Module, context) -> nn.Module:
-        try:
-            router = module.router.weight
-            gate = module.gate.weight
-            up = module.up.weight
-            down = module.down.weight
-        except AttributeError as error:
-            raise ValueError(
-                f"stacked SwiGLU adapter at {context.module_path or '<root>'} "
-                "requires router/gate/up/down weight attributes"
-            ) from error
-        selected_k = top_k
-        if selected_k is None:
-            selected_k = int(getattr(module, "top_k", getattr(module, "moe_top_k", 1)))
-        return StackedSwiGLUMoE(
-            router, gate, up, down,
-            top_k=selected_k,
-            normalize_selected=normalize_selected,
-        )
-
-    return ModuleAdapter(module_type, convert)
-
-
 __all__ = [
     "ExpertFamily", "RoutingScores", "SparseMoE", "StackedSwiGLUMoE",
-    "routed_experts", "select_routes", "stacked_swiglu_moe_adapter",
+    "routed_experts", "select_routes",
 ]

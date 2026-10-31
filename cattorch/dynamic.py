@@ -94,13 +94,33 @@ def varied_at_length(value: torch.Tensor, axis: int, length: int, seed: int = 0)
     return torch.randint(low, high + 1, repeated.shape, generator=generator, dtype=value.dtype)
 
 
-def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs) -> None:
+_LONGEST_CHECKED = 1024
+
+
+def exact_export(*, optimization, storage, quantization, sig_figs) -> bool:
+    """Whether an export's numbers should match PyTorch to float32 rounding."""
+    precision = getattr(storage, "precision", "float32")
+    return (
+        optimization == "exact" and quantization is None and precision == "float32"
+        and sig_figs is None
+    )
+
+
+# Tolerances for an export that should match PyTorch exactly, a little looser
+# than ``verify``'s because a long sum accumulates float32 rounding.
+_EXACT_TOLERANCE = {"atol": 1e-3, "rtol": 1e-4}
+
+
+def check_lengths(
+    model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs, *, exact=False,
+) -> None:
     """Compare the sprite with PyTorch at lengths other than the traced one.
 
     The trace saw one row, so a model that builds something from the length
     itself (``torch.arange(n)``, a position table, a reshape over it) is
-    exported for one row only. Comparing at other lengths finds that. The
-    error at one row is the baseline, so approximate kernels and quantization
+    exported for one row only. Comparing at other lengths finds that. An
+    ``exact`` export must match at every length. Otherwise the error at the
+    shortest length is the baseline, so approximate kernels and quantization
     don't trip the check.
     """
     ((index, (_, minimum, maximum, axis)),) = spec.items()
@@ -112,26 +132,28 @@ def check_lengths(model, flat_inputs, kwarg_names, spec, result, verify, example
         values[index] = varied_at_length(values[index], axis, length)
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
+        tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
         return verify(
             model, tuple(values[:positional]), result,
-            example_kwargs=keywords or None, atol=math.inf, rtol=math.inf,
+            example_kwargs=keywords or None, **tolerance,
         )
 
     def error(outcome):
+        """The largest difference, and whether an exact export is within tolerance."""
         reports = getattr(outcome, "outputs", None) or (outcome,)
         if any(item.values_compared != item.actual_values for item in reports):
-            return math.inf
-        return max(item.max_abs_error for item in reports)
+            return math.inf, False
+        return max(item.max_abs_error for item in reports), outcome.passed
 
-    baseline = error(report(lengths[0]))
-    if baseline == math.inf:
+    baseline, matches = error(report(lengths[0]))
+    if not matches:
         raise UnsupportedModelError(
-            f"with {lengths[0]} items along the dynamic dimension the sprite returns "
-            "the wrong number of values"
+            f"with {lengths[0]} items along the dynamic dimension the sprite doesn't "
+            f"match the model (largest difference {baseline:.3g})"
         )
     for length in lengths[1:]:
-        found = error(report(length))
-        if found > 10 * baseline + 1e-4:
+        found, matches = error(report(length))
+        if not matches or found > 10 * baseline + 1e-4:
             raise UnsupportedModelError(
                 f"with {length} items along the dynamic dimension the sprite doesn't "
                 f"match the model (largest difference {found:.3g}), though it does with "
@@ -145,17 +167,20 @@ def _lengths(minimum, original, maximum) -> list[int]:
     """Lengths to check, the first one as the baseline.
 
     The export traces one item and literals at two, so three items or more
-    are needed to catch a wrong extrapolation, and a long length catches
-    capacity mistakes.
+    are needed to catch a wrong extrapolation. The maximum catches capacity
+    mistakes and behaviour that starts past some length, up to
+    ``_LONGEST_CHECKED`` items to keep the emulator's run time bounded.
     """
-    longest = maximum if maximum <= 32 else max(16, min(original, maximum))
+    longest = min(maximum, max(_LONGEST_CHECKED, original))
     return sorted({
         length for length in (minimum, 1, 2, 3, original, longest)
-        if max(minimum, 1) <= length <= maximum and (length <= 8 or length in {original, longest})
+        if max(minimum, 1) <= length <= maximum
     })
 
 
-def check_entry_lengths(model, program, result, verify, *, adapters=(), quantization=None) -> None:
+def check_entry_lengths(
+    model, program, result, verify, *, adapters=(), quantization=None, exact=False,
+) -> None:
     """``check_lengths`` for each variable-length input of a program's entry points.
 
     Each check calls the entry point once, from the initial state, with that
@@ -175,29 +200,31 @@ def check_entry_lengths(model, program, result, verify, *, adapters=(), quantiza
             def error(length):
                 values = [value.example for value in inputs]
                 values[position] = varied_at_length(binding.example, 0, length)
+                tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
                 outcome = verify(
                     model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
-                    atol=math.inf, rtol=math.inf, adapters=adapters, quantization=quantization,
+                    adapters=adapters, quantization=quantization, **tolerance,
                 )
                 (call,) = outcome.calls
                 reports = [*call.outputs, *(report for _, report in call.states)]
                 if call.status != "ok" or any(
                     report.values_compared != report.actual_values for report in reports
                 ):
-                    return math.inf
-                return max((report.max_abs_error for report in reports), default=0.0)
+                    return math.inf, False
+                found = max((report.max_abs_error for report in reports), default=0.0)
+                return found, outcome.passed
 
             lengths = _lengths(minimum, binding.example.shape[0], maximum)
-            baseline = error(lengths[0])
+            baseline, matches = error(lengths[0])
             where = f"input {binding.name!r} of entry point {entry.name!r}"
-            if baseline == math.inf:
+            if not matches:
                 raise UnsupportedModelError(
-                    f"with {lengths[0]} items in {where} the sprite fails or returns the "
-                    "wrong number of values"
+                    f"with {lengths[0]} items in {where} the sprite fails or doesn't "
+                    f"match the model (largest difference {baseline:.3g})"
                 )
             for length in lengths[1:]:
-                found = error(length)
-                if found > 10 * baseline + 1e-4:
+                found, matches = error(length)
+                if not matches or found > 10 * baseline + 1e-4:
                     raise UnsupportedModelError(
                         f"with {length} items in {where} the sprite doesn't match the model "
                         f"(largest difference {found:.3g}), though it does with {lengths[0]}. "
@@ -285,8 +312,8 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         _remove_completion_broadcast,
     )
     from cattorch.util.scratch.dsl import (
-        Program, add, append, broadcast_and_wait, call, change_var, clear, div, for_each,
-        item, length, mul, set_var, var,
+        Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
+        gt, if_, item, length, lt, mod, mul, set_var, var,
     )
     from cattorch.util.scratch.interface import rename_list, rename_procedure
 
@@ -312,8 +339,7 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
         private = f"_cattorch unit {public}"
         rename_list(sprite, public, private)
         outputs.append((public, private, math.prod(shape)))
-    body = [
-        *(clear(public) for public, _, _ in outputs),
+    run_units = (
         set_var(unit, 0),
         for_each("_cattorch units", div(length(public_input), input_size), (
             clear(private_input),
@@ -327,7 +353,22 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
             ),
             change_var(unit, 1),
         )),
-        set_var("cattorch status", "ok"),
+    )
+    # Whole items within the bounds, as an exported forward checks them.
+    status = "cattorch status"
+    body = [
+        *(clear(public) for public, _, _ in outputs),
+        set_var(status, "ok"),
+        if_(gt(mod(length(public_input), input_size), 0), (
+            set_var(status, f"invalid dynamic length: {public_input}"),
+        )),
+        if_(lt(length(public_input), input_size * max(minimum, 1)), (
+            set_var(status, f"too few items: {public_input}"),
+        )),
+        if_(gt(length(public_input), input_size * maximum), (
+            set_var(status, f"dynamic capacity exceeded: {public_input}"),
+        )),
+        if_(eq(var(status), "ok"), run_units),
         broadcast_and_wait("cattorch forward complete"),
     ]
     program = Program(
@@ -350,7 +391,9 @@ def loop_over_units(result, spec, output_axes, input_shapes, output_shapes):
 
     def bounded(spec_value, shape, dim):
         public_shape = list(shape)
-        public_shape[dim] = BoundedDimension(name, minimum, maximum)
+        # Each item can give several rows, as reshape(-1, 2) of four features does.
+        rows = shape[dim]
+        public_shape[dim] = BoundedDimension(name, minimum * rows, maximum * rows)
         return TensorSpec(
             list_name=spec_value.list_name, shape=tuple(public_shape), dtype=spec_value.dtype,
             numel=None, max_numel=math.prod(shape) * maximum,

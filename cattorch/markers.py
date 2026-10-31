@@ -338,6 +338,33 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
     return changed, result
 
 
+def _rewritten_rows(model: nn.Module, method_name: str, arguments: tuple, names) -> list[str]:
+    """Growing buffers whose existing rows a second call changes.
+
+    The sprite commits only the rows a call adds. One call from the initial
+    state, often empty, can't show whether the method also rewrites or
+    shifts the old rows, as ``cat([decay * old, new])`` or prepending does.
+    """
+    from cattorch.dynamic import varied_at_length
+
+    probe = copy.deepcopy(model).eval()
+    # Other values the second time, so the rows it adds look different.
+    others = tuple(
+        varied_at_length(value, 0, value.shape[0], seed=1) if value.ndim else value + 1
+        for value in arguments
+    )
+    with torch.no_grad():
+        getattr(probe, method_name)(*copy.deepcopy(arguments))
+        first = {name: _get_buffer(probe, name).detach().clone() for name in names}
+        getattr(probe, method_name)(*others)
+    rewritten = []
+    for name, rows in first.items():
+        grown = _get_buffer(probe, name)
+        if grown.shape[0] < rows.shape[0] or not torch.equal(grown[:rows.shape[0]], rows):
+            rewritten.append(name)
+    return rewritten
+
+
 def has_entrypoints(model: nn.Module) -> bool:
     return bool(marked_methods(type(model), "entrypoint"))
 
@@ -357,6 +384,11 @@ def marked_program(model: nn.Module):
     if not methods:
         raise UnsupportedModelError(f"{type(model).__name__} has no @entrypoint methods")
     buffers = dict(model.named_buffers())
+    # A tensor registered under several names is one state, set under each.
+    names_of: dict[int, list[str]] = {}
+    for name, buffer in model.named_buffers(remove_duplicate=False):
+        names_of.setdefault(id(buffer), []).append(name)
+    aliases = {name: names_of[id(buffer)] for name, buffer in buffers.items()}
     plans = []
     modes: dict[str, str] = {}
     capacities: dict[str, int] = {}
@@ -393,6 +425,11 @@ def marked_program(model: nn.Module):
                     f"@entrypoint {method_name} gives a capacity for {name!r}, but doesn't "
                     "grow it along its first dimension"
                 )
+        for name in _rewritten_rows(model, method_name, arguments, options["capacity"]):
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} changes rows of {name!r} that were already "
+                "there; a buffer with a capacity may only grow by adding rows at its end"
+            )
         for name, (old, new) in changed.items():
             if name not in buffers:
                 continue
@@ -451,7 +488,9 @@ def marked_program(model: nn.Module):
     entrypoints = []
     for method_name, entry_name, input_names, arguments, output_names, changed, dynamic in plans:
         wrapper_name = f"_cattorch_entry_{method_name}"
-        generated[wrapper_name] = _entry_method(method_name, len(arguments), state_order, changed)
+        generated[wrapper_name] = _entry_method(
+            method_name, len(arguments), state_order, changed, aliases,
+        )
         entrypoints.append(EntryPoint(
             entry_name, method=wrapper_name,
             arguments=(
@@ -471,12 +510,14 @@ def marked_program(model: nn.Module):
     return exported, ExportProgram(entrypoints=tuple(entrypoints), states=states)
 
 
-def _entry_method(method_name: str, inputs: int, states, changed):
+def _entry_method(method_name: str, inputs: int, states, changed, aliases):
     def entry(self, *values):
         arguments, values = values[:inputs], values[inputs:]
         for (name, _), value in zip(states, values):
             # A copy, so in-place updates are on a tensor the method created.
-            _set_buffer(self, name, value.clone())
+            value = value.clone()
+            for alias in aliases.get(name, (name,)):
+                _set_buffer(self, alias, value)
         result = getattr(self, method_name)(*arguments)
         updates = []
         for (name, mode), value in zip(states, values):

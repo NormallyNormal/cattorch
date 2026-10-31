@@ -91,6 +91,8 @@ def fold_eval_batch_norms(
             for left, right in eligible
         ):
             continue
+        if isinstance(layer, torch.nn.Linear) and layer.out_features != batch_norm.num_features:
+            continue  # the BatchNorm normalizes another axis
         # A different method may consume a layer's parameters directly.
         if any(
             target.startswith((f"{producer_path}.", f"{batch_norm_path}."))
@@ -111,10 +113,31 @@ def fold_eval_batch_norms(
         if isinstance(layer, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
             folded = fuse_conv_bn_eval(layer, batch_norm)
         else:
-            folded = fuse_linear_bn_eval(layer, batch_norm)
+            folded = _LinearThenBatchNorm(
+                fuse_linear_bn_eval(copy.deepcopy(layer), batch_norm), layer, batch_norm,
+            )
         _set_submodule(transformed, layer_path, folded)
         _set_submodule(transformed, batch_norm_path, torch.nn.Identity())
     return transformed
+
+
+class _LinearThenBatchNorm(torch.nn.Module):
+    """A Linear folded with the BatchNorm1d after it, for 2-D inputs only.
+
+    BatchNorm1d normalizes dimension 1. For a ``(batch, features)`` output
+    that is the Linear's features, but for ``(batch, tokens, features)`` it
+    is the tokens, which a fold can't express. The rank is known when the
+    model is traced, so only one branch is exported.
+    """
+
+    def __init__(self, folded, linear, batch_norm):
+        super().__init__()
+        self.folded, self.linear, self.batch_norm = folded, linear, batch_norm
+
+    def forward(self, value):
+        if value.dim() == 2:
+            return self.folded(value)
+        return self.batch_norm(self.linear(value))
 
 
 __all__ = ["fold_eval_batch_norms"]

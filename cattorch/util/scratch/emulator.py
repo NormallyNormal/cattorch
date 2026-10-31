@@ -51,6 +51,9 @@ def _arithmetic_factory(symbol: str, left_kind: str, right_kind: str):
                 f"        if {name}.__class__ is not float and {name}.__class__ is not int:"
             )
             lines.append(f"            {name} = numeric({name})")
+        # Scratch's Cast.toNumber turns NaN into 0.
+        lines.append(f"        if {name} != {name}:")
+        lines.append(f"            {name} = 0")
         names.append(name)
     lines.append(f"        return {names[0]} {symbol} {names[1]}")
     lines.append("    return run")
@@ -503,14 +506,15 @@ class ScratchEmulator:
         constant = getattr(value, "constant", _MISSING)
         if constant is not _MISSING:
             return _constant(self._scratch_numeric(constant))
-        if getattr(value, "numeric", False):
-            return value
         numeric = self._scratch_numeric
 
+        # Scratch's Cast.toNumber turns NaN into 0, even for a number.
         def run():
             result = value()
             kind = result.__class__
-            return result if kind is float or kind is int else numeric(result)
+            if kind is float or kind is int:
+                return result if result == result else 0
+            return numeric(result)
         return run
 
     def _compile_reporter(self, block_id: str):
@@ -861,8 +865,9 @@ class ScratchEmulator:
 
     @classmethod
     def _scratch_numeric(cls, value):
+        """``Cast.toNumber``: what can't be read as a number, and NaN, is 0."""
         converted = cls._scratch_number(value)
-        return 0 if converted is None else converted
+        return 0 if converted is None or converted != converted else converted
 
 
 class ProjectEmulator:

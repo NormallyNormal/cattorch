@@ -9,7 +9,7 @@ supported:
 | Exporter | Use for | Main requirement |
 |---|---|---|
 | `CharTokenizer` | Very small character vocabularies | Requires a valid unknown-token ID. |
-| `BPETokenizer` | Raw-text Hugging Face BPE | No pre-tokenizer, dropout, subword prefix, or suffix. |
+| `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`. |
 | `SentencePieceBPETokenizer` | Raw SentencePiece BPE with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
 
 Hugging Face tokenizers need the optional dependencies:
@@ -23,7 +23,8 @@ from cattorch import BPETokenizer, transpile_tokenizer
 
 result = BPETokenizer(tokenizer).save("build/my_tokenizer")
 
-# Or let cattorch select BPE versus character lookup from the backend.
+# Or let cattorch pick the exporter. A backend that isn't BPE is exported with
+# character lookup only if every token is one character.
 result = transpile_tokenizer(tokenizer, "build/my_tokenizer")
 ```
 
@@ -54,6 +55,9 @@ exported sprite does the same.
 
 Scratch compares text without regard to ASCII case, so export fails if the
 vocabulary contains entries that differ only by case, such as `a` and `A`.
+For the same reason, a letter whose case is missing from the vocabulary is
+read as the other case: with only lowercase entries, `The` is encoded like
+`the` instead of starting with the unknown token.
 Export also fails on characters outside the Basic Multilingual Plane, such as
 emoji, because Scratch treats each one as two separate characters.
 

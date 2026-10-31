@@ -551,7 +551,7 @@ _POINTWISE = frozenset({
     "minimum", "where", "sin", "cos", "masked_fill", "square", "sign", "softplus",
     "hardswish", "hardsigmoid", "mish", "nan_to_num", "dropout", "contiguous",
     "clone", "alias", "detach", "detach_", "lift_fresh_copy", "type_as", "copy",
-    "isnan", "isinf", "full_like", "ones_like", "zeros_like", "rotary_embedding",
+    "isnan", "isinf", "full_like", "ones_like", "zeros_like", "rotary_embedding", "rotary_half",
     "_assert_tensor_metadata",
 })
 # Operations that only relabel axes: each input axis survives in the output.
@@ -1522,6 +1522,12 @@ def check_step_equivalence(
     names = plan.long.user_output_names
     with torch.no_grad():
         reference = tensor_output_leaves(adapted(tokens), warn=False)
+        # Shorter prompts too: a model whose positions depend on the prompt
+        # length, such as dynamic NTK RoPE, matches only at the full length.
+        prefixes = {
+            count: tensor_output_leaves(adapted(tokens[:, :count]), warn=False)
+            for count in sorted({1, length // 2, length - 1}) if 0 < count < length
+        }
         step.reset()
         try:
             rows = [step(tokens[:, i:i + 1]) for i in range(length)]
@@ -1538,9 +1544,12 @@ def check_step_equivalence(
                     f"{tuple(actual.shape)} but the model gives {tuple(expected.shape)} "
                     f"for token {row}"
                 )
-            error = (actual.double() - expected.double()).abs()
+            # Equal values, such as -inf for a banned token, match exactly.
+            same = actual.double() == expected.double()
+            error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
             largest = float(error.max()) if error.numel() else 0.0
-            scale = float(expected.double().abs().max()) if expected.numel() else 0.0
+            finite = expected.double()[torch.isfinite(expected)].abs()
+            scale = float(finite.max()) if finite.numel() else 0.0
             if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
                     or largest > rtol * max(scale, 1e-3) or largest != largest:
                 overall = max(
@@ -1553,6 +1562,24 @@ def check_step_equivalence(
                     f"{scale:.3g}, tolerance {rtol:g} relative; max error over all "
                     f"rows {overall:.3g}. The rewrite assumed the model computes each "
                     "token from its own row and earlier tokens only"
+                )
+
+    # The cached step matches the full prompt; check it is the model's answer
+    # for shorter prompts too.
+    for count, shorter in prefixes.items():
+        for name, axis in plan.outputs:
+            leaf = names.index(name)
+            expected = shorter[leaf].narrow(axis.axis, count - 1, 1)
+            actual = rows[count - 1][leaf]
+            scale = float(expected.double().abs().max()) if expected.numel() else 0.0
+            if actual.shape != expected.shape or not torch.allclose(
+                actual.double(), expected.double(), rtol=0, atol=rtol * max(scale, 1e-3),
+                equal_nan=True,
+            ):
+                raise UnsupportedModelError(
+                    f"the model's output for token {count} changes when more tokens "
+                    "follow it, so it can't be generated one token at a time; for "
+                    "example, its positions are scaled by the prompt length"
                 )
 
 

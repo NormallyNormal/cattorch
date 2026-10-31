@@ -33,6 +33,12 @@ def unmarked():
     return nn.Sequential(nn.Embedding(10, 4), nn.Flatten(), nn.Linear(12, 2))
 
 
+@cattorch.example(lambda: (torch.randn(3, 3),))
+class Determinant(nn.Module):
+    def forward(self, value):
+        return torch.linalg.det(value)
+
+
 class Language(nn.Module):
     def __init__(self):
         super().__init__()
@@ -97,6 +103,8 @@ def test_errors_are_reported_without_a_traceback(models, capsys):
     assert code == 1 and "--shape" in message
     code, message = run(capsys, "export", "models.py:missing", "--shape", "1,2")
     assert code == 1 and "no attribute 'missing'" in message
+    code, message = run(capsys, "export", "models.py:Determinant")
+    assert code == 1 and "Unsupported operation" in message
     with pytest.raises(SystemExit):
         main(["export", "models.py:Marked", "--dynamic", "zero"])
 

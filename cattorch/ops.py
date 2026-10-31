@@ -21,6 +21,20 @@ def _rotary_embedding(
     return value * cosine + rotated * sine
 
 
+@op(name="cattorch::rotary_half", fake=lambda value, cosine, sine: torch.empty_like(value))
+def _rotary_half(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> torch.Tensor:
+    """Hugging Face ``rotate_half`` RoPE: the halves of the last dimension pair up.
+
+    The graph recognizer rewrites ``x * cos + rotate_half(x) * sin`` to this.
+    """
+    first, second = value.chunk(2, dim=-1)
+    return value * cosine + torch.cat((-second, first), dim=-1) * sine
+
+
 def rotary_embedding(
     value: torch.Tensor,
     cosine: torch.Tensor,

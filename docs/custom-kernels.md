@@ -62,8 +62,10 @@ already lowers replaces the built-in kernel for that export only.
   sprite). `dynamic_axis` is the dimension that varies at run time in a
   [variable-length export](supported-models.md#variable-length-inputs), or
   `None`; `shape` is then the traced shape, and `length(info.list)` gives the
-  actual number of items. A kernel that ignores it runs once per item when
-  the operation treats items independently. Find the names in the schema, for example with
+  actual number of items. A kernel passed to an export runs once per item
+  when the operation treats items independently. Where it can't, as on an
+  `@entrypoint` buffer that grows, the export fails instead of running the
+  kernel on the traced size. Find the names in the schema, for example with
   `print(torch.ops.aten.mish.default._schema)`.
 - `ctx.scalars` holds the other arguments, with the schema's defaults filled
   in.

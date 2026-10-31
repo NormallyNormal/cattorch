@@ -192,9 +192,42 @@ linear layers written as two matrix products. Convolution, attention,
 in-place modification, and data-dependent control flow are rejected.
 
 For SwiGLU experts without biases, `StackedSwiGLUMoE` is a faster
-implementation. If your MoE module has `router.weight`, `gate.weight`,
-`up.weight`, and `down.weight` attributes, `stacked_swiglu_moe_adapter(YourMoEClass)`
-converts it.
+implementation, which `SparseMoE` and recognized MoE blocks switch to by
+themselves. A block whose experts' weights are stacked into one tensor each
+isn't recognized; an [`@adapter`](markers.md#classes-you-dont-own) converts it:
+
+```python
+import torch
+from torch import nn
+
+from cattorch import adapter
+from cattorch.experimental import StackedSwiGLUMoE
+
+
+class MyStackedMoE(nn.Module):
+    def __init__(self, width=8, hidden=16, experts=4):
+        super().__init__()
+        self.top_k = 2
+        self.router = nn.Linear(width, experts, bias=False)
+        self.gate = nn.Linear(1, 1)  # each weight holds every expert's matrix
+        self.up = nn.Linear(1, 1)
+        self.down = nn.Linear(1, 1)
+        self.gate.weight = nn.Parameter(torch.randn(experts, hidden, width))
+        self.up.weight = nn.Parameter(torch.randn(experts, hidden, width))
+        self.down.weight = nn.Parameter(torch.randn(experts, width, hidden))
+
+    # forward routes each token through its top_k experts.
+
+
+@adapter(MyStackedMoE)
+def stacked_experts(module, context):
+    return StackedSwiGLUMoE(
+        module.router.weight, module.gate.weight, module.up.weight, module.down.weight,
+        top_k=module.top_k,
+    )
+```
+
+Pass it to the export with `transpile(..., adapters=[stacked_experts])`.
 
 ### Hand-written MoE blocks
 

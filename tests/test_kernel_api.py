@@ -9,7 +9,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from cattorch import FastConfig, StorageConfig, UnsupportedOperationError, verify
+from cattorch import (
+    FastConfig, StorageConfig, UnsupportedModelError, UnsupportedOperationError, transpile, verify,
+)
 from cattorch.kernel_api import Kernel, KernelContext, TensorInfo
 from cattorch.operator_registry import default_registry
 from cattorch.transpiler import _transpile
@@ -370,3 +372,31 @@ def test_builtin_rotary_and_topk_use_context_kernels():
     ):
         kernel = default_registry().operation(target).exact_kernel
         assert hasattr(kernel, "kernel") and isinstance(kernel.kernel, Kernel)
+
+
+def test_a_user_kernel_on_growing_state_is_rejected(tmp_path):
+    from cattorch import entrypoint
+    from cattorch.scratch import append, change_var, clear, gt, item, mul, repeat, set_var, var
+
+    def emit(ctx):
+        value, out = ctx.inputs["self"], ctx.output.list
+        index = ctx.temp_var("relu index")
+        x = item(value.list, var(index))
+        return (
+            clear(out), set_var(index, 1),
+            repeat(value.numel, (append(out, mul(x, gt(x, 0))), change_var(index, 1))),
+        )
+
+    class Memory(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("seen", torch.zeros(0, 3))
+
+        @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 8})
+        def add(self, row):
+            self.seen = torch.cat([self.seen, row.reshape(1, 3)])
+            return torch.relu(self.seen).sum(0)
+
+    relu = Kernel(torch.ops.aten.relu.default, emit, name="relu")
+    with pytest.raises(UnsupportedModelError, match="kernel passed for aten.relu"):
+        transpile(Memory().eval(), None, tmp_path / "memory", kernels=[relu])

@@ -32,7 +32,7 @@ artifact = transpile(model, example, "model_fast", optimization="fast")
 
 By default, fast mode:
 
-- Replaces tanh GELU with QuickGELU, `x * sigmoid(1.702 * x)`.
+- Replaces GELU, exact or tanh, with QuickGELU, `x * sigmoid(1.702 * x)`.
 - Computes LayerNorm variance in one pass as `E[x²] - E[x]²`.
 - Skips subtracting the maximum in softmax and reuses exponentials.
 

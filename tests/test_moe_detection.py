@@ -165,3 +165,31 @@ def test_detected_moe_works_in_cached_generation(tmp_path):
         result = transpile(model, GenerationProgram(max_context=8), tmp_path / "decoder")
     emulator = ScratchEmulator(load_sprite(result.path))
     prefill_and_decode(emulator, model, [3, 1, 4], [1, 5])
+
+
+class CappedMoE(nn.Module):
+    """Switch Transformer style: an expert takes at most ``capacity`` tokens."""
+
+    def __init__(self, width=4, experts=4, capacity=8):
+        super().__init__()
+        self.top_k = 1
+        self.capacity = capacity
+        self.gate = nn.Linear(width, experts, bias=False)
+        self.experts = nn.ModuleList(nn.Linear(width, width) for _ in range(experts))
+
+    def forward(self, x):
+        flat = x.reshape(-1, x.shape[-1])
+        weight, chosen = self.gate(flat).softmax(-1).max(-1)
+        out = torch.zeros_like(flat)
+        for index, expert in enumerate(self.experts):
+            tokens = torch.nonzero(chosen == index).flatten()[:self.capacity]
+            if tokens.numel():
+                out[tokens] = weight[tokens, None] * expert(flat[tokens])
+        return out.reshape(x.shape)
+
+
+def test_an_expert_capacity_is_not_mistaken_for_plain_routing():
+    torch.manual_seed(0)
+    model = CappedMoE().eval()
+    with pytest.raises(UnsupportedModelError, match="looks like a mixture of experts"):
+        default_registry().clone().adapt_model(model)

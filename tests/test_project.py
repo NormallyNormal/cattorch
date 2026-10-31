@@ -194,3 +194,12 @@ def test_generators_need_their_tokenizer(generator):
         build_project(directory / "none", result)
     with pytest.raises(TypeError, match="result of cattorch.transpile"):
         build_project(directory / "wrong", tokenizer)
+
+
+@pytest.mark.parametrize("name", ["cattorch", "Demo", "Stage"])
+def test_reserved_sprite_names_are_renamed(tmp_path, name):
+    result = transpile(nn.Linear(2, 2).eval(), torch.randn(1, 2), tmp_path / "m", name=name)
+    project = build_project(tmp_path / "project", result)
+    assert name not in project.sprites
+    assert len(set(project.sprites)) == len(project.sprites)
+    assert not any(entry.startswith("cattorch ") for entry in project.lists)

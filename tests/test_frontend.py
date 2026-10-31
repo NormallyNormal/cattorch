@@ -48,7 +48,8 @@ def test_frontends_have_equivalent_public_interfaces(tmp_path):
     model = StatefulModel().eval()
     inputs = (torch.randn(2, 4), torch.randn(2, 4))
     fx = transpile(model, inputs, tmp_path / "fx", frontend="fx")
-    exported = transpile(model, inputs, tmp_path / "export", frontend="export")
+    with pytest.warns(DeprecationWarning, match="frontend='export' is deprecated"):
+        exported = transpile(model, inputs, tmp_path / "export", frontend="export")
 
     assert fx.inputs == exported.inputs
     assert fx.output == exported.output
@@ -317,3 +318,38 @@ def test_in_place_update_seen_through_an_earlier_view_stays_unsupported(tmp_path
 
     with pytest.raises(UnsupportedOperationError, match="copy_"):
         transpile(ViewThenUpdate().eval(), torch.randn(3, 4), tmp_path / "aliased")
+
+
+class _ListScaled(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("scales", torch.tensor([2.0, 3.0]))
+
+    def forward(self, x):
+        # The buffer's values are fixed, so reading them in Python is fine.
+        return x * self.scales.tolist()[1] / max(x.tolist())
+
+
+class _NumpyScaled(nn.Module):
+    def forward(self, x):
+        return x * float(x.numpy().sum())
+
+
+@pytest.mark.parametrize("model", [_ListScaled(), _NumpyScaled()])
+def test_python_conversions_of_inputs_are_rejected(model):
+    with pytest.raises(UnsupportedModelError, match="on a value computed from its inputs"):
+        capture_model(model, (torch.tensor([1.0, 4.0]),))
+    assert torch.Tensor.tolist.__name__ == "tolist"  # restored afterwards
+
+
+def test_python_conversions_of_constants_still_fold():
+    class Constant(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scales", torch.tensor([2.0, 3.0]))
+
+        def forward(self, x):
+            return x * self.scales.tolist()[1]
+
+    captured = capture_model(Constant(), (torch.ones(2),))
+    assert torch.equal(captured.graph_module(torch.ones(2))[0], torch.full((2,), 3.0))

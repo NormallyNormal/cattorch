@@ -55,8 +55,8 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `quantization` | A `QuantizationConfig` for symmetric or GPTQ integer weights. Don't combine with an integer `StorageConfig.precision`. |
 | `calibration_inputs` | Iterable of tensors or tensor tuples for GPTQ with tensor inputs. Read once. Only valid with `method="gptq"`. |
 | `codegen` | A `CodegenConfig` for JSON size target, loop unrolling, IDs, and compaction. |
-| `frontend` | How the model is traced: `"fx"` (default) or `"export"` (`torch.export`). Programs require `"fx"`. |
-| `adapters` | `ModuleAdapter`s for an `ExportProgram` or `GenerationProgram`. |
+| `frontend` | How the model is traced: `"fx"` (default) or `"export"` (`torch.export`). `"export"` is deprecated and will be removed in 2.0. It supports fewer operations: integer indexing such as `x[:, 0]`, `cumsum`, `topk`, attention, and recurrent layers need `"fx"`, as do programs. |
+| `adapters` | `ModuleAdapter`s that replace module types for this export. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
 | `dynamic` | One variable-length input, as `{input: (minimum, maximum)}` for its first dimension or `{input: {dimension: (minimum, maximum)}}`; see [variable-length inputs](supported-models.md#variable-length-inputs). Not valid with programs. |
@@ -258,7 +258,7 @@ error when the object is created.
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `activations` | `True` | Use fast activation approximations (currently QuickGELU for GELU). |
+| `activations` | `True` | Use fast activation approximations (currently QuickGELU for exact and tanh GELU). |
 | `layer_norm` | `True` | Compute LayerNorm variance in one pass. |
 | `softmax` | `True` | Skip max subtraction in softmax. |
 | `neuron_pruning` | `0.0` | Fraction in `[0, 1)` of hidden units to remove from Linear → activation → Linear paths and `StackedSwiGLUMoE` experts. |
@@ -282,7 +282,7 @@ multiplications. See [optimization modes](optimization.md#weight-transforms).
 |---|---:|---|
 | `max_context` | required | Maximum number of tokens the cache holds. The only positional field; the others are keyword-only. |
 | `method` | `"forward"` | Name of the model method that takes token IDs and returns next-token logits for every position. |
-| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. Without layer sharing, the final layer's query, attention output and MLP are skipped too. |
+| `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. The final layer's query, attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 
 See [KV-cached generation](generation.md) for model requirements and the

@@ -506,6 +506,23 @@ def test_broken_table_trips_the_equivalence_check():
     assert "max error" in str(raised.value)
 
 
+def test_positions_scaled_by_the_prompt_length_are_rejected():
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    config = transformers.LlamaConfig(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
+        num_key_value_heads=1, vocab_size=48, max_position_embeddings=8,
+        rope_scaling={"rope_type": "dynamic", "factor": 4.0},
+    )
+    model = transformers.LlamaForCausalLM(config).eval()
+    with torch.no_grad():  # large enough that attention isn't uniform
+        for parameter in model.parameters():
+            if parameter.dim() > 1:
+                parameter.normal_(0, 0.5)
+    with pytest.raises(UnsupportedModelError, match="changes when more tokens follow it"):
+        build_generation_step(model, 16)
+
+
 def test_broken_attention_scale_trips_the_equivalence_check():
     adapted, plan, step = step_for(tiny_decoder("llama"), 16)
     for node in step.graph.nodes:

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import zipfile
 from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 from cattorch import (
     CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
@@ -17,7 +20,7 @@ from cattorch import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 sys.path.insert(0, str(Path(__file__).parent))
-from test_autoregressive import NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
+from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
 from test_optimization import CachedLM  # noqa: E402
 
 TOLERANCE = 1e-4
@@ -149,15 +152,18 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     )
 
 
-def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, sharing):
     torch.manual_seed(13)
     model = CachedLM(context=16, layers=2).eval()
     counts = {}
     for hidden in (False, True):
         emulator, _ = emulator_for(
-            model, tmp_path, f"unshared_{hidden}", max_context=16,
-            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing="off"),
+            model, tmp_path, f"{sharing}_{hidden}", max_context=16,
+            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing),
         )
+        shared = "_cattorch shared transformer layer" in emulator._procedures
+        assert shared == (sharing == "auto")
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
         emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -169,6 +175,129 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path):
         emulator.run_procedure("cattorch decode")
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8, 9])
     assert counts[True] < counts[False] * 0.8
+
+
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
+    torch.manual_seed(13)
+    model = CachedLM(context=8, layers=2).eval()
+    emulator, _ = emulator_for(
+        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing),
+    )
+    emulator.lists["cattorch tokens"] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert_logits(emulator, model, [3])
+
+
+def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
+    class Block(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = scale
+            self.qkv = nn.Linear(8, 24)
+            self.mlp = nn.Linear(8, 8)
+
+        def forward(self, x):
+            q, k, v = self.qkv(x).chunk(3, dim=-1)
+            attended = F.scaled_dot_product_attention(
+                q[:, None], k[:, None], v[:, None], is_causal=True,
+            )[:, 0]
+            x = x + self.scale * attended
+            return x + self.mlp(x)
+
+    class Scaled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tokens = nn.Embedding(16, 8)
+            self.blocks = nn.ModuleList(Block(1.0 / (index + 1)) for index in range(2))
+            self.head = nn.Linear(8, 16)
+
+        def forward(self, tokens):
+            x = self.tokens(tokens)
+            for block in self.blocks:
+                x = block(x)
+            return self.head(x)
+
+    torch.manual_seed(0)
+    model = Scaled().eval()
+    emulator, _ = emulator_for(
+        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing="auto"),
+    )
+    assert "_cattorch shared transformer layer" not in emulator._procedures
+    prefill_and_decode(emulator, model, [1, 2, 3], [4])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_reduced_precision_models_export(tmp_path, dtype):
+    # Hub checkpoints load in their saved dtype, usually bfloat16.
+    model = tiny_decoder("llama", layers=1).to(dtype).eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.run_procedure("cattorch prefill")
+    expected = logits_of(model.float(), [1, 2, 3])
+    actual = torch.tensor(emulator.lists["cattorch logits"])
+    torch.testing.assert_close(actual, expected, atol=TOLERANCE, rtol=0)
+
+
+def test_banned_tokens_with_negative_infinity_export(tmp_path):
+    class Banned(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = nano()
+            bias = torch.zeros(VOCAB)
+            bias[[0, 5]] = float("-inf")
+            self.register_buffer("ban", bias)
+
+        def forward(self, tokens):
+            return self.inner(tokens) + self.ban
+
+    model = Banned().eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.run_procedure("cattorch prefill")
+    logits = emulator.lists["cattorch logits"]
+    assert logits[0] == logits[5] == -math.inf
+    assert all(math.isfinite(value) for index, value in enumerate(logits) if index not in (0, 5))
+
+
+def test_token_ids_outside_the_vocabulary_are_rejected(tmp_path):
+    model = nano()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    emulator.run_procedure("cattorch init")
+    for tokens in ([1, VOCAB], [1, -1], [1, 2.5], [1, "abc"]):
+        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.run_procedure("cattorch prefill")
+        assert emulator.variables["cattorch status"].startswith("token ids must be"), tokens
+        assert emulator.lists["cattorch logits"] == []
+    emulator.lists["cattorch tokens"] = [VOCAB - 1]
+    emulator.run_procedure("cattorch prefill")
+    assert emulator.variables["cattorch status"] == "ok"
+    emulator.lists["cattorch tokens"] = [VOCAB]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"].startswith("token ids must be")
+
+
+def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
+    import cattorch.graph
+
+    fused = []
+    original = cattorch.graph._fuse_rotate_half
+
+    def counting(graph):
+        original(graph)
+        fused.extend(
+            node for node in graph.nodes if str(node.target) == "cattorch.rotary_half.default"
+        )
+
+    monkeypatch.setattr(cattorch.graph, "_fuse_rotate_half", counting)
+    torch.manual_seed(6)
+    model = RopeLM(layers=1).eval()
+    emulator, _ = emulator_for(model, tmp_path, max_context=8)
+    assert len(fused) == 2  # queries and keys
+    prefill_and_decode(emulator, model, [1, 2, 3], [4])
 
 
 def test_caches_and_position_are_not_static_weights(exported):

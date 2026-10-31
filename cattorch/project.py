@@ -155,7 +155,17 @@ class _Builder:
         sprite, assets = _load_sprite(path)
         names = {target["name"] for target in self.sprites}
         base, index = sprite["name"], 2
-        while sprite["name"] in names or sprite["name"] == "Stage":
+
+        def taken(name):
+            # Global data is named "<sprite> <list>", so a sprite called
+            # "cattorch" would collide with the sprites' own "cattorch ..."
+            # names. "Demo" is the demo sprite's name.
+            return (
+                name in names or name in {"Stage", "Demo"}
+                or name == "cattorch" or name.startswith(("cattorch ", "_cattorch"))
+            )
+
+        while taken(sprite["name"]):
             sprite["name"] = f"{base}{index}"
             index += 1
         sprite.update(visible=visible, layerOrder=len(self.sprites) + 1)

@@ -616,3 +616,104 @@ def test_benchmark_input_restore_and_output_read_are_shard_aware():
         1.0,
         2.0,
     ]
+
+
+@pytest.mark.parametrize("optimization", ["exact", "fast"])
+@pytest.mark.parametrize("norm", [
+    lambda: nn.LayerNorm(4, bias=False),
+    lambda: nn.LayerNorm(4, elementwise_affine=False),
+])
+def test_layer_norm_without_bias_or_weight(tmp_path, norm, optimization):
+    model = norm().eval()
+    value = torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "norm", optimization=optimization)
+    assert verify(model, value, result, atol=1e-3).passed
+
+
+def test_a_batch_norm_used_twice(tmp_path):
+    class Twice(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.BatchNorm1d(3)
+            with torch.no_grad():
+                self.norm.running_var.uniform_(0.5, 2.0)
+                self.norm.running_mean.normal_()
+
+        def forward(self, first, second):
+            return self.norm(first) + self.norm(second)
+
+    model = Twice().eval()
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    assert verify(model, inputs, transpile(model, inputs, tmp_path / "twice")).passed
+
+
+def test_a_weight_read_both_ways_keeps_both_lists_under_quantization(tmp_path):
+    from cattorch import QuantizationConfig
+
+    class Both(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(6, 6) / 6**0.5)
+
+        def forward(self, x):
+            return x @ self.weight.T, x @ self.weight
+
+    torch.manual_seed(0)
+    model, value = Both().eval(), torch.randn(2, 6)
+    result = transpile(model, value, tmp_path / "both", quantization=QuantizationConfig(bits=8))
+    report = verify(model, value, result)
+    # Each output is off by quantization only; a dropped list read as zeros.
+    assert all(output.max_abs_error < 0.01 for output in report.outputs)
+
+
+@pytest.mark.parametrize("width", [4, 8])
+def test_linear_then_batch_norm_over_tokens_is_not_folded(tmp_path, width):
+    # BatchNorm1d on (batch, tokens, features) normalizes the tokens.
+    model = nn.Sequential(nn.Linear(16, width), nn.BatchNorm1d(4)).eval()
+    with torch.no_grad():
+        model[1].running_mean.normal_()
+        model[1].running_var.uniform_(0.5, 2.0)
+    value = torch.randn(2, 4, 16)
+    assert verify(model, value, transpile(model, value, tmp_path / "tokens")).passed
+    flat = torch.randn(3, 16)
+    if width == 4:  # the 2-D case still folds into the Linear
+        folded = fold_eval_batch_norms(model)
+        torch.testing.assert_close(folded(flat), model(flat))
+
+
+def test_reads_through_an_index_list_across_shards(tmp_path, small_list_limit):
+    small_list_limit(100)
+
+    class Broadcast(nn.Module):
+        def forward(self, left, right):
+            return (left * right)[-1, -1]
+
+    class Pick(nn.Module):
+        def forward(self, value, index):
+            return value.t()[-1] + value[index].sum()
+
+    torch.manual_seed(0)
+    cases = (
+        (Broadcast(), (torch.randn(15, 10, 1), torch.randn(1, 1, 2))),
+        (Pick(), (torch.randn(15, 10), torch.tensor([14]))),
+    )
+    for index, (model, inputs) in enumerate(cases):
+        result = transpile(model.eval(), inputs, tmp_path / f"case{index}")
+        assert result.sharded_lists
+        assert verify(model, inputs, result).passed
+
+
+def test_sig_figs_keeps_integer_buffers_exact(tmp_path):
+    class Shuffle(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("order", torch.randperm(300))
+
+        def forward(self, value, index):
+            return value[:, self.order[index]]
+
+    torch.manual_seed(0)
+    model = Shuffle().eval()
+    inputs = (torch.randn(1, 300), torch.tensor([0, 299, 150]))
+    result = transpile(model, inputs, tmp_path / "shuffle", sig_figs=2)
+    assert verify(model, inputs, result).passed

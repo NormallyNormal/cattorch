@@ -30,7 +30,7 @@ A sprite from [`transpile`](getting-started.md) with an example input:
 | `cattorch prepare for save` | block | Re-encodes the weights so a saved project stays small. |
 | `input`, `input_1`, ... | lists | The model's input tensors, flattened in PyTorch order. |
 | `output`, `output_1`, ... | lists | The model's outputs, flattened the same way. |
-| `cattorch status` | variable | `ok` after a block finishes. |
+| `cattorch status` | variable | `ok` after a block finishes, or why `cattorch forward` didn't run, such as a variable-length input with too many items. |
 | `cattorch initialized` | variable | `1` once the weights are decoded, `0` before. |
 | `cattorch init complete`, `cattorch forward complete` | broadcasts | Sent when each block finishes. |
 
@@ -54,7 +54,7 @@ A sprite from a [`GenerationProgram`](generation.md#scratch-interface) has no
 | `cattorch top k values`, `cattorch top k ids` | lists | With `top_k`, the largest logits and their token IDs. |
 | `cattorch cache length` | variable | Tokens in the cache. |
 | `cattorch max context` | variable | The `max_context` it was exported with. |
-| `cattorch status` | variable | `ok`, or an error message such as a full context. |
+| `cattorch status` | variable | `ok`, or an error message such as a full context or a token ID outside the vocabulary. |
 | `cattorch initialized` | variable | `1` once the weights are decoded. |
 | `cattorch init complete`, `cattorch reset complete`, `cattorch prefill complete`, `cattorch decode complete` | broadcasts | Sent when each block finishes. |
 

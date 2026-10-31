@@ -103,6 +103,53 @@ def _emit_rotary_embedding(ctx: KernelContext):
     )
 
 
+def _emit_rotary_half(ctx: KernelContext):
+    """Fused exact Hugging Face RoPE, pairing position ``i`` with ``i + half``.
+
+    Each row writes its first half, then its second half, so the output is
+    appended in order.
+    """
+    value, cosine, sine = ctx.inputs["value"], ctx.inputs["cosine"], ctx.inputs["sine"]
+    output_shape = value.shape
+    if not output_shape or output_shape[-1] % 2:
+        raise ValueError("rotary embedding requires an even final dimension")
+    half = output_shape[-1] // 2
+    index = ctx.temp_var("index")
+    out = ctx.output.list
+    first = var(index)
+    second = add(var(index), half)
+    indices = {}
+    for name, tensor in (("cos", cosine), ("sin", sine)):
+        map_name = f"_rope {name} map"
+        low, table = _broadcast_index(tensor.shape, output_shape, map_name, first)
+        high, _ = _broadcast_index(tensor.shape, output_shape, map_name, second)
+        if table is not None:
+            ctx.static_list(map_name, table)
+        indices[name] = (low, high)
+    (cos_low, cos_high), (sin_low, sin_high) = indices["cos"], indices["sin"]
+    low_half = _static_unrolled_repeat(half, (
+        append(out, sub(
+            mul(item(value.list, first), item(cosine.list, cos_low)),
+            mul(item(value.list, second), item(sine.list, sin_low)),
+        )),
+        change_var(index, 1),
+    ))
+    high_half = _static_unrolled_repeat(half, (
+        append(out, add(
+            mul(item(value.list, second), item(cosine.list, cos_high)),
+            mul(item(value.list, first), item(sine.list, sin_high)),
+        )),
+        change_var(index, 1),
+    ))
+    row = (*low_half, change_var(index, -half), *high_half, change_var(index, half))
+    rows = math.prod(output_shape) // output_shape[-1]
+    return (
+        clear(out),
+        set_var(index, 1),
+        *(row if rows == 1 else (repeat(rows, row),)),
+    )
+
+
 def _emit_topk(ctx: KernelContext, *, values: bool):
     """Select the ``k`` largest or smallest entries along one dimension.
 
@@ -386,10 +433,11 @@ def _emit_cached_attention(ctx: KernelContext, *, fast: bool):
         set_var("heads_on_key", 0),
         repeat(heads, head),
     )
-    if ctx.options.get("hidden_prefill_last"):
+    gate = ctx.options.get("hidden_prefill_gate")
+    if gate:
         # The final layer's attention output only feeds the logits, which a
         # hidden prefill token never reads: keep the cache append, skip the rest.
-        attend = (if_(eq(var(ctx.temp_var("cattorch project output")), 1), attend),)
+        attend = (if_(eq(var(ctx.temp_var(str(gate))), 1), attend),)
     return (
         *append_row(k.list, k_cache.list, key_row),
         *append_row(v.list, v_cache.list, value_row),
@@ -867,6 +915,40 @@ def _emit_runtime_reduce(ctx: KernelContext):
     )
 
 
+def _emit_scan(ctx: KernelContext, *, product: bool):
+    """Running sum or product along ``dim``, in one pass over the values.
+
+    The output starts as a copy of the input; then each value past the first
+    along ``dim`` is combined with the one ``inner`` places before it.
+    """
+    value = ctx.inputs["self"]
+    if not value.shape:
+        return (clear(ctx.output.list), append(ctx.output.list, item(value.list, 1)))
+    dim = int(ctx.scalars["dim"]) % len(value.shape)
+    outer, extent, inner = _runtime_layout(value, dim)
+    out = ctx.output.list
+    index, position = ctx.temp_var("scan index"), ctx.temp_var("scan position")
+    combine = mul if product else add
+    return (
+        clear(out),
+        set_var(index, 1),
+        repeat(length(value.list), (
+            append(out, item(value.list, var(index))),
+            change_var(index, 1),
+        )),
+        set_var(position, add(inner, 1)),
+        repeat(outer, (
+            repeat(mul(sub(extent, 1), inner), (
+                replace(out, var(position), combine(
+                    item(out, var(position)), item(out, sub(var(position), inner)),
+                )),
+                change_var(position, 1),
+            )),
+            change_var(position, inner),
+        )),
+    )
+
+
 def _emit_runtime_softmax(ctx: KernelContext):
     """Softmax along a runtime axis: maximum, sum of exponentials, then scale."""
     value = ctx.inputs["value"]
@@ -1115,10 +1197,18 @@ BUILTIN_KERNELS = (
         "aten.scatter.value_reduce", partial(_emit_scatter_reduce, scalar=True),
         name="scatter_reduce", validator=_validate_scatter_reduce,
     ),
+    Kernel("aten.cumsum.default", partial(_emit_scan, product=False), name="cumsum"),
+    Kernel("aten.cumprod.default", partial(_emit_scan, product=True), name="cumprod"),
     Kernel(
         "cattorch.rotary_embedding.default",
         _emit_rotary_embedding,
         name="rotary_embedding_fused",
+        validator=_validate_rotary_embedding,
+    ),
+    Kernel(
+        "cattorch.rotary_half.default",
+        _emit_rotary_half,
+        name="rotary_half_fused",
         validator=_validate_rotary_embedding,
     ),
     Kernel(

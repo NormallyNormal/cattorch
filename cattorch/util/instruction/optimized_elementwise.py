@@ -113,7 +113,16 @@ class OptimizedElementwiseInstruction(Instruction):
             self.output_shape = torch.broadcast_shapes(*tensor_shapes)
         else:
             self.output_shape = self.args[0].shape
-        self.size = length("T1") if self.args[0].dynamic else math.prod(self.output_shape)
+        self.size = math.prod(self.output_shape)
+        dynamic = [position for position in self.slots if self.args[position].dynamic]
+        if dynamic:
+            # The output repeats this many values for each one of the runtime
+            # input, when broadcasting adds dimensions to it.
+            position = dynamic[0]
+            per_value = self.size // max(math.prod(self.args[position].shape), 1)
+            self.size = length(self.slots[position])
+            if per_value != 1:
+                self.size = mul(self.size, per_value)
         self.broadcast_lists = {}
 
     def _is_nary(self):
@@ -413,7 +422,7 @@ class OptimizedElementwiseInstruction(Instruction):
             variables = ("index", "value", "inner")
             iteration = (*setup, output, change_var("index", 1))
 
-        if self.args[0].dynamic:
+        if not isinstance(self.size, int):
             traversal = (
                 set_var("index", 1),
                 repeat(self.size, iteration),

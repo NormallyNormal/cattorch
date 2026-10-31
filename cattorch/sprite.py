@@ -111,8 +111,11 @@ def _deduplicate_static_tensors(
     winners: dict[tuple[str, int, bytes], tuple[str, bytes]] = {}
     aliases: dict[str, str] = {}
     kept: dict[str, torch.Tensor | None] = {}
+    # A tensor that no block reads, such as one a fast-mode kernel replaced,
+    # can't stand in for the others: its list isn't in the sprite.
+    in_sprite = {entry[0] for entry in sprite.get("lists", {}).values()}
     for key, tensor in static_tensors.items():
-        if not isinstance(tensor, torch.Tensor):
+        if not isinstance(tensor, torch.Tensor) or f"W_{key}" not in in_sprite:
             kept[key] = tensor
             continue
         contiguous = tensor.detach().cpu().contiguous()
@@ -320,13 +323,16 @@ def _program_stack(sprite: dict, program) -> tuple[str, str]:
 
 
 def _share_repeated_transformer_layers(
-    sprite: dict, compiler, storage: StorageConfig,
+    sprite: dict, compiler, storage: StorageConfig, *,
+    layer_tail: tuple[str, str] | None = None,
 ) -> bool:
     """Factor structurally identical ``blocks.N`` slabs into one warp block.
 
     Scratch cannot pass lists to custom blocks. The shared slab therefore uses
     the first layer's activation lists, copies only its final hidden state
     between calls, and selects concatenated weight banks through scalar bases.
+    ``layer_tail`` is ``(gate, final)``: the gate variable is set to 1 before
+    each call, and to the ``final`` variable's value before the last one.
     """
     def reject(reason: str) -> bool:
         log.info("Shared transformer layer skipped: %s", reason)
@@ -354,9 +360,31 @@ def _share_repeated_transformer_layers(
         [(name, root) for name, root, found in emitted if found == layer]
         for layer in layers
     ]
+    def literals(value):
+        """An argument with tensors blanked out: what the code bakes in."""
+        if isinstance(value, torch.fx.Node):
+            return None
+        if isinstance(value, (list, tuple)):
+            return tuple(literals(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(sorted((key, literals(item)) for key, item in value.items()))
+        if isinstance(value, torch.Tensor):
+            return tuple(value.shape), str(value.dtype)
+        return repr(value)
+
+    # Constants such as an attention window or a scale are compiled into each
+    # layer's code, so layers that differ in them can't share it.
+    # Fused nodes have no root of their own, so compare every node.
     signatures = [
-        [(str(nodes[name].target), tuple(_get_shape(nodes[name]))) for name, _ in group]
-        for group in grouped
+        [
+            (
+                str(node.target), literals(node.meta.get("val")),
+                literals(node.args), literals(dict(node.kwargs)),
+            )
+            for node in compiler.graph.nodes
+            if node.op == "call_function" and _graph_layer(node) == layer
+        ]
+        for layer in layers
     ]
     if any(signature != signatures[0] for signature in signatures[1:]):
         return reject("emitted operation signatures differ")
@@ -586,6 +614,9 @@ def _share_repeated_transformer_layers(
     )
     for layer in layers:
         body.extend(set_var(name, layer * size) for name, size in base_variables)
+        if layer_tail is not None:
+            gate, final = layer_tail
+            body.append(set_var(gate, var(final) if layer == layers[-1] else 1))
         if cache_base is not None:
             body.append(set_var(
                 cache_base,
@@ -613,6 +644,7 @@ def _share_repeated_transformer_layers(
             copy_index,
             *(name for name, _ in base_variables),
             *((cache_base,) if cache_base is not None else ()),
+            *(layer_tail or ()),
         ),
         lists=tuple(dict.fromkeys((input_list, output_list, final_output_list))),
         body=tuple(body),
@@ -639,6 +671,8 @@ def _share_repeated_transformer_layers(
     )
     if cache_base is not None:
         _merge_variables_by_name(sprite, {cache_base})
+    if layer_tail is not None:
+        _merge_variables_by_name(sprite, set(layer_tail))
     return True
 
 
@@ -699,12 +733,16 @@ def _remove_unused(sprite):
         elif isinstance(value, str):
             referenced.add(value)
 
+    from cattorch.interface import is_public_data
+
     for section in ("lists", "variables"):
         slots = sprite.get(section, {})
+        # Public names stay even when no block reads them, such as the input
+        # of a model that only uses its shape.
         unused = [
             sid for sid, entry in slots.items()
             if sid not in referenced
-            and not entry[0].startswith("cattorch ")
+            and not entry[0].startswith("cattorch ") and not is_public_data(entry[0])
         ]
         for sid in unused:
             log.info("Removing unused %s: %s", section.rstrip("s"), slots[sid][0])
@@ -1538,14 +1576,19 @@ def _add_prepare_for_save(
     *,
     static_names: set[str],
     compressed: bool,
+    inputs: set[str] = frozenset(),
 ) -> None:
-    """Add a public procedure that drops rebuildable runtime list contents."""
+    """Add a public procedure that drops rebuildable runtime list contents.
+
+    Input lists are kept: they hold the caller's values, and a program's
+    persistent state is passed to its entry points as inputs.
+    """
     from cattorch.util.scratch.dsl import Program, clear
 
     names = [
         shard.name
         for layout in layouts.values()
-        if not layout.name.startswith("_")
+        if not layout.name.startswith("_") and layout.name not in inputs
         and (compressed or layout.name not in static_names)
         for shard in layout.shards
     ]
@@ -1621,8 +1664,13 @@ def _guard_generation_output(sprite: dict, output_root: str) -> None:
     blocks[output_root]["parent"] = guard
 
 
-def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
-    """Skip the final attention/MLP suffix after direct K/V cache emission."""
+def _guard_generation_suffix(
+    sprite: dict, suffix_root: str, gate: str = "cattorch project output",
+) -> None:
+    """Skip the final attention/MLP suffix after direct K/V cache emission.
+
+    The suffix runs while the ``gate`` variable is 1.
+    """
     blocks = sprite["blocks"]
     predecessors = [
         identifier
@@ -1634,11 +1682,13 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
             f"expected one final QKV suffix predecessor, got {predecessors}"
         )
     predecessor = predecessors[0]
+    variables = sprite.setdefault("variables", {})
     variable_id = next(
-        identifier
-        for identifier, entry in sprite.get("variables", {}).items()
-        if entry[0] == "cattorch project output"
+        (identifier for identifier, entry in variables.items() if entry[0] == gate), None,
     )
+    if variable_id is None:
+        variable_id = f"cattorch_gate_{uuid.uuid4().hex[:8]}"
+        variables[variable_id] = [gate, 1]
     token = uuid.uuid4().hex[:8]
     guard = f"cattorch_hidden_suffix_{token}_guard"
     condition = f"cattorch_hidden_suffix_{token}_condition"
@@ -1654,11 +1704,7 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     blocks[condition] = {
         "opcode": "operator_equals", "next": None, "parent": guard,
         "inputs": {
-            "OPERAND1": [
-                3,
-                [12, "cattorch project output", variable_id],
-                [10, ""],
-            ],
+            "OPERAND1": [3, [12, gate, variable_id], [10, ""]],
             "OPERAND2": [1, [4, 1]],
         },
         "fields": {}, "shadow": False, "topLevel": False,
@@ -1666,7 +1712,9 @@ def _guard_generation_suffix(sprite: dict, suffix_root: str) -> None:
     blocks[suffix_root]["parent"] = guard
 
 
-def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
+def _guard_generation_range(
+    sprite: dict, start: str, stop: str, gate: str = "cattorch project output",
+) -> None:
     """Run the chain from ``start`` up to ``stop`` only for projected tokens.
 
     Hidden prefill tokens never read what this range computes, such as the
@@ -1679,7 +1727,7 @@ def _guard_generation_range(sprite: dict, start: str, stop: str) -> None:
     if blocks[last].get("next") != stop:
         raise ValueError("the guarded range does not end at the next operation")
     blocks[last]["next"] = None
-    _guard_generation_suffix(sprite, start)
+    _guard_generation_suffix(sprite, start, gate)
     guard = blocks[start]["parent"]
     blocks[guard]["next"] = stop
     blocks[stop]["parent"] = guard
@@ -1822,11 +1870,12 @@ def _wrap_generation_lifecycle(
     hidden_prefill: bool,
     top_k: int | None,
     compact_top_k: bool,
+    vocabulary: int | None = None,
 ) -> dict:
     """Add reset/prefill/decode blocks and guard the cached forward procedure."""
     from cattorch.util.scratch.dsl import (
-        Program, append, call, clear, eq, for_each, gt, if_else, item,
-        length, set_var, sub, var,
+        Program, append, call, clear, eq, for_each, gt, if_, if_else, item,
+        length, lt, not_, round_, set_var, sub, var,
     )
 
     top_k_lists = (_TOP_K_VALUES, _TOP_K_IDS) if top_k is not None else ()
@@ -1853,19 +1902,49 @@ def _wrap_generation_lifecycle(
         sprite, "cattorch reset cache", reset, x=640, y=0,
     )
 
+    # A token that isn't a whole number in the vocabulary would read past the
+    # embedding table and still report ok.
+    valid_tokens = "_cattorch tokens valid"
+    token = "_cattorch token"
+
+    def check_tokens(source):
+        if vocabulary is None:
+            return (set_var(valid_tokens, 1),)
+        return (
+            set_var(valid_tokens, 1),
+            for_each("_cattorch token index", length(source), (
+                set_var(token, item(source, var("_cattorch token index"))),
+                if_(not_(eq(var(token), round_(var(token)))), (set_var(valid_tokens, 0),)),
+                if_(lt(var(token), 0), (set_var(valid_tokens, 0),)),
+                if_(gt(var(token), vocabulary - 1), (set_var(valid_tokens, 0),)),
+            )),
+        )
+
+    invalid_token = f"token ids must be whole numbers from 0 to {(vocabulary or 0) - 1}"
     invalid_decode = (
         clear("output"),
         *(clear(name) for name in top_k_lists),
         set_var("cattorch status", "decode requires exactly one token"),
     )
+    token_variables = (valid_tokens, token, "_cattorch token index")
     decode = Program(
         "generation_decode",
-        variables=("cattorch status",),
+        variables=("cattorch status", *token_variables),
         lists=("input", "output", *top_k_lists),
         body=(
             if_else(
                 eq(length("input"), 1),
-                (call("cattorch forward"),),
+                (
+                    *check_tokens("input"),
+                    if_else(
+                        eq(var(valid_tokens), 1),
+                        (call("cattorch forward"),),
+                        (
+                            clear("output"), *(clear(name) for name in top_k_lists),
+                            set_var("cattorch status", invalid_token),
+                        ),
+                    ),
+                ),
                 invalid_decode,
             ),
         ),
@@ -1898,26 +1977,8 @@ def _wrap_generation_lifecycle(
                 call("cattorch forward"),
                 clear("input"),
         )
-        prefill_body = (*copy_and_reset,
-            if_else(
-                eq(length("cattorch prefill buffer"), 0),
-                (set_var("cattorch status", "prefill requires at least one token"),),
-                (
-                    if_else(
-                        gt(length("cattorch prefill buffer"), max_context),
-                        (
-                            set_var(
-                                "cattorch status",
-                                "prefill exceeds maximum context",
-                            ),
-                        ),
-                        valid_prefill,
-                    ),
-                ),
-            ),
-        )
         prefill_variables = (
-            "prefill index", "cattorch project output", "cattorch status",
+            "prefill index", "cattorch project output", "cattorch status", *token_variables,
         )
     else:
         valid_prefill = (
@@ -1927,25 +1988,24 @@ def _wrap_generation_lifecycle(
                 clear("input"),
             )),
         )
-        prefill_body = (*copy_and_reset,
-            if_else(
-                eq(length("cattorch prefill buffer"), 0),
-                (set_var("cattorch status", "prefill requires at least one token"),),
-                (
-                    if_else(
-                        gt(length("cattorch prefill buffer"), max_context),
-                        (
-                            set_var(
-                                "cattorch status",
-                                "prefill exceeds maximum context",
-                            ),
-                        ),
-                        valid_prefill,
-                    ),
-                ),
-            ),
-        )
-        prefill_variables = ("prefill index", "cattorch status")
+        prefill_variables = ("prefill index", "cattorch status", *token_variables)
+    prefill_body = (
+        *copy_and_reset,
+        *check_tokens("cattorch prefill buffer"),
+        if_else(
+            eq(length("cattorch prefill buffer"), 0),
+            (set_var("cattorch status", "prefill requires at least one token"),),
+            (if_else(
+                gt(length("cattorch prefill buffer"), max_context),
+                (set_var("cattorch status", "prefill exceeds maximum context"),),
+                (if_else(
+                    eq(var(valid_tokens), 1),
+                    valid_prefill,
+                    (set_var("cattorch status", invalid_token),),
+                ),),
+            ),),
+        ),
+    )
     prefill = Program(
         "generation_prefill",
         variables=prefill_variables,
@@ -1953,8 +2013,13 @@ def _wrap_generation_lifecycle(
         body=prefill_body,
     )
     sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
+    _merge_variables_by_name(sprite, set(token_variables))
     if hidden_prefill:
         _merge_variables_by_name(sprite, {"cattorch project output"})
+        # Only prefill clears it, so a decode before any prefill must find 1.
+        for entry in sprite["variables"].values():
+            if entry[0] == "cattorch project output":
+                entry[1] = 1
     if top_k_lists:
         _merge_lists_by_name(sprite, set(top_k_lists))
 

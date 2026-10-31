@@ -47,7 +47,10 @@ def _flatten(tensor, sig_figs: int | None = None) -> list:
                     yield x
             values = list(_recurse(tensor))
 
-    if sig_figs is not None:
+    # Integer tensors, such as indices or token IDs, stay exact.
+    is_floating = getattr(tensor, "is_floating_point", None)
+    integral = callable(is_floating) and not is_floating()
+    if sig_figs is not None and not integral:
         values = [float(f"%.{sig_figs}g" % v) for v in values]
     return values
 

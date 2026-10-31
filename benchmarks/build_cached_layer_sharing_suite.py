@@ -42,9 +42,18 @@ from cattorch.benchmark import (  # noqa: E402
     _stage_target,
     _write_project,
 )
-from cattorch.experimental import stacked_swiglu_moe_adapter
+from cattorch import adapter  # noqa: E402
+from cattorch.experimental import StackedSwiGLUMoE  # noqa: E402
 from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
 from cattorch.util.scratch.dsl import Program, append, call, clear  # noqa: E402
+
+
+@adapter(Top1SwiGLUMoE)
+def _stacked_experts(module, context):
+    """Run the top-1 experts, whose weights are stacked, on the stacked SwiGLU kernel."""
+    return StackedSwiGLUMoE(
+        module.router.weight, module.gate.weight, module.up.weight, module.down.weight,
+    )
 
 
 def _compile_variant(model, directory: Path, label: str, sharing: str, namespace: str):
@@ -67,7 +76,7 @@ def _compile_variant(model, directory: Path, label: str, sharing: str, namespace
             compact_schema=True,
             layer_sharing=sharing,
         ),
-        adapters=(stacked_swiglu_moe_adapter(Top1SwiGLUMoE),),
+        adapters=(_stacked_experts,),
     )
     sprite, assets = _load_sprite(result.path)
     for entry in sprite.get("lists", {}).values():

@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ import torch
 from torch import nn
 
 from cattorch import (
-    CharTokenizer, GenerationProgram, QuantizationConfig, StorageConfig, build_project,
+    CharTokenizer, CodegenConfig, GenerationProgram, QuantizationConfig, StorageConfig, build_project,
     entrypoint, transpile,
 )
 from cattorch.util.scratch.emulator import ProjectEmulator
@@ -186,12 +187,44 @@ def test_program_state_carries_between_calls(tmp_path):
     )
 
 
-def test_generation_with_its_tokenizer_matches_pytorch(tmp_path):
+def _layered_language():
+    from test_project import Language
+
+    class Layered(Language):
+        """Two ``blocks.N`` layers, which layer sharing factors into one."""
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList(
+                nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+                for _ in range(2)
+            )
+            del self.layer
+
+        def forward(self, tokens):
+            length = tokens.shape[1]
+            x = self.tokens(tokens) + self.positions(torch.arange(length))
+            mask = nn.Transformer.generate_square_subsequent_mask(length)
+            for block in self.blocks:
+                x = block(x, src_mask=mask, is_causal=True)
+            return self.head(x)
+
+    return Layered()
+
+
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
     from test_project import CHARACTERS, Language, char_tokenizer, greedy
 
     torch.manual_seed(2)
-    model = Language().eval()
-    result = transpile(model, GenerationProgram(max_context=16), tmp_path / "lm")
+    model = (Language() if sharing == "off" else _layered_language()).eval()
+    result = transpile(
+        model, GenerationProgram(max_context=16), tmp_path / "lm",
+        codegen=CodegenConfig(layer_sharing=sharing),
+    )
+    if sharing == "auto":
+        with zipfile.ZipFile(result.path) as archive:
+            assert b"_cattorch shared transformer layer" in archive.read("sprite.json")
     tokenizer = CharTokenizer(char_tokenizer()).save(tmp_path / "chars", name="chars")
     project = build_project(
         tmp_path / "demo", result, tokenizer=tokenizer, max_new_tokens=6, temperature=0,

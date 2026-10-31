@@ -553,6 +553,135 @@ def _broadcast_matmul_batches(graph) -> None:
         node.args, node.kwargs = (product, list(_get_shape(node))), {}
 
 
+def _fuse_rotate_half(graph) -> None:
+    """Rewrite Hugging Face RoPE, ``x * cos + rotate_half(x) * sin``, to one kernel.
+
+    ``rotate_half(x)`` traces as ``cat([-x[..., h:], x[..., :h]], -1)``. The
+    match needs ``cos`` and ``sin`` to broadcast to ``x`` without enlarging it.
+    Anything else is left to the general kernels, which give the same values.
+    """
+    import cattorch.ops  # noqa: F401 - registers cattorch.rotary_half
+
+    def call(value, *targets):
+        return (
+            isinstance(value, torch.fx.Node) and value.op == "call_function"
+            and str(value.target) in targets and not value.kwargs
+        )
+
+    def last_dim(value, dim) -> bool:
+        rank = len(_get_shape(value))
+        return isinstance(dim, int) and dim % rank == rank - 1
+
+    def half_slice(value, source, start, end) -> bool:
+        if not call(value, "aten.slice.Tensor") or value.args[0] is not source:
+            return False
+        defaults = [0, None, None, 1]
+        dim, low, high, step = [*value.args[1:], *defaults[len(value.args) - 1:]]
+        width = _get_shape(source)[-1]
+        low = low or 0
+        high = width if high is None or high >= width else high
+        return last_dim(source, dim) and low == start and high == end and step == 1
+
+    def rotated(value):
+        """``x`` if ``value`` is ``rotate_half(x)``, else ``None``."""
+        if not call(value, "aten.cat.default") or len(value.args[0]) != 2:
+            return None
+        if len(value.args) > 1 and not last_dim(value, value.args[1]):
+            return None
+        if len(value.args) == 1 and len(_get_shape(value)) != 1:
+            return None
+        negated, first = value.args[0]
+        if not call(negated, "aten.neg.default"):
+            return None
+        second = negated.args[0]
+        if not call(second, "aten.slice.Tensor"):
+            return None
+        source = second.args[0]
+        width = _get_shape(source)[-1]
+        half = width // 2
+        if width % 2 or not (
+            half_slice(second, source, half, width) and half_slice(first, source, 0, half)
+        ):
+            return None
+        return source
+
+    def product(value):
+        """``(tensor, factor)`` pairs of a ``mul`` node, both ways round."""
+        if not call(value, "aten.mul.Tensor"):
+            return []
+        left, right = value.args
+        return [(left, right), (right, left)]
+
+    for node in list(graph.nodes):
+        if not call(node, "aten.add.Tensor") or len(node.args) != 2:
+            continue
+        match = None
+        for plain, turned in (node.args, node.args[::-1]):
+            for value, cosine in product(plain):
+                for rotation, sine in product(turned):
+                    source = rotated(rotation)
+                    if source is not None and source is value:
+                        match = value, cosine, sine
+        if match is None:
+            continue
+        value, cosine, sine = match
+        if not all(isinstance(table, torch.fx.Node) for table in (cosine, sine)):
+            continue
+        shape = tuple(_get_shape(value))
+        try:
+            broadcast = torch.broadcast_shapes(shape, _get_shape(cosine), _get_shape(sine))
+        except RuntimeError:
+            continue
+        dtypes = {_get_dtype(item) for item in (value, cosine, sine, node)}
+        if tuple(broadcast) != shape or tuple(_get_shape(node)) != shape or len(dtypes) != 1:
+            continue
+        replaced = list(node.all_input_nodes)
+        node.target = torch.ops.cattorch.rotary_half.default
+        node.args = (value, cosine, sine)
+        while replaced:
+            unused = replaced.pop()
+            if unused.graph is graph and unused.op == "call_function" and not unused.users:
+                replaced.extend(unused.all_input_nodes)
+                graph.erase_node(unused)
+
+
+def _user_kernel(registry, target: str, fast: bool, config) -> bool:
+    """Whether ``target`` lowers through a kernel passed to this export."""
+    from cattorch.builtin_kernels import BUILTIN_KERNELS
+
+    kernel = registry.kernel(target, fast=fast, config=config)
+    context = getattr(kernel, "kernel", None)
+    return context is not None and not any(context is builtin for builtin in BUILTIN_KERNELS)
+
+
+def _drop_identity_permutes(graph) -> None:
+    """Remove ``permute`` calls that keep every dimension in place.
+
+    Decompositions such as ``x[index]`` emit them. Lowered, each would copy
+    its whole input into a new list.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.permute.default":
+            continue
+        if any(user.op == "output" for user in node.users):
+            continue  # outputs are recorded by node name
+        dims = [int(dim) % max(len(_get_shape(node)), 1) for dim in node.args[1]]
+        if dims == list(range(len(dims))):
+            node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+
+
+def _normalize_graph(graph) -> None:
+    """Rewrites every captured graph gets before analysis.
+
+    The traces at other lengths get them too, so their nodes line up.
+    """
+    _drop_empty_cat_inputs(graph)
+    _drop_identity_permutes(graph)
+    _broadcast_matmul_batches(graph)
+    _fuse_rotate_half(graph)
+
+
 _RUNTIME_END = 2**63 - 1
 
 
@@ -588,8 +717,7 @@ def _length_literals(
         )
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
-    _drop_empty_cat_inputs(longer.graph)
-    _broadcast_matmul_batches(longer.graph)
+    _normalize_graph(longer.graph)
     first, second = list(captured.graph.nodes), list(longer.graph.nodes)
     if len(first) != len(second) or any(
         (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
@@ -907,8 +1035,7 @@ def _prepare_graph(
         captured = _captured or capture_model(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
-    _drop_empty_cat_inputs(captured.graph)
-    _broadcast_matmul_batches(captured.graph)
+    _normalize_graph(captured.graph)
     if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.
@@ -1164,6 +1291,18 @@ def _prepare_graph(
                     )
                 node.target = runtime.runtime_slice.default
                 node.args, node.kwargs = (parent, dimension, first, last), {}
+        elif target in elementwise and _user_kernel(registry, target, fast, fast_config):
+            # A user's kernel for it may handle only the traced row.
+            if offset or any(
+                math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
+                for value in dynamic_parents
+            ):
+                raise UnsupportedModelError(
+                    f"the kernel passed for {target} gets a variable-length input "
+                    "that can't be split into items; read the length from "
+                    "ctx.inputs[...].dynamic_axis, or export without the kernel"
+                )
+            row_loops.add(node.name)
         elif target in elementwise and not (
             # These kernels size their rows from the list's length.
             target == "aten.linear.default" and dynamic_parents == [node.args[0]]

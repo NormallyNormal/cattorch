@@ -297,17 +297,29 @@ class _BlockSharder:
     def apply(self):
         pending = []
         priorities = {"data_lengthoflist": 0, "data_itemoflist": 1}
+
+        def depth(identifier):
+            count, parent = 0, self.blocks[identifier].get("parent")
+            while parent is not None and parent in self.blocks:
+                count, parent = count + 1, self.blocks[parent].get("parent")
+            return count
+
         for order, (identifier, block) in enumerate(tuple(self.blocks.items())):
             field = block.get("fields", {}).get("LIST")
             if field and field[1] in self.by_id:
+                # A read's index may hold another read, which rewriting the
+                # outer one copies per shard; rewrite the inner one first.
+                nesting = -depth(identifier) if block["opcode"] == "data_itemoflist" else 0
                 pending.append((
-                    priorities.get(block["opcode"], 2), order,
+                    priorities.get(block["opcode"], 2), nesting, order,
                     identifier, block, self.by_id[field[1]],
                 ))
         # Reporter subtrees must be lowered before command rewriters clone
         # them. In particular, `delete (length of logical list)` needs the
         # summed physical length inside every routed delete command.
-        for _priority, _order, identifier, block, layout in sorted(pending):
+        for _priority, _nesting, _order, identifier, block, layout in sorted(
+            pending, key=lambda entry: entry[:3],
+        ):
             opcode = block["opcode"]
             if opcode == "data_itemoflist":
                 self._rewrite_read(identifier, block, layout)

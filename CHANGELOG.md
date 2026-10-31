@@ -218,8 +218,94 @@
 - `torch.addmm` with a bias vector, which GPT-2's `Conv1D` layers use, runs on
   the linear kernel instead of a separate multiply and add. A two-layer GPT-2
   sprite has about 22% fewer blocks.
+- Hugging Face style RoPE (`x * cos + rotate_half(x) * sin`, as in Llama,
+  Qwen2 and Mistral) runs as one rotary loop instead of slices, negation,
+  `cat` and three elementwise passes. A two-layer Llama sprite has about 14%
+  fewer blocks.
+- Hidden prefill skips the final layer's query, attention output and MLP for
+  prompt tokens when layers are shared too, not just the output head. A
+  three-layer shared model runs about 18% fewer Scratch operations for an
+  8-token prompt.
 
 ## Fixes
+
+- Layer sharing merged layers that differ only in a constant, such as an
+  attention window or a residual scale, and ran every layer with the first
+  layer's value. Such layers are no longer shared.
+- With layer sharing, a `cattorch decode` before any prefill wrote the hidden
+  state to `cattorch logits` instead of the logits.
+- A model that reads input-dependent values with `tolist()` or `.numpy()`
+  exported the example's values as constants. It is now rejected, like
+  `.item()`.
+- With `dynamic=`, a broadcast that adds dimensions to the variable-length
+  input, such as `x.unsqueeze(-1) * weight`, gave wrong numbers at every
+  length.
+- The export-time check of variable-length exports compared each length with
+  the error at the shortest one, so a sprite equally wrong everywhere passed,
+  and it never checked lengths past 32. Exact exports must now match at every
+  checked length, including the maximum (up to 1024 items).
+- An `@entrypoint` whose growing buffer also changed its old rows, as in
+  `cat([seen * 0.5, row])` or prepending, exported and then lost the change.
+  It is now rejected.
+- A buffer registered under two names in an `@entrypoint` model was read as a
+  constant through the second name.
+- The emulator kept NaN through arithmetic, where Scratch reads it as 0, so
+  `verify` could pass a sprite that gives different numbers in Scratch.
+- Hugging Face dynamic-NTK RoPE past `max_position_embeddings` exported for
+  generation with wrong logits. Generation now checks shorter prompts too and
+  rejects models whose positions depend on the prompt length.
+- `BPETokenizer` accepted normalizers, pre-tokenizers, `fuse_unk` and
+  `byte_fallback`, then tokenized differently from Hugging Face; it now
+  rejects them. `transpile_tokenizer` exported WordPiece, WordLevel and Unigram
+  tokenizers one character at a time; it now rejects those with
+  multi-character tokens.
+- SentencePiece sprites with `scratch_casefold=True` used the uppercase byte
+  token for a lowercase letter without a vocabulary entry, and encoded a run
+  of unknown characters as one unknown token each.
+- `nn.LayerNorm(bias=False)`, `elementwise_affine=False`, and `F.layer_norm`
+  with a weight but no bias failed with an `IndexError`.
+- A BatchNorm used more than once, as in a Siamese encoder, normalized with
+  the wrong standard deviation after its first use.
+- Sharing identical weights could keep a copy no block read, so another
+  weight's list was left empty and read as zeros. This showed up with
+  quantization or fast-mode low rank as an unexpectedly large error.
+- A Linear followed by BatchNorm1d was folded even when the BatchNorm
+  normalized another axis, as for `(batch, tokens, features)` inputs, giving
+  wrong numbers or an `AssertionError`.
+- Reading a list of more than 200,000 values at positions taken from another
+  such list, as broadcasting and large transposes do, returned zeros past the
+  first 200,000 values. `x[i]` on such an input copied it into a list that
+  lost the same values.
+- `cattorch prepare for save` emptied input lists, which in a program sprite
+  hold its state, so the next call failed until `cattorch reset`.
+- `sig_figs` rounded integer buffers, such as permutations and token offsets.
+- A kernel passed with `kernels=` for an elementwise operation ran on the
+  traced size when its input grew at run time. It now runs once per item, and
+  export fails where it can't.
+- Automatic MoE detection swapped a block that caps how many tokens an
+  expert takes for plain top-k routing, which is wrong once an expert is full.
+- `cumsum` and `cumprod` ran as a decomposition whose size grows with the
+  square of the length: a 1,600-item `cumsum` made 11.8 MB of JSON, and a
+  210,000-item one didn't finish. They now run as one pass.
+- float16 and bfloat16 models, including Hub checkpoints loaded by
+  `cattorch generate --hf`, were rejected for generation with a misleading
+  message. They are exported in float32.
+- The command line printed a traceback for an unsupported operation instead
+  of an error message.
+- Generation models with `-inf` logits, as for banned tokens, were rejected.
+- `build_project` gave a sprite named `cattorch` global lists that collided
+  with its own, and could make two sprites named `Demo`. Such sprites are
+  renamed, like duplicates.
+- Generation sprites had two `cattorch status` variables, so a failed cache
+  transaction never reported its status.
+- Generation sprites accepted token IDs outside the vocabulary, fractions and
+  text, and reported `ok`. They now report an error.
+- A variable-length `cattorch forward` accepted any input length and reported
+  `ok`. It now reports too few items, too many, or a partial item.
+- A variable-length export whose output gives several rows per item, as
+  `x.reshape(-1, 2)` does, crashed.
+- `frontend="export"` leaked raw `torch.export` errors.
+- `transpile` rejected `adapters=` for plain and variable-length exports.
 
 - `@cattorch.moe` stopped working once anything imported
   `cattorch.experimental`, because the module holding the MoE classes had the
@@ -277,11 +363,23 @@
 - `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
   failed during export.
 
+## Deprecations
+
+- `transpile(..., frontend="export")` is deprecated and will be removed in
+  2.0. It supports a subset of what the default `frontend="fx"` does, without
+  its decompositions and pattern recognition. It now warns with a
+  `DeprecationWarning`.
+
 ## Breaking changes
 
 - cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from
   Python 3.10 and PyTorch 2.6. Python 3.10 reached its end of life in
   October 2026.
+- `cattorch.experimental.stacked_swiglu_moe_adapter` is removed. MoE blocks
+  with SwiGLU experts switch to `StackedSwiGLUMoE` by themselves. For a block
+  whose expert weights are stacked into one tensor each, an `@adapter` that
+  returns `StackedSwiGLUMoE` does the same; see
+  [mixture of experts](docs/programs-and-moe.md#mixture-of-experts).
 - `op` moved back to `cattorch.experimental`, next to the kernel interface it
   uses. Only names outside `cattorch.experimental` are stable; see
   [stability](docs/stability.md).

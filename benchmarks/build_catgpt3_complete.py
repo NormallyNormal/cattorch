@@ -43,8 +43,17 @@ from cattorch import (  # noqa: E402
     transpile_tokenizer,
 )
 from cattorch import ModuleAdapter
-from cattorch.experimental import stacked_swiglu_moe_adapter
+from cattorch import adapter  # noqa: E402
+from cattorch.experimental import StackedSwiGLUMoE  # noqa: E402
 from cattorch.util.scratch.finalize_scratch import finalize_sprite  # noqa: E402
+
+
+@adapter(Top1SwiGLUMoE)
+def _stacked_experts(module, context):
+    """Run the top-1 experts, whose weights are stacked, on the stacked SwiGLU kernel."""
+    return StackedSwiGLUMoE(
+        module.router.weight, module.gate.weight, module.up.weight, module.down.weight,
+    )
 
 
 DEFAULT_CHECKPOINT = (
@@ -121,7 +130,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
         min_quantized_values=1,
     )
     adapters = (
-        stacked_swiglu_moe_adapter(Top1SwiGLUMoE),
+        _stacked_experts,
         _rotary_adapter(),
     )
     processor = transpile(

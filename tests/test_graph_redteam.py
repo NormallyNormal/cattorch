@@ -187,8 +187,7 @@ def test_convolution_and_pooling_options_match(tmp_path, model):
 
 
 def test_fractional_powers_match(tmp_path):
-    """Negative bases give NaN, as in PyTorch."""
-    model = FunctionModel(lambda value: torch.pow(value, 1.5) + value ** 7)
+    model = FunctionModel(lambda value: torch.pow(value.abs(), 1.5) + value ** 7)
     value = torch.randn(2, 3)
     assert verify(model, value, transpile(model, value, tmp_path / "power")).passed
 

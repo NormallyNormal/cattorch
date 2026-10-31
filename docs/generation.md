@@ -79,12 +79,12 @@ that break the requirements below in ways the analysis can't see.
 ## Hidden prefill
 
 With `hidden_prefill=True` (the default), prefill computes logits only for the
-last prompt token. For the other prompt tokens, the output head is skipped.
-When the layers aren't [shared](code-generation.md#optional-compaction), the
-final layer also keeps only its K/V append for those tokens and skips its
-attention output, MLP, and final norm, and the operations that only compute
-its query, such as the query projection and its RoPE. Set it to `False` only
-for debugging or measurement.
+last prompt token. For the other prompt tokens, the output head is skipped,
+and the final layer keeps only its K/V append: it skips its attention output,
+MLP, and final norm, and the operations that only compute its query, such as
+the query projection and its RoPE. With [shared](#layer-sharing) layers, the
+shared code checks whether it is running as the final layer. Set it to
+`False` only for debugging or measurement.
 
 ## Layer sharing
 
@@ -96,8 +96,7 @@ Hugging Face's `model.layers.N`, export without sharing and with one list per
 layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
 repeated but can't be factored, for example because the MLP widths differ,
 cattorch logs a warning and exports again without sharing. Sharing makes
-sprites smaller; shared layers can't skip the final layer's work during hidden
-prefill.
+sprites smaller.
 
 ## Quantization
 
@@ -184,6 +183,7 @@ reaches `cattorch max context`.
 | Decode when the cache is full | Cache unchanged; logits and top-k lists cleared | `maximum context exceeded` |
 | Prefill with no tokens | Cache reset; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
 
 ## Cache behavior
 

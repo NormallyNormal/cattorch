@@ -702,11 +702,15 @@ def transpile_program(
         isinstance(binding, Input) and binding.dynamic is not None
         for entry in program.entrypoints for binding in entry.arguments
     ):
-        from cattorch.dynamic import check_entry_lengths
+        from cattorch.dynamic import check_entry_lengths, exact_export
         from cattorch.verify import verify
 
         check_entry_lengths(
             model, program, result, verify, adapters=adapters, quantization=quantization,
+            exact=exact_export(
+                optimization=optimization, storage=storage, quantization=quantization,
+                sig_figs=sig_figs,
+            ),
         )
     return result
 

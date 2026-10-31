@@ -17,6 +17,7 @@ from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.frontend import Frontend, flat_example_inputs, keep_operations
 from cattorch.graph import (
+    _NOOP_OPS,
     _GenerationSpec,
     _GraphInfo,
     _get_dtype,
@@ -84,6 +85,10 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 log = logging.getLogger(__name__)
 
 _LAYER_CACHE_BASE = "cattorch layer cache base"
+_PROJECT_OUTPUT = "cattorch project output"
+# 1 when a shared layer computes past its K/V append: always, except in the
+# final layer for a hidden prefill token.
+_LAYER_TAIL = "cattorch layer tail"
 
 
 def _bank_generation_caches(graph: _GraphInfo) -> bool:
@@ -136,6 +141,120 @@ def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
         ):
             query_only.add(node.name)
     return query_only
+
+
+def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> None:
+    """Reject a variable-length input of the wrong length before running.
+
+    ``cattorch forward`` becomes a wrapper that checks each variable-length
+    input holds whole items within its bounds, as program entry points do;
+    otherwise it clears the outputs and reports why in ``cattorch status``.
+    """
+    from cattorch.util.scratch.dsl import broadcast_and_wait, if_else, lt, mod
+
+    checks = []
+    for node in graph.nodes:
+        name = graph.input_names.get(node.name)
+        if name is None or node.name not in graph.dynamic_bounds:
+            continue
+        if name in layouts and len(layouts[name].shards) > 1:
+            continue  # a split list's length isn't one list's length
+        shape = _get_shape(node)
+        axis = graph.dynamic_axes[node.name]
+        width = max(math.prod(shape) // max(shape[axis], 1), 1)
+        _, minimum, _ = graph.dynamic_bounds[node.name]
+        checks.extend((
+            if_(gt(mod(length(name), width), 0), (
+                set_var("cattorch status", f"invalid dynamic length: {name}"),
+            )),
+            if_(lt(length(name), width * max(minimum, 1)), (
+                set_var("cattorch status", f"too few items: {name}"),
+            )),
+            if_(gt(length(name), graph.runtime_capacity(node.name, shape)), (
+                set_var("cattorch status", f"dynamic capacity exceeded: {name}"),
+            )),
+        ))
+    if not checks:
+        return
+    internal = "_cattorch checked forward"
+    _rename_procedure(sprite, "cattorch forward", internal)
+    wrapper = Program(
+        "checked_forward",
+        variables=("cattorch status",),
+        lists=tuple(dict.fromkeys((*graph.input_names.values(), *output_names))),
+        body=(
+            set_var("cattorch status", "ok"),
+            *checks,
+            if_else(
+                eq(var("cattorch status"), "ok"),
+                (call(internal),),
+                (
+                    *(clear(name) for name in output_names),
+                    broadcast_and_wait("cattorch forward complete"),
+                ),
+            ),
+        ),
+    )
+    _add_warp_procedure(sprite, "cattorch forward", wrapper, x=640, y=960)
+    _merge_variables_by_name(sprite, {"cattorch status"})
+    _merge_lists_by_name(sprite, set(graph.input_names.values()) | set(output_names))
+
+
+def _token_vocabulary(graph: _GraphInfo) -> int | None:
+    """Rows of the embedding table the token input is looked up in."""
+    tokens = {name for name, list_name in graph.input_names.items() if list_name == "input"}
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if str(node.target) == "aten.embedding.default" and getattr(
+            node.args[1], "name", None,
+        ) in tokens:
+            return int(_get_shape(node.args[0])[0])
+        if node.all_input_nodes and node.all_input_nodes[0].name in tokens and str(
+            node.target,
+        ) in _NOOP_OPS | {"aten.to.dtype", "aten._to_copy.default"}:
+            tokens.add(node.name)
+    return None
+
+
+def _shared_layer_attention(graph: _GraphInfo) -> str:
+    """The cached attention of layer zero, whose code the shared layer runs."""
+    by_name = {node.name: node for node in graph.nodes}
+    return next(
+        name for name in graph.generation.score_caches if _graph_layer(by_name[name]) == 0
+    )
+
+
+def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attention: str) -> None:
+    """Skip what a hidden prefill token never reads in ``attention``'s layer.
+
+    That is the query, which only feeds the attention output, and everything
+    after the attention. Its K/V append still runs. In a shared layer, the
+    work stops at the end of the layer's code and the gate is the layer tail;
+    otherwise it runs to the end of the step.
+    """
+    gate = _LAYER_TAIL if graph.generation.banked_caches else _PROJECT_OUTPUT
+    root_entries = compiler.emitted_roots
+    root_names = [name for name, _ in root_entries]
+    attention_position = root_names.index(attention)
+    if attention_position + 1 < len(root_entries):
+        following = root_entries[attention_position + 1][1]
+        # In a shared layer, a following root of another layer was removed.
+        if following in sprite["blocks"]:
+            _guard_generation_suffix(sprite, following, gate)
+    query_only = _query_only_nodes(graph, attention)
+    position = 0
+    while position < attention_position:
+        if root_names[position] not in query_only:
+            position += 1
+            continue
+        end = position
+        while end < attention_position and root_names[end] in query_only:
+            end += 1
+        _guard_generation_range(
+            sprite, root_entries[position][1], root_entries[end][1], gate,
+        )
+        position = end
 
 
 def _wrap_transactional_generation_step(
@@ -322,12 +441,17 @@ class _Compiler:
         if str(node.target) != "cattorch.cached_attention.default":
             return {}
         if generation.banked_caches:
-            return {
+            options: dict[str, object] = {
                 "cache_stride": generation.cache_widths[generation.score_caches[node.name]],
                 "cache_base_variable": _LAYER_CACHE_BASE,
             }
+            if generation.hidden_prefill_attention is not None:
+                # Every shared layer reads the gate; only the final one sets it
+                # to skip work for hidden prefill tokens.
+                options["hidden_prefill_gate"] = _LAYER_TAIL
+            return options
         if node.name == generation.hidden_prefill_attention:
-            return {"hidden_prefill_last": True}
+            return {"hidden_prefill_gate": _PROJECT_OUTPUT}
         return {}
 
     # ── public ───────────────────────────────────────────────────────────
@@ -1636,9 +1760,9 @@ def transpile(
         Expanded-JSON budget, loop-unrolling, compact-ID, and optional
         structural-compaction policy.
     frontend:
-        How the model is traced. ``"fx"`` (default) uses FX tracing;
-        ``"export"`` uses ``torch.export`` and is kept temporarily for
-        comparison. Programs require ``"fx"``.
+        How the model is traced. ``"fx"`` (default) uses FX tracing.
+        ``"export"`` uses ``torch.export``; it is deprecated, supports fewer
+        operations, and will be removed in 2.0. Programs require ``"fx"``.
     adapters:
         Scoped module adapters for an ``ExportProgram`` or
         ``GenerationProgram``. They apply to an export-owned model copy.
@@ -1678,6 +1802,13 @@ def transpile(
         sig_figs=sig_figs, frontend=frontend, adapters=adapters,
         example_kwargs=example_kwargs,
     )
+    if frontend == "export":
+        warnings.warn(
+            "frontend='export' is deprecated and will be removed in cattorch 2.0; "
+            "the default frontend='fx' supports every model it does, and more",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     kernels = validate_kernels(kernels)
     kept = active_kernel_targets(
         kernels, fast=optimization == "fast", config=fast_config or FastConfig(),
@@ -1697,11 +1828,12 @@ def transpile(
 
 def _transpile_dynamic(
     model, example_inputs, output_path, sig_figs, dynamic, *, example_kwargs, kernels,
-    **options,
+    adapters=(), **options,
 ):
     """Trace one row of the dynamic input, export, and check other lengths."""
     from cattorch.dynamic import (
-        at_length, check_lengths, loop_over_units, normalize_dynamic, unit_output_axes,
+        at_length, check_lengths, exact_export, loop_over_units, normalize_dynamic,
+        unit_output_axes,
     )
     from cattorch.verify import verify
 
@@ -1721,7 +1853,8 @@ def _transpile_dynamic(
     traced_kwargs.update(zip(kwarg_names, representative[positional:]))
     arguments = dict(
         generation=None, example_kwargs=traced_kwargs or None,
-        _registry=_registry_with(kernels) if kernels else None, **options,
+        _registry=_registry_with(kernels, adapters) if kernels or adapters else None,
+        **options,
     )
     try:
         result = _transpile(
@@ -1743,7 +1876,11 @@ def _transpile_dynamic(
             [tuple(value.shape) for value in representative],
             [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
         )
-    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs)
+    exact = exact_export(
+        optimization=options.get("optimization", "exact"), storage=options.get("storage"),
+        quantization=options.get("quantization"), sig_figs=sig_figs,
+    )
+    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs, exact=exact)
     return result
 
 
@@ -1847,8 +1984,6 @@ def _transpile_any(
             calibration_sequences=calibration_sequences,
             codegen=codegen, registry=registry,
         )
-    if adapters:
-        raise ValueError("adapters require an ExportProgram or GenerationProgram")
     if calibration_calls is not None:
         raise ValueError("calibration_calls require an ExportProgram")
     if calibration_sequences is not None:
@@ -1860,6 +1995,7 @@ def _transpile_any(
             storage=storage, quantization=quantization,
             calibration_inputs=calibration_inputs, codegen=codegen,
             frontend=frontend, example_kwargs=example_kwargs, kernels=kernels,
+            adapters=adapters,
         )
     return _transpile(
         model, example_inputs, output_path, sig_figs,
@@ -1870,7 +2006,7 @@ def _transpile_any(
         codegen=codegen,
         frontend=frontend,
         example_kwargs=example_kwargs,
-        _registry=_registry_with(kernels) if kernels else None,
+        _registry=_registry_with(kernels, adapters) if kernels or adapters else None,
     )
 
 
@@ -1910,6 +2046,13 @@ def _transpile_automatic_generation(
     ):
         raise ValueError("calibration_inputs can only be used with GPTQ quantization")
     max_context = program.max_context
+    if any(
+        value.is_floating_point() and value.dtype != torch.float32
+        for value in (*model.parameters(), *model.buffers())
+    ):
+        # Scratch computes in doubles either way. In float32 the cached step
+        # can be checked against the model without bfloat16 rounding noise.
+        model = copy.deepcopy(model).float()
     module = model if program.method == "forward" else MethodLeaves(model, program.method)
     prepared = registry.adapt_model(module)
     if optimization == "fast":
@@ -2094,7 +2237,14 @@ def _transpile(
     )
     sprite = tensor_adder.apply(sprite, list(graph.input_names.values()))
     if codegen.layer_sharing == "auto":
-        shared = _share_repeated_transformer_layers(sprite, compiler, storage)
+        hidden_layers = (
+            generation is not None and graph.generation.banked_caches
+            and graph.generation.hidden_prefill_attention is not None
+        )
+        shared = _share_repeated_transformer_layers(
+            sprite, compiler, storage,
+            layer_tail=(_LAYER_TAIL, _PROJECT_OUTPUT) if hidden_layers else None,
+        )
         if shared:
             log.info("Factored repeated transformer layers into one shared procedure")
         elif generation is not None and graph.generation.banked_caches:
@@ -2162,32 +2312,32 @@ def _transpile(
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
             hidden_attention = graph.generation.hidden_prefill_attention
-            if (
-                not graph.generation.banked_caches
-                and hidden_attention in root_names
+            if graph.generation.banked_caches:
+                # The shared layer is layer zero's code, gated by the layer
+                # tail variable the calls set.
+                _guard_hidden_layer_tail(sprite, graph, compiler, _shared_layer_attention(graph))
+                # After the layers, only the logits remain.
+                by_name = {node.name: node for node in graph.nodes}
+                last_layer = max(
+                    position for position, name in enumerate(root_names)
+                    if name in by_name and _graph_layer(by_name[name]) is not None
+                )
+                if last_layer + 1 >= len(root_entries):
+                    raise ValueError("hidden prefill requires a compiled output projection")
+                _guard_generation_suffix(
+                    sprite, root_entries[last_layer + 1][1], _PROJECT_OUTPUT,
+                )
+                _merge_variables_by_name(sprite, {_PROJECT_OUTPUT, _LAYER_TAIL})
+            elif (
+                hidden_attention in root_names
                 and root_names.index(hidden_attention) + 1 < len(root_entries)
             ):
                 # Keep the final layer's K/V append, skip its attention output
                 # and everything after it for hidden prompt tokens.
                 for entry in sprite.get("variables", {}).values():
-                    if entry[0] == "cattorch project output":
+                    if entry[0] == _PROJECT_OUTPUT:
                         entry[1] = 1
-                attention_position = root_names.index(hidden_attention)
-                _guard_generation_suffix(sprite, root_entries[attention_position + 1][1])
-                # The final layer's query only feeds that attention output.
-                query_only = _query_only_nodes(graph, hidden_attention)
-                position = 0
-                while position < attention_position:
-                    if root_names[position] not in query_only:
-                        position += 1
-                        continue
-                    end = position
-                    while end < attention_position and root_names[end] in query_only:
-                        end += 1
-                    _guard_generation_range(
-                        sprite, root_entries[position][1], root_entries[end][1],
-                    )
-                    position = end
+                _guard_hidden_layer_tail(sprite, graph, compiler, hidden_attention)
             else:
                 if not compiler.emitted_roots:
                     raise ValueError(
@@ -2204,6 +2354,7 @@ def _transpile(
             hidden_prefill=generation.hidden_prefill,
             top_k=generation.top_k,
             compact_top_k=codegen.unrolling != "speed",
+            vocabulary=_token_vocabulary(graph),
         )
         # Kernels declare `cattorch cache length` themselves; unify them with
         # the lifecycle's variable.
@@ -2216,6 +2367,8 @@ def _transpile(
             },
             top_k=generation.top_k is not None,
         )
+        # The step wrapper declares its own copy of the status variable.
+        _merge_variables_by_name(sprite, {"cattorch status"})
         generation_lists = {
             "input", "output", "cattorch prefill buffer",
         }
@@ -2292,6 +2445,7 @@ def _transpile(
             layouts,
             static_names=static_names,
             compressed=storage.compression,
+            inputs=set(graph.input_names.values()),
         )
     if generation is not None:
         _add_procedure_completion_broadcast(
@@ -2318,6 +2472,7 @@ def _transpile(
             _add_procedure_completion_broadcast(
                 sprite, procedure, f"{procedure} complete", status="ok",
             )
+        _check_input_lengths(sprite, graph, layouts, output_names)
     sprite.setdefault("variables", {}).update({
         "cattorch_storage_compression": [
             "cattorch storage compression",
