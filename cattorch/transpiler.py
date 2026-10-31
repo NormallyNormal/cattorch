@@ -64,6 +64,9 @@ from cattorch.operator_registry import (
     INDEX_MAP_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
 )
 from cattorch.util.instruction.generic import INDEX_MAP_KERNEL, index_map
+from cattorch.util.instruction.optimized_tensor import (
+    CAT_KERNEL, EMBEDDING_ADD_KERNEL, GETITEM_KERNEL, STRIDED_SLICE_KERNEL,
+)
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
@@ -404,6 +407,14 @@ class _Compiler:
             static=name.startswith("W_"),
         )
 
+    @staticmethod
+    def _kernel_instruction(kernel, output, *args, options=None):
+        """An instruction running ``kernel``, a ``Kernel`` the compiler calls itself."""
+        instruction = kernel.instruction_class()(kernel.target_name, output, *args)
+        if options:
+            instruction.options = options
+        return instruction
+
     def _instantiate(self, kernel, lowering_target, node, target_list, args):
         """Create a kernel instruction; context kernels also get output info."""
         output = target_list
@@ -516,10 +527,7 @@ class _Compiler:
                     Argument("C_skip", torch.Size([]), value=0),
                     Argument("C_offset", torch.Size([]), value=0),
                 )
-                from cattorch.util.instruction.optimized import OptimizedGetItemInstruction
-                instruction = OptimizedGetItemInstruction(
-                    "cattorch.output.copy", target_list, *args,
-                )
+                instruction = self._kernel_instruction(GETITEM_KERNEL, target_list, *args)
                 self._emit(instruction, [source_list], target_list)
             else:
                 target_list = source_list
@@ -706,12 +714,11 @@ class _Compiler:
             self._argument(name, value)
             for name, value in zip(input_lists, tensor_nodes)
         ]
-        from cattorch.util.instruction.optimized import EmbeddingAddInstruction
-        instruction = EmbeddingAddInstruction(node.target, target_list, *args)
-        instruction.interleaved_sides = (
+        instruction = self._kernel_instruction(EMBEDDING_ADD_KERNEL, target_list, *args)
+        instruction.options = {"interleaved_sides": (
             self._uses_grouped_tied_weight(first),
             self._uses_grouped_tied_weight(second),
-        )
+        )}
         self._emit(instruction, input_lists, target_list)
         self.scope.release_dependencies(first)
         self.scope.release_dependencies(second)
@@ -1098,7 +1105,10 @@ class _Compiler:
             instruction = self._instantiate(
                 kernel, lowering_target, node, target_list, args,
             )
-            instruction.interleaved_weight = self._uses_grouped_tied_weight(node)
+            instruction.options = {
+                **(getattr(instruction, "options", None) or {}),
+                "interleaved_weight": self._uses_grouped_tied_weight(node),
+            }
         elif node.name in self.graph.causal_value_matmuls:
             from cattorch.util.instruction.optimized import CausalValueMatMulInstruction
             value_offset = self.graph.qkv_offsets.get(node.args[1].name, 0)
@@ -1158,8 +1168,7 @@ class _Compiler:
                 Argument("C_skip", torch.Size([]), value=0),
                 Argument("C_offset", torch.Size([]), value=0),
             )
-            from cattorch.util.instruction.optimized import OptimizedGetItemInstruction
-            instruction = OptimizedGetItemInstruction(node.target, target_list, *args)
+            instruction = self._kernel_instruction(GETITEM_KERNEL, target_list, *args)
             self._emit(instruction, [source_list], target_list)
             return
 
@@ -1196,8 +1205,7 @@ class _Compiler:
                 Argument("C_chunk_1", torch.Size([]), value=chunk_1),
                 Argument("C_chunk_2", torch.Size([]), value=chunk_2),
             ]
-            from cattorch.util.instruction.optimized import OptimizedCatInstruction
-            instruction = OptimizedCatInstruction(node.target, cat_target, *cat_args)
+            instruction = self._kernel_instruction(CAT_KERNEL, cat_target, *cat_args)
             self._emit(instruction, cat_inputs, cat_target)
 
             out_shape = list(cur_shape)
@@ -1242,8 +1250,7 @@ class _Compiler:
                 Argument("C_offset", torch.Size([]), value=start * trailing),
                 Argument("C_step_skip", torch.Size([]), value=(step - 1) * trailing),
             ]
-            from cattorch.util.instruction.optimized import StridedSliceInstruction
-            instruction = StridedSliceInstruction(node.target, target_list, *args)
+            instruction = self._kernel_instruction(STRIDED_SLICE_KERNEL, target_list, *args)
             self._emit(instruction, input_lists, target_list)
             return
 
@@ -1264,8 +1271,7 @@ class _Compiler:
             Argument("C_skip", torch.Size([]), value=skip),
             Argument("C_offset", torch.Size([]), value=offset),
         ]
-        from cattorch.util.instruction.optimized import OptimizedGetItemInstruction
-        instruction = OptimizedGetItemInstruction(node.target, target_list, *args)
+        instruction = self._kernel_instruction(GETITEM_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
 
     # ── getitem on split/chunk ───────────────────────────────────────────
@@ -1314,8 +1320,7 @@ class _Compiler:
             Argument("C_skip", torch.Size([]), value=skip),
             Argument("C_offset", torch.Size([]), value=offset),
         ]
-        from cattorch.util.instruction.optimized import OptimizedGetItemInstruction
-        instruction = OptimizedGetItemInstruction(node.target, target_list, *args)
+        instruction = self._kernel_instruction(GETITEM_KERNEL, target_list, *args)
         self._emit(instruction, input_lists, target_list)
 
     # ── helpers ──────────────────────────────────────────────────────────

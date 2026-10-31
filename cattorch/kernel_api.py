@@ -139,10 +139,14 @@ class KernelContext:
     @classmethod
     def from_arguments(
         cls, target: object, output: Argument | str, args: tuple[Argument, ...],
-        operator=None,
+        operator=None, names: tuple[str, ...] | None = None,
     ) -> KernelContext:
         operator = resolve_operator(target) if operator is None else operator
-        names, defaults = _schema_names(operator, len(args))
+        if names:
+            # A kernel the compiler builds itself names its arguments.
+            names, defaults = [*names, *(f"arg{i}" for i in range(len(names), len(args)))], {}
+        else:
+            names, defaults = _schema_names(operator, len(args))
         slots, output_slot = _tensor_slots(args)
         inputs: dict[str, TensorInfo] = {}
         scalars: dict[str, object] = {
@@ -270,6 +274,9 @@ class Kernel:
     validator: Callable[[KernelContext], str | None] | None = None
     fast_flag: str | None = None
     approximate: bool = False
+    #: Names of the positional arguments, for an internal target with no
+    #: PyTorch schema to name them.
+    arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         target = getattr(self.target, "operator", self.target)
@@ -319,6 +326,7 @@ class _ContextInstruction(Instruction):
     def prepare(self):
         self.context = KernelContext.from_arguments(
             self.kernel.target_name, self.output, self.args, self._operator(),
+            names=self.kernel.arguments,
         )
         self.temporary_sizes: dict[str, int] = {}
 

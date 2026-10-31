@@ -26,19 +26,19 @@ from cattorch.util.instruction.optimized import (
     OptimizedBatchNormInstruction,
     OptimizedConvolutionInstruction,
     OptimizedElementwiseInstruction,
-    OptimizedEmbeddingInstruction,
     OptimizedLayerNormInstruction,
     OptimizedLogSoftmaxInstruction,
-    OptimizedMaskedFillInstruction,
     OptimizedMatMulInstruction,
     OptimizedMeanInstruction,
     OptimizedPoolingInstruction,
     OptimizedRMSNormInstruction,
     OptimizedSoftmaxInstruction,
-    OptimizedTransposeInstruction,
 )
 from cattorch.util.instruction.optimized_moe import (
     ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
+)
+from cattorch.util.instruction.optimized_tensor import (
+    EMBEDDING_KERNEL, MASKED_FILL_KERNEL, TRANSPOSE_KERNELS,
 )
 from cattorch.util.instruction.generic import (
     INDEX_MAP_KERNEL, REDUCTION_KERNELS, REDUCTIONS,
@@ -581,11 +581,10 @@ def _build_default_registry() -> OperatorRegistry:
         "aten.layer_norm.default": OptimizedLayerNormInstruction,
         "aten.rms_norm.default": OptimizedRMSNormInstruction,
         "aten.batch_norm.default": OptimizedBatchNormInstruction,
-        "aten.embedding.default": OptimizedEmbeddingInstruction,
-        "aten.numpy_T.default": OptimizedTransposeInstruction,
-        "aten.transpose.int": OptimizedTransposeInstruction,
-        "aten.permute.default": OptimizedTransposeInstruction,
-        "aten.masked_fill.Scalar": OptimizedMaskedFillInstruction,
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (EMBEDDING_KERNEL, MASKED_FILL_KERNEL, *TRANSPOSE_KERNELS)
+        },
         "aten.conv1d.default": OptimizedConvolutionInstruction,
         "aten.conv2d.default": OptimizedConvolutionInstruction,
         "aten.max_pool1d.default": OptimizedPoolingInstruction,

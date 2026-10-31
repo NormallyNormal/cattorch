@@ -32,21 +32,11 @@ from cattorch.util.instruction.optimized_normalization import (
     OptimizedRMSNormInstruction,
     OptimizedSoftmaxInstruction,
 )
-from cattorch.util.instruction.optimized_tensor import (
-    EmbeddingAddInstruction,
-    OptimizedCatInstruction,
-    OptimizedEmbeddingInstruction,
-    OptimizedGetItemInstruction,
-    OptimizedMaskedFillInstruction,
-    OptimizedTransposeInstruction,
-    StridedSliceInstruction,
-)
 
 __all__ = [
     "CausalScoreInstruction",
     "CausalSoftmaxInstruction",
     "CausalValueMatMulInstruction",
-    "EmbeddingAddInstruction",
     "FastCausalSoftmaxInstruction",
     "FastElementwiseInstruction",
     "FastLayerNormInstruction",
@@ -56,14 +46,10 @@ __all__ = [
     "FusedArithmeticInstruction",
     "LinearInstruction",
     "OptimizedBatchNormInstruction",
-    "OptimizedCatInstruction",
     "OptimizedConvolutionInstruction",
     "OptimizedElementwiseInstruction",
-    "OptimizedEmbeddingInstruction",
-    "OptimizedGetItemInstruction",
     "OptimizedLayerNormInstruction",
     "OptimizedLogSoftmaxInstruction",
-    "OptimizedMaskedFillInstruction",
     "OptimizedMatMulInstruction",
     "OptimizedMeanInstruction",
     "OptimizedPoolingInstruction",
@@ -71,7 +57,5 @@ __all__ = [
     "OptimizedSoftmaxInstruction",
     "OptimizedSwiGLUInstruction",
     "PairedLinearSwiGLUInstruction",
-    "OptimizedTransposeInstruction",
-    "StridedSliceInstruction",
     "QKVLinearInstruction",
 ]
