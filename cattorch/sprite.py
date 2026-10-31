@@ -357,9 +357,31 @@ def _share_repeated_transformer_layers(
         [(name, root) for name, root, found in emitted if found == layer]
         for layer in layers
     ]
+    def literals(value):
+        """An argument with tensors blanked out: what the code bakes in."""
+        if isinstance(value, torch.fx.Node):
+            return None
+        if isinstance(value, (list, tuple)):
+            return tuple(literals(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(sorted((key, literals(item)) for key, item in value.items()))
+        if isinstance(value, torch.Tensor):
+            return tuple(value.shape), str(value.dtype)
+        return repr(value)
+
+    # Constants such as an attention window or a scale are compiled into each
+    # layer's code, so layers that differ in them can't share it.
+    # Fused nodes have no root of their own, so compare every node.
     signatures = [
-        [(str(nodes[name].target), tuple(_get_shape(nodes[name]))) for name, _ in group]
-        for group in grouped
+        [
+            (
+                str(node.target), literals(node.meta.get("val")),
+                literals(node.args), literals(dict(node.kwargs)),
+            )
+            for node in compiler.graph.nodes
+            if node.op == "call_function" and _graph_layer(node) == layer
+        ]
+        for layer in layers
     ]
     if any(signature != signatures[0] for signature in signatures[1:]):
         return reject("emitted operation signatures differ")
@@ -1969,6 +1991,10 @@ def _wrap_generation_lifecycle(
     sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
     if hidden_prefill:
         _merge_variables_by_name(sprite, {"cattorch project output"})
+        # Only prefill clears it, so a decode before any prefill must find 1.
+        for entry in sprite["variables"].values():
+            if entry[0] == "cattorch project output":
+                entry[1] = 1
     if top_k_lists:
         _merge_lists_by_name(sprite, set(top_k_lists))
 

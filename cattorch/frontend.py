@@ -607,6 +607,41 @@ def _onednn_disabled():
         torch._C._set_mkldnn_enabled(enabled)
 
 
+_PYTHON_CONVERSIONS = ("tolist", "numpy", "__array__")
+
+
+@contextlib.contextmanager
+def _input_conversions_rejected():
+    """Reject ``tolist()`` and NumPy conversions of values that depend on inputs.
+
+    Unlike ``.item()``, they read the data without the tracer seeing it, so
+    the example's values would be baked into the sprite as constants.
+    """
+    originals = {name: getattr(torch.Tensor, name) for name in _PYTHON_CONVERSIONS}
+
+    def guarded(name):
+        original = originals[name]
+
+        @functools.wraps(original)
+        def conversion(self, *args, **kwargs):
+            if traced_from_input(self):
+                raise UnsupportedModelError(
+                    f"the model calls Tensor.{name}() on a value computed from its "
+                    "inputs; Scratch would keep the example's values as constants. "
+                    "Keep the computation in tensor operations"
+                )
+            return original(self, *args, **kwargs)
+        return conversion
+
+    for name in _PYTHON_CONVERSIONS:
+        setattr(torch.Tensor, name, guarded(name))
+    try:
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(torch.Tensor, name, original)
+
+
 # Mode switches that make_fx records but that have no effect on a traced
 # inference graph. Enter-autocast results are consumed by the matching exit.
 _IGNORED_CALLS = tuple(
@@ -857,7 +892,7 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     try:
         # With oneDNN enabled, PyTorch's LSTM decomposition emits an
         # oneDNN-only operation instead of the portable cell arithmetic.
-        with _onednn_disabled():
+        with _onednn_disabled(), _input_conversions_rejected():
             graph_module = make_fx(
                 forward,
                 decomposition_table=_fx_decompositions(),

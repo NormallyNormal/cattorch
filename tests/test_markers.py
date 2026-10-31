@@ -254,3 +254,54 @@ def test_an_entry_points_non_tensor_results_are_skipped_with_a_warning(tmp_path)
     with pytest.warns(UserWarning, match=r"@entrypoint add: ignoring non-tensor results \(NoneType, int\)"):
         result = transpile(Totals().eval(), None, tmp_path / "totals")
     assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["cattorch add output"]
+
+
+class _Decaying(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("seen", torch.zeros(0, 1))
+
+    @entrypoint(example=lambda: (torch.ones(1),), capacity={"seen": 8})
+    def remember(self, row):
+        self.seen = torch.cat([self.seen * 0.5, row.reshape(1, 1)])
+        return self.seen.sum(0)
+
+
+class _Prepending(_Decaying):
+    @entrypoint(example=lambda: (torch.ones(1),), capacity={"seen": 8})
+    def remember(self, row):
+        self.seen = torch.cat([row.reshape(1, 1), self.seen])
+        return self.seen.sum(0)
+
+
+@pytest.mark.parametrize("model", [_Decaying(), _Prepending()])
+def test_growing_state_that_rewrites_old_rows_is_rejected(tmp_path, model):
+    with pytest.raises(UnsupportedModelError, match="changes rows of 'seen'"):
+        transpile(model.eval(), None, tmp_path / "rows")
+
+
+def test_a_buffer_under_two_names_is_one_state(tmp_path):
+    class Holder(nn.Module):
+        pass
+
+    class Shared(nn.Module):
+        def __init__(self):
+            super().__init__()
+            memory = torch.zeros(2)
+            self.writer, self.reader = Holder(), Holder()
+            self.writer.register_buffer("memory", memory)
+            self.reader.register_buffer("memory", memory)
+
+        @entrypoint(example=lambda: (torch.ones(2),))
+        def step(self, value):
+            self.writer.memory += value
+            return self.reader.memory * 1
+
+    result = transpile(Shared().eval(), None, tmp_path / "shared")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    eager = Shared().eval()
+    for _ in range(3):
+        emulator.lists["cattorch step value"] = [1.0, 2.0]
+        emulator.run_procedure("cattorch step")
+        expected = eager.step(torch.tensor([1.0, 2.0]))
+        assert emulator.lists["cattorch step output"] == expected.tolist()

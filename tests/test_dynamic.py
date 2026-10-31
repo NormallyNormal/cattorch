@@ -234,3 +234,27 @@ def test_row_loop_capture_sees_only_its_own_thread():
         mine.compile()
     thread.join()
     assert programs == [mine]
+
+
+class _FeatureTokens(nn.Module):
+    """Each feature becomes a token: ``(items, features) -> (items, features, width)``."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(3, 4))
+        self.bias = nn.Parameter(torch.randn(3, 4))
+
+    def forward(self, x):
+        return x.unsqueeze(-1) * self.weight + self.bias
+
+
+def test_broadcast_that_adds_a_dimension_follows_the_length(tmp_path):
+    torch.manual_seed(0)
+    _check(tmp_path, _FeatureTokens().eval(), torch.randn(2, 3), {0: (1, 8)}, (1, 4, 8))
+
+
+def test_length_check_reaches_the_maximum(tmp_path):
+    # Correct up to 20 items, wrong past them.
+    model = Lambda(lambda x: x.sum(0) / min(x.shape[0], 20)).eval()
+    with pytest.raises(UnsupportedModelError, match="with 64 items"):
+        transpile(model, torch.randn(4, 2), tmp_path / "capped", dynamic={0: (1, 64)})

@@ -1750,7 +1750,8 @@ def _transpile_dynamic(
 ):
     """Trace one row of the dynamic input, export, and check other lengths."""
     from cattorch.dynamic import (
-        at_length, check_lengths, loop_over_units, normalize_dynamic, unit_output_axes,
+        at_length, check_lengths, exact_export, loop_over_units, normalize_dynamic,
+        unit_output_axes,
     )
     from cattorch.verify import verify
 
@@ -1792,7 +1793,11 @@ def _transpile_dynamic(
             [tuple(value.shape) for value in representative],
             [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
         )
-    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs)
+    exact = exact_export(
+        optimization=options.get("optimization", "exact"), storage=options.get("storage"),
+        quantization=options.get("quantization"), sig_figs=sig_figs,
+    )
+    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs, exact=exact)
     return result
 
 

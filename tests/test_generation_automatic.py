@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 from cattorch import (
     CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
@@ -172,6 +174,57 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, shari
         emulator.run_procedure("cattorch decode")
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8, 9])
     assert counts[True] < counts[False] * 0.8
+
+
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
+    torch.manual_seed(13)
+    model = CachedLM(context=8, layers=2).eval()
+    emulator, _ = emulator_for(
+        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing),
+    )
+    emulator.lists["cattorch tokens"] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert_logits(emulator, model, [3])
+
+
+def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
+    class Block(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = scale
+            self.qkv = nn.Linear(8, 24)
+            self.mlp = nn.Linear(8, 8)
+
+        def forward(self, x):
+            q, k, v = self.qkv(x).chunk(3, dim=-1)
+            attended = F.scaled_dot_product_attention(
+                q[:, None], k[:, None], v[:, None], is_causal=True,
+            )[:, 0]
+            x = x + self.scale * attended
+            return x + self.mlp(x)
+
+    class Scaled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tokens = nn.Embedding(16, 8)
+            self.blocks = nn.ModuleList(Block(1.0 / (index + 1)) for index in range(2))
+            self.head = nn.Linear(8, 16)
+
+        def forward(self, tokens):
+            x = self.tokens(tokens)
+            for block in self.blocks:
+                x = block(x)
+            return self.head(x)
+
+    torch.manual_seed(0)
+    model = Scaled().eval()
+    emulator, _ = emulator_for(
+        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing="auto"),
+    )
+    assert "_cattorch shared transformer layer" not in emulator._procedures
+    prefill_and_decode(emulator, model, [1, 2, 3], [4])
 
 
 def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
