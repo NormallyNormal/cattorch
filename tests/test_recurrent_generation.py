@@ -299,6 +299,37 @@ def test_invalid_tokens_leave_every_state_untouched(exported):
     assert run(emulator, "cattorch decode", [vocabulary - 1]) == "ok"
 
 
+@pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
+    ("cattorch prefill", "_cattorch token step", 3, [1, 2, 3, 4, 5]),
+    ("cattorch decode", "_cattorch token step", 1, [5]),
+    ("cattorch reset", "_cattorch reset state", 1, None),
+])
+def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
+    tmp_path, public, procedure, call, tokens,
+):
+    from test_generation_automatic import INTERRUPTED, stop_during
+
+    model = make("lstm")
+    emulator, _ = export(model, tmp_path / "lstm", top_k=2)
+    assert run(emulator, "cattorch prefill", [2, 7]) == "ok"
+    stop_during(emulator, public, procedure, call, tokens)
+    before = (states(emulator, model), emulator.variables["cattorch cache length"])
+    assert run(emulator, "cattorch decode", [3]) == INTERRUPTED
+    assert emulator.lists["cattorch logits"] == emulator.lists["cattorch top k ids"] == []
+    assert (states(emulator, model), emulator.variables["cattorch cache length"]) == before
+    assert run(emulator, "cattorch reset") == "ok"
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [3])[0].double(), atol=TOLERANCE, rtol=0,
+    )
+    stop_during(emulator, public, procedure, call, tokens)
+    assert run(emulator, "cattorch prefill", [4, 1]) == "ok"
+    assert run(emulator, "cattorch decode", [6]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [4, 1, 6])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
 def test_decode_in_a_freshly_loaded_sprite_fills_constant_states(tmp_path):
     model = make("lstm")
     emulator, result = export(model, tmp_path / "lstm")
@@ -359,14 +390,14 @@ def test_hidden_prefill_skips_the_logits_of_prompt_tokens(tmp_path, name):
         assert run(emulator, "cattorch decode", [9]) == "ok"
         results[hidden] = (*prefilled, logits(emulator))
         if hidden:
-            # A decode computes the logits a hidden prompt token skips.
-            before = sum(emulator.opcode_counts.values())
-            run(emulator, "cattorch decode", [9])
-            full = sum(emulator.opcode_counts.values()) - before
-            emulator.variables["_cattorch project output"] = 0
-            before = sum(emulator.opcode_counts.values())
-            run(emulator, "cattorch decode", [9])
-            skipped = full - (sum(emulator.opcode_counts.values()) - before)
+            # A step computes the logits a hidden prompt token skips.
+            cost = {}
+            for output in (1, 0):
+                emulator.variables["_cattorch project output"] = output
+                before = sum(emulator.opcode_counts.values())
+                run(emulator, "_cattorch token step", [9])
+                cost[output] = sum(emulator.opcode_counts.values()) - before
+            skipped = cost[1] - cost[0]
     assert torch.equal(results[True][0], results[False][0])
     assert results[True][1] == results[False][1]
     assert torch.equal(results[True][2], results[False][2])
@@ -381,9 +412,10 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
     run(emulator, "cattorch prefill", [1])
     emulator.variables["_cattorch project output"] = 0
     kept = list(emulator.lists["cattorch logits"])
-    assert run(emulator, "cattorch decode", [2]) == "ok"
+    assert run(emulator, "_cattorch token step", [2]) == "ok"
     assert emulator.lists["cattorch logits"] == kept
-    emulator.variables["_cattorch project output"] = 1
+    # Decode computes its logits whatever a stopped prefill left behind.
+    emulator.variables["_cattorch project output"] = 0
     assert run(emulator, "cattorch decode", [3]) == "ok"
     torch.testing.assert_close(
         logits(emulator), reference_rows(model, [1, 2, 3])[-1].double(), atol=TOLERANCE, rtol=0,

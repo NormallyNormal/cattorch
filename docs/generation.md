@@ -189,11 +189,19 @@ reaches `cattorch max context`.
 | Prefill with no tokens | Cache reset; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
+| Decode after a reset, prefill or decode was stopped partway | Cache unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped; reset or prefill first` |
 
 ## Cache behavior
 
-If a step fails partway, every layer's cache is rolled back, so the cache never
-holds a partial token.
+A step past `max_context` is refused before it changes any cache.
+
+Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
+`cattorch prefill` or `cattorch decode` partway, leaving some layers' caches a
+token longer than others or holding part of a token. Every `cattorch decode`
+after that fails as in the table above and changes nothing, until
+`cattorch reset` or `cattorch prefill` runs; both start from empty caches.
+`cattorch init` doesn't clear the condition. `cattorch cache length` keeps
+whatever value the stopped block left.
 
 Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
 shrink the sprite, see layer sharing in

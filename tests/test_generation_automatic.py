@@ -190,6 +190,70 @@ def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
     assert_logits(emulator, model, [3])
 
 
+class Stopped(Exception):
+    """Scratch's stop button, pressed while a block runs."""
+
+
+def stop_on_call(emulator, procedure, call):
+    """Stop the project as the ``call``-th run of ``procedure`` starts.
+
+    Returns a function that undoes it.
+    """
+    start = emulator._procedures[procedure]
+    chain = emulator._chain_runner(start)
+    calls = 0
+
+    def run():
+        nonlocal calls
+        calls += 1
+        if calls == call:
+            raise Stopped
+        chain()
+
+    emulator._chains[start] = run
+    return lambda: emulator._chains.__setitem__(start, chain)
+
+
+INTERRUPTED = "an earlier reset, prefill or decode was stopped; reset or prefill first"
+
+
+def stop_during(emulator, public, procedure, call, tokens=None):
+    restore = stop_on_call(emulator, procedure, call)
+    if tokens is not None:
+        emulator.lists["cattorch tokens"] = tokens
+    with pytest.raises(Stopped):
+        emulator.run_procedure(public)
+    restore()
+
+
+@pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
+    ("cattorch prefill", "_cattorch token compute", 4, [1, 2, 3, 4, 5, 6]),
+    ("cattorch decode", "_cattorch token compute", 1, [5]),
+    ("cattorch reset", "_cattorch reset state", 1, None),
+])
+def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
+    tmp_path, public, procedure, call, tokens,
+):
+    model = nano()
+    emulator, _ = emulator_for(model, tmp_path, max_context=16, top_k=2)
+    prefill_and_decode(emulator, model, [2, 7], [])
+    stop_during(emulator, public, procedure, call, tokens)
+    length = emulator.variables["cattorch cache length"]
+    emulator.lists["cattorch tokens"] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == INTERRUPTED
+    assert emulator.lists["cattorch logits"] == emulator.lists["cattorch top k ids"] == []
+    assert emulator.variables["cattorch cache length"] == length
+    emulator.run_procedure("cattorch reset")
+    assert emulator.variables["cattorch status"] == "ok"
+    emulator.lists["cattorch tokens"] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert_logits(emulator, model, [3])
+    stop_during(emulator, public, procedure, call, tokens)
+    prefill_and_decode(emulator, model, [4, 1], [6])
+
+
 def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
     class Block(nn.Module):
         def __init__(self, scale):

@@ -52,6 +52,7 @@ from cattorch.sprite import (
     _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
+    _public_generation_reset,
     _graph_layer,
     _merge_lists_by_name,
     _merge_variables_by_name,
@@ -2542,10 +2543,7 @@ def _transpile(
             sprite = _add_warp_procedure(
                 sprite,
                 "cattorch reset",
-                Program(
-                    "generation_public_reset",
-                    body=(call("_cattorch reset state"),),
-                ),
+                _public_generation_reset("_cattorch reset state"),
                 x=640,
                 y=640,
             )

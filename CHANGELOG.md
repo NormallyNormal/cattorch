@@ -260,6 +260,14 @@
 
 ## Fixes
 
+- Stopping a `GenerationProgram` sprite during a hidden prefill made every
+  later `cattorch decode` report `ok` and advance `cattorch cache length`
+  without writing logits, even after `cattorch reset`. Decode now computes its
+  logits whatever a stopped prefill left behind, and after any stopped reset,
+  prefill or decode it refuses with a status naming the problem until
+  `cattorch reset` or `cattorch prefill` runs, instead of decoding from a
+  half-updated cache. See
+  [cache behavior](docs/generation.md#cache-behavior).
 - An `ExportProgram` entry point, or a variable-length export, could return
   wrong values with status `ok` when the compiler first used an output's list,
   or a list shared with a variable-length tensor, for a larger intermediate

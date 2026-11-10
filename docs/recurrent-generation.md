@@ -195,6 +195,14 @@ differences:
 A failed prefill or decode changes no state partway: the step's results are
 committed only after it succeeds.
 
+Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
+`cattorch prefill` or `cattorch decode` partway, even while a step commits its
+states, so some states may be updated and others not. Every `cattorch decode`
+after that fails as in the last row below and changes nothing, until
+`cattorch reset` or `cattorch prefill` runs; both start from the initial
+states. `cattorch init` doesn't clear the condition. `cattorch cache length`
+keeps whatever value the stopped block left.
+
 | Situation | Result | `cattorch status` |
 |---|---|---|
 | Decode with zero or several tokens | States unchanged; logits and top-k lists cleared | `decode requires exactly one token` |
@@ -202,6 +210,7 @@ committed only after it succeeds.
 | Prefill with no tokens | States restored to their initial values; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_tokens` | States restored; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: states restored, logits empty. Decode: states unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
+| Decode after a reset, prefill or decode was stopped partway | States unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped; reset or prefill first` |
 
 ## Hugging Face models
 
