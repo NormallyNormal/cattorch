@@ -1714,20 +1714,52 @@ def _gate_chain(
 _TOP_K_VALUES = "cattorch top k values"
 _TOP_K_IDS = "cattorch top k ids"
 _TOP_K_PROCEDURE = "cattorch select top k"
-# 1 while reset, prefill or decode runs. Still 1 when one starts, the last one
-# was stopped part way or is paused by Scratch, and the states are in an
-# unknown condition.
-_GENERATION_BUSY = "_cattorch generation busy"
-# Changed by every reset, prefill and decode that starts, and by every call
-# that finds, when it ends, that it changed since that call started: another
-# call then took over the states while it was paused, and wrote to them, or
-# will write to them, when it resumes.
-_GENERATION_EPOCH = "_cattorch generation epoch"
+# 1 while a call is changing the states: while reset, prefill or decode runs in
+# a generation sprite, or while a program's reset or entry point writes them.
+# Still 1 when another call starts if that one was stopped part way or is
+# paused by Scratch, and the states are in an unknown condition.
+_BUSY = "_cattorch busy"
+# Changed by every call that starts, and by every generation call that finds,
+# when it ends, that it changed since that call started: another call then
+# took over the states while it was paused, and wrote to them, or will write
+# to them, when it resumes.
+_EPOCH = "_cattorch epoch"
 _INTERRUPTED = (
     "an earlier reset, prefill or decode was stopped or is still running; "
     "reset or prefill first"
 )
 _OVERTAKEN = "another reset, prefill or decode ran during this one; reset or prefill first"
+
+
+def _epoch_current():
+    """Whether no call has started since the one running the epoch procedure body."""
+    from cattorch.util.scratch.dsl import argument, eq, var
+
+    return eq(argument("epoch"), var(_EPOCH))
+
+
+def _add_epoch_procedure(
+    sprite: dict, name: str, body, *, x: int, y: int, take_over=(), refusal=None,
+    variables: Sequence[str] = (), lists: Sequence[str] = (),
+) -> dict:
+    """Add the public ``name``, which changes the epoch and runs ``body`` with it.
+
+    Scratch can pause a warp block and run other scripts meanwhile, so the
+    body, an internal procedure with an ``epoch`` argument, tells by
+    ``_epoch_current()`` whether another call started since. ``take_over``
+    runs first; with a ``refusal``, that runs instead while ``_BUSY`` is 1.
+    ``variables`` and ``lists`` are what those two use.
+    """
+    from cattorch.util.scratch.dsl import Program, call, change_var, eq, if_else, var
+
+    inner = f"_cattorch {name.removeprefix('cattorch ')} in epoch %s"
+    sprite = _add_warp_procedure(sprite, inner, body, x=x + 320, y=y, arguments=("epoch",))
+    start = (*take_over, change_var(_EPOCH, 1), call(inner, epoch=var(_EPOCH)))
+    public = Program(
+        f"{body.name}_public", variables=dict.fromkeys((_BUSY, _EPOCH, *variables)), lists=lists,
+        body=start if refusal is None else (if_else(eq(var(_BUSY), 1), refusal, start),),
+    )
+    return _add_warp_procedure(sprite, name, public, x=x, y=y)
 
 
 def _top_k_insertion(rank: int, top_k: int):
@@ -1915,7 +1947,7 @@ def _add_generation_blocks(
     finish with an ok status. A ``capacity`` of None sets no token limit.
     """
     from cattorch.util.scratch.dsl import (
-        Program, append, argument, call, change_var, clear, eq, for_each, gt, if_, if_else,
+        Program, append, call, change_var, clear, eq, for_each, gt, if_, if_else,
         item, length, lt, not_, round_, set_var, sub, var,
     )
 
@@ -1945,40 +1977,24 @@ def _add_generation_blocks(
     )
     sprite = _add_warp_procedure(sprite, reset, reset_program, x=640, y=0)
 
-    # Each public block takes the states over and runs its body with the
-    # epoch it set, so the body can tell whether another call took them over
-    # since; Scratch can pause a warp block and run other scripts meanwhile.
-    current = eq(argument("epoch"), var(_GENERATION_EPOCH))
+    current = _epoch_current()
     overtaken = (
-        set_var(_GENERATION_BUSY, 1),
-        change_var(_GENERATION_EPOCH, 1),
+        set_var(_BUSY, 1),
+        change_var(_EPOCH, 1),
         clear(logits), *(clear(name) for name in top_k_lists),
         set_var(STATUS_VARIABLE, _OVERTAKEN),
     )
-    finish = if_else(current, (set_var(_GENERATION_BUSY, 0),), overtaken)
-    lifecycle_variables = (_GENERATION_BUSY, _GENERATION_EPOCH, STATUS_VARIABLE)
+    finish = if_else(current, (set_var(_BUSY, 0),), overtaken)
+    lifecycle_variables = (_BUSY, _EPOCH, STATUS_VARIABLE)
     lifecycle_lists = (logits, *top_k_lists)
 
     def add_public(name: str, body: Program, *, y: int, refusal=None) -> None:
-        """Add ``name``, which takes the states over and runs ``body`` with its epoch.
-
-        With a ``refusal``, it runs that instead while another call is busy.
-        """
+        """Add ``name``, which takes the states over and runs ``body`` with its epoch."""
         nonlocal sprite
-        inner = f"_cattorch {name.removeprefix('cattorch ')} in epoch %s"
-        sprite = _add_warp_procedure(sprite, inner, body, x=960, y=y, arguments=("epoch",))
-        take_over = (
-            set_var(_GENERATION_BUSY, 1),
-            change_var(_GENERATION_EPOCH, 1),
-            call(inner, epoch=var(_GENERATION_EPOCH)),
+        sprite = _add_epoch_procedure(
+            sprite, name, body, x=640, y=y, take_over=(set_var(_BUSY, 1),), refusal=refusal,
+            variables=lifecycle_variables, lists=lifecycle_lists,
         )
-        public = Program(
-            f"{body.name}_public", variables=lifecycle_variables, lists=lifecycle_lists,
-            body=take_over if refusal is None else (
-                if_else(eq(var(_GENERATION_BUSY), 1), refusal, take_over),
-            ),
-        )
-        sprite = _add_warp_procedure(sprite, name, public, x=640, y=y)
 
     add_public("cattorch reset", Program(
         "generation_reset_in_epoch", variables=lifecycle_variables, lists=lifecycle_lists,
@@ -2041,7 +2057,7 @@ def _add_generation_blocks(
     # A refusal sets the status, so a call still running couldn't report its
     # own; it is stopped too.
     add_public("cattorch decode", decode, y=160, refusal=(
-        change_var(_GENERATION_EPOCH, 1),
+        change_var(_EPOCH, 1),
         clear(logits), *(clear(name) for name in top_k_lists),
         set_var(STATUS_VARIABLE, _INTERRUPTED),
     ))

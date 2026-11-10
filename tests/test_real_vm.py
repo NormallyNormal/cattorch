@@ -300,7 +300,7 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     )
     done = builder.global_variable("first done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, busy = "cattorch status", "_cattorch generation busy"
+    status, busy = "cattorch status", "_cattorch busy"
     tokens = "cattorch tokens"
 
     def run(procedure, values, results):

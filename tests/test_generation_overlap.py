@@ -46,8 +46,21 @@ def paused_procedures(emulator):
     }
 
 
+def run_generation_call(emulator, call):
+    """Run one ``(procedure, tokens)`` call and return what it left."""
+    procedure, tokens = call
+    if tokens is not None:
+        emulator.lists["cattorch tokens"] = list(tokens)
+    emulator.run_procedure(procedure)
+    return (
+        procedure, tokens, emulator.variables["cattorch status"],
+        list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"]),
+        emulator.variables["cattorch cache length"],
+    )
+
+
 class Script:
-    """A Scratch script making generation calls, each ``(procedure, tokens)``."""
+    """A Scratch script making calls, by default generation calls ``(procedure, tokens)``."""
 
     def __init__(self, name, calls):
         self.name = name
@@ -62,24 +75,36 @@ class Script:
 
 
 class Scripts:
-    """Run scripts on one sprite, switching between them where a procedure is called."""
+    """Run scripts on one sprite, switching between them where a procedure is called.
 
-    def __init__(self, emulator, finished):
+    ``run_call(emulator, call)`` runs each call and returns what to record of
+    it; the chains starting at ``pauses`` are where scripts can pause.
+    """
+
+    def __init__(self, emulator, finished, run_call=run_generation_call, pauses=None):
         self.emulator = emulator
         self.finished = finished
+        self.run_call = run_call
         self.condition = threading.Condition()
         self.running: Script | None = None
         self.local = threading.local()
-        for start in paused_procedures(emulator):
-            emulator._chains[start] = self._pausing(emulator._chain_runner(start))
+        for start in paused_procedures(emulator) if pauses is None else pauses:
+            emulator._chains[start] = self._pausing(start)
 
-    def _pausing(self, chain):
+    def _pausing(self, start):
+        # Compiled when it first runs, so that it runs the pausing chains
+        # nested in it.
+        chain = None
+
         def run():
+            nonlocal chain
             script = getattr(self.local, "script", None)
             if script is not None:
                 script.pauses += 1
                 if script.pauses > script.budget:
                     self._pause(script)
+            if chain is None:
+                chain = self.emulator._compile_chain(start)
             chain()
         return run
 
@@ -100,18 +125,9 @@ class Scripts:
         self.local.script = script
         with self.condition:
             self.condition.wait_for(lambda: self.running is script)
-        emulator = self.emulator
         try:
-            for procedure, tokens in script.calls:
-                if tokens is not None:
-                    emulator.lists["cattorch tokens"] = list(tokens)
-                emulator.run_procedure(procedure)
-                result = (
-                    script.name, procedure, tokens, emulator.variables["cattorch status"],
-                    list(emulator.lists["cattorch logits"]),
-                    list(emulator.lists["cattorch top k ids"]),
-                    emulator.variables["cattorch cache length"],
-                )
+            for call in script.calls:
+                result = (script.name, *self.run_call(self.emulator, call))
                 script.results.append(result)
                 self.finished.append(result)
         except Stopped:
