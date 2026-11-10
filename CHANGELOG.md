@@ -260,6 +260,12 @@
 
 ## Fixes
 
+- An `ExportProgram` entry point, or a variable-length export, could return
+  wrong values with status `ok` when the compiler first used an output's list,
+  or a list shared with a variable-length tensor, for a larger intermediate
+  longer than a Scratch list, as in `(state.reshape(5, -1) * w).sum(-1) + b`
+  with a state over 200,000 values: that list wasn't split, and Scratch
+  dropped the items past its limit.
 - An `ExportProgram` entry point computed wrong values when one of its
   inputs, states or outputs was longer than a Scratch list and stored
   weights or intermediate lists were split too: splitting the interface

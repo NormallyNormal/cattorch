@@ -624,7 +624,10 @@ def transpile_program(
             if entry_name == entrypoint.name and name in _hidden_outputs
         )
 
+        deferred_sizes: dict[str, int] = {}
+
         def capture(arguments, dynamic, edit=None):
+            deferred_sizes.clear()
             return _transpile(
                 wrapper,
                 tuple(arguments),
@@ -646,6 +649,7 @@ def transpile_program(
                 _edit_sprite=edit,
                 _finalize=keep_entry,
                 _hidden_outputs=hidden,
+                _deferred_sizes=deferred_sizes,
             )
 
         try:
@@ -694,10 +698,21 @@ def transpile_program(
             )
         for index in range(len(entrypoint.returns)):
             old = output_name(index)
-            _rename_list(sprite, old, _temporary_return(entrypoint.name, index))
-            interface_capacities[_temporary_return(entrypoint.name, index)] = (
-                sub_result.outputs[index].max_numel or 0
-            )
+            temporary = _temporary_return(entrypoint.name, index)
+            private_unit = f"_cattorch unit {old}"
+            if any(entry[0] == private_unit for entry in sprite.get("lists", {}).values()):
+                # Run once per item: the entry's own output list became the
+                # private unit list, and the public one only collects items.
+                interface_capacities[private_unit] = max(
+                    interface_capacities.get(private_unit, 0), deferred_sizes.get(old, 0),
+                )
+                capacity = sub_result.outputs[index].max_numel or 0
+            else:
+                # The compiler may have used the output's list as scratch
+                # space for a larger intermediate first.
+                capacity = max(sub_result.outputs[index].max_numel or 0, deferred_sizes.get(old, 0))
+            _rename_list(sprite, old, temporary)
+            interface_capacities[temporary] = capacity
 
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(

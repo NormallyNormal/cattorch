@@ -507,3 +507,31 @@ def test_nan_to_num_replaces_nan_and_infinities(tmp_path):
         torch.nan_to_num(torch.log(x)), torch.nan_to_num(x / 0, posinf=5.0, neginf=-5.0),
     )).eval()
     _check(model, torch.tensor([[-1.0, 0.5, 2.0, -3.0]]), tmp_path / "nan")
+
+
+def test_a_dynamic_tensor_reusing_a_longer_list_keeps_its_size(tmp_path, small_list_limit):
+    # The [n] product reuses the list of the 650-value one; its smaller
+    # dynamic capacity must not replace the list's size.
+    from cattorch.util.scratch.archive import read_json
+    from cattorch.util.scratch.emulator import ScratchEmulator
+
+    small_list_limit(300)
+
+    class Reuse(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.linspace(0.5, 1.5, 650))
+
+        def forward(self, x):
+            total = (self.weight * x.sum()).sum()
+            return (x * total) * 2 + 1
+
+    model = Reuse().eval()
+    result = transpile(model, torch.ones(3), tmp_path / "reuse", dynamic={0: {0: (1, 8)}})
+    emulator = ScratchEmulator(read_json(result.path))
+    emulator.run_procedure("cattorch init")
+    emulator.lists["input"] = [1.0, 2.0]
+    emulator.run_procedure("cattorch forward")
+    assert emulator.variables["cattorch status"] == "ok"
+    expected = model(torch.tensor([1.0, 2.0])).tolist()
+    assert [float(value) for value in emulator.lists["output"]] == pytest.approx(expected)

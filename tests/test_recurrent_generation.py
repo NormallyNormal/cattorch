@@ -666,6 +666,45 @@ def test_a_state_longer_than_a_list_is_sharded(tmp_path, small_list_limit):
     assert restored == pytest.approx(model.start.flatten().tolist())
 
 
+class Readout(Memory):
+    """Logits reduced from a product as long as the state, plus a bias."""
+
+    def __init__(self, size=650, vocab=5):
+        super().__init__(size, vocab)
+        self.weight = nn.Parameter(torch.randn(vocab, size // vocab))
+        self.bias = nn.Parameter(torch.randn(vocab))
+
+    def forward(self, tokens):
+        memory, rows = self.start, []
+        for position in range(tokens.shape[1]):
+            memory, row = self._next(memory, self.embed(tokens[:, position]))
+            rows.append(row)
+        return torch.stack(rows, 1)
+
+    def _next(self, memory, row):
+        memory = 0.5 * memory + row
+        vocab = self.bias.numel()
+        return memory, (memory.reshape(vocab, -1) * self.weight).sum(-1).reshape(1, vocab) + self.bias
+
+    def step(self, token, memory):
+        memory, row = self._next(memory, self.embed(token)[:, 0])
+        return row, memory
+
+
+def test_a_logits_list_used_for_a_product_longer_than_a_list_is_sharded(
+    tmp_path, small_list_limit,
+):
+    small_list_limit(300)
+    torch.manual_seed(4)
+    model = Readout().eval()
+    emulator, _ = export(model, tmp_path / "readout", reference="forward")
+    assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [1, 2, 3])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
 def test_a_fixed_table_longer_than_a_list_is_rejected_as_for_plain_exports(
     tmp_path, small_list_limit,
 ):

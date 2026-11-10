@@ -167,6 +167,31 @@ def test_an_entry_point_that_cant_follow_the_length_runs_per_item(tmp_path):
     assert verify(model, None, result, calls=calls).passed
 
 
+def test_a_per_item_output_list_holding_a_longer_intermediate_is_sharded(
+    tmp_path, small_list_limit,
+):
+    # Each item's 640-value product is computed in its output's list.
+    small_list_limit(300)
+
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+            self.weight = nn.Parameter(torch.randn(1, 1, 20))
+            self.bias = nn.Parameter(torch.randn(32))
+
+        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            return (self.layer(sequences).reshape(-1, 32, 1) * self.weight).sum(-1) + self.bias
+
+    torch.manual_seed(0)
+    model = Encoder().eval()
+    result = transpile(model, None, tmp_path / "encoder")
+    assert any("runs once per item" in warning for warning in result.warnings)
+    calls = tuple(ProgramCall("encode", (torch.randn(length, 4, 8),)) for length in (1, 5))
+    assert verify(model, None, result, calls=calls).passed
+
+
 def test_an_entry_point_that_updates_state_doesnt_run_per_item(tmp_path):
     class Encoder(nn.Module):
         def __init__(self):

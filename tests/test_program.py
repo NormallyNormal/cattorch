@@ -592,6 +592,41 @@ def test_sharded_constant_initial_state(tmp_path, small_list_limit):
     assert comparison.passed, comparison
 
 
+class _ShardedReadout(nn.Module):
+    """A small output computed from an intermediate longer than a list."""
+
+    def __init__(self, size):
+        super().__init__()
+        self.weight = nn.Parameter(torch.linspace(0.5, 1.5, size))
+
+    def read(self, total, count):
+        return (total * self.weight).sum().reshape(1) + count, total
+
+
+def test_output_list_reused_for_a_longer_intermediate_is_sharded(tmp_path, small_list_limit):
+    # The compiler computes the product in the output's list before reducing
+    # it, so that list must hold the product, not just the one output value.
+    from cattorch.util.scratch.interface import read_logical_list
+
+    small_list_limit(300)
+    size = 650
+    initial = torch.linspace(1, 3, size)
+    program = ExportProgram(
+        states=(State("total", initial), State("count", torch.zeros(1))),
+        entrypoints=(EntryPoint(
+            "read", method="read", arguments=(StateInput("total"), StateInput("count")),
+            returns=(Output("value"), Output("copy")),
+        ),),
+    )
+    model = _ShardedReadout(size).eval()
+    result = transpile(model, program, tmp_path / "readout")
+    emulator = _emulator(result)
+    emulator.run_procedure("cattorch read")
+    assert emulator.variables["cattorch status"] == "ok"
+    value = _floats(read_logical_list(emulator.lists, "cattorch read value"))
+    assert value == pytest.approx([float((initial * model.weight).sum())], rel=1e-6)
+
+
 def test_sharded_input_read_by_a_sharded_weight(tmp_path, small_list_limit):
     # The interface lists are split after the weights, in a second pass over
     # the same blocks.

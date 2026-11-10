@@ -188,6 +188,36 @@ def test_program_state_carries_between_calls(tmp_path):
     )
 
 
+class Readout(nn.Module):
+    """A five-value output reduced from a product longer than a Scratch list."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([[0.5], [1.0], [1.5], [2.0], [2.5]]))
+        self.bias = nn.Parameter(torch.arange(5.0))
+
+    def read(self, memory):
+        return (memory.reshape(5, -1) * self.weight).sum(-1) + self.bias
+
+
+def test_an_output_list_holding_a_longer_intermediate_is_sharded(tmp_path):
+    # The output's list holds the 200,005-value product before the reduction.
+    from cattorch import EntryPoint, ExportProgram, Output, State, StateInput
+
+    program = ExportProgram(
+        states=(State("memory", torch.ones(200_005)),),
+        entrypoints=(EntryPoint(
+            "read", method="read", arguments=(StateInput("memory"),), returns=(Output("value"),),
+        ),),
+    )
+    model = Readout().eval()
+    result = transpile(model, program, tmp_path / "readout")
+    project = build_project(tmp_path / "readout", result)
+    stage = run_vm(project, tmp_path, flag=False, calls=[("readout read", {})])["stage"]
+    expected = model.read(torch.ones(200_005)).detach()
+    torch.testing.assert_close(values(stage, "readout cattorch read value"), expected, atol=1e-6, rtol=1e-6)
+
+
 def _layered_language():
     from test_project import Language
 

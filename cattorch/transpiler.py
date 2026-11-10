@@ -2273,6 +2273,7 @@ def _transpile(
     _edit_sprite: Callable[[dict], dict] | None = None,
     _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
     _hidden_outputs: frozenset[int] = frozenset(),
+    _deferred_sizes: dict[str, int] | None = None,
 ) -> TranspileResult:
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
@@ -2430,7 +2431,7 @@ def _transpile(
             list_name = f"T{compiler.scope.assignments[node.name]}"
         else:
             continue
-        logical_sizes[list_name] = maximum
+        logical_sizes[list_name] = max(logical_sizes.get(list_name, 0), maximum)
     for old_name, public_name, (node_name, shape, _) in zip(
         output_lists, output_names, graph.outputs,
     ):
@@ -2561,13 +2562,14 @@ def _transpile(
                 if old in logical_sizes:
                     logical_sizes[new] = logical_sizes.pop(old)
 
+    deferred_names = (
+        frozenset((*graph.input_names.values(), *output_names))
+        if _defer_interface_sharding else frozenset()
+    )
     layouts = shard_sprite_lists(
         sprite,
         logical_sizes,
-        deferred_names=(
-            frozenset((*graph.input_names.values(), *output_names))
-            if _defer_interface_sharding else frozenset()
-        ),
+        deferred_names=deferred_names,
         alignments=compiler.static_shard_alignments,
         limits=_static_storage_shard_limits(
             compiler.static_lists, storage,
@@ -2575,6 +2577,12 @@ def _transpile(
             interleaved_layouts=compiler.interleaved_static_layouts,
         ),
     )
+    if _deferred_sizes is not None:
+        # An output list can be a reused scratch list larger than the output;
+        # the caller shards it later and needs its peak size.
+        _deferred_sizes.update({
+            name: layouts[name].logical_size for name in deferred_names if name in layouts
+        })
     _apply_tied_static_aliases(
         sprite,
         layouts,
