@@ -109,18 +109,23 @@ def test_errors_are_reported_without_a_traceback(models, capsys):
         main(["export", "models.py:Marked", "--dynamic", "zero"])
 
 
-def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
+CHARACTERS = "?abcdefghij "
+
+
+def save_characters(directory):
+    """A Hugging Face tokenizer with one token per character of ``CHARACTERS``."""
     from tokenizers import Tokenizer, models as tokenizer_models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    characters = "?abcdefghij "
     backend = Tokenizer(tokenizer_models.WordLevel(
-        vocab={character: index for index, character in enumerate(characters)}, unk_token="?",
+        vocab={character: index for index, character in enumerate(CHARACTERS)}, unk_token="?",
     ))
     backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
-    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="?").save_pretrained(
-        models / "chars",
-    )
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="?").save_pretrained(directory)
+
+
+def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
+    save_characters(models / "chars")
     code, report = run(
         capsys, "generate", "models.py:Language", "--tokenizer", "chars",
         "--max-context", "8", "--project",
@@ -131,3 +136,45 @@ def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
 
     code, message = run(capsys, "generate", "models.py:Language", "--project")
     assert code == 1 and "needs a tokenizer" in message
+
+
+def max_context(sprite_path):
+    with zipfile.ZipFile(sprite_path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    (value,) = (
+        entry[1] for entry in sprite["variables"].values() if entry[0] == "cattorch max context"
+    )
+    return value
+
+
+def test_generate_detects_a_recurrent_hugging_face_model(models, capsys):
+    transformers = pytest.importorskip("transformers")
+    from cattorch.util.scratch.emulator import ProjectEmulator
+
+    save_characters(models / "chars")
+    torch.manual_seed(0)
+    model = transformers.Mamba2ForCausalLM(transformers.Mamba2Config(
+        vocab_size=len(CHARACTERS), hidden_size=16, num_hidden_layers=1, expand=2, num_heads=4,
+        head_dim=8, state_size=4, n_groups=1, conv_kernel=3, chunk_size=4,
+    )).eval()
+    model.save_pretrained(models / "ssm")
+    code, report = run(
+        capsys, "generate", "--hf", "ssm", "--tokenizer", "chars", "--project",
+        "--temperature", "0", "--max-new-tokens", "6",
+    )
+    assert code == 0 and report["max_context"] is None
+    assert max_context(report["sprite"]) == "Infinity"
+
+    # The demo runs past any context limit until its token budget is spent.
+    emulator = ProjectEmulator(report["project"], answers=["badge", ""])
+    emulator.green_flag()
+    ids = [CHARACTERS.index(character) for character in "badge"]
+    with torch.no_grad():
+        for _ in range(6):
+            ids.append(int(model(torch.tensor([ids])).logits[0, -1].argmax()))
+    text = "".join(CHARACTERS[index] for index in ids)
+    assert text in emulator.sprites["Demo"].said
+
+    code, report = run(capsys, "generate", "--hf", "ssm", "--max-context", "5", "-o", "bounded")
+    assert code == 0 and report["max_context"] == 5
+    assert max_context(report["sprite"]) == 5

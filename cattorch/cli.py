@@ -1,8 +1,9 @@
 """The ``cattorch`` command line.
 
 ``cattorch export MODEL`` exports a model and checks it against PyTorch;
-``cattorch generate`` exports a text generator, with its tokenizer and a demo
-project when it can. ``MODEL`` is ``module:name`` or ``path/to/file.py:name``
+``cattorch generate`` exports a text generator (a recurrent one for a Hugging
+Face Mamba, Mamba-2 or RWKV model), with its tokenizer and a demo project when
+it can. ``MODEL`` is ``module:name`` or ``path/to/file.py:name``
 (a module, a class to construct without arguments, or a function returning a
 module), or a ``.pt`` file saved with ``torch.save(model)``.
 """
@@ -167,7 +168,10 @@ def _export(args) -> int:
 
 
 def _generate(args) -> int:
-    from cattorch import GenerationProgram, transpile, transpile_tokenizer
+    from cattorch import (
+        GenerationProgram, RecurrentGenerationProgram, transpile, transpile_tokenizer,
+    )
+    from cattorch.huggingface_recurrent import recurrent_family
     from cattorch.project import build_project
 
     tokenizer = None
@@ -188,11 +192,18 @@ def _generate(args) -> int:
     else:
         raise CommandError("give a MODEL or --hf REPO")
     output = Path(args.output or name)
+    program: GenerationProgram | RecurrentGenerationProgram
+    if recurrent_family(model) is not None:
+        # Without --max-context a recurrent model takes any number of tokens.
+        max_context = args.max_context
+        program = RecurrentGenerationProgram(max_tokens=max_context, top_k=args.top_k)
+    else:
+        max_context = 64 if args.max_context is None else args.max_context
+        program = GenerationProgram(max_context=max_context, top_k=args.top_k)
     result = transpile(
-        model, GenerationProgram(max_context=args.max_context, top_k=args.top_k), output,
-        optimization="fast" if args.fast else "exact", **_storage(args),
+        model, program, output, optimization="fast" if args.fast else "exact", **_storage(args),
     )
-    extra: dict = {"max_context": args.max_context}
+    extra: dict = {"max_context": max_context}
     tokenizer_result = None
     if tokenizer is not None:
         try:
@@ -267,10 +278,17 @@ def _parser() -> argparse.ArgumentParser:
     export.set_defaults(run=_export)
 
     generate = commands.add_parser("generate", help="export a text generator")
-    generate.add_argument("model", nargs="?", help="a forward(tokens) -> logits model")
+    generate.add_argument(
+        "model", nargs="?",
+        help="a forward(tokens) -> logits model, or a Hugging Face Mamba, Mamba-2 or RWKV model",
+    )
     generate.add_argument("--hf", metavar="REPO", help="a Hugging Face model name or directory")
     generate.add_argument("--tokenizer", help="a Hugging Face tokenizer name or directory")
-    generate.add_argument("--max-context", type=int, default=64)
+    generate.add_argument(
+        "--max-context", type=int,
+        help="the most tokens the generator takes between resets (default 64; "
+        "unlimited for a Mamba, Mamba-2 or RWKV model)",
+    )
     generate.add_argument("--top-k", type=int)
     generate.add_argument("--max-new-tokens", type=int, default=40)
     generate.add_argument("--temperature", type=float, default=0.8)
