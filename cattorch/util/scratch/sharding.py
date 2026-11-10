@@ -43,7 +43,12 @@ class _BlockSharder:
             offset += shard.capacity
 
     def new_id(self, label: str) -> str:
-        return f"cattorch_shard_{label}_{next(self.counter)}"
+        # A program shards its interface lists in a second pass over blocks
+        # the first pass already created.
+        while True:
+            identifier = f"cattorch_shard_{label}_{next(self.counter)}"
+            if identifier not in self.blocks:
+                return identifier
 
     @staticmethod
     def _literal(value):

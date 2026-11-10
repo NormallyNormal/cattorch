@@ -237,6 +237,10 @@
 
 ## Fixes
 
+- An `ExportProgram` entry point computed wrong values when one of its
+  inputs, states or outputs was longer than a Scratch list and stored
+  weights or intermediate lists were split too: splitting the interface
+  lists reused block IDs from splitting the others.
 - Variable-length exports:
   - Elementwise operations on an input with one value per item, such as a
     1-D input or a `(T, 1)` column, read only the first item.

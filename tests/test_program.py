@@ -592,6 +592,31 @@ def test_sharded_constant_initial_state(tmp_path, small_list_limit):
     assert comparison.passed, comparison
 
 
+def test_sharded_input_read_by_a_sharded_weight(tmp_path, small_list_limit):
+    # The interface lists are split after the weights, in a second pass over
+    # the same blocks.
+    small_list_limit(300)
+
+    class Project(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(600, 8)
+
+        def step(self, value):
+            return self.linear(value)
+
+    torch.manual_seed(0)
+    model = Project().eval()
+    program = ExportProgram(entrypoints=(EntryPoint(
+        "step", method="step", arguments=(Input("value", torch.randn(1, 600)),),
+        returns=(Output("result"),),
+    ),))
+    result = transpile(model, program, tmp_path / "wide")
+    assert "cattorch step value" in result.sharded_lists
+    calls = tuple(ProgramCall("step", (torch.randn(1, 600),)) for _ in range(2))
+    assert verify(model, program, result, calls=calls).passed
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_private_states_and_renamed_interface(tmp_path, compact):
     from cattorch.program_export import transpile_program
