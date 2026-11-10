@@ -304,6 +304,22 @@ def test_states_are_needed_for_other_models(tmp_path):
         transpile(base, RecurrentGenerationProgram(), tmp_path / "base")
 
 
+def test_a_wrapped_model_points_to_the_model_inside(tmp_path):
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.parts = torch.nn.ModuleDict({"language": mamba()})
+
+        def forward(self, tokens):
+            return self.parts["language"](tokens).logits
+
+    with pytest.raises(UnsupportedModelError, match=(
+        r"exports a Hugging Face Mamba model only on its own, and this Wrapper holds one "
+        r"at 'parts.language': export model.parts.language directly, or pass states=\.\.\."
+    )):
+        transpile(Wrapper().eval(), RecurrentGenerationProgram(), tmp_path / "wrapped")
+
+
 def test_explicit_states_bypass_the_adapter(tmp_path):
     program = RecurrentGenerationProgram((State("h", torch.zeros(2)),))
     with pytest.raises(ValueError, match="model has no callable recurrent step 'step'"):

@@ -44,15 +44,22 @@ def recurrent_family(model: nn.Module) -> str | None:
     return None if family is None else family[0]
 
 
-def contains_recurrent_model(model: nn.Module) -> str | None:
-    """The family of the first supported recurrent Hugging Face model inside ``model``."""
+def find_recurrent_model(model: nn.Module) -> tuple[str, str] | None:
+    """The attribute path and family of the first supported recurrent Hugging
+    Face model in ``model`` (path ``""`` for ``model`` itself)."""
     if "transformers" not in sys.modules:
         return None
-    for module in model.modules():
+    for path, module in model.named_modules():
         family = recurrent_family(module)
         if family is not None:
-            return family
+            return path, family
     return None
+
+
+def contains_recurrent_model(model: nn.Module) -> str | None:
+    """The family of the first supported recurrent Hugging Face model inside ``model``."""
+    found = find_recurrent_model(model)
+    return None if found is None else found[1]
 
 
 def version_hint() -> str:

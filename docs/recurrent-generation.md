@@ -138,6 +138,7 @@ adapter doesn't.
 | Message contains | Cause |
 |---|---|
 | `RecurrentGenerationProgram needs states=...` | No states were given, and the model isn't a supported Hugging Face recurrent model. |
+| `RecurrentGenerationProgram() exports a Hugging Face ... model only on its own` | No states were given, and the model holds a supported Hugging Face model inside it, at the path named. Export that model directly, or write a step and pass states. |
 | `step= and reference= need states=` | `step` or `reference` was given without `states`. |
 | `model has no callable recurrent step`, `model has no callable reference` | The named method doesn't exist. |
 | `step returned N tensors, expected 1 + number of states` | The step doesn't return the logits and one new value per state. |

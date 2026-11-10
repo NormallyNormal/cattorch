@@ -26,7 +26,9 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.fast import FastConfig
 from cattorch.frontend import tensor_output_leaves
-from cattorch.huggingface_recurrent import adapt_recurrent_model, version_hint
+from cattorch.huggingface_recurrent import (
+    adapt_recurrent_model, find_recurrent_model, version_hint,
+)
 from cattorch.interface import STATUS_VARIABLE
 from cattorch.program import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, RecurrentGenerationProgram, State,
@@ -288,6 +290,15 @@ def transpile_recurrent_generation(
     if program.states is None:
         adapted = adapt_recurrent_model(model)
         if adapted is None:
+            found = find_recurrent_model(model)
+            if found is not None:
+                path, family = found
+                raise UnsupportedModelError(
+                    f"RecurrentGenerationProgram() exports a Hugging Face {family} model "
+                    f"only on its own, and this {type(model).__name__} holds one at "
+                    f"{path!r}: export model.{path} directly, or pass states=... and a "
+                    "step method"
+                )
             raise UnsupportedModelError(
                 "RecurrentGenerationProgram needs states=... unless the model is a "
                 "supported Hugging Face recurrent model (Mamba, Mamba-2, RWKV)"
