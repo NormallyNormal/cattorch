@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import uuid
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -1713,8 +1714,8 @@ def _top_k_decision(rank: int, top_k: int):
     )
 
 
-def _build_top_k_program(top_k: int):
-    """Select sorted top-k logits in one pass without mutating ``output``."""
+def _build_top_k_program(top_k: int, *, logits: str = "output"):
+    """Select sorted top-k logits in one pass without mutating ``logits``."""
     from cattorch.util.scratch.dsl import (
         Program, append, clear, for_each, gt, if_, item, length,
         set_var, var,
@@ -1726,11 +1727,11 @@ def _build_top_k_program(top_k: int):
     return Program(
         "generation_top_k",
         variables=("top k index", "top k current"),
-        lists=("output", _TOP_K_VALUES, _TOP_K_IDS),
+        lists=(logits, _TOP_K_VALUES, _TOP_K_IDS),
         body=(
             *initialize,
-            for_each("top k index", length("output"), (
-                set_var("top k current", item("output", var("top k index"))),
+            for_each("top k index", length(logits), (
+                set_var("top k current", item(logits, var("top k index"))),
                 if_(
                     gt(var("top k current"), item(_TOP_K_VALUES, top_k)),
                     _top_k_decision(1, top_k),
@@ -1740,7 +1741,7 @@ def _build_top_k_program(top_k: int):
     )
 
 
-def _build_compact_top_k_program(top_k: int):
+def _build_compact_top_k_program(top_k: int, *, logits: str = "output"):
     """Select top-k with constant-size dynamic insertion loops."""
     from cattorch.util.scratch.dsl import (
         Program, append, change_var, clear, gt, if_, item, for_each, length,
@@ -1756,11 +1757,11 @@ def _build_compact_top_k_program(top_k: int):
             "top k index", "top k current", "top k rank",
             "top k shift",
         ),
-        lists=("output", _TOP_K_VALUES, _TOP_K_IDS),
+        lists=(logits, _TOP_K_VALUES, _TOP_K_IDS),
         body=(
             *initialize,
-            for_each("top k index", length("output"), (
-                set_var("top k current", item("output", var("top k index"))),
+            for_each("top k index", length(logits), (
+                set_var("top k current", item(logits, var("top k index"))),
                 if_(
                     gt(var("top k current"), item(_TOP_K_VALUES, top_k)),
                     (
@@ -1803,46 +1804,92 @@ def _build_compact_top_k_program(top_k: int):
         ),
     )
 
-def _wrap_generation_lifecycle(
+
+# Writes a reporter of the consumed-token count as block ``identifier`` under
+# ``parent``.
+_TokenCount = Callable[[dict, str, str], None]
+
+
+def _guard_cache_capacity(first_cache: tuple[str, int]) -> _TokenCount:
+    """Measure the generation capacity guard in rows of a K/V cache.
+
+    The count is the cache's length over its per-token width, so a step whose
+    rows are rolled back also gives its token back.
+    """
+    cache_name, cache_width = first_cache
+
+    def report(sprite: dict, identifier: str, parent: str) -> None:
+        cache_id = next(
+            sid for sid, entry in sprite["lists"].items() if entry[0] == cache_name
+        )
+        list_length = f"{identifier}_list_length"
+        sprite["blocks"][identifier] = {
+            "opcode": "operator_divide", "next": None, "parent": parent,
+            "inputs": {
+                "NUM1": [3, list_length, [4, 0]],
+                "NUM2": [1, [4, cache_width]],
+            },
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        sprite["blocks"][list_length] = {
+            "opcode": "data_lengthoflist", "next": None, "parent": identifier,
+            "inputs": {}, "fields": {"LIST": [cache_name, cache_id]},
+            "shadow": False, "topLevel": False,
+        }
+
+    return report
+
+
+def _add_generation_blocks(
     sprite: dict,
     *,
-    cache_names: list[str],
-    first_cache: tuple[str, int],
-    max_context: int,
+    step: str = "cattorch forward",
+    reset: str = "cattorch reset cache",
+    tokens: str = "input",
+    logits: str = "output",
+    state_lists: Sequence[str] = (),
+    capacity: int | None,
     hidden_prefill: bool,
     top_k: int | None,
     compact_top_k: bool,
     vocabulary: int | None = None,
+    token_count: _TokenCount | None = None,
 ) -> dict:
-    """Add reset/prefill/decode blocks and guard the cached forward procedure."""
+    """Add the public reset/prefill/decode blocks around a one-token step.
+
+    ``step`` must already be a procedure whose first block is the automatic
+    init check; it consumes the one token in ``tokens`` and writes ``logits``.
+    A ``reset`` procedure is created that clears ``state_lists``. Without a
+    ``token_count``, ``cattorch cache length`` counts steps that finish with
+    an ok status. A ``capacity`` of None sets no token limit.
+    """
     from cattorch.util.scratch.dsl import (
         Program, append, call, clear, eq, for_each, gt, if_, if_else, item,
         length, lt, not_, round_, set_var, sub, var,
     )
 
+    buffer = "cattorch prefill buffer"
     top_k_lists = (_TOP_K_VALUES, _TOP_K_IDS) if top_k is not None else ()
     if top_k is not None:
         sprite = _add_warp_procedure(
             sprite,
             _TOP_K_PROCEDURE,
             (
-                _build_compact_top_k_program(top_k)
+                _build_compact_top_k_program(top_k, logits=logits)
                 if compact_top_k
-                else _build_top_k_program(top_k)
+                else _build_top_k_program(top_k, logits=logits)
             ),
             x=640,
             y=480,
         )
 
-    reset_lists = (*cache_names, "output", *top_k_lists)
-    reset = Program(
+    reset_lists = (*state_lists, logits, *top_k_lists)
+    reset_program = Program(
         "generation_reset",
         lists=reset_lists,
         body=tuple(clear(name) for name in reset_lists),
     )
-    sprite = _add_warp_procedure(
-        sprite, "cattorch reset cache", reset, x=640, y=0,
-    )
+    sprite = _add_warp_procedure(sprite, reset, reset_program, x=640, y=0)
 
     # A token that isn't a whole number in the vocabulary would read past the
     # embedding table and still report ok.
@@ -1864,7 +1911,7 @@ def _wrap_generation_lifecycle(
 
     invalid_token = f"token ids must be whole numbers from 0 to {(vocabulary or 0) - 1}"
     invalid_decode = (
-        clear("output"),
+        clear(logits),
         *(clear(name) for name in top_k_lists),
         set_var(STATUS_VARIABLE, "decode requires exactly one token"),
     )
@@ -1872,17 +1919,17 @@ def _wrap_generation_lifecycle(
     decode = Program(
         "generation_decode",
         variables=(STATUS_VARIABLE, *token_variables),
-        lists=("input", "output", *top_k_lists),
+        lists=(tokens, logits, *top_k_lists),
         body=(
             if_else(
-                eq(length("input"), 1),
+                eq(length(tokens), 1),
                 (
-                    *check_tokens("input"),
+                    *check_tokens(tokens),
                     if_else(
                         eq(var(valid_tokens), 1),
-                        (call("cattorch forward"),),
+                        (call(step),),
                         (
-                            clear("output"), *(clear(name) for name in top_k_lists),
+                            clear(logits), *(clear(name) for name in top_k_lists),
                             set_var(STATUS_VARIABLE, invalid_token),
                         ),
                     ),
@@ -1894,64 +1941,62 @@ def _wrap_generation_lifecycle(
     sprite = _add_warp_procedure(sprite, "cattorch decode", decode, x=640, y=160)
 
     copy_and_reset = (
-            clear("cattorch prefill buffer"),
-            for_each("prefill index", length("input"), (
-                append(
-                    "cattorch prefill buffer",
-                    item("input", var("prefill index")),
-                ),
+            clear(buffer),
+            for_each("prefill index", length(tokens), (
+                append(buffer, item(tokens, var("prefill index"))),
             )),
-            call("cattorch reset cache"),
-            clear("input"),
+            call(reset),
+            clear(tokens),
     )
     if hidden_prefill:
         valid_prefill = (
                 set_var("cattorch project output", 0),
-                for_each("prefill index", sub(length("cattorch prefill buffer"), 1), (
-                    append("input", item("cattorch prefill buffer", var("prefill index"))),
-                    call("cattorch forward"),
-                    clear("input"),
+                for_each("prefill index", sub(length(buffer), 1), (
+                    append(tokens, item(buffer, var("prefill index"))),
+                    call(step),
+                    clear(tokens),
                 )),
                 set_var("cattorch project output", 1),
-                append(
-                    "input", item("cattorch prefill buffer", length("cattorch prefill buffer")),
-                ),
-                call("cattorch forward"),
-                clear("input"),
+                append(tokens, item(buffer, length(buffer))),
+                call(step),
+                clear(tokens),
         )
         prefill_variables = (
             "prefill index", "cattorch project output", STATUS_VARIABLE, *token_variables,
         )
     else:
         valid_prefill = (
-            for_each("prefill index", length("cattorch prefill buffer"), (
-                append("input", item("cattorch prefill buffer", var("prefill index"))),
-                call("cattorch forward"),
-                clear("input"),
+            for_each("prefill index", length(buffer), (
+                append(tokens, item(buffer, var("prefill index"))),
+                call(step),
+                clear(tokens),
             )),
         )
         prefill_variables = ("prefill index", STATUS_VARIABLE, *token_variables)
+    checked_prefill = if_else(
+        eq(var(valid_tokens), 1),
+        valid_prefill,
+        (set_var(STATUS_VARIABLE, invalid_token),),
+    )
+    if capacity is not None:
+        checked_prefill = if_else(
+            gt(length(buffer), capacity),
+            (set_var(STATUS_VARIABLE, "prefill exceeds maximum context"),),
+            (checked_prefill,),
+        )
     prefill_body = (
         *copy_and_reset,
-        *check_tokens("cattorch prefill buffer"),
+        *check_tokens(buffer),
         if_else(
-            eq(length("cattorch prefill buffer"), 0),
+            eq(length(buffer), 0),
             (set_var(STATUS_VARIABLE, "prefill requires at least one token"),),
-            (if_else(
-                gt(length("cattorch prefill buffer"), max_context),
-                (set_var(STATUS_VARIABLE, "prefill exceeds maximum context"),),
-                (if_else(
-                    eq(var(valid_tokens), 1),
-                    valid_prefill,
-                    (set_var(STATUS_VARIABLE, invalid_token),),
-                ),),
-            ),),
+            (checked_prefill,),
         ),
     )
     prefill = Program(
         "generation_prefill",
         variables=prefill_variables,
-        lists=("input", "cattorch prefill buffer"),
+        lists=(tokens, buffer),
         body=prefill_body,
     )
     sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
@@ -1963,133 +2008,138 @@ def _wrap_generation_lifecycle(
     if top_k_lists:
         _merge_lists_by_name(sprite, set(top_k_lists))
 
-    # Insert a max-context guard after forward's automatic init check.
+    # Splice the guard and bookkeeping in after the step's automatic init check.
     blocks = sprite["blocks"]
-    forward_def = _find_procedure_definition(sprite, "cattorch forward")
-    init_check = blocks[forward_def]["next"]
+    step_def = _find_procedure_definition(sprite, step)
+    init_check = blocks[step_def]["next"]
     old_root = blocks[init_check]["next"]
-    cache_name, cache_width = first_cache
-    cache_id = next(
-        sid for sid, entry in sprite["lists"].items() if entry[0] == cache_name
-    )
-    output_id = next(
-        sid for sid, entry in sprite["lists"].items() if entry[0] == "output"
+    logits_id = next(
+        sid for sid, entry in sprite["lists"].items() if entry[0] == logits
     )
     suffix = uuid.uuid4().hex[:8]
     prefix = f"cattorch_generation_guard_{suffix}"
     status_id = f"{prefix}_status"
     cache_length_id = f"{prefix}_cache_length"
-    max_context_id = f"{prefix}_max_context"
     sprite.setdefault("variables", {})[status_id] = [STATUS_VARIABLE, "ok"]
     sprite["variables"][cache_length_id] = ["cattorch cache length", 0]
-    sprite["variables"][max_context_id] = ["cattorch max context", max_context]
+    if capacity is not None:
+        sprite["variables"][f"{prefix}_max_context"] = ["cattorch max context", capacity]
 
-    guard = f"{prefix}_guard"
-    condition = f"{prefix}_condition"
-    list_length = f"{prefix}_list_length"
-    normalized_length = f"{prefix}_normalized_length"
+    def count_input(identifier: str, parent: str, shadow: list) -> list:
+        if token_count is None:
+            return [3, [12, "cattorch cache length", cache_length_id], shadow]
+        token_count(sprite, identifier, parent)
+        return [3, identifier, shadow]
+
     success = f"{prefix}_success"
-    failure = f"{prefix}_failure"
-    clear_output = f"{prefix}_clear_output"
-    blocks[init_check]["next"] = guard
-    blocks[guard] = {
-        "opcode": "control_if_else", "next": None, "parent": init_check,
-        "inputs": {
-            "CONDITION": [2, condition],
-            "SUBSTACK": [2, success],
-            "SUBSTACK2": [2, failure],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[condition] = {
-        "opcode": "operator_lt", "next": None, "parent": guard,
-        "inputs": {
-            "OPERAND1": [3, normalized_length, [10, ""]],
-            "OPERAND2": [1, [4, max_context]],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[normalized_length] = {
-        "opcode": "operator_divide", "next": None, "parent": condition,
-        "inputs": {
-            "NUM1": [3, list_length, [4, 0]],
-            "NUM2": [1, [4, cache_width]],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[list_length] = {
-        "opcode": "data_lengthoflist", "next": None, "parent": normalized_length,
-        "inputs": {}, "fields": {"LIST": [cache_name, cache_id]},
-        "shadow": False, "topLevel": False,
-    }
+    if capacity is None:
+        blocks[init_check]["next"] = success
+        success_parent = init_check
+    else:
+        guard = f"{prefix}_guard"
+        condition = f"{prefix}_condition"
+        failure = f"{prefix}_failure"
+        clear_output = f"{prefix}_clear_output"
+        blocks[init_check]["next"] = guard
+        blocks[guard] = {
+            "opcode": "control_if_else", "next": None, "parent": init_check,
+            "inputs": {
+                "CONDITION": [2, condition],
+                "SUBSTACK": [2, success],
+                "SUBSTACK2": [2, failure],
+            },
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[condition] = {
+            "opcode": "operator_lt", "next": None, "parent": guard,
+            "inputs": {"OPERAND1": None, "OPERAND2": [1, [4, capacity]]},
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[condition]["inputs"]["OPERAND1"] = count_input(
+            f"{prefix}_normalized_length", condition, [10, ""],
+        )
+        success_parent = guard
     blocks[success] = {
-        "opcode": "data_setvariableto", "next": old_root, "parent": guard,
+        "opcode": "data_setvariableto", "next": old_root, "parent": success_parent,
         "inputs": {"VALUE": [1, [10, "ok"]]},
         "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[old_root]["parent"] = success
-    blocks[failure] = {
-        "opcode": "data_setvariableto", "next": clear_output, "parent": guard,
-        "inputs": {"VALUE": [1, [10, "maximum context exceeded"]]},
-        "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
-        "shadow": False, "topLevel": False,
-    }
-    blocks[clear_output] = {
-        "opcode": "data_deletealloflist", "next": None, "parent": failure,
-        "inputs": {}, "fields": {"LIST": ["output", output_id]},
-        "shadow": False, "topLevel": False,
-    }
-    clear_failure_tail = clear_output
-    for index, name in enumerate(top_k_lists):
-        list_id = next(
-            sid for sid, entry in sprite["lists"].items() if entry[0] == name
-        )
-        clear_top_k = f"{prefix}_clear_top_k_{index}"
-        blocks[clear_failure_tail]["next"] = clear_top_k
-        blocks[clear_top_k] = {
-            "opcode": "data_deletealloflist", "next": None,
-            "parent": clear_failure_tail,
-            "inputs": {}, "fields": {"LIST": [name, list_id]},
+    if capacity is not None:
+        blocks[failure] = {
+            "opcode": "data_setvariableto", "next": clear_output, "parent": guard,
+            "inputs": {"VALUE": [1, [10, "maximum context exceeded"]]},
+            "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
             "shadow": False, "topLevel": False,
         }
-        clear_failure_tail = clear_top_k
+        blocks[clear_output] = {
+            "opcode": "data_deletealloflist", "next": None, "parent": failure,
+            "inputs": {}, "fields": {"LIST": [logits, logits_id]},
+            "shadow": False, "topLevel": False,
+        }
+        clear_failure_tail = clear_output
+        for index, name in enumerate(top_k_lists):
+            list_id = next(
+                sid for sid, entry in sprite["lists"].items() if entry[0] == name
+            )
+            clear_top_k = f"{prefix}_clear_top_k_{index}"
+            blocks[clear_failure_tail]["next"] = clear_top_k
+            blocks[clear_top_k] = {
+                "opcode": "data_deletealloflist", "next": None,
+                "parent": clear_failure_tail,
+                "inputs": {}, "fields": {"LIST": [name, list_id]},
+                "shadow": False, "topLevel": False,
+            }
+            clear_failure_tail = clear_top_k
 
-    # Update the public cache-length variable after a successful forward.
+    # Update the public cache-length variable after a successful step.
     terminal = old_root
     while blocks[terminal].get("next") is not None:
         terminal = blocks[terminal]["next"]
-    set_cache_length = f"{prefix}_set_cache_length"
-    length_reporter = f"{prefix}_final_length"
-    normalized_reporter = f"{prefix}_final_normalized_length"
-    blocks[terminal]["next"] = set_cache_length
-    blocks[set_cache_length] = {
-        "opcode": "data_setvariableto", "next": None, "parent": terminal,
-        "inputs": {"VALUE": [3, normalized_reporter, [4, 0]]},
-        "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
-        "shadow": False, "topLevel": False,
-    }
-    blocks[normalized_reporter] = {
-        "opcode": "operator_divide", "next": None, "parent": set_cache_length,
-        "inputs": {
-            "NUM1": [3, length_reporter, [4, 0]],
-            "NUM2": [1, [4, cache_width]],
-        },
-        "fields": {}, "shadow": False, "topLevel": False,
-    }
-    blocks[length_reporter] = {
-        "opcode": "data_lengthoflist", "next": None, "parent": normalized_reporter,
-        "inputs": {}, "fields": {"LIST": [cache_name, cache_id]},
-        "shadow": False, "topLevel": False,
-    }
+    if token_count is None:
+        tail = f"{prefix}_count_step"
+        step_ok = f"{prefix}_count_step_condition"
+        increment = f"{prefix}_count_step_increment"
+        blocks[tail] = {
+            "opcode": "control_if", "next": None, "parent": terminal,
+            "inputs": {"CONDITION": [2, step_ok], "SUBSTACK": [2, increment]},
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[step_ok] = {
+            "opcode": "operator_equals", "next": None, "parent": tail,
+            "inputs": {
+                "OPERAND1": [3, [12, STATUS_VARIABLE, status_id], [10, ""]],
+                "OPERAND2": [1, [10, "ok"]],
+            },
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[increment] = {
+            "opcode": "data_changevariableby", "next": None, "parent": tail,
+            "inputs": {"VALUE": [1, [4, 1]]},
+            "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
+            "shadow": False, "topLevel": False,
+        }
+    else:
+        tail = f"{prefix}_set_cache_length"
+        blocks[tail] = {
+            "opcode": "data_setvariableto", "next": None, "parent": terminal,
+            "inputs": {"VALUE": None},
+            "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
+            "shadow": False, "topLevel": False,
+        }
+        blocks[tail]["inputs"]["VALUE"] = count_input(
+            f"{prefix}_final_normalized_length", tail, [4, 0],
+        )
+    blocks[terminal]["next"] = tail
     if top_k is not None:
         top_k_guard = f"{prefix}_top_k_guard"
         top_k_condition = f"{prefix}_top_k_condition"
         top_k_output_length = f"{prefix}_top_k_output_length"
         top_k_call = f"{prefix}_top_k_call"
-        blocks[set_cache_length]["next"] = top_k_guard
+        blocks[tail]["next"] = top_k_guard
         blocks[top_k_guard] = {
-            "opcode": "control_if", "next": None, "parent": set_cache_length,
+            "opcode": "control_if", "next": None, "parent": tail,
             "inputs": {
                 "CONDITION": [2, top_k_condition],
                 "SUBSTACK": [2, top_k_call],
@@ -2107,7 +2157,7 @@ def _wrap_generation_lifecycle(
         blocks[top_k_output_length] = {
             "opcode": "data_lengthoflist", "next": None,
             "parent": top_k_condition,
-            "inputs": {}, "fields": {"LIST": ["output", output_id]},
+            "inputs": {}, "fields": {"LIST": [logits, logits_id]},
             "shadow": False, "topLevel": False,
         }
         blocks[top_k_call] = {
@@ -2117,7 +2167,7 @@ def _wrap_generation_lifecycle(
         }
 
     # Reset also resets public state variables.
-    reset_def = _find_procedure_definition(sprite, "cattorch reset cache")
+    reset_def = _find_procedure_definition(sprite, reset)
     reset_root = blocks[reset_def]["next"]
     reset_status = f"{prefix}_reset_status"
     reset_length = f"{prefix}_reset_length"
@@ -2137,3 +2187,27 @@ def _wrap_generation_lifecycle(
     blocks[reset_root]["parent"] = reset_length
     _merge_variables_by_name(sprite, {STATUS_VARIABLE})
     return sprite
+
+
+def _wrap_generation_lifecycle(
+    sprite: dict,
+    *,
+    cache_names: list[str],
+    first_cache: tuple[str, int],
+    max_context: int,
+    hidden_prefill: bool,
+    top_k: int | None,
+    compact_top_k: bool,
+    vocabulary: int | None = None,
+) -> dict:
+    """Add the generation blocks for K/V-cached generation."""
+    return _add_generation_blocks(
+        sprite,
+        state_lists=cache_names,
+        capacity=max_context,
+        hidden_prefill=hidden_prefill,
+        top_k=top_k,
+        compact_top_k=compact_top_k,
+        vocabulary=vocabulary,
+        token_count=_guard_cache_capacity(first_cache),
+    )
