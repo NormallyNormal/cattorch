@@ -50,7 +50,8 @@ covers input layout, connecting other sprites, and saving after a run.
   [supported operations](https://github.com/NormallyNormal/cattorch/blob/main/docs/supported-models.md).
 - Exact inference by default, with optional approximate kernels and smaller
   weight storage.
-- Cached text generation and character, BPE, or SentencePiece tokenizer sprites.
+- Cached text generation, recurrent generation (GRU and LSTM language models,
+  Mamba, Mamba-2, RWKV), and character, BPE, or SentencePiece tokenizer sprites.
 - Multi-method models with persistent state, and sparse mixture-of-experts
   models.
 - Runnable demo projects, including a prompt-and-continue text generator,

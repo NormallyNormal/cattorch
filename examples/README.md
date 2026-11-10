@@ -9,12 +9,14 @@ against PyTorch, and writes a runnable Scratch project to `build/`. Open the
 | [`mlp.py`](mlp.py) | MLP that names the quadrant of a point | Edit the point in `quadrants input` and press space. |
 | [`cnn.py`](cnn.py) | CNN that tells horizontal lines from vertical ones in 8×8 images | Set pixels in `lines input` (row by row) and press space. |
 | [`text_generator.py`](text_generator.py) | Character-level transformer trained on a nursery rhyme | Click the green flag and type the start of a line. |
+| [`recurrent_generator.py`](recurrent_generator.py) | Character-level GRU trained on the same rhyme, exported with a [`RecurrentGenerationProgram`](../docs/recurrent-generation.md) | Click the green flag and type the start of a line. |
 
 ```bash
 python examples/mlp.py
 python examples/cnn.py
 pip install "cattorch[tokenizers]"   # for the text generator's tokenizer
 python examples/text_generator.py
+python examples/recurrent_generator.py
 ```
 
 `--output DIR` writes somewhere other than `build/`. The models export from

@@ -92,6 +92,16 @@ If the model runs but gives wrong output, check whether the generated sprite's
 costumes were changed. They store the compressed weights; see
 [preserve processor costumes](storage.md#preserve-processor-costumes).
 
+## Generate with a recurrent model
+
+A `GenerationProgram` only handles transformers whose tokens mix in causal
+attention. For a Mamba, Mamba-2, or RWKV model from Hugging Face, use
+`RecurrentGenerationProgram()`; for your own GRU, LSTM, or state-space model,
+write a one-token `step` and pass its states. If a Hugging Face model's export
+fails the reference check or reports a missing attribute, the installed
+transformers version may compute the model differently from the one cattorch
+was tested with. See [recurrent generation](recurrent-generation.md).
+
 ## Read the error
 
 `UnsupportedOperationError` names the operation that failed and the module it

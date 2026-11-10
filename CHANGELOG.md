@@ -92,7 +92,15 @@
   `max_tokens` optionally limits the tokens (by default `cattorch max context`
   is `Infinity`), hidden prefill skips what only the logits need for prompt
   tokens, and `reference=` checks the step against a stateless method at
-  export. See [`RecurrentGenerationProgram`](docs/api-reference.md#recurrentgenerationprogram).
+  export. Hugging Face Mamba, Mamba-2 and RWKV causal language models need no
+  step: `transpile(model, RecurrentGenerationProgram(), path)` builds one from
+  the model's weights, with one state per layer and kind, and always checks it
+  against the model's forward, which catches transformers versions the step
+  doesn't follow. The caller's model isn't changed, including RWKV's in-place
+  rescaling. A `GenerationProgram` given one of these models points to
+  `RecurrentGenerationProgram`, and `cattorch generate` exports them as
+  recurrent generators, with `--max-context` optional. See
+  [recurrent generation](docs/recurrent-generation.md).
 - `ProgramResult` has `fallback_operations` and `approximate_operations`, and
   warns about decomposed operations, as `TranspileResult` does. A
   `RecurrentGenerationProgram` export reports both.

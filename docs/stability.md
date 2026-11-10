@@ -11,8 +11,9 @@ exported sprites keep working across 1.x releases.
   documented parameters, fields, and behavior. This includes `transpile`,
   `verify`, `build_project`, the tokenizers, the configuration classes, the
   result types, the exceptions, programs (`ExportProgram`, `EntryPoint`,
-  `Input`, `Output`, `State`, `StateInput`, `StateUpdate`, `ProgramCall`), the
-  markers, and `ModuleAdapter`.
+  `Input`, `Output`, `State`, `StateInput`, `StateUpdate`, `ProgramCall`),
+  `GenerationProgram` and `RecurrentGenerationProgram`, the markers, and
+  `ModuleAdapter`.
 - **The Scratch interface:** every block, list, variable, and broadcast in the
   [Scratch interface](scratch-interface.md), including the names
   [`build_project`](projects-and-cli.md#bridges) adds to a project.

@@ -293,7 +293,7 @@ Scratch blocks.
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `states` | required | A tuple of replace-mode `State`s with their initial values, in the order the step takes and returns them. The only positional field; the others are keyword-only. |
+| `states` | `None` | A tuple of replace-mode `State`s with their initial values, in the order the step takes and returns them. The only positional field; the others are keyword-only. `None` exports a Hugging Face Mamba, Mamba-2 or RWKV causal LM through cattorch's own step, states and reference check; `step` and `reference` must then keep their defaults. Any other model needs `states`. |
 | `step` | `"step"` | Name of the model method `step(token, *states) -> (logits, *new_states)`. `token` is a `[1, 1]` tensor of one token ID, looked up in an embedding; the logits flatten to one vocabulary row; each new state keeps its shape. |
 | `max_tokens` | `None` | Maximum number of tokens consumed between resets, like `max_context`. `None` sets no limit, and `cattorch max context` is `Infinity`. |
 | `hidden_prefill` | `True` | During prefill, skip the operations that only compute the logits for every prompt token but the last. State updates still run. |
@@ -307,7 +307,9 @@ statuses and notifications as a `GenerationProgram`'s, with
 prefill restore every state's initial value. A token that isn't valid, or a
 step that fails, leaves the states unchanged. `quantization`,
 `calibration_sequences`, `optimization="fast"`, `adapters` and the storage
-options work as for a `GenerationProgram`.
+options work as for a `GenerationProgram`. See
+[recurrent generation](recurrent-generation.md) for the step contract, the
+supported Hugging Face models and the Scratch interface.
 
 ### `StorageConfig`
 

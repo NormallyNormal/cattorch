@@ -20,10 +20,16 @@
   pruning and low-rank weight transforms.
 - **KV cache**: attention keys and values saved from earlier tokens, so
   generation doesn't recompute the whole sequence for each new token.
+- **One-token step**: a model method that reads one token and the recurrent
+  state and returns the next token's logits and the new state; what a
+  `RecurrentGenerationProgram` exports.
 - **Processor sprite**: a generated model or tokenizer sprite, used for
   computation rather than display.
 - **Pytree leaf order**: the order PyTorch uses to flatten nested tuples,
   lists, and dictionaries. cattorch uses it to number output lists.
+- **Recurrent state**: values a recurrent model, such as a GRU, Mamba, or
+  RWKV, carries from one token to the next. Unlike a KV cache, it doesn't grow
+  with the number of tokens.
 - **Runtime extent**: the one dimension of a tensor whose length can change
   while the sprite runs, such as the row count of an append state.
 - **Static tensor**: a parameter, buffer, or constant stored in the sprite.

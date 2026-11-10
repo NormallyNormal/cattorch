@@ -71,6 +71,15 @@ against the model's own `forward` during export. GPT-2, Llama, and Qwen2
 causal language models work this way; BERT doesn't, because its attention isn't
 causal.
 
+Hugging Face Mamba, Mamba-2, and RWKV causal language models generate through
+a [`RecurrentGenerationProgram`](recurrent-generation.md), again without a
+wrapper. cattorch builds their one-token step and states and checks them
+against the model's forward:
+
+```python
+cattorch.transpile(model, cattorch.RecurrentGenerationProgram(), "model.sprite3")
+```
+
 Mixture-of-experts models from transformers, such as Mixtral, Qwen2-MoE,
 Qwen3-MoE, OLMoE, and DeepSeek-V3, export the same way, with or without a
 `GenerationProgram`. Their experts classes, marked with transformers'
@@ -108,7 +117,9 @@ sprite doesn't grow with the sequence length, and the sequence can vary at
 run time (see [variable-length inputs](#variable-length-inputs)). To process
 one step per call, write a step method around a cell and keep the hidden
 state in a buffer; [`@cattorch.entrypoint`](markers.md) exports it with the
-state kept between calls.
+state kept between calls. A GRU or LSTM language model with a one-token `step`
+becomes a text generator with a
+[`RecurrentGenerationProgram`](recurrent-generation.md).
 
 A listed operation can still be rejected for an unsupported shape,
 broadcasting pattern, or option. The error names the operation that failed.

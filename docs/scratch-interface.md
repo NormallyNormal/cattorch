@@ -58,6 +58,11 @@ A sprite from a [`GenerationProgram`](generation.md#scratch-interface) has no
 | `cattorch initialized` | variable | `1` once the weights are decoded. |
 | `cattorch init complete`, `cattorch reset complete`, `cattorch prefill complete`, `cattorch decode complete` | broadcasts | Sent when each block finishes. |
 
+A sprite from a [`RecurrentGenerationProgram`](recurrent-generation.md#scratch-interface)
+has the same names. It has no cache: `cattorch reset` restores the model's
+initial state, `cattorch cache length` counts the tokens read since then, and
+`cattorch max context` is `max_tokens`, or `Infinity` when it has no limit.
+
 ## Program sprites
 
 A sprite from an [`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state)

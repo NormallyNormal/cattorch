@@ -14,7 +14,9 @@ artifact = transpile(model, GenerationProgram(max_context=64), "cached_model")
 ```
 
 The model can be a hand-written decoder or an unwrapped Hugging Face causal
-language model (GPT-2, Llama, Qwen2) loaded as it is. It must be in evaluation
+language model (GPT-2, Llama, Qwen2) loaded as it is. Models without attention,
+whose tokens mix through a recurrence (GRU and LSTM language models, Mamba,
+RWKV), use a [`RecurrentGenerationProgram`](recurrent-generation.md) instead. It must be in evaluation
 mode. `max_context` is fixed at export. Other fields are `hidden_prefill`,
 `top_k`, and `method`, which names the method to export when it isn't
 `forward`. See [`GenerationProgram`](api-reference.md#generationprogram) for
@@ -51,7 +53,9 @@ that break the requirements below in ways the analysis can't see.
   recognized.
 - Tokens mix only in attention. Everything else works on each position
   separately, so a `cumsum`, mean, `roll`, or convolution along the sequence is
-  rejected.
+  rejected. A model that mixes tokens through a recurrence or a causal
+  convolution, such as an RNN, Mamba, or RWKV, can be exported with a
+  [`RecurrentGenerationProgram`](recurrent-generation.md) and a one-token step.
 - The graph doesn't depend on the sequence length. A Python `if
   tokens.shape[1] > 16:` that changes the operations is rejected, and so is a
   position table whose first rows change with the length.
@@ -75,6 +79,7 @@ that break the requirements below in ways the analysis can't see.
 | `not a recognised attention pattern` | A softmax over the sequence that isn't matmul, scale, causal mask, softmax, matmul. The message says which part didn't match. |
 | `the table's first N rows ... differ` | A position table whose rows depend on the sequence length. |
 | `the cached step disagrees with the model` | The export-time check failed. The message gives the first differing row and the largest error. |
+| `GenerationProgram caches attention keys and values, and this ... model has no attention` | A Hugging Face Mamba, Mamba-2, or RWKV model. Use [`RecurrentGenerationProgram()`](recurrent-generation.md). |
 
 ## Hidden prefill
 
@@ -197,6 +202,7 @@ shrink the sprite, see layer sharing in
 Generation sprites don't have `cattorch prepare for save`; see
 [save after running](storage.md#save-after-running).
 
-Related: [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
+Related: [recurrent generation](recurrent-generation.md),
+[tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
 [supported models](supported-models.md), and
 [generation benchmarking](verification-and-benchmarking.md#scratch-benchmark-projects).

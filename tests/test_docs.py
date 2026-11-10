@@ -80,10 +80,11 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
         ("docs/custom-kernels.md", (0, 1, 2, 3)),
         ("docs/markers.md", (0,)),
         ("docs/projects-and-cli.md", (0,)),
+        ("docs/recurrent-generation.md", (0,)),
     ],
     ids=(
         "quick-start", "getting-started", "stateful-program", "sparse-moe",
-        "routed-experts", "custom-kernels", "markers", "projects",
+        "routed-experts", "custom-kernels", "markers", "projects", "recurrent-generation",
     ),
 )
 def test_documented_export_examples_run(

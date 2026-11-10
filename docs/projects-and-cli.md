@@ -31,8 +31,9 @@ shows the `points input` and `points output` lists, starting from
 model. Edit the input list's items to try other inputs. With `labels`, the
 `points prediction` monitor shows the label of the largest output.
 
-For a [`GenerationProgram`](generation.md) export, pass the exported
-[tokenizer](tokenizers.md) too:
+For a [`GenerationProgram`](generation.md) or
+[`RecurrentGenerationProgram`](recurrent-generation.md) export, pass the
+exported [tokenizer](tokenizers.md) too:
 
 ```python
 words = cattorch.CharTokenizer(hf_tokenizer).save("build/tokenizer", name="tokenizer")
@@ -46,7 +47,8 @@ start of some text, continues it one token at a time with the model, and
 shows the text so far in a speech bubble. An empty answer stops it. The
 temperature slider sets how random the choices are; 0 always picks the
 likeliest token. Generation stops after `max_new_tokens`, at `eos_token_id`
-when you give one, or when the model's context is full. `prompt` replaces the
+when you give one, or when the model's context is full (never, for a recurrent
+generator without `max_tokens`). `prompt` replaces the
 question it asks.
 
 A model with [entry points](markers.md) gets a bridge for each one but no
@@ -88,6 +90,7 @@ cattorch export my_models.py:Classifier --project
 cattorch export model.pt --shape 1,28,28 --labels "0,1,2,3,4,5,6,7,8,9" --project
 cattorch generate my_models.py:TinyGPT --tokenizer path/to/tokenizer --project
 cattorch generate --hf some-user/tiny-model --max-context 64 --project
+cattorch generate --hf AntonV/mamba2-130m-hf --precision int8 --project
 ```
 
 `cattorch export MODEL` exports a model, checks it against PyTorch with
@@ -108,7 +111,11 @@ from 1 to 32 at run time, and `--dynamic 0.1=1:64` its second; see
 
 `cattorch generate` exports a `forward(tokens) -> logits` model as a
 [`GenerationProgram`](generation.md) with `--max-context` (default 64) and
-`--top-k`. `--hf REPO` loads a Hugging Face causal language model and its
+`--top-k`. A Hugging Face Mamba, Mamba-2, or RWKV model is recognized and
+exported as a [`RecurrentGenerationProgram`](recurrent-generation.md)
+instead; there `--max-context` is optional and sets `max_tokens`, and without
+it the generator takes any number of tokens (the summary's `max_context` is
+`null`). `--hf REPO` loads a Hugging Face causal language model and its
 tokenizer by name or directory; `--tokenizer` names a Hugging Face tokenizer
 for a model given as `MODEL`. The tokenizer is exported too when its type is
 [supported](tokenizers.md#compatibility). Generation exports aren't verified.
@@ -130,10 +137,10 @@ saved [benchmark project's](verification-and-benchmarking.md) timings, like
 
 ## Examples
 
-The repository's [`examples/`](../examples/README.md) directory has three
+The repository's [`examples/`](../examples/README.md) directory has four
 scripts that train a small model in a few seconds, export it, and build its
 project: an MLP that names a point's quadrant, a CNN that tells horizontal
-lines from vertical ones, and a character-level transformer that continues
-a nursery rhyme.
+lines from vertical ones, and a character-level transformer and GRU that
+continue a nursery rhyme.
 
 Related: [getting started](getting-started.md), [API reference](api-reference.md#buildproject).
