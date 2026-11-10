@@ -81,6 +81,18 @@
   `topk` results, along any dimension. This covers DeepSeek-V3's
   group-limited router, and DeepSeek-V3 models now export, with or without a
   `GenerationProgram`.
+- `RecurrentGenerationProgram(states, step="step")` exports token-by-token
+  generation for a model whose tokens mix through a recurrence, such as a GRU
+  or LSTM language model, Mamba or RWKV: a method `step(token, *states) ->
+  (logits, *new_states)` and the states' initial values. The sprite has the
+  same init, reset, prefill and decode blocks, lists, statuses and
+  notifications as a `GenerationProgram`, so `build_project` and Scratch
+  projects written for one drive the other. Reset restores each initial
+  state, invalid tokens and failed steps leave the states unchanged,
+  `max_tokens` optionally limits the tokens (by default `cattorch max context`
+  is `Infinity`), hidden prefill skips what only the logits need for prompt
+  tokens, and `reference=` checks the step against a stateless method at
+  export. See [`RecurrentGenerationProgram`](docs/api-reference.md#recurrentgenerationprogram).
 - `GenerationProgram` accepts sliding-window masks (Mistral, GPT-OSS), ALiBi
   biases, and GPT-OSS attention sinks. A windowed decode step reads only the
   window's cache rows.

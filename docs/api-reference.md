@@ -45,7 +45,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | Parameter | Meaning |
 |---|---|
 | `model` | Module to export. Export works on a copy; a model with modules in training mode is exported in evaluation mode, with a warning. |
-| `example_inputs` | A tensor or tuple of tensors, an `ExportProgram`, or a `GenerationProgram`. Programs carry their own examples. |
+| `example_inputs` | A tensor or tuple of tensors, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. Programs carry their own examples. |
 | `output_path` | Destination. `.sprite3` is appended when absent and missing parent directories are created. |
 | `sig_figs` | Round stored values to this many significant figures. Lossy. |
 | `name` | Scratch sprite display name. Defaults to the destination filename stem. |
@@ -58,7 +58,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `frontend` | How the model is traced: `"fx"` (default) or `"export"` (`torch.export`). `"export"` is deprecated and will be removed in 2.0. It supports fewer operations: integer indexing such as `x[:, 0]`, `cumsum`, `topk`, attention, and recurrent layers need `"fx"`, as do programs. |
 | `adapters` | `ModuleAdapter`s that replace module types for this export. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
-| `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram`. |
+| `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram` or `RecurrentGenerationProgram` (`[1, length]` tensors for the latter). |
 | `dynamic` | One variable-length input, as `{input: (minimum, maximum)}` for its first dimension or `{input: {dimension: (minimum, maximum)}}`; see [variable-length inputs](supported-models.md#variable-length-inputs). Not valid with programs. |
 | `kernels` | Experimental `Kernel`s for this export; see [custom kernels](custom-kernels.md). Each replaces the built-in lowering of its operation for this export. |
 | `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
@@ -87,8 +87,9 @@ transpile(
 See [programs and sparse MoE](programs-and-moe.md) for interface names,
 state updates, and calibration.
 
-A `GenerationProgram` export also accepts `adapters`, for example to convert
-your MoE module to `SparseMoE` or `StackedSwiGLUMoE`.
+A `GenerationProgram` or `RecurrentGenerationProgram` export also accepts
+`adapters`, for example to convert your MoE module to `SparseMoE` or
+`StackedSwiGLUMoE`.
 
 ### `rotary_embedding`
 
@@ -287,6 +288,26 @@ multiplications. See [optimization modes](optimization.md#weight-transforms).
 
 See [KV-cached generation](generation.md) for model requirements and the
 Scratch blocks.
+
+### `RecurrentGenerationProgram`
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `states` | required | A tuple of replace-mode `State`s with their initial values, in the order the step takes and returns them. The only positional field; the others are keyword-only. |
+| `step` | `"step"` | Name of the model method `step(token, *states) -> (logits, *new_states)`. `token` is a `[1, 1]` tensor of one token ID, looked up in an embedding; the logits flatten to one vocabulary row; each new state keeps its shape. |
+| `max_tokens` | `None` | Maximum number of tokens consumed between resets, like `max_context`. `None` sets no limit, and `cattorch max context` is `Infinity`. |
+| `hidden_prefill` | `True` | During prefill, skip the operations that only compute the logits for every prompt token but the last. State updates still run. |
+| `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
+| `reference` | `None` | Name of a stateless model method `reference(tokens) -> logits` (`[1, n, V]` or `[n, V]`). At export, the step runs over up to 32 random tokens from the initial states and each logits row must match it within `1e-4` of the row's largest value. |
+
+For models whose tokens mix through a recurrence rather than attention: GRU
+and LSTM language models, Mamba, RWKV. The sprite has the same blocks, lists,
+statuses and notifications as a `GenerationProgram`'s, with
+`cattorch cache length` counting the tokens consumed; `cattorch reset` and
+prefill restore every state's initial value. A token that isn't valid, or a
+step that fails, leaves the states unchanged. `quantization`,
+`calibration_sequences`, `optimization="fast"`, `adapters` and the storage
+options work as for a `GenerationProgram`.
 
 ### `StorageConfig`
 

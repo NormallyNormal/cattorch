@@ -29,7 +29,9 @@ from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
     TranspileResult, _tensor_spec as boundary_spec, fallback_warning,
 )
-from cattorch.program import ExportProgram, GenerationProgram, ProgramCall
+from cattorch.program import (
+    ExportProgram, GenerationProgram, ProgramCall, RecurrentGenerationProgram,
+)
 from cattorch.adapters import ModuleAdapter
 from cattorch.kernel_api import (
     Kernel, active_kernel_targets, validate_kernels, warn_unused_kernels,
@@ -1791,7 +1793,10 @@ def _select_unroll_factor(
 
 def transpile(
     model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram | None,
+    example_inputs: (
+        torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram
+        | RecurrentGenerationProgram | None
+    ),
     output_path: str | Path,
     sig_figs: int | None = None,
     *,
@@ -1824,8 +1829,9 @@ def transpile(
         training mode are exported in evaluation mode with a warning.
     example_inputs:
         One tensor or a tuple defining a fixed interface, an ``ExportProgram``
-        defining named methods and state, or a ``GenerationProgram`` defining
-        the cached decoder interface. ``None`` takes the interface from the
+        defining named methods and state, a ``GenerationProgram`` defining
+        the cached decoder interface, or a ``RecurrentGenerationProgram``
+        defining the same interface for a recurrent step. ``None`` takes the interface from the
         model's experimental markers: its ``@entrypoint`` methods, or the
         ``@example`` inputs of ``forward``.
     output_path:
@@ -1851,7 +1857,8 @@ def transpile(
     calibration_calls:
         Named whole-program GPTQ calls for an ``ExportProgram``.
     calibration_sequences:
-        Token sequences used to calibrate a ``GenerationProgram`` with GPTQ.
+        Token sequences used to calibrate a ``GenerationProgram`` or
+        ``RecurrentGenerationProgram`` with GPTQ.
     codegen:
         Expanded-JSON budget, loop-unrolling, compact-ID, and optional
         structural-compaction policy.
@@ -1860,8 +1867,9 @@ def transpile(
         ``"export"`` uses ``torch.export``; it is deprecated, supports fewer
         operations, and will be removed in 2.0. Programs require ``"fx"``.
     adapters:
-        Scoped module adapters for an ``ExportProgram`` or
-        ``GenerationProgram``. They apply to an export-owned model copy.
+        Scoped module adapters for an ``ExportProgram``,
+        ``GenerationProgram`` or ``RecurrentGenerationProgram``. They apply to
+        an export-owned model copy.
     example_kwargs:
         Keyword arguments for the traced call, like ``torch.export``'s
         ``kwargs``. Tensor values become inputs after the positional ones
@@ -2029,12 +2037,19 @@ def _transpile_any(
             "dynamic= can't be used with a GenerationProgram, whose prompts already "
             "vary up to max_context"
         )
+    if dynamic is not None and isinstance(example_inputs, RecurrentGenerationProgram):
+        raise ValueError(
+            "dynamic= can't be used with a RecurrentGenerationProgram, which takes "
+            "prompts of any length"
+        )
     if example_kwargs is not None and isinstance(
         example_inputs, (ExportProgram, GenerationProgram),
     ):
         raise ValueError(
             "example_kwargs cannot be used with an ExportProgram or GenerationProgram"
         )
+    if example_kwargs is not None and isinstance(example_inputs, RecurrentGenerationProgram):
+        raise ValueError("example_kwargs cannot be used with a RecurrentGenerationProgram")
     if isinstance(example_inputs, ExportProgram):
         if frontend != "fx":
             raise ValueError("ExportProgram is supported only by the FX frontend")
@@ -2043,7 +2058,10 @@ def _transpile_any(
                 "ExportProgram uses calibration_calls instead of calibration_inputs"
             )
         if calibration_sequences is not None:
-            raise ValueError("calibration_sequences require a GenerationProgram")
+            raise ValueError(
+                "calibration_sequences require a GenerationProgram or "
+                "RecurrentGenerationProgram"
+            )
         from cattorch.program_export import transpile_program
         return transpile_program(
             model,
@@ -2086,10 +2104,32 @@ def _transpile_any(
             calibration_sequences=calibration_sequences,
             codegen=codegen, registry=registry,
         )
+    if isinstance(example_inputs, RecurrentGenerationProgram):
+        if frontend != "fx":
+            raise ValueError("RecurrentGenerationProgram is supported only by the FX frontend")
+        if any(not isinstance(adapter, ModuleAdapter) for adapter in adapters):
+            raise TypeError("adapters must contain ModuleAdapter values")
+        if calibration_calls is not None:
+            raise ValueError("calibration_calls require an ExportProgram")
+        if calibration_inputs is not None:
+            raise ValueError(
+                "RecurrentGenerationProgram uses calibration_sequences instead of "
+                "calibration_inputs"
+            )
+        from cattorch.recurrent_generation import transpile_recurrent_generation
+        return transpile_recurrent_generation(
+            model, example_inputs, output_path, sig_figs,
+            name=name, optimization=optimization, fast_config=fast_config,
+            storage=storage, quantization=quantization,
+            calibration_sequences=calibration_sequences,
+            codegen=codegen, adapters=adapters, kernels=kernels,
+        )
     if calibration_calls is not None:
         raise ValueError("calibration_calls require an ExportProgram")
     if calibration_sequences is not None:
-        raise ValueError("calibration_sequences require a GenerationProgram")
+        raise ValueError(
+            "calibration_sequences require a GenerationProgram or RecurrentGenerationProgram"
+        )
     if dynamic is not None:
         return _transpile_dynamic(
             model, example_inputs, output_path, sig_figs, dynamic,

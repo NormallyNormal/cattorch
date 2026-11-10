@@ -18,7 +18,7 @@ STABLE = {
     "transpile", "transpile_tokenizer", "verify", "build_project",
     "CharTokenizer", "BPETokenizer", "SentencePieceBPETokenizer",
     "FastConfig", "FastLayerConfig", "StorageConfig", "QuantizationConfig", "CodegenConfig",
-    "GenerationProgram", "BoundedDimension", "rotary_embedding",
+    "GenerationProgram", "RecurrentGenerationProgram", "BoundedDimension", "rotary_embedding",
     "ExportProgram", "EntryPoint", "Input", "Output", "State", "StateInput", "StateUpdate",
     "ProgramCall", "ModuleAdapter", "AdapterContext", "CustomMoEWarning",
     "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",

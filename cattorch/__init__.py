@@ -20,8 +20,8 @@ from cattorch.markers import (
     adapter, entrypoint, example, export_forward, generate, marked_program, moe,
 )
 from cattorch.program import (
-    EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall, State,
-    StateInput, StateUpdate,
+    EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall,
+    RecurrentGenerationProgram, State, StateInput, StateUpdate,
 )
 from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
 from cattorch.results import (
@@ -51,7 +51,8 @@ def __getattr__(name):
 __all__ = [
     "transpile", "transpile_tokenizer", "CharTokenizer", "BPETokenizer",
     "SentencePieceBPETokenizer",
-    "FastConfig", "FastLayerConfig", "GenerationProgram", "BoundedDimension",
+    "FastConfig", "FastLayerConfig", "GenerationProgram", "RecurrentGenerationProgram",
+    "BoundedDimension",
     "StorageConfig", "QuantizationConfig", "QuantizationReport",
     "TensorQuantizationReport",
     "CodegenConfig", "rotary_embedding",

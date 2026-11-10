@@ -16,7 +16,8 @@ import torch
 from torch import nn
 
 from cattorch import (
-    CharTokenizer, GenerationProgram, entrypoint, interface, transpile,
+    CharTokenizer, GenerationProgram, RecurrentGenerationProgram, entrypoint, interface,
+    transpile,
 )
 
 PUBLIC = interface.PUBLIC_PREFIX
@@ -118,6 +119,16 @@ def test_a_generation_sprite(tmp_path):
 
     result = transpile(
         Language().eval(), GenerationProgram(max_context=16, top_k=3), tmp_path / "lm",
+    )
+    check(result.path, GENERATION)
+
+
+def test_a_recurrent_generation_sprite_has_the_generation_interface(tmp_path):
+    from test_recurrent_generation import GRULM
+
+    model = GRULM().eval()
+    result = transpile(
+        model, RecurrentGenerationProgram(model.states(), top_k=3), tmp_path / "rnn",
     )
     check(result.path, GENERATION)
 

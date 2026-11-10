@@ -256,6 +256,61 @@ class GenerationProgram:
 
 
 @dataclass(frozen=True)
+class RecurrentGenerationProgram:
+    """A token-by-token generator for a model whose sequence mixing is a recurrence.
+
+    ``RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 64)),))``
+    exports a model method ``step(token, *states) -> (logits, *new_states)``,
+    where ``token`` is a ``[1, 1]`` tensor of one token ID, the states come in
+    the order of ``states``, and the logits flatten to one vocabulary row.
+    It suits GRU and LSTM language models, Mamba and RWKV. The sprite has the
+    same init, reset, prefill and decode blocks as a ``GenerationProgram``;
+    reset restores each state's initial value. ``max_tokens`` limits how many
+    tokens it consumes between resets (None: no limit), and ``reference``
+    names a stateless ``method(tokens) -> logits`` the step is checked
+    against at export.
+    """
+
+    states: tuple[State, ...]
+    _: KW_ONLY
+    step: str = "step"
+    max_tokens: int | None = None
+    hidden_prefill: bool = True
+    top_k: int | None = None
+    reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.states, State) or not isinstance(self.states, (tuple, list)):
+            raise TypeError("RecurrentGenerationProgram.states must be a tuple of State values")
+        object.__setattr__(self, "states", tuple(self.states))
+        if not self.states:
+            raise ValueError("RecurrentGenerationProgram needs at least one state")
+        if any(not isinstance(value, State) for value in self.states):
+            raise TypeError("RecurrentGenerationProgram.states must contain State values")
+        names = [state.name for state in self.states]
+        if len(names) != len(set(names)):
+            raise ValueError("RecurrentGenerationProgram state names must be unique")
+        for state in self.states:
+            if state.mode != "replace":
+                raise ValueError(f"recurrent state {state.name!r} must be a replace state")
+        object.__setattr__(self, "step", _name(self.step, "recurrent step"))
+        if self.reference is not None:
+            object.__setattr__(self, "reference", _name(self.reference, "reference method"))
+        if self.max_tokens is not None:
+            if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
+                raise TypeError("RecurrentGenerationProgram.max_tokens must be an integer or None")
+            if self.max_tokens < 1:
+                raise ValueError("RecurrentGenerationProgram.max_tokens must be positive")
+        if not isinstance(self.hidden_prefill, bool):
+            raise TypeError("RecurrentGenerationProgram.hidden_prefill must be a boolean")
+        if self.top_k is not None:
+            if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
+                raise TypeError("RecurrentGenerationProgram.top_k must be an integer or None")
+            if not 1 <= self.top_k <= 64:
+                raise ValueError("RecurrentGenerationProgram.top_k must be between 1 and 64")
+
+
+@dataclass(frozen=True)
 class ProgramCall:
     """One named invocation used by calibration and stateful verification."""
 
@@ -271,5 +326,6 @@ class ProgramCall:
 
 __all__ = [
     "ArgumentBinding", "EntryPoint", "ExportProgram", "GenerationProgram", "Input", "Output",
-    "ProgramCall", "ReturnBinding", "State", "StateInput", "StateUpdate",
+    "ProgramCall", "RecurrentGenerationProgram", "ReturnBinding", "State", "StateInput",
+    "StateUpdate",
 ]
