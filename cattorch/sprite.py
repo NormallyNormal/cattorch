@@ -1715,9 +1715,19 @@ _TOP_K_VALUES = "cattorch top k values"
 _TOP_K_IDS = "cattorch top k ids"
 _TOP_K_PROCEDURE = "cattorch select top k"
 # 1 while reset, prefill or decode runs. Still 1 when one starts, the last one
-# was stopped part way and left the states in an unknown condition.
+# was stopped part way or is paused by Scratch, and the states are in an
+# unknown condition.
 _GENERATION_BUSY = "_cattorch generation busy"
-_INTERRUPTED = "an earlier reset, prefill or decode was stopped; reset or prefill first"
+# Changed by every reset, prefill and decode that starts, and by every call
+# that finds, when it ends, that it changed since that call started: another
+# call then took over the states while it was paused, and wrote to them, or
+# will write to them, when it resumes.
+_GENERATION_EPOCH = "_cattorch generation epoch"
+_INTERRUPTED = (
+    "an earlier reset, prefill or decode was stopped or is still running; "
+    "reset or prefill first"
+)
+_OVERTAKEN = "another reset, prefill or decode ran during this one; reset or prefill first"
 
 
 def _top_k_insertion(rank: int, top_k: int):
@@ -1900,13 +1910,13 @@ def _add_generation_blocks(
     ``step`` must already be a procedure whose first block is the automatic
     init check; it consumes the one token in ``tokens`` and writes ``logits``.
     A ``reset`` procedure is created that calls the ``restore`` procedure, if
-    given, and clears ``state_lists``. Without a
-    ``token_count``, ``cattorch cache length`` counts steps that finish with
-    an ok status. A ``capacity`` of None sets no token limit.
+    given, and clears ``state_lists``; the public ``cattorch reset`` runs it.
+    Without a ``token_count``, ``cattorch cache length`` counts steps that
+    finish with an ok status. A ``capacity`` of None sets no token limit.
     """
     from cattorch.util.scratch.dsl import (
-        Program, append, call, clear, eq, for_each, gt, if_, if_else, item,
-        length, lt, not_, round_, set_var, sub, var,
+        Program, append, argument, call, change_var, clear, eq, for_each, gt, if_, if_else,
+        item, length, lt, not_, round_, set_var, sub, var,
     )
 
     buffer = "cattorch prefill buffer"
@@ -1934,6 +1944,46 @@ def _add_generation_blocks(
         ),
     )
     sprite = _add_warp_procedure(sprite, reset, reset_program, x=640, y=0)
+
+    # Each public block takes the states over and runs its body with the
+    # epoch it set, so the body can tell whether another call took them over
+    # since; Scratch can pause a warp block and run other scripts meanwhile.
+    current = eq(argument("epoch"), var(_GENERATION_EPOCH))
+    overtaken = (
+        set_var(_GENERATION_BUSY, 1),
+        change_var(_GENERATION_EPOCH, 1),
+        clear(logits), *(clear(name) for name in top_k_lists),
+        set_var(STATUS_VARIABLE, _OVERTAKEN),
+    )
+    finish = if_else(current, (set_var(_GENERATION_BUSY, 0),), overtaken)
+    lifecycle_variables = (_GENERATION_BUSY, _GENERATION_EPOCH, STATUS_VARIABLE)
+    lifecycle_lists = (logits, *top_k_lists)
+
+    def add_public(name: str, body: Program, *, y: int, refusal=None) -> None:
+        """Add ``name``, which takes the states over and runs ``body`` with its epoch.
+
+        With a ``refusal``, it runs that instead while another call is busy.
+        """
+        nonlocal sprite
+        inner = f"_cattorch {name.removeprefix('cattorch ')} in epoch %s"
+        sprite = _add_warp_procedure(sprite, inner, body, x=960, y=y, arguments=("epoch",))
+        take_over = (
+            set_var(_GENERATION_BUSY, 1),
+            change_var(_GENERATION_EPOCH, 1),
+            call(inner, epoch=var(_GENERATION_EPOCH)),
+        )
+        public = Program(
+            f"{body.name}_public", variables=lifecycle_variables, lists=lifecycle_lists,
+            body=take_over if refusal is None else (
+                if_else(eq(var(_GENERATION_BUSY), 1), refusal, take_over),
+            ),
+        )
+        sprite = _add_warp_procedure(sprite, name, public, x=640, y=y)
+
+    add_public("cattorch reset", Program(
+        "generation_reset_in_epoch", variables=lifecycle_variables, lists=lifecycle_lists,
+        body=(call(reset), finish),
+    ), y=640)
 
     # A token that isn't a whole number in the vocabulary would read past the
     # embedding table and still report ok.
@@ -1963,72 +2013,73 @@ def _add_generation_blocks(
     decode = Program(
         "generation_decode",
         variables=(
-            STATUS_VARIABLE, _GENERATION_BUSY, *token_variables,
+            *lifecycle_variables, *token_variables,
             *(("cattorch project output",) if hidden_prefill else ()),
         ),
-        lists=(tokens, logits, *top_k_lists),
-        body=(if_else(
-            eq(var(_GENERATION_BUSY), 1),
-            (
-                clear(logits), *(clear(name) for name in top_k_lists),
-                set_var(STATUS_VARIABLE, _INTERRUPTED),
-            ),
-            (
-                set_var(_GENERATION_BUSY, 1),
-                # A stopped hidden prefill can leave it 0.
-                *((set_var("cattorch project output", 1),) if hidden_prefill else ()),
-                if_else(
-                    eq(length(tokens), 1),
-                    (
-                        *check_tokens(tokens),
-                        if_else(
-                            eq(var(valid_tokens), 1),
-                            (call(step),),
-                            (
-                                clear(logits), *(clear(name) for name in top_k_lists),
-                                set_var(STATUS_VARIABLE, invalid_token),
-                            ),
+        lists=(tokens, *lifecycle_lists),
+        body=(
+            # A stopped hidden prefill can leave it 0.
+            *((set_var("cattorch project output", 1),) if hidden_prefill else ()),
+            if_else(
+                eq(length(tokens), 1),
+                (
+                    *check_tokens(tokens),
+                    if_else(
+                        eq(var(valid_tokens), 1),
+                        (call(step),),
+                        (
+                            clear(logits), *(clear(name) for name in top_k_lists),
+                            set_var(STATUS_VARIABLE, invalid_token),
                         ),
                     ),
-                    invalid_decode,
                 ),
-                set_var(_GENERATION_BUSY, 0),
+                invalid_decode,
             ),
-        ),),
+            finish,
+        ),
     )
-    sprite = _add_warp_procedure(sprite, "cattorch decode", decode, x=640, y=160)
+    # A refusal sets the status, so a call still running couldn't report its
+    # own; it is stopped too.
+    add_public("cattorch decode", decode, y=160, refusal=(
+        change_var(_GENERATION_EPOCH, 1),
+        clear(logits), *(clear(name) for name in top_k_lists),
+        set_var(STATUS_VARIABLE, _INTERRUPTED),
+    ))
 
+    # A prefill that another call took over skips the rest of its work.
     copy_and_reset = (
             clear(buffer),
             for_each("prefill index", length(tokens), (
                 append(buffer, item(tokens, var("prefill index"))),
             )),
-            call(reset),
+            if_(current, (call(reset),)),
             clear(tokens),
     )
     if hidden_prefill:
         valid_prefill = (
-                set_var("cattorch project output", 0),
-                for_each("prefill index", sub(length(buffer), 1), (
+                if_(current, (set_var("cattorch project output", 0),)),
+                for_each("prefill index", sub(length(buffer), 1), (if_(current, (
                     append(tokens, item(buffer, var("prefill index"))),
                     call(step),
                     clear(tokens),
+                )),)),
+                if_(current, (
+                    set_var("cattorch project output", 1),
+                    append(tokens, item(buffer, length(buffer))),
+                    call(step),
+                    clear(tokens),
                 )),
-                set_var("cattorch project output", 1),
-                append(tokens, item(buffer, length(buffer))),
-                call(step),
-                clear(tokens),
         )
         prefill_variables = (
             "prefill index", "cattorch project output", STATUS_VARIABLE, *token_variables,
         )
     else:
         valid_prefill = (
-            for_each("prefill index", length(buffer), (
+            for_each("prefill index", length(buffer), (if_(current, (
                 append(tokens, item(buffer, var("prefill index"))),
                 call(step),
                 clear(tokens),
-            )),
+            )),)),
         )
         prefill_variables = ("prefill index", STATUS_VARIABLE, *token_variables)
     checked_prefill = if_else(
@@ -2043,7 +2094,6 @@ def _add_generation_blocks(
             (checked_prefill,),
         )
     prefill_body = (
-        set_var(_GENERATION_BUSY, 1),
         *copy_and_reset,
         *check_tokens(buffer),
         if_else(
@@ -2051,15 +2101,15 @@ def _add_generation_blocks(
             (set_var(STATUS_VARIABLE, "prefill requires at least one token"),),
             (checked_prefill,),
         ),
-        set_var(_GENERATION_BUSY, 0),
+        finish,
     )
     prefill = Program(
         "generation_prefill",
-        variables=(*prefill_variables, _GENERATION_BUSY),
-        lists=(tokens, buffer),
+        variables=(*prefill_variables, *lifecycle_variables),
+        lists=(tokens, buffer, *lifecycle_lists),
         body=prefill_body,
     )
-    sprite = _add_warp_procedure(sprite, "cattorch prefill", prefill, x=640, y=320)
+    add_public("cattorch prefill", prefill, y=320)
     if hidden_prefill:
         # Only prefill clears it, so a decode before any prefill must find 1.
         for entry in sprite["variables"].values():
@@ -2247,17 +2297,6 @@ def _add_generation_blocks(
     blocks[reset_root]["parent"] = reset_length
     _merge_variables_by_name(sprite, {STATUS_VARIABLE})
     return sprite
-
-
-def _public_generation_reset(reset: str) -> Program:
-    """The public ``cattorch reset``: the internal ``reset``, marked busy while it runs."""
-    from cattorch.util.scratch.dsl import Program, call, set_var
-
-    return Program(
-        "generation_public_reset",
-        variables=(_GENERATION_BUSY,),
-        body=(set_var(_GENERATION_BUSY, 1), call(reset), set_var(_GENERATION_BUSY, 0)),
-    )
 
 
 def _wrap_generation_lifecycle(

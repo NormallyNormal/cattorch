@@ -262,7 +262,9 @@ def stop_on_call(emulator, procedure, call):
     return lambda: emulator._chains.__setitem__(start, chain)
 
 
-INTERRUPTED = "an earlier reset, prefill or decode was stopped; reset or prefill first"
+INTERRUPTED = (
+    "an earlier reset, prefill or decode was stopped or is still running; reset or prefill first"
+)
 
 
 def stop_during(emulator, public, procedure, call, tokens=None):

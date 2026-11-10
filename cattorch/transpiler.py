@@ -52,7 +52,6 @@ from cattorch.sprite import (
     _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
-    _public_generation_reset,
     _remove_canvas_calls,
     _graph_layer,
     _merge_lists_by_name,
@@ -2483,13 +2482,6 @@ def _transpile(
             _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
             _rename_procedure(
                 sprite, "cattorch reset cache", "_cattorch reset state",
-            )
-            sprite = _add_warp_procedure(
-                sprite,
-                "cattorch reset",
-                _public_generation_reset("_cattorch reset state"),
-                x=640,
-                y=640,
             )
             _rename_list(sprite, "input", "cattorch tokens")
             _rename_list(sprite, "output", "cattorch logits")

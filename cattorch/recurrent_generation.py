@@ -39,7 +39,7 @@ from cattorch.quantization import QuantizationConfig
 from cattorch.results import TranspileResult
 from cattorch.sprite import (
     _TOP_K_IDS, _TOP_K_VALUES, _add_generation_blocks, _add_procedure_completion_broadcast,
-    _add_warp_procedure, _public_generation_reset, _remove_completion_broadcast,
+    _add_warp_procedure, _remove_completion_broadcast,
 )
 from cattorch.storage import StorageConfig
 from cattorch.util.scratch.dsl import Program, call, clear, eq, if_, not_, set_var, var
@@ -247,13 +247,6 @@ def _generation_interface(
             sprite["variables"]["cattorch_recurrent_max_context"] = [
                 "cattorch max context", "Infinity",
             ]
-        _add_warp_procedure(
-            sprite,
-            "cattorch reset",
-            _public_generation_reset(_RESET),
-            x=1600,
-            y=160,
-        )
         rename_list(sprite, "cattorch prefill buffer", "_cattorch prefill buffer")
         if program.max_tokens is not None:
             assembly.capacities["_cattorch prefill buffer"] = program.max_tokens

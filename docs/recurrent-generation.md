@@ -206,6 +206,15 @@ after that fails as in the last row below and changes nothing, until
 states. `cattorch init` doesn't clear the condition. `cattorch cache length`
 keeps whatever value the stopped block left.
 
+Calls from several scripts at once behave as for a K/V cache: see
+[overlapping calls](generation.md#overlapping-calls). A block that another
+block ran during reports the last status below, and decode then fails until
+reset or prefill, which always recover once nothing else is running. The same
+case isn't caught: a block that was
+taken over, resumed while the newer block is paused, and unfinished when it
+ends, or stopped after resuming, can leave the newer block or a later decode
+reporting `ok` with logits from states it changed.
+
 | Situation | Result | `cattorch status` |
 |---|---|---|
 | Decode with zero or several tokens | States unchanged; logits and top-k lists cleared | `decode requires exactly one token` |
@@ -213,7 +222,8 @@ keeps whatever value the stopped block left.
 | Prefill with no tokens | States restored to their initial values; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_tokens` | States restored; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: states restored, logits empty. Decode: states unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
-| Decode after a reset, prefill or decode was stopped partway | States unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped; reset or prefill first` |
+| Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | States unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
+| A reset, prefill or decode that another one ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill or decode ran during this one; reset or prefill first` |
 
 ## Hugging Face models
 

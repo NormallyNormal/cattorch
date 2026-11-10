@@ -189,7 +189,8 @@ reaches `cattorch max context`.
 | Prefill with no tokens | Cache reset; logits empty | `prefill requires at least one token` |
 | Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
-| Decode after a reset, prefill or decode was stopped partway | Cache unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped; reset or prefill first` |
+| Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | Cache unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
+| A reset, prefill or decode that another one ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill or decode ran during this one; reset or prefill first` |
 
 ## Cache behavior
 
@@ -202,6 +203,32 @@ after that fails as in the table above and changes nothing, until
 `cattorch reset` or `cattorch prefill` runs; both start from empty caches.
 `cattorch init` doesn't clear the condition. `cattorch cache length` keeps
 whatever value the stopped block left.
+
+### Overlapping calls
+
+Scratch pauses a block that has run for half a second where it calls a
+procedure or repeats a loop, and runs other scripts meanwhile, so another
+script can call `cattorch reset`, `cattorch prefill` or `cattorch decode`
+while one is still running:
+
+- `cattorch reset` and `cattorch prefill` take over and run; they can't tell
+  a paused block from a stopped one.
+- `cattorch decode` refuses, as after a stop, and the block it found running
+  then fails too.
+- A block that another one ran during reports the last status in the table
+  instead of `ok` when it ends, clears the logits, and leaves every decode
+  failing until the next reset or prefill; it still sends its completion
+  broadcast. A reset or prefill running at that moment fails the same way.
+
+`cattorch reset` or `cattorch prefill`, run once nothing else is running,
+always recovers, and apart from one case a block that reports `ok` ran alone.
+That case: if the block that was taken over resumes while the newer
+block is itself paused, and is still unfinished when the newer block ends, or
+is stopped after it resumed, the newer block or a later decode can report
+`ok` with logits from caches the old block changed. A Scratch block can't
+stop another script's paused block, and checking at every loop would slow
+every step. Call the generation blocks from one script at a time; to reset
+from another script, stop the generating script first.
 
 Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
 shrink the sprite, see layer sharing in

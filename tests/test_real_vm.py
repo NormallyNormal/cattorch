@@ -275,3 +275,64 @@ def test_a_benchmark_suite_runs(tmp_path):
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
     results = stage["cattorch benchmark results"]
     assert [entry.split(":")[0] for entry in results] == ["first exact", "first fast"]
+
+
+def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
+    # Scratch pauses the prefill once it has run for 500 ms, and runs the
+    # second script, which resets: the prefill must not then report ok, and
+    # decode must fail until the next prefill.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
+        set_var, var,
+    )
+    from test_autoregressive import NanoGPT
+    from test_generation_automatic import INTERRUPTED, logits_of
+    from test_generation_overlap import OVERTAKEN
+
+    torch.manual_seed(4)
+    model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
+    result = transpile(model, GenerationProgram(max_context=32), tmp_path / "lm")
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    first, second, logits = (
+        builder.global_list(name) for name in ("first results", "second results", "logits")
+    )
+    done = builder.global_variable("first done", 0)
+    flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    status, busy = "cattorch status", "_cattorch generation busy"
+    tokens = "cattorch tokens"
+
+    def run(procedure, values, results):
+        return (
+            clear(tokens), *(append(tokens, value) for value in values),
+            call(procedure), append(results, var(status)),
+        )
+
+    builder.script(sprite, flag, (
+        call("cattorch init"),
+        *run("cattorch prefill", list(range(1, 25)), first),
+        set_var(done, 1),
+    ), lists=(tokens, first), variables=(status, done))
+    builder.script(sprite, flag, (
+        repeat_until(gt(add(var(busy), var(done)), 0), (change_var("waits", 1),)),
+        # 0 if the prefill was still running.
+        append(second, var(done)),
+        call("cattorch reset"), append(second, var(status)),
+        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
+        *run("cattorch decode", [6], second),
+        *run("cattorch prefill", [5, 3], second),
+        *run("cattorch decode", [7], second),
+        for_each("index", length("cattorch logits"), (
+            append(logits, item("cattorch logits", var("index"))),
+        )),
+    ), lists=(tokens, second, logits, "cattorch logits"),
+        variables=(status, busy, done, "waits", "index"), y=400)
+    path = tmp_path / "overlap.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["first results"] == [OVERTAKEN]
+    assert stage["second results"] == [0, "ok", INTERRUPTED, "ok", "ok"]
+    torch.testing.assert_close(
+        values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
+    )

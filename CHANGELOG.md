@@ -261,6 +261,17 @@
 
 ## Fixes
 
+- In `GenerationProgram` and `RecurrentGenerationProgram` sprites,
+  `cattorch reset` or `cattorch prefill` run from a second script while
+  Scratch had paused a decode or prefill (it pauses a block after 500 ms)
+  let the paused block resume and write into the new caches or states, and
+  it and later decodes reported `ok` with wrong logits. Such a block now
+  reports `another reset, prefill or decode ran during this one; reset or
+  prefill first`, and decode fails until the next reset or prefill. A decode
+  refused because another block is running stops that block too; its status
+  now reads `an earlier reset, prefill or decode was stopped or is still
+  running; reset or prefill first`. One overlap is still not caught. See
+  [overlapping calls](docs/generation.md#overlapping-calls).
 - Generation, recurrent generation and `ExportProgram` sprites had loose call
   blocks on the canvas that ran private procedures directly. The one in a
   `GenerationProgram` sprite ran a step without checking its token or marking
