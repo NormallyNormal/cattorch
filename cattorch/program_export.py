@@ -51,14 +51,20 @@ from cattorch.util.scratch.sharding import shard_sprite_lists
 class _ProgramCalibrationModule(nn.Module):
     """Present a sequence of named program calls to the shared GPTQ observer."""
 
-    def __init__(self, model: nn.Module, program: ExportProgram, calls: tuple[ProgramCall, ...]):
+    def __init__(
+        self, model: nn.Module, program: ExportProgram, calls: tuple[ProgramCall, ...],
+        resets: frozenset[int] = frozenset(),
+    ):
         super().__init__()
         self.model = model
         self.calls = calls
+        self.resets = resets
         self.position = 0
         self.replay = ProgramReplay(model, program)
 
     def forward(self, _sentinel: torch.Tensor):
+        if self.position in self.resets:
+            self.replay.reset()
         invocation = self.calls[self.position]
         self.position += 1
         return self.replay.run(invocation)
@@ -284,14 +290,21 @@ def _build_entry_wrapper(
     result,
     program: ExportProgram,
     ensure_states: bool = False,
+    hidden: frozenset[int] = frozenset(),
+    gate: str = "",
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
+    """The public procedure body that checks, computes and commits one entry point.
+
+    The ``hidden`` return positions are checked and copied only while the
+    ``gate`` variable is 1.
+    """
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
     internal = f"_cattorch {entrypoint.name} compute"
     completion = f"cattorch {entrypoint.name} complete"
     public_outputs = []
     lists = set()
-    variables = {status}
+    variables = {status, gate} if hidden else {status}
     body: list[Statement] = [set_var(status, "ok")]
     if ensure_states:
         body.append(call(_ENSURE_STATES))
@@ -355,14 +368,17 @@ def _build_entry_wrapper(
                 ))
             else:
                 expected = spec.numel
-                computation.extend((
+                checks: tuple[Statement, ...] = (
                     if_(gt(length(temporary), expected), (
                         set_var(status, f"invalid return length: {binding.name}"),
                     )),
                     if_(lt(length(temporary), expected), (
                         set_var(status, f"invalid return length: {binding.name}"),
                     )),
-                ))
+                )
+                computation.extend(
+                    (if_(eq(var(gate), 1), checks),) if index in hidden else checks,
+                )
             continue
         state = states[binding.name]
         destination = _state_list(state.name)
@@ -403,9 +419,8 @@ def _build_entry_wrapper(
                 (append(destination, item(temporary, var(f"{entrypoint.name} append {index}"))),),
             ))
         else:
-            commits.extend(_copy_list(
-                temporary, destination, f"{entrypoint.name} copy {index}",
-            ))
+            copy = _copy_list(temporary, destination, f"{entrypoint.name} copy {index}")
+            commits.extend((if_(eq(var(gate), 1), copy),) if index in hidden else copy)
     commits.append(broadcast_and_wait(completion))
     computation.append(if_(eq(var(status), "ok"), tuple(commits)))
     body.append(if_(eq(var(status), "ok"), tuple(computation)))
@@ -455,6 +470,8 @@ def transpile_program(
     _edit_program: Callable[[dict, ProgramAssembly], None] | None = None,
     _public_names: Mapping[str, str] | None = None,
     _private_states: bool = False,
+    _hidden_outputs: frozenset[str] = frozenset(),
+    _calibration_resets: frozenset[int] = frozenset(),
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -478,9 +495,16 @@ def transpile_program(
       compacted, so the entry point results then name it only as built.
     - ``_private_states`` names state lists ``_cattorch state <name>`` and
       leaves them out of the public interface and of the result's states.
+    - ``_hidden_outputs`` names entry point output lists (by default name)
+      that are computed, checked and written only while the
+      ``cattorch project output`` variable is 1; the operations only they
+      need are skipped otherwise.
+    - ``_calibration_resets`` holds the positions in ``calibration_calls``
+      before which GPTQ calibration resets every state.
 
-    The renaming hooks can't be combined with variable-length inputs, whose
-    export check runs the entry points through their default names.
+    The renaming and hidden-output hooks can't be combined with
+    variable-length inputs, whose export check runs the entry points through
+    their default names.
     """
     if not isinstance(program, ExportProgram):
         raise TypeError("program must be an ExportProgram")
@@ -488,11 +512,21 @@ def transpile_program(
         program, _public_names, _private_states,
     )
     renames = {**list_renames, **procedure_renames, **broadcast_renames}
-    if renames and any(
+    output_lists = {
+        _input_list(entry.name, binding.name): (entry.name, index)
+        for entry in program.entrypoints
+        for index, binding in enumerate(entry.returns) if isinstance(binding, Output)
+    }
+    unknown = sorted(set(_hidden_outputs) - set(output_lists))
+    if unknown:
+        raise ValueError(f"_hidden_outputs has no entry point output {unknown[0]!r}")
+    if (renames or _hidden_outputs) and any(
         isinstance(binding, Input) and binding.dynamic is not None
         for entry in program.entrypoints for binding in entry.arguments
     ):
-        raise ValueError("_public_names and _private_states need fixed-length inputs")
+        raise ValueError(
+            "_public_names, _private_states and _hidden_outputs need fixed-length inputs"
+        )
 
     def name_of(default: str) -> str:
         return renames.get(default, default)
@@ -536,7 +570,7 @@ def transpile_program(
         gptq = quantization.method == "gptq"
         observed_calls = calls if gptq else default_program_calls(program)
         calibration_model = _ProgramCalibrationModule(
-            prepared_model, program, observed_calls,
+            prepared_model, program, observed_calls, _calibration_resets if gptq else frozenset(),
         )
         sentinels = [torch.zeros(1) for _ in observed_calls]
         quantization_report = quantize_model(
@@ -566,7 +600,7 @@ def transpile_program(
             warnings=(),
         )
 
-    from cattorch.transpiler import _transpile
+    from cattorch.transpiler import _PROJECT_OUTPUT, _transpile
 
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
@@ -582,6 +616,11 @@ def transpile_program(
             compact_schema=False,
             id_namespace=None,
         )
+        hidden = frozenset(
+            index for name, (entry_name, index) in output_lists.items()
+            if entry_name == entrypoint.name and name in _hidden_outputs
+        )
+
         def capture(arguments, dynamic, edit=None):
             return _transpile(
                 wrapper,
@@ -603,6 +642,7 @@ def transpile_program(
                 _defer_interface_sharding=True,
                 _edit_sprite=edit,
                 _finalize=keep_entry,
+                _hidden_outputs=hidden,
             )
 
         try:
@@ -659,6 +699,7 @@ def transpile_program(
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
             entrypoint, sub_result, program, ensure_states=any_filled,
+            hidden=hidden, gate=_PROJECT_OUTPUT,
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(
@@ -798,6 +839,11 @@ def transpile_program(
     )
     _merge_lists_by_name(combined, lifecycle_lists)
     _merge_variables_by_name(combined, lifecycle_variables | {STATUS_VARIABLE})
+    if _hidden_outputs:
+        _merge_variables_by_name(combined, {_PROJECT_OUTPUT})
+        for entry in combined["variables"].values():
+            if entry[0] == _PROJECT_OUTPUT:
+                entry[1] = 1
 
     for old, new in list_renames.items():
         _rename_list(combined, old, new)

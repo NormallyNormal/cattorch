@@ -46,6 +46,7 @@ from cattorch.sprite import (
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
+    _find_procedure_definition,
     _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
@@ -267,6 +268,58 @@ def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attentio
         position = end
 
 
+def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: frozenset[int]) -> None:
+    """Run the operations only the ``hidden`` outputs need only while projecting.
+
+    They run while ``cattorch project output`` is 1, so a hidden prefill token
+    skips them; everything another output reads still runs. If the compiled
+    chain no longer holds every node's root in order, as after layer sharing,
+    nothing is gated.
+    """
+    hidden_names = {name for index, (name, _, _) in enumerate(graph.outputs) if index in hidden}
+    kept_names = {name for index, (name, _, _) in enumerate(graph.outputs) if index not in hidden}
+    only_hidden: set[str] = set()
+    for node in reversed(graph.nodes):
+        if node.op != "call_function" or not node.users or node.name in kept_names:
+            continue
+        if all(
+            user.name in only_hidden or (user.op == "output" and node.name in hidden_names)
+            for user in node.users
+        ):
+            only_hidden.add(node.name)
+    roots = compiler.emitted_roots
+    gated = [
+        position < compiler.node_roots and name in only_hidden
+        for position, (name, _) in enumerate(roots)
+    ]
+    if not any(gated):
+        return
+    blocks = sprite["blocks"]
+    definition = _find_procedure_definition(sprite, "cattorch forward")
+    chain = []
+    current = blocks[blocks[definition]["next"]]["next"]
+    while current is not None:
+        chain.append(current)
+        current = blocks[current].get("next")
+    emitted = [block for _, block in roots]
+    if [block for block in chain if block in set(emitted)] != emitted:
+        log.info("Hidden prefill computes every output: the compiled roots were rearranged")
+        return
+    position = 0
+    while position < len(roots):
+        if not gated[position]:
+            position += 1
+            continue
+        end = position
+        while end < len(roots) and gated[end]:
+            end += 1
+        _gate_chain(
+            sprite, roots[position][1], _PROJECT_OUTPUT,
+            stop=roots[end][1] if end < len(roots) else None,
+        )
+        position = end
+
+
 def _wrap_transactional_generation_step(
     sprite: dict,
     cache_widths: dict[str, int],
@@ -359,6 +412,8 @@ class _Compiler:
         self.logical_sizes: dict[str, int] = {}
         self.active_node: str | None = None
         self.emitted_roots: list[tuple[str, str]] = []
+        # How many of ``emitted_roots`` compute graph nodes; output copies follow.
+        self.node_roots = 0
         self.static_shard_alignments: dict[str, int] = {}
         self.tied_storage_aliases: dict[str, tuple[str, ...]] = {}
         self.row_aligned_weights = row_aligned_weights
@@ -556,6 +611,7 @@ class _Compiler:
             if node.name in self.graph.fused_nodes:
                 continue
             self._compile_node(node)
+        self.node_roots = len(self.emitted_roots)
         self._materialize_output_if_needed()
         return self.sprite
 
@@ -2169,6 +2225,7 @@ def _transpile(
     _defer_interface_sharding: bool = False,
     _edit_sprite: Callable[[dict], dict] | None = None,
     _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
+    _hidden_outputs: frozenset[int] = frozenset(),
 ) -> TranspileResult:
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
@@ -2355,6 +2412,8 @@ def _transpile(
     _merge_lists_by_name(sprite, cache_names)
     _merge_duplicate_lists(sprite)
     _wrap_optimized_lifecycle(sprite)
+    if _hidden_outputs:
+        _gate_hidden_outputs(sprite, graph, compiler, _hidden_outputs)
     if generation is not None:
         if generation.hidden_prefill:
             root_entries = compiler.emitted_roots

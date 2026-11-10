@@ -1845,6 +1845,7 @@ def _add_generation_blocks(
     *,
     step: str = "cattorch forward",
     reset: str = "cattorch reset cache",
+    restore: str | None = None,
     tokens: str = "input",
     logits: str = "output",
     state_lists: Sequence[str] = (),
@@ -1859,7 +1860,8 @@ def _add_generation_blocks(
 
     ``step`` must already be a procedure whose first block is the automatic
     init check; it consumes the one token in ``tokens`` and writes ``logits``.
-    A ``reset`` procedure is created that clears ``state_lists``. Without a
+    A ``reset`` procedure is created that calls the ``restore`` procedure, if
+    given, and clears ``state_lists``. Without a
     ``token_count``, ``cattorch cache length`` counts steps that finish with
     an ok status. A ``capacity`` of None sets no token limit.
     """
@@ -1887,7 +1889,10 @@ def _add_generation_blocks(
     reset_program = Program(
         "generation_reset",
         lists=reset_lists,
-        body=tuple(clear(name) for name in reset_lists),
+        body=(
+            *((call(restore),) if restore is not None else ()),
+            *(clear(name) for name in reset_lists),
+        ),
     )
     sprite = _add_warp_procedure(sprite, reset, reset_program, x=640, y=0)
 
