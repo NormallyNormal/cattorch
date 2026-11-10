@@ -411,8 +411,10 @@
 - `build_project` gave a sprite named `cattorch` global lists that collided
   with its own, and could make two sprites named `Demo`. Such sprites are
   renamed, like duplicates.
-- Generation sprites had two `cattorch status` variables, so a failed cache
-  transaction never reported its status.
+- Generation sprites had a second `cattorch status` variable, declared by a
+  procedure meant to undo a step that failed partway. Nothing called that
+  procedure. Both are gone, which saves about 13 blocks plus 17 per cache
+  list.
 - Generation sprites accepted token IDs outside the vocabulary, fractions and
   text, and reported `ok`. They now report an error.
 - A variable-length `cattorch forward` accepted any input length and reported

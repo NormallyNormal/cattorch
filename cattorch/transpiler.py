@@ -93,8 +93,7 @@ from cattorch.util.scratch.interface import (
     rename_list as _rename_list, rename_procedure as _rename_procedure,
 )
 from cattorch.util.scratch.dsl import (
-    Program, add, call, clear, delete, div, eq, gt, if_, length, mul, not_,
-    repeat, set_var, sub, unroll_factor_limit, var,
+    Program, call, clear, eq, gt, if_, length, set_var, unroll_factor_limit, var,
 )
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
 from cattorch.util.scratch.tensor_adder import TensorAdder
@@ -321,64 +320,6 @@ def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: froz
             stop=roots[end][1] if end < len(roots) else None,
         )
         position = end
-
-
-def _wrap_transactional_generation_step(
-    sprite: dict,
-    cache_widths: dict[str, int],
-    *,
-    top_k: bool,
-) -> dict:
-    """Commit all KV rows together or restore every cache to its old length."""
-    _rename_procedure(sprite, "cattorch forward", "_cattorch token compute")
-    ordered = sorted(cache_widths.items())
-    first_cache, first_width = ordered[0]
-    old_tokens = "_cattorch old cache tokens"
-    variables = {"_cattorch transaction ok", old_tokens, STATUS_VARIABLE}
-    body = [
-        set_var("_cattorch transaction ok", 1),
-        set_var(old_tokens, div(length(first_cache), first_width)),
-    ]
-    body.append(call("_cattorch token compute"))
-    for cache_name, width in ordered:
-        body.append(if_(
-            not_(eq(length(cache_name), mul(add(var(old_tokens), 1), width))),
-            (set_var("_cattorch transaction ok", 0),),
-        ))
-    rollback = []
-    for cache_name, width in ordered:
-        old_length = mul(var(old_tokens), width)
-        rollback.append(if_(
-            gt(length(cache_name), old_length),
-            (repeat(
-                sub(length(cache_name), old_length),
-                (delete(cache_name, length(cache_name)),),
-            ),),
-        ))
-    rollback.extend((
-        clear("output"),
-        if_(
-            eq(var(STATUS_VARIABLE), "ok"),
-            (set_var(STATUS_VARIABLE, "cache transaction failed"),),
-        ),
-    ))
-    if top_k:
-        rollback.extend((clear(_TOP_K_VALUES), clear(_TOP_K_IDS)))
-    body.append(if_(eq(var("_cattorch transaction ok"), 0), tuple(rollback)))
-    return _add_warp_procedure(
-        sprite,
-        "cattorch forward",
-        Program(
-            "transactional_generation_step",
-            variables=variables,
-            lists=("output", *cache_widths, *(
-                (_TOP_K_VALUES, _TOP_K_IDS) if top_k else ()
-            )),
-            body=tuple(body),
-        ),
-        x=640,
-        y=800,
-    )
 
 
 # ── Compiler ─────────────────────────────────────────────────────────────────
@@ -2525,16 +2466,6 @@ def _transpile(
         # Kernels declare `cattorch cache length` themselves; unify them with
         # the lifecycle's variable.
         _merge_variables_by_name(sprite, {"cattorch cache length"})
-        sprite = _wrap_transactional_generation_step(
-            sprite,
-            {
-                cache_name: graph.generation.cache_widths[cache_name]
-                for cache_name in cache_names
-            },
-            top_k=generation.top_k is not None,
-        )
-        # The step wrapper declares its own copy of the status variable.
-        _merge_variables_by_name(sprite, {STATUS_VARIABLE})
         generation_lists = {
             "input", "output", "cattorch prefill buffer",
         }

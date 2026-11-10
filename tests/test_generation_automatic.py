@@ -190,6 +190,43 @@ def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
     assert_logits(emulator, model, [3])
 
 
+def procedure_callers(sprite):
+    """Map each defined procedure to the procedures whose definitions call it."""
+    blocks = {key: block for key, block in sprite["blocks"].items() if isinstance(block, dict)}
+
+    def top(key):
+        while blocks[key].get("parent"):
+            key = blocks[key]["parent"]
+        return key
+
+    def name(definition):
+        return blocks[blocks[definition]["inputs"]["custom_block"][1]]["mutation"]["proccode"]
+
+    callers = {
+        name(key): set() for key, block in blocks.items()
+        if block["opcode"] == "procedures_definition"
+    }
+    for key, block in blocks.items():
+        if block["opcode"] == "procedures_call":
+            root = top(key)
+            if blocks[root]["opcode"] == "procedures_definition":
+                callers[block["mutation"]["proccode"]].add(name(root))
+    return callers
+
+
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_every_private_procedure_is_called(tmp_path, sharing):
+    torch.manual_seed(13)
+    model = CachedLM(context=8, layers=2).eval()
+    result = transpile(
+        model, GenerationProgram(max_context=8, top_k=2), tmp_path / "gen",
+        codegen=CodegenConfig(layer_sharing=sharing),
+    )
+    callers = procedure_callers(load_sprite(result.path))
+    assert set(result.procedures) <= set(callers)
+    assert not [name for name, by in callers.items() if not by and name not in result.procedures]
+
+
 class Stopped(Exception):
     """Scratch's stop button, pressed while a block runs."""
 
@@ -227,8 +264,8 @@ def stop_during(emulator, public, procedure, call, tokens=None):
 
 
 @pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
-    ("cattorch prefill", "_cattorch token compute", 4, [1, 2, 3, 4, 5, 6]),
-    ("cattorch decode", "_cattorch token compute", 1, [5]),
+    ("cattorch prefill", "_cattorch token step", 4, [1, 2, 3, 4, 5, 6]),
+    ("cattorch decode", "_cattorch token step", 1, [5]),
     ("cattorch reset", "_cattorch reset state", 1, None),
 ])
 def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(

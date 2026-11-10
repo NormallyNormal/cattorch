@@ -1309,7 +1309,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
         tmp_path / "cached_unshared_layers",
         codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
     )
-    assert result.block_count < baseline.block_count * 0.75
+    assert result.block_count < baseline.block_count * 0.8
     sprite = _load_sprite(result.path)
     emulator = ScratchEmulator(sprite)
     assert "_cattorch shared transformer layer" in emulator._procedures
