@@ -88,7 +88,8 @@
   same init, reset, prefill and decode blocks, lists, statuses and
   notifications as a `GenerationProgram`, so `build_project` and Scratch
   projects written for one drive the other. Reset restores each initial
-  state, invalid tokens and failed steps leave the states unchanged,
+  state, a failed decode leaves the states unchanged and a failed prefill
+  restores the initial ones,
   `max_tokens` optionally limits the tokens (by default `cattorch max context`
   is `Infinity`), hidden prefill skips what only the logits need for prompt
   tokens, and `reference=` checks the step against a stateless method at

@@ -304,8 +304,10 @@ For models whose tokens mix through a recurrence rather than attention: GRU
 and LSTM language models, Mamba, RWKV. The sprite has the same blocks, lists,
 statuses and notifications as a `GenerationProgram`'s, with
 `cattorch cache length` counting the tokens consumed; `cattorch reset` and
-prefill restore every state's initial value. A token that isn't valid, or a
-step that fails, leaves the states unchanged. `quantization`,
+prefill restore every state's initial value. A decode with a token that
+isn't valid, or whose step fails, leaves the states unchanged; a prefill that
+fails restores the initial states, as a `GenerationProgram`'s empties its
+cache. `quantization`,
 `calibration_sequences`, `optimization="fast"`, `adapters` and the storage
 options work as for a `GenerationProgram`. See
 [recurrent generation](recurrent-generation.md) for the step contract, the
