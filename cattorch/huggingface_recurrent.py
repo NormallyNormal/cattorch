@@ -129,7 +129,7 @@ class _HuggingFaceStep(nn.Module):
         self.training = model.training
 
     def reference(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.model(tokens, use_cache=False).logits
+        return self.model(tokens, use_cache=False, return_dict=True).logits
 
 
 class _Mamba2Step(_HuggingFaceStep):

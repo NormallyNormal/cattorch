@@ -227,6 +227,9 @@ def checks_only(monkeypatch):
     ("rwkv", {"intermediate_size": 20}),
     ("rwkv", {"num_hidden_layers": 3, "rescale_every": 1}),
     ("rwkv", {"tie_word_embeddings": True}),
+    ("mamba2", {"return_dict": False}),
+    ("mamba", {"return_dict": False}),
+    ("rwkv", {"return_dict": False}),
 ])
 def test_config_variants_pass_the_reference_check(tmp_path, checks_only, name, overrides):
     with pytest.raises(Checked):
