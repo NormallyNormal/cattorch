@@ -510,6 +510,56 @@ def test_program_validation():
             RecurrentGenerationProgram(**options)
 
 
+TOKEN_FORMS = {
+    "token[:, 0]": lambda token: token[:, 0],
+    "token[0]": lambda token: token[0],
+    "token[..., -1]": lambda token: token[..., -1],
+    "token.T": lambda token: token.T,
+    "token.permute(1, 0)": lambda token: token.permute(1, 0),
+    "token.transpose(0, 1)": lambda token: token.transpose(0, 1),
+    "token.expand(1, 1)": lambda token: token.expand(1, 1),
+    "token.squeeze(0)": lambda token: token.squeeze(0),
+    "token.float().long()": lambda token: token.float().long(),
+    "token.flatten()[-1:]": lambda token: token.flatten()[-1:],
+}
+
+
+class TokenForm(nn.Module):
+    """Looks up a rearranged token, after a larger table indexed by a constant 0."""
+
+    def __init__(self, form, vocab=9, width=4):
+        super().__init__()
+        self.form = form
+        self.start = nn.Embedding(20, width)
+        self.embed = nn.Embedding(vocab, width)
+        self.head = nn.Linear(width, vocab)
+
+    def step(self, token, hidden):
+        start = self.start(torch.zeros_like(token)).reshape(1, -1)
+        embedded = self.embed(TOKEN_FORMS[self.form](token)).reshape(1, -1)
+        hidden = torch.tanh(embedded + hidden + start)
+        return self.head(hidden), hidden
+
+
+@pytest.mark.parametrize("form", sorted(TOKEN_FORMS))
+def test_the_token_may_be_rearranged_before_its_lookup(tmp_path, form):
+    torch.manual_seed(0)
+    model = TokenForm(form).eval()
+    states = (State("hidden", torch.zeros(1, 4)),)
+    result = transpile(model, RecurrentGenerationProgram(states), tmp_path / "form")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    hidden, rows = torch.zeros(1, 4), []
+    with torch.no_grad():
+        for token in (8, 3):
+            row, hidden = model.step(torch.tensor([[token]]), hidden)
+            rows.append(row.reshape(-1).double())
+    assert run(emulator, "cattorch prefill", [8]) == "ok"
+    torch.testing.assert_close(logits(emulator), rows[0], atol=TOLERANCE, rtol=0)
+    assert run(emulator, "cattorch decode", [9]).startswith("token ids must be whole numbers from 0 to 8")
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(logits(emulator), rows[1], atol=TOLERANCE, rtol=0)
+
+
 class Broken(GRULM):
     def only_logits(self, token, hidden):
         return self.step(token, hidden)[0]

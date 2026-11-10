@@ -75,7 +75,9 @@ From the terminal, `cattorch generate --hf REPO` does the same; see
 
 - `token` is a `[1, 1]` tensor holding one token ID. The step must look it up
   in an embedding table; cattorch uses the table's size as the vocabulary when
-  it checks token IDs in Scratch.
+  it checks token IDs in Scratch. The token may be reshaped, indexed,
+  transposed, expanded or cast first, as in `self.embed(token[:, 0])`, but not
+  computed with, as in `self.embed(token + 1)`.
 - The states come in the order of `RecurrentGenerationProgram.states`, and the
   step returns the new values in the same order, each with its state's shape.
 - The logits flatten to one row of vocabulary scores: `[V]`, `[1, V]` and
