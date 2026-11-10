@@ -581,11 +581,45 @@ def test_gptq_resets_the_states_between_sequences(monkeypatch, tmp_path):
     assert len(resets) == 1 + len(sequences)
 
 
-def test_fast_mode(tmp_path):
-    model = make("lstm")
-    emulator, _ = export(model, tmp_path / "fast", optimization="fast")
-    error, scale = max_error(emulator, model, [1, 2, 3, 4, 5])
-    assert error < 0.01 * scale
+class NormedGRULM(GRULM):
+    """A GRU language model with a LayerNorm and GELU feed-forward before its head,
+    operations fast mode approximates, and mish, which runs as a decomposition."""
+
+    def __init__(self, vocab=16, width=8):
+        super().__init__(vocab, width)
+        self.norm = nn.LayerNorm(width)
+        self.up = nn.Linear(width, 2 * width)
+        self.down = nn.Linear(2 * width, width)
+
+    def project(self, output):
+        output = self.norm(output)
+        return self.head(output + self.down(F.mish(F.gelu(self.up(output)))))
+
+    def forward(self, tokens):
+        output, _ = self.gru(self.embed(tokens), self.h0)
+        return self.project(output)
+
+    def step(self, token, hidden):
+        output, hidden = self.gru(self.embed(token), hidden)
+        return self.project(output), hidden
+
+
+def test_fast_mode_reports_its_approximations(tmp_path):
+    torch.manual_seed(6)
+    model = NormedGRULM().eval()
+    tokens = [1, 2, 3, 4, 5, 6]
+    errors = {}
+    approximated = {
+        "exact": (), "fast": (("aten.gelu.default", 1), ("aten.layer_norm.default", 1)),
+    }
+    for optimization in ("exact", "fast"):
+        emulator, result = export(model, tmp_path / optimization, optimization=optimization)
+        errors[optimization], scale = max_error(emulator, model, tokens)
+        assert result.approximate_operations == approximated[optimization]
+        assert result.fallback_operations == (("aten.mish.default", 1),)
+        assert any("aten.mish.default (1 call)" in warning for warning in result.warnings)
+    # QuickGELU moves the logits measurably, but stays close.
+    assert errors["exact"] < TOLERANCE < errors["fast"] < 0.02 * scale
 
 
 class Memory(nn.Module):
@@ -626,6 +660,16 @@ def test_a_state_longer_than_a_list_is_sharded(tmp_path, small_list_limit):
     run(emulator, "cattorch reset")
     restored = read_logical_list(emulator.lists, "_cattorch state memory")
     assert restored == pytest.approx(model.start.flatten().tolist())
+
+
+def test_a_fixed_table_longer_than_a_list_is_rejected_as_for_plain_exports(
+    tmp_path, small_list_limit,
+):
+    # The storage decoder's table of powers of two can't be sharded.
+    small_list_limit(200)
+    model = make("gru")
+    with pytest.raises(ValueError, match="_cattorch f32 powers.* exceeds Scratch's limit of 200"):
+        export(model, tmp_path / "tiny")
 
 
 def test_build_project_runs_the_generation_demo(tmp_path):

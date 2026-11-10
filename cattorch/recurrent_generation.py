@@ -382,6 +382,8 @@ def transpile_recurrent_generation(
         output=entry.outputs[0],
         procedures=("cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode"),
         quantization=result.quantization,
+        fallback_operations=result.fallback_operations,
+        approximate_operations=result.approximate_operations,
     )
 
 

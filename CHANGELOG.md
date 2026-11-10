@@ -93,6 +93,9 @@
   is `Infinity`), hidden prefill skips what only the logits need for prompt
   tokens, and `reference=` checks the step against a stateless method at
   export. See [`RecurrentGenerationProgram`](docs/api-reference.md#recurrentgenerationprogram).
+- `ProgramResult` has `fallback_operations` and `approximate_operations`, and
+  warns about decomposed operations, as `TranspileResult` does. A
+  `RecurrentGenerationProgram` export reports both.
 - `GenerationProgram` accepts sliding-window masks (Mistral, GPT-OSS), ALiBi
   biases, and GPT-OSS attention sinks. A windowed decode step reads only the
   window's cache rows.

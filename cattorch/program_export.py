@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -26,7 +27,7 @@ from cattorch.program_runtime import (
     validate_entry_outputs,
 )
 from cattorch.results import (
-    EntryPointResult, ProgramResult, StateResult, TensorSpec,
+    EntryPointResult, ProgramResult, StateResult, TensorSpec, fallback_warning,
 )
 from cattorch.quantization import quantize_model
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
@@ -45,7 +46,7 @@ from cattorch.util.scratch.interface import (
     rename_procedure as _rename_procedure, refresh_data_display_name,
 )
 from cattorch.util.scratch.remap import remap_ids
-from cattorch.util.scratch.sharding import shard_sprite_lists
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
 
 
 class _ProgramCalibrationModule(nn.Module):
@@ -586,6 +587,8 @@ def transpile_program(
     combined = None
     entry_results = []
     sub_warnings: list[str] = []
+    fallbacks: Counter[str] = Counter()
+    approximations: Counter[str] = Counter()
     sharded_names: set[str] = set()
     interface_capacities: dict[str, int] = {}
     payload_names: set[str] = set()
@@ -746,6 +749,8 @@ def transpile_program(
             warning for warning in sub_result.warnings
             if warning.startswith("GPTQ fallback")
         )
+        fallbacks.update(dict(sub_result.fallback_operations))
+        approximations.update(dict(sub_result.approximate_operations))
         sharded_names.update(storage_names.get(name, name) for name in sub_result.sharded_lists)
         quantization_report = sub_result.quantization
 
@@ -913,7 +918,16 @@ def transpile_program(
     public_data_names = {name for name in public_data_names if not name.startswith("_")}
     public_procedures = {name for name in public_procedures if not name.startswith("_")}
 
-    program_layouts = shard_sprite_lists(combined, program_capacities)
+    # Entry points have sharded their own lists already. A list still too
+    # long, such as the storage decoder's powers table at a tiny limit, is a
+    # fixed table: left whole, finalization rejects it as for a plain export.
+    fixed_tables = frozenset(
+        entry[0] for entry in combined.get("lists", {}).values()
+        if entry[0] not in program_capacities and len(entry[1]) > SCRATCH_LIST_LIMIT
+    )
+    program_layouts = shard_sprite_lists(
+        combined, program_capacities, deferred_names=fixed_tables,
+    )
     sharded_names = {name_of(name) for name in sharded_names}
     sharded_names.update(
         layout.name for layout in program_layouts.values()
@@ -979,11 +993,16 @@ def transpile_program(
         sharded_lists=tuple(sorted(
             final_data_name(name, frozenset(public_data_names)) for name in sharded_names
         )),
-        warnings=tuple(dict.fromkeys((*sub_warnings, *finalized.warnings))),
+        warnings=tuple(dict.fromkeys((
+            *sub_warnings, *finalized.warnings,
+            *filter(None, (fallback_warning(tuple(sorted(fallbacks.items()))),)),
+        ))),
         entrypoints=tuple(entry_results),
         states=state_results,
         procedures=procedures,
         quantization=quantization_report,
+        fallback_operations=tuple(sorted(fallbacks.items())),
+        approximate_operations=tuple(sorted(approximations.items())),
     )
     if any(
         isinstance(binding, Input) and binding.dynamic is not None

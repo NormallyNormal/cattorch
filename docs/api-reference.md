@@ -354,7 +354,9 @@ See [code generation](code-generation.md) before turning on `compact_schema` or
 ## Result types
 
 An `ExportProgram` export returns a `ProgramResult`: the `ArtifactResult`
-fields plus `EntryPointResult` and `StateResult` records. Verifying a program
+fields plus `EntryPointResult` and `StateResult` records, and
+`fallback_operations` and `approximate_operations` as for a `TranspileResult`,
+summed over the entry points. Verifying a program
 returns a `ProgramVerifyResult`, with one `ProgramCallVerifyResult` per call.
 These result types, and the classes that define programs and calls, are
 imported from `cattorch`.

@@ -156,12 +156,18 @@ class StateResult:
 
 @dataclass(frozen=True)
 class ProgramResult(ArtifactResult):
-    """Artifact metadata for an experimental multi-entrypoint program."""
+    """Artifact metadata for an experimental multi-entrypoint program.
+
+    ``fallback_operations`` and ``approximate_operations`` are as for
+    ``TranspileResult``, summed over the entry points.
+    """
 
     entrypoints: tuple[EntryPointResult, ...]
     states: tuple[StateResult, ...]
     procedures: tuple[str, ...]
     quantization: QuantizationReport | None = None
+    fallback_operations: tuple[tuple[str, int], ...] = ()
+    approximate_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
