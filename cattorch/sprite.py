@@ -1981,11 +1981,14 @@ def _add_generation_blocks(
     overtaken = (
         set_var(_BUSY, 1),
         change_var(_EPOCH, 1),
+        # Another call may have finished decoding the weights while this one
+        # was, and this one then left them half overwritten.
+        set_var("cattorch initialized", 0),
         clear(logits), *(clear(name) for name in top_k_lists),
         set_var(STATUS_VARIABLE, _OVERTAKEN),
     )
     finish = if_else(current, (set_var(_BUSY, 0),), overtaken)
-    lifecycle_variables = (_BUSY, _EPOCH, STATUS_VARIABLE)
+    lifecycle_variables = (_BUSY, _EPOCH, "cattorch initialized", STATUS_VARIABLE)
     lifecycle_lists = (logits, *top_k_lists)
 
     def add_public(name: str, body: Program, *, y: int, refusal=None) -> None:

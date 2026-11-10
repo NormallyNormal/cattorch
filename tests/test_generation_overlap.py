@@ -181,22 +181,20 @@ class Generator:
         assert top_k == expected.topk(2).indices.tolist()
         assert length == len(prefix)
 
-    def interleave(self, first, second, schedule):
+    def interleave(self, first, second, schedule, fresh=False):
         """Run two scripts after a prefill of ``SETUP``, as ``schedule`` says.
 
         ``schedule`` is a list of ``(script index, pauses)``; None pauses runs
         the script to its end, and "stop" stops it where it is paused.
-        Returns the emulator and the calls that finished, in order.
+        Returns the emulator and the calls that finished, in order. A
+        ``fresh`` sprite, as in a freshly loaded project, has no setup and
+        its weights aren't decoded.
 
         Calls that report ok never overlap, so each one's logits follow the
         tokens of the ok calls that finished before it. Any other status
         leaves the generator stopped until a reset or prefill.
         """
-        emulator = ScratchEmulator(self.sprite)
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = list(SETUP)
-        emulator.run_procedure("cattorch prefill")
-        assert emulator.variables["cattorch status"] == "ok"
+        emulator = self.start(fresh)
         finished: list[tuple] = []
         scripts = Scripts(emulator, finished)
         pair = (Script("first", first), Script("second", second))
@@ -207,7 +205,7 @@ class Generator:
                 scripts.run(pair[index], pauses)
         for script in pair:
             scripts.run(script)
-        self.prefix: list | None = list(SETUP)
+        self.prefix: list | None = [] if fresh else list(SETUP)
         for result in finished:
             procedure, tokens, status = result[1:4]
             if status == "ok":
@@ -247,10 +245,20 @@ class Generator:
             emulator.variables["cattorch cache length"],
         )
 
-    def pauses(self, calls):
+    def start(self, fresh=False):
+        """A new emulator, after a prefill of ``SETUP`` unless ``fresh``."""
+        emulator = ScratchEmulator(self.sprite)
+        if not fresh:
+            emulator.run_procedure("cattorch init")
+            emulator.lists["cattorch tokens"] = list(SETUP)
+            emulator.run_procedure("cattorch prefill")
+            assert emulator.variables["cattorch status"] == "ok"
+        return emulator
+
+    def pauses(self, calls, fresh=False):
         """How many procedure calls ``calls`` make, run on their own after the setup."""
         counter = {"calls": 0}
-        emulator = ScratchEmulator(self.sprite)
+        emulator = self.start(fresh)
         for start in paused_procedures(emulator):
             chain = emulator._chain_runner(start)
 
@@ -258,10 +266,6 @@ class Generator:
                 counter["calls"] += 1
                 chain()
             emulator._chains[start] = counted
-        emulator.run_procedure("cattorch init")
-        emulator.lists["cattorch tokens"] = list(SETUP)
-        emulator.run_procedure("cattorch prefill")
-        counter["calls"] = 0
         for procedure, tokens in calls:
             if tokens is not None:
                 emulator.lists["cattorch tokens"] = list(tokens)
@@ -321,6 +325,21 @@ def test_a_call_paused_while_another_runs_never_reports_wrong_logits(generator, 
         # the first resumes; or the first is stopped where it was paused.
         for resume in (None, "stop"):
             state = generator.interleave(first, second, [(0, pause), (1, None), (0, resume)])
+            generator.check_afterwards(*state)
+
+
+@pytest.mark.parametrize("overlap", ["decode, then prefill", "prefill, then prefill"])
+def test_a_call_taken_over_while_it_decodes_the_weights_leaves_them_to_decode_again(
+    generator, overlap,
+):
+    # In a freshly loaded project the first call decodes the weights; one that
+    # resumes doing so after another call decoded them leaves them wrong.
+    first, second = OVERLAPS[overlap]
+    for pause in range(generator.pauses(first, fresh=True)):
+        for resume in (None, "stop"):
+            state = generator.interleave(
+                first, second, [(0, pause), (1, None), (0, resume)], fresh=True,
+            )
             generator.check_afterwards(*state)
 
 

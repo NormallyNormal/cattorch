@@ -286,7 +286,10 @@
   prefill first`, and decode fails until the next reset or prefill. A decode
   refused because another block is running stops that block too; its status
   now reads `an earlier reset, prefill or decode was stopped or is still
-  running; reset or prefill first`. One overlap is still not caught. See
+  running; reset or prefill first`. A block taken over while it decoded the
+  weights, in a freshly loaded project, could leave them wrong for every
+  later block, reset and prefill included; it now leaves them for the next
+  block to decode again. One overlap is still not caught. See
   [overlapping calls](docs/generation.md#overlapping-calls).
 - Generation, recurrent generation and `ExportProgram` sprites had loose call
   blocks on the canvas that ran private procedures directly. The one in a

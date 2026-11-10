@@ -219,6 +219,8 @@ while one is still running:
   instead of `ok` when it ends, clears the logits, and leaves every decode
   failing until the next reset or prefill; it still sends its completion
   broadcast. A reset or prefill running at that moment fails the same way.
+  If it was decoding the weights, in a freshly loaded project, it leaves
+  them for the next block to decode again.
 
 `cattorch reset` or `cattorch prefill`, run once nothing else is running,
 always recovers, and apart from one case a block that reports `ok` ran alone.
