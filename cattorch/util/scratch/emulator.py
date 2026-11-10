@@ -20,6 +20,7 @@ Usage
 """
 
 import math
+import re
 import time
 from collections import Counter
 
@@ -35,6 +36,8 @@ _SIMPLE_ARITHMETIC = {
     "operator_add": "+", "operator_subtract": "-", "operator_multiply": "*",
 }
 _ARITHMETIC_FACTORIES: dict = {}
+_JS_RADIX_NUMBER = re.compile(r"0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+")
+_JS_DECIMAL_NUMBER = re.compile(r"[+-]?(?:Infinity|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
 
 
 def _arithmetic_factory(symbol: str, left_kind: str, right_kind: str):
@@ -276,9 +279,11 @@ class ScratchEmulator:
             var_id = fields["VARIABLE"][1]
             value = value_of(inputs["VALUE"])
 
+            numeric = self._scratch_numeric
+
             def run():
                 counts[opcode] += 1
-                variables[var_id] = float(variables[var_id]) + float(value())
+                variables[var_id] = numeric(variables[var_id]) + numeric(value())
 
         elif opcode == "data_deletealloflist":
             list_id = fields["LIST"][1]
@@ -598,8 +603,9 @@ class ScratchEmulator:
 
             def round_half_up():
                 # Scratch uses JavaScript Math.round, including its handling
-                # of negative half values.
-                return math.floor(value() + 0.5)
+                # of negative half values and of infinities.
+                number = value()
+                return math.floor(number + 0.5) if math.isfinite(number) else number
             round_half_up.numeric = True
             return round_half_up
 
@@ -816,35 +822,36 @@ class ScratchEmulator:
         except (ValueError, TypeError):
             return 0
 
-    @staticmethod
-    def _to_number(value):
+    @classmethod
+    def _to_number(cls, value):
         """Convert a value to a number if possible, like Scratch does."""
         if isinstance(value, (int, float)):
             return value
-        try:
-            f = float(value)
-            if not math.isfinite(f):
-                return f
-            return int(f) if f == int(f) else f
-        except (ValueError, TypeError):
+        f = cls._scratch_number(value) if isinstance(value, str) and value.strip() else None
+        if f is None:
             return value
+        if not math.isfinite(f):
+            return f
+        return int(f) if f == int(f) else f
 
     @staticmethod
     def _scratch_number(value):
-        """Convert to a number using Scratch's casting rules.
+        """Convert to a number as JavaScript's ``Number`` does.
 
-        Returns None if the value cannot be cast.  Scratch treats empty
-        strings and whitespace-only strings as 0.
+        Returns None if the value cannot be cast. Empty and whitespace-only
+        strings are 0, and ``0x``, ``0o`` and ``0b`` prefixes and ``Infinity``
+        are read; Python's ``inf``, ``nan`` and digit underscores are not.
         """
         if isinstance(value, (int, float)):
             return value
         s = str(value).strip()
         if s == "":
             return 0
-        try:
+        if _JS_RADIX_NUMBER.fullmatch(s):
+            return float(int(s, 0))
+        if _JS_DECIMAL_NUMBER.fullmatch(s):
             return float(s)
-        except ValueError:
-            return None
+        return None
 
     @classmethod
     def _scratch_round(cls, value) -> int:

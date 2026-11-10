@@ -84,6 +84,37 @@ def test_comparisons_fall_back_to_case_insensitive_strings():
     assert _reporter("operator_gt", {"OPERAND1": 10, "OPERAND2": 9}) is True
 
 
+@pytest.mark.parametrize(("text", "expected"), [
+    ("0x1F", 32), ("0o7", 8), ("0b11", 4), (" 2 ", 3), (".5e1", 6), ("+1", 2),
+    ("Infinity", math.inf), ("-Infinity", -math.inf),
+    # Not numbers to JavaScript's Number, so 0.
+    ("inf", 1), ("1_0", 1), ("-0x1", 1), ("nan", 1),
+])
+def test_text_is_read_as_javascript_numbers(text, expected):
+    assert _reporter("operator_add", {"NUM1": text, "NUM2": 1}) == expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("Infinity", math.inf), ("-Infinity", -math.inf), (-2.5, -2), ("0x10", 16),
+])
+def test_round_matches_javascript(value, expected):
+    assert _reporter("operator_round", {"NUM": value}) == expected
+
+
+def test_change_by_reads_an_empty_variable_as_zero():
+    emulator = ScratchEmulator({
+        "variables": {"counter": ["counter", ""]},
+        "blocks": {"change": {
+            "opcode": "data_changevariableby", "next": None, "parent": None,
+            "inputs": {"VALUE": _literal("0x2")},
+            "fields": {"VARIABLE": ["counter", "counter"]},
+            "shadow": False, "topLevel": True,
+        }},
+    })
+    emulator.run()
+    assert emulator.variables["counter"] == 2
+
+
 @pytest.mark.parametrize(("times", "expected"), [(2.5, 3), (2.4, 2), ("", 0)])
 def test_repeat_rounds_its_count(times, expected):
     emulator = ScratchEmulator({

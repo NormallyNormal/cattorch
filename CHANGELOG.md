@@ -261,6 +261,10 @@
 
 ## Fixes
 
+- The emulator behind `verify` read text as Scratch does: `0x`, `0o` and `0b`
+  numbers and `Infinity` are numbers, while Python-only forms such as `inf`
+  and `1_0` aren't. Rounding an infinity no longer crashes, and changing an
+  empty variable starts from 0.
 - GPTQ errors name the argument to fix: a `GenerationProgram` without
   calibration sequences asked for `calibration_inputs`, which it then
   rejected, and an `ExportProgram` without calls did the same; non-GPTQ
