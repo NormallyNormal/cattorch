@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import re
@@ -746,17 +747,24 @@ def _remove_unused(sprite):
             del slots[sid]
 
 
-def _procedure_mutation(name: str, *, warp: bool = False) -> dict:
+def _procedure_mutation(
+    name: str, *, warp: bool = False, arguments: Sequence[str] = (),
+) -> dict:
+    from cattorch.util.scratch.dsl import argument_id
+
+    def encode(values) -> str:
+        return json.dumps(list(values), separators=(",", ":"))
+
     mutation = {
         "tagName": "mutation",
         "children": [],
         "proccode": name,
-        "argumentids": "[]",
+        "argumentids": encode(argument_id(argument) for argument in arguments),
     }
     if warp:
         mutation.update({
-            "argumentnames": "[]",
-            "argumentdefaults": "[]",
+            "argumentnames": encode(arguments),
+            "argumentdefaults": encode("" for _ in arguments),
             "warp": "true",
         })
     return mutation
@@ -864,8 +872,15 @@ def _wrap_optimized_lifecycle(sprite: dict) -> None:
     blocks[old_root]["parent"] = init_check
 
 
-def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> dict:
-    """Combine a DSL command stack and expose it as a no-argument warp block."""
+def _add_warp_procedure(
+    sprite: dict, name: str, program, *, x: int, y: int, arguments: Sequence[str] = (),
+) -> dict:
+    """Combine a DSL command stack and expose it as a warp block.
+
+    ``name`` is the proccode, with a ``%s`` for each of ``arguments``.
+    """
+    from cattorch.util.scratch.dsl import argument_id
+
     data = program.compile()
     roots = [
         bid for bid, block in data["blocks"].items()
@@ -889,8 +904,16 @@ def _add_warp_procedure(sprite: dict, name: str, program, *, x: int, y: int) -> 
     data["blocks"][prototype] = {
         "opcode": "procedures_prototype", "next": None, "parent": definition,
         "inputs": {}, "fields": {}, "shadow": True, "topLevel": False,
-        "mutation": _procedure_mutation(name, warp=True),
+        "mutation": _procedure_mutation(name, warp=True, arguments=arguments),
     }
+    for argument in arguments:
+        reporter = f"{prototype}_{argument_id(argument)}"
+        data["blocks"][prototype]["inputs"][argument_id(argument)] = [1, reporter]
+        data["blocks"][reporter] = {
+            "opcode": "argument_reporter_string_number", "next": None,
+            "parent": prototype, "inputs": {}, "fields": {"VALUE": [argument, None]},
+            "shadow": True, "topLevel": False,
+        }
     # Lifecycle wrapping gives the sprite several legitimate top-level roots,
     # whereas the ordinary block combiner expects one computation chain.  A
     # procedure is independent, so merge it directly after uniquifying every

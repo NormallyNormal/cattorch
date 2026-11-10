@@ -19,6 +19,7 @@ Usage
     result = emu.lists["output"]
 """
 
+import json
 import math
 import re
 import time
@@ -128,6 +129,8 @@ class ScratchEmulator:
     def __init__(self, sprite: dict, *, stage: "ScratchEmulator | None" = None):
         self.blocks = sprite["blocks"]
         self._procedures = self._find_procedures()
+        # The argument values of the procedure calls running, innermost last.
+        self._arguments: list[dict] = []
         self.opcode_counts = Counter()
         self._costume_names = [
             costume.get("name", "") for costume in sprite.get("costumes", [])
@@ -197,6 +200,17 @@ class ScratchEmulator:
         if not roots:
             raise ValueError("no topLevel roots found")
         return roots
+
+    def _argument_names(self, proccode: str) -> dict[str, str]:
+        """Map the argument IDs of ``proccode``'s prototype to the argument names."""
+        for block in self.blocks.values():
+            mutation = block.get("mutation", {})
+            if block.get("opcode") == "procedures_prototype" and mutation.get("proccode") == proccode:
+                return dict(zip(
+                    json.loads(mutation.get("argumentids") or "[]"),
+                    json.loads(mutation.get("argumentnames") or "[]"),
+                ))
+        return {}
 
     def _find_procedures(self) -> dict[str, str | None]:
         procedures = {}
@@ -381,15 +395,34 @@ class ScratchEmulator:
                     other()
 
         elif opcode == "procedures_call":
-            proccode = block.get("mutation", {}).get("proccode")
+            mutation = block.get("mutation", {})
+            proccode = mutation.get("proccode")
             procedures = self._procedures
             exec_chain = self._exec_chain
+            argument_ids = json.loads(mutation.get("argumentids") or "[]")
+            if not argument_ids:
+                def run():
+                    counts[opcode] += 1
+                    if proccode not in procedures:
+                        raise ValueError(f"procedure not found: {proccode}")
+                    exec_chain(procedures[proccode])
+            else:
+                names = self._argument_names(proccode)
+                arguments = [
+                    (names.get(identifier), value_of(inputs[identifier]))
+                    for identifier in argument_ids if identifier in inputs
+                ]
+                frames = self._arguments
 
-            def run():
-                counts[opcode] += 1
-                if proccode not in procedures:
-                    raise ValueError(f"procedure not found: {proccode}")
-                exec_chain(procedures[proccode])
+                def run():
+                    counts[opcode] += 1
+                    if proccode not in procedures:
+                        raise ValueError(f"procedure not found: {proccode}")
+                    frames.append({name: value() for name, value in arguments})
+                    try:
+                        exec_chain(procedures[proccode])
+                    finally:
+                        frames.pop()
 
         elif opcode == "looks_switchcostumeto":
             requested_of = value_of(inputs["COSTUME"])
@@ -633,6 +666,15 @@ class ScratchEmulator:
                     return random.randint(int(low), int(high))
                 return random.uniform(low, high)
             return random_value
+
+        if opcode == "argument_reporter_string_number":
+            name = fields["VALUE"][0]
+            frames = self._arguments
+
+            def argument():
+                # Scratch reports 0 for an argument outside its procedure.
+                return frames[-1].get(name, 0) if frames else 0
+            return argument
 
         if opcode == "data_itemoflist":
             list_id = fields["LIST"][1]

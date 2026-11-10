@@ -152,3 +152,31 @@ def test_item_number_of_uses_scratch_comparison():
     assert emulator._eval_reporter("reporter") == 2
     emulator.blocks["reporter"]["inputs"]["ITEM"] = _literal("a")
     assert emulator._eval_reporter("reporter") == 4
+
+
+def test_procedure_arguments_are_local_to_each_call():
+    from cattorch.sprite import _add_warp_procedure
+    from cattorch.util.scratch.dsl import Program, add, append, argument, call, gt, if_
+    from cattorch.util.scratch.finalize_scratch import _compact_internal_display_names
+
+    sprite = {"blocks": {}, "variables": {}, "lists": {}, "broadcasts": {}}
+    # Counts down from its argument, recording it before and after the call
+    # inside, which has its own.
+    _add_warp_procedure(sprite, "count %s", Program("count", lists=("seen",), body=(
+        append("seen", argument("n")),
+        if_(gt(argument("n"), 0), (call("count %s", n=add(argument("n"), -1)),)),
+        append("seen", argument("n")),
+    )), x=0, y=0, arguments=("n",))
+    _add_warp_procedure(sprite, "run", Program("run", lists=("seen",), body=(
+        call("count %s", n=2), append("seen", argument("n")),
+    )), x=0, y=200)
+    _compact_internal_display_names(
+        sprite, public_data_names=frozenset({"seen"}), public_procedures=frozenset({"run"}),
+    )
+    assert "p0 %s" in {
+        block["mutation"]["proccode"] for block in sprite["blocks"].values() if "mutation" in block
+    }
+    emulator = ScratchEmulator(sprite)
+    emulator.run_procedure("run")
+    # Outside every procedure, an argument reports 0, as in Scratch.
+    assert emulator.lists["seen"] == [2, 1, 0, 0, 1, 2, 0]

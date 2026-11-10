@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import shutil
 import tempfile
 import uuid
@@ -188,7 +189,8 @@ def _compact_internal_display_names(
             data_names[identifier] = f"{prefixes[section]}{counters[section]}"
             counters[section] += 1
     procedure_names = {
-        proccode: f"p{position}"
+        # Keep each argument's slot, which calls and the editor read.
+        proccode: f"p{position}" + "".join(f" {slot}" for slot in re.findall(r"%[snb]", proccode))
         for position, proccode in enumerate(sorted(
             proccode for proccode in _procedure_codes(sprite)
             if proccode not in interface.PUBLIC_PROCEDURES

@@ -7,6 +7,7 @@ in this module and rendered as readable pseudocode for review.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from collections import Counter
 from contextlib import contextmanager
@@ -110,6 +111,13 @@ class CostumeNumber(Expr):
 
 
 @dataclass(frozen=True)
+class Argument(Expr):
+    """The value a procedure was called with for its argument ``name``."""
+
+    name: str
+
+
+@dataclass(frozen=True)
 class Timer(Expr):
     """Seconds since the timer was last reset."""
 
@@ -117,6 +125,15 @@ class Timer(Expr):
 @dataclass(frozen=True)
 class DaysSince2000(Expr):
     """Days since 2000-01-01, with sub-millisecond resolution."""
+
+
+def argument(name: str) -> Argument:
+    return Argument(name)
+
+
+def argument_id(name: str) -> str:
+    """The ID that a procedure's prototype and calls give argument ``name``."""
+    return f"cattorch_argument_{name}"
 
 
 def value(expr: Expr | int | float | str) -> Expr:
@@ -283,6 +300,8 @@ class IfElse(Statement):
 @dataclass(frozen=True)
 class ProcedureCall(Statement):
     name: str
+    # (argument name, value) pairs, in the order of the procedure's prototype.
+    arguments: tuple[tuple[str, Expr], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -387,8 +406,10 @@ def if_else(condition, then_body: Iterable[Statement], else_body: Iterable[State
     return IfElse(value(condition), tuple(then_body), tuple(else_body))
 
 
-def call(name: str) -> ProcedureCall:
-    return ProcedureCall(name)
+def call(name: str, **arguments) -> ProcedureCall:
+    return ProcedureCall(
+        name, tuple((key, value(expr)) for key, expr in arguments.items()),
+    )
 
 
 def switch_costume(expr) -> SwitchCostume:
@@ -655,9 +676,15 @@ class _Lowerer:
             block = self._base("procedures_call", parent)
             block["mutation"] = {
                 "tagName": "mutation", "children": [],
-                "proccode": statement.name, "argumentids": "[]",
+                "proccode": statement.name,
+                "argumentids": json.dumps(
+                    [argument_id(name) for name, _ in statement.arguments],
+                    separators=(",", ":"),
+                ),
             }
             self.blocks[block_id] = block
+            for name, expr in statement.arguments:
+                block["inputs"][argument_id(name)] = self._expr(expr, block_id, text=True)
         elif isinstance(statement, BroadcastAndWait):
             broadcast_id = self.broadcast_ids.setdefault(
                 statement.message,
@@ -778,6 +805,10 @@ class _Lowerer:
             self.blocks[block_id] = self._base("sensing_timer", parent)
         elif isinstance(expr, DaysSince2000):
             self.blocks[block_id] = self._base("sensing_dayssince2000", parent)
+        elif isinstance(expr, Argument):
+            block = self._base("argument_reporter_string_number", parent)
+            block["fields"]["VALUE"] = [expr.name, None]
+            self.blocks[block_id] = block
         elif isinstance(expr, CostumeNumber):
             block = self._base("looks_costumenumbername", parent)
             block["fields"]["NUMBER_NAME"] = ["number", None]
@@ -863,7 +894,7 @@ def _resolve_static_unrolling(
 def _expr_uses_variable(expr: Expr, name: str) -> bool:
     if isinstance(expr, Variable):
         return expr.name == name
-    if isinstance(expr, (Literal, ListLength, CostumeNumber, Answer)):
+    if isinstance(expr, (Literal, ListLength, CostumeNumber, Answer, Argument)):
         return False
     if isinstance(expr, ListItem):
         return _expr_uses_variable(expr.index, name)
@@ -899,7 +930,9 @@ def _statement_accesses_variable(statement: Statement, name: str) -> bool:
         return statement.name == name or _expr_uses_variable(statement.value, name)
     if isinstance(statement, ChangeVariable):
         return statement.name == name or _expr_uses_variable(statement.value, name)
-    if isinstance(statement, (ClearList, ProcedureCall, BroadcastAndWait)):
+    if isinstance(statement, ProcedureCall):
+        return any(_expr_uses_variable(expr, name) for _, expr in statement.arguments)
+    if isinstance(statement, (ClearList, BroadcastAndWait)):
         return False
     if isinstance(statement, SwitchCostume):
         return _expr_uses_variable(statement.value, name)
@@ -1074,6 +1107,8 @@ def _render_expr(expr: Expr) -> str:
         return f"round({_render_expr(expr.value)})"
     if isinstance(expr, Random):
         return f"random({_render_expr(expr.low)}, {_render_expr(expr.high)})"
+    if isinstance(expr, Argument):
+        return f"argument({expr.name!r})"
     if isinstance(expr, CostumeNumber):
         return "costume_number()"
     if isinstance(expr, Answer):
@@ -1131,7 +1166,10 @@ def _render_statements(statements: Iterable[Statement], lines: list[str], depth:
             lines.append(f"{indent}else:")
             _render_statements(statement.else_body, lines, depth + 1)
         elif isinstance(statement, ProcedureCall):
-            lines.append(f"{indent}call {statement.name}")
+            arguments = ", ".join(
+                f"{name}={_render_expr(expr)}" for name, expr in statement.arguments
+            )
+            lines.append(f"{indent}call {statement.name}" + (f"({arguments})" if arguments else ""))
         elif isinstance(statement, BroadcastAndWait):
             lines.append(f"{indent}broadcast and wait {statement.message}")
         elif isinstance(statement, SwitchCostume):
