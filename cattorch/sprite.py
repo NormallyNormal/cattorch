@@ -171,27 +171,29 @@ def _apply_tied_static_aliases(
     layouts: dict[str, ListLayout],
     static_tensors: dict[str, torch.Tensor | None],
     aliases: dict[str, tuple[str, ...]],
-) -> None:
-    """Point aligned embedding shards at grouped output-head storage."""
+) -> dict[str, str]:
+    """Point aligned embedding shards at the output head's row shards.
+
+    Returns the tables that keep their own copy, with the reason.
+    """
     lists = sprite.get("lists", {})
     remap: dict[str, str] = {}
     display_names: dict[str, str] = {}
+    copies: dict[str, str] = {}
     for source_name, destination_names in aliases.items():
         source = layouts.get(source_name)
+        if source is None:
+            continue  # only the head reads the table
         destinations = [layouts.get(name) for name in destination_names]
         if (
-            source is None
-            or any(layout is None or len(layout.shards) != 1 for layout in destinations)
-            or len(source.shards) != len(destinations)
+            any(layout is None or len(layout.shards) != 1 for layout in destinations)
+            or [shard.capacity for shard in source.shards]
+            != [layout.shards[0].capacity for layout in destinations if layout is not None]
         ):
-            # Precision-aware storage shards can be smaller than the grouped
-            # output-head layout. Retaining both representations is larger,
-            # but remains correct and lets the normal storage path encode each
-            # physical list within its temporary-byte budget.
-            log.info(
-                "Tied embedding/head sharing skipped because shard layouts "
-                "do not match"
-            )
+            # The compiler cuts the head's shards to the table's physical
+            # lists, so this is not expected. Both copies remain correct.
+            copies[source_name] = "its shards do not line up with the output head's"
+            log.warning("Tied embedding/head sharing skipped: %s", copies[source_name])
             continue
         for source_shard, destination_layout in zip(source.shards, destinations):
             assert destination_layout is not None
@@ -205,7 +207,7 @@ def _apply_tied_static_aliases(
         static_tensors.pop(source_name.removeprefix("W_"), None)
 
     if not remap:
-        return
+        return copies
     sprite["blocks"] = remap_ids(sprite["blocks"], remap)
     stack = [sprite["blocks"]]
     while stack:
@@ -220,6 +222,7 @@ def _apply_tied_static_aliases(
             ):
                 value[0] = display_names[value[1]]
             stack.extend(value)
+    return copies
 
 
 def _merge_slots_by_name(

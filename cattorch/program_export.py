@@ -840,7 +840,7 @@ def transpile_program(
         ))
         sub_warnings.extend(
             warning for warning in sub_result.warnings
-            if warning.startswith("GPTQ fallback")
+            if warning.startswith(("GPTQ fallback", "tied weight"))
         )
         fallbacks.update(dict(sub_result.fallback_operations))
         approximations.update(dict(sub_result.approximate_operations))

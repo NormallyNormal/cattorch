@@ -139,6 +139,11 @@ If your own scripts copy a sharded input or output, copy every shard in order,
 not only the first. `result.sharded_lists` names the lists that were split.
 `verify` handles shards for you.
 
+A token embedding tied to the output head, as in GPT-2 and Mamba, is stored
+once even when it spans several lists: the embedding reads the head's shards.
+When another operation or a custom kernel needs the table in a different
+layout from the head's, it is stored twice and `result.warnings` says so.
+
 ## Project size
 
 cattorch reports `archive_bytes` (the compressed file) and

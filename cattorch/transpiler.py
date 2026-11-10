@@ -341,7 +341,7 @@ class _Compiler:
     """Walk the graph, dispatch each node to the right handler, and produce
     a single Scratch sprite dict with all blocks chained together."""
 
-    def __init__(self, graph: _GraphInfo, *, row_aligned_weights: bool = False):
+    def __init__(self, graph: _GraphInfo, *, storage: StorageConfig):
         self.graph = graph
         # Operations lowered by an approximate kernel, for the result.
         self.approximate: Counter[str] = Counter(graph.approximate_fusions)
@@ -360,11 +360,15 @@ class _Compiler:
         self.node_roots = 0
         self.static_shard_alignments: dict[str, int] = {}
         self.tied_storage_aliases: dict[str, tuple[str, ...]] = {}
-        self.row_aligned_weights = row_aligned_weights
+        # A tied table that ends up stored a second time, with the reason.
+        self.tied_storage_copies: dict[str, str] = {}
+        self.storage = storage
+        self.row_aligned_weights = storage.grouping == "row"
+        self._tied_shard_limits: dict[tuple, int] = {}
         self.interleaved_static_layouts: dict[
             str, tuple[tuple[int, int, int], ...]
         ] = {}
-        self._grouped_tied_weights = self._find_grouped_tied_weights()
+        self._tied_weights, self._grouped_tied_weights = self._find_tied_weights()
         self._compiled_output_lists: tuple[str, ...] = ()
 
     @staticmethod
@@ -374,10 +378,26 @@ class _Compiler:
             tuple(tensor.shape), tensor.stride(),
         )
 
-    def _find_grouped_tied_weights(self) -> set[tuple]:
-        """Tables read only by embeddings and by grouped Linears, all built in.
+    def _tied_shard_limit(self, weight: torch.Tensor) -> int:
+        """The values in each row shard of a tied Linear's weight.
 
-        Such a weight is stored once, in the Linear's four-row interleaved
+        A weight larger than a list is cut to the largest physical list
+        storage gives it, so the table, sharded at the same row boundaries,
+        can share the head's lists.
+        """
+        if weight.numel() <= SCRATCH_LIST_LIMIT:
+            return SCRATCH_LIST_LIMIT
+        identity = self._weight_identity(weight)
+        if identity not in self._tied_shard_limits:
+            limits = _static_storage_shard_limits({"tied": weight}, self.storage)
+            self._tied_shard_limits[identity] = limits.get("W_tied", SCRATCH_LIST_LIMIT)
+        return self._tied_shard_limits[identity]
+
+    def _find_tied_weights(self) -> tuple[set[tuple], set[tuple]]:
+        """Weights a library Linear reads that something else reads too, and
+        those of them read only by embeddings and grouped Linears, all built in.
+
+        The second kind is stored once, in the Linear's four-row interleaved
         layout (see ``_prepare_linear_weight``), and the embedding kernel reads
         it that way. Any other reader, or a user's kernel for either
         operation, needs the plain layout.
@@ -386,26 +406,26 @@ class _Compiler:
 
         graph = self.graph
         registry, fast, config = graph.registry, graph.fast, graph.fast_config
-        if fast and config.weights.enabled:
-            return set()  # weight pruning owns the Linear's layout
         linear = registry.kernel("aten.linear.default", fast=fast, config=config)
         embedding = registry.kernel("aten.embedding.default", fast=fast, config=config)
-        if (
-            getattr(linear, "kernel", None) is not LINEAR_KERNEL
-            or embedding is not default_registry().kernel(
+        interleaving = (
+            # Weight pruning owns the Linear's layout.
+            not (fast and config.weights.enabled)
+            and getattr(linear, "kernel", None) is LINEAR_KERNEL
+            and embedding is default_registry().kernel(
                 "aten.embedding.default", fast=fast, config=config,
             )
-        ):
-            return set()
+        )
 
         def interleavable(tensor):
             columns, inner = tensor.shape
-            rows_per_shard = SCRATCH_LIST_LIMIT // inner
+            rows_per_shard = self._tied_shard_limit(tensor) // inner
             return (
                 grouped_linear(columns, inner) and rows_per_shard - rows_per_shard % 4 >= 4
             )
 
         readers: dict[tuple, set[str]] = {}
+        tensors: dict[tuple, torch.Tensor] = {}
         for node in graph.nodes:
             if node.op not in {"call_function", "output"}:
                 continue
@@ -422,17 +442,23 @@ class _Compiler:
                         continue
                     if target == "aten.embedding.default" and position == 0:
                         kind = "embedding"
-                    elif (
-                        target == "aten.linear.default" and position == 1
-                        and interleavable(tensor)
-                    ):
+                    elif target == "aten.linear.default" and position == 1:
                         kind = "linear"
                     else:
                         kind = "other"
-                    readers.setdefault(self._weight_identity(tensor), set()).add(kind)
-        return {
-            identity for identity, kinds in readers.items() if kinds == {"embedding", "linear"}
+                    identity = self._weight_identity(tensor)
+                    readers.setdefault(identity, set()).add(kind)
+                    tensors[identity] = tensor
+        tied = {
+            identity for identity, kinds in readers.items()
+            if "linear" in kinds and len(kinds) > 1
         }
+        grouped = {
+            identity for identity in tied
+            if interleaving and readers[identity] == {"embedding", "linear"}
+            and interleavable(tensors[identity])
+        }
+        return tied, grouped
 
     def _uses_grouped_tied_weight(self, node) -> bool:
         weight_index = 0 if str(node.target) == "aten.embedding.default" else 1
@@ -1403,7 +1429,11 @@ class _Compiler:
         if not grouped and not oversized:
             return input_lists, (), False
 
-        rows_per_shard = SCRATCH_LIST_LIMIT // inner
+        identity = self._weight_identity(weight)
+        table = input_lists[1] if input_lists[1].startswith("W_") else None
+        tied = table is not None and identity in self._tied_weights
+        shard_limit = self._tied_shard_limit(weight) if tied else SCRATCH_LIST_LIMIT
+        rows_per_shard = shard_limit // inner
         if rows_per_shard < 1:
             # A single output row crosses a shard boundary. The generic
             # sharder remains the correctness fallback for this rare shape.
@@ -1429,16 +1459,12 @@ class _Compiler:
             tensors.append(shard)
             row_counts.append(shard.shape[0])
 
-        if (
-            grouped
-            and not oversized
-            and self._weight_identity(weight) in self._grouped_tied_weights
-            and input_lists[1].startswith("W_")
-        ):
+        interleaved_table = tied and grouped and identity in self._grouped_tied_weights
+        if interleaved_table and not oversized:
             # Keep one physical copy of a tied token embedding/output head.
             # The embedding kernel reads this four-row interleaved layout with
             # a stride-four inner loop.
-            original_key = input_lists[1].removeprefix("W_")
+            original_key = table.removeprefix("W_")
             self.static_lists[original_key] = tensors[0]
             if self.row_aligned_weights:
                 self.interleaved_static_layouts[original_key] = ((0, columns, inner),)
@@ -1453,17 +1479,30 @@ class _Compiler:
                     0, tensor.shape[0], inner,
                 ),)
             names.append(f"W_{key}")
-        if (
-            grouped
-            and oversized
-            and self._weight_identity(weight) in self._grouped_tied_weights
-            and input_lists[1].startswith("W_")
-        ):
-            original_name = input_lists[1]
-            original_key = original_name.removeprefix("W_")
+        if interleaved_table:
+            # The table becomes the shards end to end, sharded at the same
+            # row boundaries, so each table shard can be the head's list.
+            original_key = table.removeprefix("W_")
             self.static_lists[original_key] = torch.cat(tensors, dim=0)
-            self.static_shard_alignments[original_name] = 4 * inner
-            self.tied_storage_aliases[original_name] = tuple(names)
+            self.static_shard_alignments[table] = 4 * inner
+            self.tied_storage_aliases[table] = tuple(names)
+            if self.row_aligned_weights:
+                # Storage must see the four-row interleave to recognize the
+                # quantized grid and choose the head's precision and shard
+                # sizes.
+                self.interleaved_static_layouts[original_key] = tuple(
+                    (start * inner, count, inner)
+                    for start, count in zip(range(0, columns, rows_per_shard), row_counts)
+                )
+        elif tied and not grouped:
+            # Plain row shards: the table itself, sharded at their boundaries.
+            self.static_shard_alignments[table] = inner
+            self.tied_storage_aliases[table] = tuple(names)
+        elif tied:
+            self.tied_storage_copies[table] = (
+                "a Linear reads it in four-row groups, and another operation "
+                "or a custom kernel reads it in rows"
+            )
         return [input_lists[0], *names, *input_lists[2:]], tuple(row_counts), grouped
 
     def _prepare_paired_linear_weights(self, node, gate, value, input_lists):
@@ -2303,7 +2342,7 @@ def _transpile(
             )
 
     # 2. Compile graph nodes into Scratch blocks
-    compiler = _Compiler(graph, row_aligned_weights=storage.grouping == "row")
+    compiler = _Compiler(graph, storage=storage)
     selected_unroll = _select_unroll_factor(model, storage, codegen)
     log.info(
         "Code generation unroll cap: %s (%s mode)",
@@ -2513,11 +2552,15 @@ def _transpile(
         _deferred_sizes.update({
             name: layouts[name].logical_size for name in deferred_names if name in layouts
         })
-    _apply_tied_static_aliases(
+    tied_copies = _apply_tied_static_aliases(
         sprite,
         layouts,
         compiler.static_lists,
         compiler.tied_storage_aliases,
+    )
+    tied_copies.update(
+        (table, reason) for table, reason in compiler.tied_storage_copies.items()
+        if table in layouts
     )
     static_names = _apply_static_storage(
         sprite,
@@ -2676,6 +2719,9 @@ def _transpile(
             f"GPTQ fallback for {item.name}: {item.fallback_reason}"
             for item in (quantization_report.tensors if quantization_report else ())
             if item.method == "symmetric" and item.fallback_reason is not None
+        ) + tuple(
+            f"tied weight {table.removeprefix('W_')!r} is stored twice: {reason}"
+            for table, reason in tied_copies.items()
         ) + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
         quantization=quantization_report,
         fallback_operations=graph.fallbacks(),

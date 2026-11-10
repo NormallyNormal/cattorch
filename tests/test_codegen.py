@@ -441,9 +441,8 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
     assert [len(entry[1]) for entry in weight_lists] == [199_680, 62_464]
     assert sum(len(entry[1]) for entry in weight_lists) == model.embedding.weight.numel()
 
-    # Float32 compression requires smaller temporary-byte-safe shards. When
-    # those no longer align with the grouped head representation, export must
-    # retain both copies rather than fail or alias mismatched physical lists.
+    # Float32 compression requires smaller temporary-byte-safe shards; the
+    # head's shards are cut to them, so the table is still stored once.
     compressed = transpile(
         model,
         torch.tensor([[3]]),
@@ -460,6 +459,9 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
     ]
     assert payloads
     assert all(len(payload) <= 250_000 for payload in payloads)
+    assert not compressed.warnings
+    # Base92 holds 13 bytes in 16 characters.
+    assert sum(map(len, payloads)) < model.embedding.weight.numel() * 4 * 16 / 13 * 1.01
 
 
 def test_compact_unrolling_emits_fewer_blocks(tmp_path):

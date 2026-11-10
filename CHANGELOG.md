@@ -270,6 +270,16 @@
 
 ## Fixes
 
+- A token embedding tied to the output head and larger than one Scratch list
+  was stored twice, as the head's weights and again as the embedding's own
+  table, in float16 beside an int8 head when quantized. Now the embedding
+  reads the head's lists. In a random-weight 2-layer Mamba2-130m shape with
+  the 50,288-token vocabulary, `sprite.json` shrinks from 161 MB to 65 MB in
+  int8 and from 428 MB to 238 MB in float32, and in a 2-layer GPT-2
+  `GenerationProgram` in float32 from 470 MB to 287 MB (with about a third
+  more blocks: the float32 head reads more, smaller lists). A table that must
+  still be stored twice, because another operation or a custom kernel reads
+  it in a different layout from the head's, is reported in `warnings`.
 - `ExportProgram` and `@entrypoint` sprites had no protection against calls
   from several scripts at once (Scratch pauses a block after 500 ms and runs
   other scripts) or stopped part way. A `cattorch reset` or another call made
