@@ -1500,6 +1500,26 @@ def _vocabulary_size(plan: SequencePlan) -> int:
     )
 
 
+def row_mismatch(
+    actual: torch.Tensor, expected: torch.Tensor, rtol: float,
+) -> tuple[float, float] | None:
+    """``(largest error, row scale)`` if a step's row differs from the model's.
+
+    The rows differ when an error exceeds ``rtol`` times the largest finite
+    value of ``expected``, or they disagree on which values are finite. Equal
+    values, such as -inf for a banned token, match exactly.
+    """
+    same = actual.double() == expected.double()
+    error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
+    largest = float(error.max()) if error.numel() else 0.0
+    finite = expected.double()[torch.isfinite(expected)].abs()
+    scale = float(finite.max()) if finite.numel() else 0.0
+    if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
+            or largest > rtol * max(scale, 1e-3) or largest != largest:
+        return largest, scale
+    return None
+
+
 def check_step_equivalence(
     adapted: nn.Module,
     step: SequenceStepModule,
@@ -1543,14 +1563,9 @@ def check_step_equivalence(
                     f"{tuple(actual.shape)} but the model gives {tuple(expected.shape)} "
                     f"for token {row}"
                 )
-            # Equal values, such as -inf for a banned token, match exactly.
-            same = actual.double() == expected.double()
-            error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
-            largest = float(error.max()) if error.numel() else 0.0
-            finite = expected.double()[torch.isfinite(expected)].abs()
-            scale = float(finite.max()) if finite.numel() else 0.0
-            if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
-                    or largest > rtol * max(scale, 1e-3) or largest != largest:
+            mismatch = row_mismatch(actual, expected, rtol)
+            if mismatch is not None:
+                largest, scale = mismatch
                 overall = max(
                     float((rows[r][leaf].double() - reference[leaf].narrow(axis.axis, r, 1).double()).abs().max())
                     for r in range(length)
