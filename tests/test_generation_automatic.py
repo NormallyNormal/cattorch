@@ -214,17 +214,28 @@ def procedure_callers(sprite):
     return callers
 
 
+def canvas_calls(sprite):
+    """The procedures that loose call blocks on the canvas run."""
+    return {
+        block["mutation"]["proccode"] for block in sprite["blocks"].values()
+        if isinstance(block, dict) and block["opcode"] == "procedures_call"
+        and block.get("topLevel")
+    }
+
+
 @pytest.mark.parametrize("sharing", ["off", "auto"])
-def test_every_private_procedure_is_called(tmp_path, sharing):
+def test_private_procedures_run_only_from_public_ones(tmp_path, sharing):
     torch.manual_seed(13)
     model = CachedLM(context=8, layers=2).eval()
     result = transpile(
         model, GenerationProgram(max_context=8, top_k=2), tmp_path / "gen",
         codegen=CodegenConfig(layer_sharing=sharing),
     )
-    callers = procedure_callers(load_sprite(result.path))
+    sprite = load_sprite(result.path)
+    callers = procedure_callers(sprite)
     assert set(result.procedures) <= set(callers)
     assert not [name for name, by in callers.items() if not by and name not in result.procedures]
+    assert canvas_calls(sprite) <= set(result.procedures)
 
 
 class Stopped(Exception):

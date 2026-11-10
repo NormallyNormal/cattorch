@@ -940,6 +940,17 @@ def _find_procedure_definition(sprite: dict, name: str) -> str:
     raise ValueError(f"procedure not found after generation wrapping: {name}")
 
 
+def _remove_canvas_calls(sprite: dict, name: str) -> None:
+    """Remove the loose call blocks for ``name`` that lifecycle wrapping left on the canvas."""
+    blocks = sprite["blocks"]
+    for identifier in [
+        identifier for identifier, block in blocks.items()
+        if block.get("opcode") == "procedures_call" and block.get("topLevel")
+        and block.get("mutation", {}).get("proccode") == name
+    ]:
+        del blocks[identifier]
+
+
 def _add_procedure_completion_broadcast(
     sprite: dict,
     procedure: str,

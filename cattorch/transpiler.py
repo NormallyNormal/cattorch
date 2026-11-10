@@ -53,6 +53,7 @@ from cattorch.sprite import (
     _logical_list_sizes,
     _merge_duplicate_lists,
     _public_generation_reset,
+    _remove_canvas_calls,
     _graph_layer,
     _merge_lists_by_name,
     _merge_variables_by_name,
@@ -2477,6 +2478,8 @@ def _transpile(
         )
         _merge_duplicate_lists(sprite)
         if _generation_public_interface:
+            # The step is private; only reset, prefill and decode run it.
+            _remove_canvas_calls(sprite, "cattorch forward")
             _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
             _rename_procedure(
                 sprite, "cattorch reset cache", "_cattorch reset state",

@@ -448,6 +448,16 @@ def test_lifecycle_broadcasts(tmp_path):
         assert emulator.broadcasts == [f"cattorch {procedure} complete"]
 
 
+def test_no_loose_canvas_block_runs_a_private_procedure(tmp_path):
+    _, result = export(make("gru"), tmp_path / "gru")
+    sprite = load_sprite(result.path)
+    loose = {
+        block["mutation"]["proccode"] for block in sprite["blocks"].values()
+        if block["opcode"] == "procedures_call" and block.get("topLevel")
+    }
+    assert loose <= set(result.procedures)
+
+
 def test_the_reference_check_catches_a_wrong_step(tmp_path):
     class Wrong(GRULM):
         def step(self, token, hidden):

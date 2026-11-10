@@ -33,7 +33,7 @@ from cattorch.quantization import quantize_model
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
-    _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name,
+    _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
@@ -677,6 +677,10 @@ def transpile_program(
         storage_names = _namespace_entry_storage(sprite, entrypoint.name)
         payload_names.update(new for old, new in storage_names.items() if not old.startswith("W_"))
 
+        # The entry point's own forward and init become private helpers of
+        # the public blocks.
+        _remove_canvas_calls(sprite, "cattorch forward")
+        _remove_canvas_calls(sprite, "cattorch init")
         internal = f"_cattorch {entrypoint.name} compute"
         _rename_procedure(sprite, "cattorch forward", internal)
         _rename_procedure(sprite, "cattorch init", f"_cattorch {entrypoint.name} init")

@@ -54,6 +54,25 @@ def test_program_exports_multiple_named_outputs(tmp_path):
     assert emulator.variables["cattorch status"] == "ok"
 
 
+def test_program_leaves_no_loose_call_to_a_private_procedure(tmp_path):
+    class Model(nn.Module):
+        def run(self, value):
+            return value + 1
+
+    program = ExportProgram(entrypoints=(EntryPoint(
+        "run", method="run", arguments=(Input("value", torch.ones(2)),),
+        returns=(Output("out"),),
+    ),))
+    result = transpile(Model().eval(), program, tmp_path / "program")
+    with zipfile.ZipFile(result.path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    assert not [
+        block["mutation"]["proccode"] for block in sprite["blocks"].values()
+        if block["opcode"] == "procedures_call" and block.get("topLevel")
+        and block["mutation"]["proccode"].startswith("_")
+    ]
+
+
 def test_program_replace_state_is_transactional_and_resettable(tmp_path):
     class Counter(nn.Module):
         def step(self, value, state):
