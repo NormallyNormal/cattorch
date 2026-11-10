@@ -2095,6 +2095,13 @@ def _transpile_any(
             raise ValueError(
                 f"model has no callable generation method {example_inputs.method!r}"
             )
+        from cattorch.huggingface_recurrent import contains_recurrent_model
+        family = contains_recurrent_model(model)
+        if family is not None:
+            raise UnsupportedModelError(
+                f"GenerationProgram caches attention keys and values, and this {family} "
+                "model has no attention; export it with RecurrentGenerationProgram() instead"
+            )
         generation_program = example_inputs
         registry = _registry_with(kernels, adapters)
         return _transpile_automatic_generation(

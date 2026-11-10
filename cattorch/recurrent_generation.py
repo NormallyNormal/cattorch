@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +26,7 @@ from cattorch.errors import UnsupportedModelError
 from cattorch.fast import FastConfig
 from cattorch.frontend import tensor_output_leaves
 from cattorch.graph import _NOOP_OPS
+from cattorch.huggingface_recurrent import adapt_recurrent_model, version_hint
 from cattorch.interface import STATUS_VARIABLE
 from cattorch.program import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, RecurrentGenerationProgram, State,
@@ -76,6 +78,7 @@ class _EmbeddingLookup(TorchDispatchMode):
 
 def _check_step(model: nn.Module, program: RecurrentGenerationProgram) -> tuple[int, int]:
     """Run the step once from the initial states; return its vocabulary and logit count."""
+    assert program.states is not None
     token = torch.zeros(1, 1, dtype=torch.long)
     lookup = _EmbeddingLookup(token)
     with torch.no_grad(), lookup:
@@ -107,10 +110,13 @@ def _check_step(model: nn.Module, program: RecurrentGenerationProgram) -> tuple[
 
 
 def _check_reference(
-    model: nn.Module, program: RecurrentGenerationProgram, vocabulary: int,
+    model: nn.Module, program: RecurrentGenerationProgram, vocabulary: int, hint: str,
 ) -> None:
-    """Run the step over random tokens and compare each logits row with the reference."""
-    assert program.reference is not None
+    """Run the step over random tokens and compare each logits row with the reference.
+
+    ``hint`` ends a mismatch's message.
+    """
+    assert program.reference is not None and program.states is not None
     length = min(program.max_tokens or 32, 32)
     generator = torch.Generator().manual_seed(0)
     tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
@@ -143,6 +149,7 @@ def _check_reference(
                 f"the recurrent step disagrees with {program.reference} at logits row "
                 f"{row}: max error {largest:.3g} against values up to {scale:.3g}, "
                 f"tolerance {_TOLERANCE:g} relative; max error over all rows {overall:.3g}"
+                + hint
             )
 
 
@@ -295,6 +302,20 @@ def transpile_recurrent_generation(
     kernels=(),
 ) -> TranspileResult:
     """Export ``program.step`` with the init, reset, prefill and decode blocks."""
+    hint = ""
+    if program.states is None:
+        adapted = adapt_recurrent_model(model)
+        if adapted is None:
+            raise UnsupportedModelError(
+                "RecurrentGenerationProgram needs states=... unless the model is a "
+                "supported Hugging Face recurrent model (Mamba, Mamba-2, RWKV)"
+            )
+        model = adapted.module
+        program = replace(
+            program, states=adapted.states, step=adapted.step, reference=adapted.reference,
+        )
+        hint = version_hint()
+    assert program.states is not None
     for method, role in ((program.step, "recurrent step"), (program.reference, "reference")):
         if method is not None and not callable(getattr(model, method, None)):
             raise ValueError(f"model has no callable {role} {method!r}")
@@ -330,7 +351,7 @@ def transpile_recurrent_generation(
     if program.top_k is not None and program.top_k > logit_count:
         raise ValueError(f"top_k ({program.top_k}) exceeds output size ({logit_count})")
     if program.reference is not None:
-        _check_reference(checked, program, vocabulary)
+        _check_reference(checked, program, vocabulary, hint)
 
     calls, resets = (
         _calibration_calls(calibration_sequences)

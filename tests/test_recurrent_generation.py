@@ -472,6 +472,10 @@ def test_program_validation():
             RecurrentGenerationProgram(arguments, **options)
     with pytest.raises(TypeError):
         RecurrentGenerationProgram((state,), "step")
+    assert RecurrentGenerationProgram().states is None
+    for options in ({"step": "next"}, {"reference": "forward"}):
+        with pytest.raises(ValueError, match="step= and reference= need states="):
+            RecurrentGenerationProgram(**options)
 
 
 class Broken(GRULM):

@@ -21,6 +21,7 @@ import torch
 from cattorch.fast import FastConfig
 from cattorch.storage import StorageConfig
 from cattorch.quantization import QuantizationConfig
+from cattorch.huggingface_recurrent import contains_recurrent_model
 from cattorch.program import GenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.transpiler import (
@@ -533,6 +534,12 @@ def build_generation_benchmark_suite(
                     "stateless_input, and prompt"
                 )
             name, model, stateless_input, prompt = case
+            family = contains_recurrent_model(model)
+            if family is not None:
+                raise ValueError(
+                    f"generation benchmark case {name!r} is a {family} model; this suite "
+                    "times a K/V-cached GenerationProgram, which recurrent models don't use"
+                )
             stateless_inputs = _normalise_inputs(stateless_input)
             prompt_inputs = _normalise_inputs(prompt)
             if len(prompt_inputs) != 1 or prompt_inputs[0].ndim != 2:

@@ -269,9 +269,13 @@ class RecurrentGenerationProgram:
     tokens it consumes between resets (None: no limit), and ``reference``
     names a stateless ``method(tokens) -> logits`` the step is checked
     against at export.
+
+    ``states=None`` (the default) exports a Hugging Face Mamba, Mamba-2 or
+    RWKV causal language model directly: cattorch supplies its step, states
+    and reference check, so ``RecurrentGenerationProgram()`` is enough.
     """
 
-    states: tuple[State, ...]
+    states: tuple[State, ...] | None = None
     _: KW_ONLY
     step: str = "step"
     max_tokens: int | None = None
@@ -280,6 +284,30 @@ class RecurrentGenerationProgram:
     reference: str | None = None
 
     def __post_init__(self) -> None:
+        if self.states is not None:
+            self._check_states()
+        object.__setattr__(self, "step", _name(self.step, "recurrent step"))
+        if self.reference is not None:
+            object.__setattr__(self, "reference", _name(self.reference, "reference method"))
+        if self.states is None and (self.step != "step" or self.reference is not None):
+            raise ValueError(
+                "RecurrentGenerationProgram step= and reference= need states=; without "
+                "states, the Hugging Face model's adapter supplies all three"
+            )
+        if self.max_tokens is not None:
+            if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
+                raise TypeError("RecurrentGenerationProgram.max_tokens must be an integer or None")
+            if self.max_tokens < 1:
+                raise ValueError("RecurrentGenerationProgram.max_tokens must be positive")
+        if not isinstance(self.hidden_prefill, bool):
+            raise TypeError("RecurrentGenerationProgram.hidden_prefill must be a boolean")
+        if self.top_k is not None:
+            if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
+                raise TypeError("RecurrentGenerationProgram.top_k must be an integer or None")
+            if not 1 <= self.top_k <= 64:
+                raise ValueError("RecurrentGenerationProgram.top_k must be between 1 and 64")
+
+    def _check_states(self) -> None:
         if isinstance(self.states, State) or not isinstance(self.states, (tuple, list)):
             raise TypeError("RecurrentGenerationProgram.states must be a tuple of State values")
         object.__setattr__(self, "states", tuple(self.states))
@@ -293,21 +321,6 @@ class RecurrentGenerationProgram:
         for state in self.states:
             if state.mode != "replace":
                 raise ValueError(f"recurrent state {state.name!r} must be a replace state")
-        object.__setattr__(self, "step", _name(self.step, "recurrent step"))
-        if self.reference is not None:
-            object.__setattr__(self, "reference", _name(self.reference, "reference method"))
-        if self.max_tokens is not None:
-            if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
-                raise TypeError("RecurrentGenerationProgram.max_tokens must be an integer or None")
-            if self.max_tokens < 1:
-                raise ValueError("RecurrentGenerationProgram.max_tokens must be positive")
-        if not isinstance(self.hidden_prefill, bool):
-            raise TypeError("RecurrentGenerationProgram.hidden_prefill must be a boolean")
-        if self.top_k is not None:
-            if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
-                raise TypeError("RecurrentGenerationProgram.top_k must be an integer or None")
-            if not 1 <= self.top_k <= 64:
-                raise ValueError("RecurrentGenerationProgram.top_k must be between 1 and 64")
 
 
 @dataclass(frozen=True)
