@@ -260,6 +260,13 @@
 
 ## Fixes
 
+- GPTQ errors name the argument to fix: a `GenerationProgram` without
+  calibration sequences asked for `calibration_inputs`, which it then
+  rejected, and an `ExportProgram` without calls did the same; non-GPTQ
+  `calibration_sequences` were reported as `calibration_inputs`. A
+  calibration token outside the vocabulary, or not a whole number, is a
+  `ValueError` naming the sequence and position, instead of an `IndexError`
+  or a PyTorch error.
 - Stopping a `GenerationProgram` sprite during a hidden prefill made every
   later `cattorch decode` report `ok` and advance `cattorch cache length`
   without writing logits, even after `cattorch reset`. Decode now computes its

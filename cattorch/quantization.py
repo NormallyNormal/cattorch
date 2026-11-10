@@ -350,6 +350,7 @@ def quantize_model(
     orientation_inputs: Iterable | None = None,
     call_kwargs: dict | None = None,
     _registry: OperatorRegistry | None = None,
+    _calibration_name: str = "calibration_inputs",
 ) -> QuantizationReport:
     """Quantize eligible weights in-place and return a structured report.
 
@@ -361,6 +362,8 @@ def quantize_model(
     matmul. Both are then grouped over the matrix's input width, the layout
     Scratch storage uses. Without it, matrices keep their stored orientation.
     ``call_kwargs`` are passed to every observed model call.
+    ``_calibration_name`` is the caller's name for ``calibration_inputs``,
+    for its errors.
     """
     effective_ndims = expert_bank_effective_ndims(model)
 
@@ -392,7 +395,7 @@ def quantize_model(
     batches = 0
     if config.method == "gptq":
         if calibration_inputs is None:
-            raise ValueError("GPTQ requires nonempty calibration_inputs")
+            raise ValueError(f"GPTQ requires nonempty {_calibration_name}")
         observed_inputs = calibration_inputs
     elif calibration_inputs is not None:
         raise ValueError("calibration_inputs can only be used with method='gptq'")
@@ -405,7 +408,7 @@ def quantize_model(
                 model(*_normalize_batch(raw_batch), **(call_kwargs or {}))
                 batches += 1
         if config.method == "gptq" and batches == 0:
-            raise ValueError("GPTQ requires nonempty calibration_inputs")
+            raise ValueError(f"GPTQ requires nonempty {_calibration_name}")
         if config.method == "symmetric":
             batches = 0
 

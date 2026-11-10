@@ -254,6 +254,26 @@ def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
     prefill_and_decode(emulator, model, [4, 1], [6])
 
 
+GPTQ = QuantizationConfig(bits=8, method="gptq", min_quantized_values=16)
+
+
+@pytest.mark.parametrize(("options", "message"), [
+    ({"quantization": GPTQ}, "GPTQ requires nonempty calibration_sequences"),
+    ({"quantization": GPTQ, "calibration_sequences": []},
+     "GPTQ requires nonempty calibration_sequences"),
+    ({"calibration_sequences": [torch.tensor([[1, 2]])]},
+     "calibration_sequences can only be used with GPTQ quantization"),
+    ({"quantization": GPTQ, "calibration_sequences": [torch.tensor([[1, 2, VOCAB]])]},
+     rf"calibration_sequences\[0\] has token {VOCAB} at position 2; token IDs must be "
+     rf"whole numbers from 0 to {VOCAB - 1}"),
+    ({"quantization": GPTQ, "calibration_sequences": [torch.tensor([[1, 2]]), torch.tensor([[2.5]])]},
+     r"calibration_sequences\[1\] has token 2.5 at position 0"),
+])
+def test_calibration_errors_name_calibration_sequences(tmp_path, options, message):
+    with pytest.raises(ValueError, match=message):
+        transpile(nano(), GenerationProgram(max_context=8), tmp_path / "gptq", **options)
+
+
 def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
     class Block(nn.Module):
         def __init__(self, scale):

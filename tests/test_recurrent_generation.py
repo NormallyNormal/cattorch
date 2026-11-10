@@ -600,6 +600,17 @@ class Broken(GRULM):
     ({"calibration_sequences": [torch.zeros(3, dtype=torch.long)],
       "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
      r"calibration_sequences must be \[1, length\] token tensors"),
+    ({"quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     "GPTQ requires nonempty calibration_sequences"),
+    ({"calibration_sequences": [], "quantization": QuantizationConfig(bits=8, method="gptq")},
+     ValueError, "GPTQ requires nonempty calibration_sequences"),
+    ({"calibration_sequences": [torch.tensor([[3, 16]])],
+      "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"calibration_sequences\[0\] has token 16 at position 1; token IDs must be whole "
+     "numbers from 0 to 15"),
+    ({"calibration_sequences": [torch.tensor([[1, 2]]), torch.tensor([[3.0, 4.5]])],
+      "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"calibration_sequences\[1\] has token 4.5 at position 1"),
 ])
 def test_export_validation(tmp_path, options, error, message):
     torch.manual_seed(0)

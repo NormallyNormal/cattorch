@@ -473,6 +473,7 @@ def transpile_program(
     _private_states: bool = False,
     _hidden_outputs: frozenset[str] = frozenset(),
     _calibration_resets: frozenset[int] = frozenset(),
+    _calibration_name: str = "calibration_calls",
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -502,6 +503,8 @@ def transpile_program(
       need are skipped otherwise.
     - ``_calibration_resets`` holds the positions in ``calibration_calls``
       before which GPTQ calibration resets every state.
+    - ``_calibration_name`` is the caller's name for ``calibration_calls``,
+      for its errors.
 
     The renaming and hidden-output hooks can't be combined with
     variable-length inputs, whose export check runs the entry points through
@@ -580,6 +583,7 @@ def transpile_program(
             sentinels if gptq else None,
             orientation_inputs=None if gptq else sentinels,
             _registry=registry,
+            _calibration_name=_calibration_name,
         )
         prepared_model = calibration_model.model
         resolved_storage = quantized_storage(resolved_storage, quantization)

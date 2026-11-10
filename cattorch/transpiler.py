@@ -2185,7 +2185,8 @@ def _transpile_automatic_generation(
     """
     import copy
     from cattorch.autoregressive import (
-        GenerationStepModule, MethodLeaves, build_generation_step,
+        EmbeddingLookup, GenerationStepModule, MethodLeaves, build_generation_step,
+        check_calibration_tokens, lookup_vocabulary,
     )
 
     config = fast_config or FastConfig()
@@ -2194,7 +2195,7 @@ def _transpile_automatic_generation(
     if calibration_sequences is not None and (
         quantization is None or quantization.method != "gptq"
     ):
-        raise ValueError("calibration_inputs can only be used with GPTQ quantization")
+        raise ValueError("calibration_sequences can only be used with GPTQ quantization")
     max_context = program.max_context
     if any(
         value.is_floating_point() and value.dtype != torch.float32
@@ -2210,12 +2211,21 @@ def _transpile_automatic_generation(
     prepared = fold_eval_batch_norms(prepared)
     report = None
     if quantization is not None:
+        if calibration_sequences is not None:
+            token = torch.zeros(1, 1, dtype=torch.long)
+            lookup = EmbeddingLookup(token)
+            with torch.no_grad(), lookup:
+                prepared(token)
+            calibration_sequences = check_calibration_tokens(
+                calibration_sequences, lookup_vocabulary(prepared, lookup),
+            )
         report = quantize_model(
             prepared,
             quantization,
             calibration_sequences,
             orientation_inputs=[(torch.zeros(1, max_context, dtype=torch.long),)],
             _registry=registry,
+            _calibration_name="calibration_sequences",
         )
     step = GenerationStepModule(build_generation_step(
         prepared, max_context, prepared=True, registry=registry,

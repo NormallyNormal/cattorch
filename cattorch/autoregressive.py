@@ -18,11 +18,14 @@ import operator
 from dataclasses import dataclass
 from math import prod
 from types import MappingProxyType
+from collections.abc import Callable, Iterable
 from typing import Any, Mapping
 
 import torch
 import torch.fx
 import torch.nn as nn
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.errors import UnsupportedModelError
 from cattorch.frontend import (
@@ -1518,6 +1521,97 @@ def row_mismatch(
             or largest > rtol * max(scale, 1e-3) or largest != largest:
         return largest, scale
     return None
+
+
+class EmbeddingLookup(TorchDispatchMode):
+    """Record the embedding tables a call looks its token up in.
+
+    A tensor stands for the token when it has one element holding the
+    token's value and was computed from the token alone, by whatever
+    operation: a view, selection, copy, reshape or dtype change of it.
+    """
+
+    def __init__(self, token: torch.Tensor):
+        super().__init__()
+        self.value = int(token)
+        self.token_values = [token]
+        # Rows of the first table looked up with the token.
+        self.rows: int | None = None
+        # Rows of every table looked up with a one-element index.
+        self.tables: set[int] = set()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        if func is torch.ops.aten.embedding.default:
+            rows = int(args[0].shape[0])
+            if args[1].numel() == 1:
+                self.tables.add(rows)
+            if self.rows is None and self._token(args[1]):
+                self.rows = rows
+            return result
+        inputs = [
+            value for value in pytree.tree_leaves((args, kwargs)) if isinstance(value, torch.Tensor)
+        ]
+        if inputs and all(self._token(value) for value in inputs):
+            self.token_values.extend(
+                value for value in pytree.tree_leaves(result)
+                if isinstance(value, torch.Tensor) and value.numel() == 1
+                and value.dtype != torch.bool and not value.is_complex()
+                and value.item() == self.value
+            )
+        return result
+
+    def _token(self, value) -> bool:
+        return any(value is token for token in self.token_values)
+
+
+def lookup_vocabulary(
+    run: Callable[[torch.Tensor], object], first: EmbeddingLookup,
+) -> int | None:
+    """The rows of the table ``run`` looks a ``[1, 1]`` token up in, if any.
+
+    ``first`` watched ``run`` on token 0, which can't tell the token from a
+    constant 0 index. So each table size it saw is tried as the vocabulary:
+    with its last token, from the largest. A table larger than the token's
+    makes the call fail or not look the token up.
+    """
+    for rows in sorted(first.tables, reverse=True):
+        if rows < 2:
+            break
+        lookup = EmbeddingLookup(torch.full((1, 1), rows - 1, dtype=torch.long))
+        try:
+            with torch.no_grad(), lookup:
+                run(lookup.token_values[0])
+        except (IndexError, RuntimeError):
+            continue
+        if lookup.rows is not None:
+            return lookup.rows
+    return 1 if first.rows == 1 else None
+
+
+def check_calibration_tokens(sequences: Iterable, vocabulary: int | None) -> list:
+    """``calibration_sequences`` as a list, each token checked against ``vocabulary``."""
+    checked = list(sequences)
+    allowed = (
+        f"from 0 to {vocabulary - 1}" if vocabulary is not None else "of 0 or more"
+    )
+    for index, sequence in enumerate(checked):
+        tokens = sequence[0] if isinstance(sequence, tuple) and sequence else sequence
+        if not isinstance(tokens, torch.Tensor) or tokens.is_complex():
+            continue
+        flat = tokens.detach().flatten().double()
+        wrong = (flat != flat.round()) | (flat < 0)
+        if vocabulary is not None:
+            wrong |= flat >= vocabulary
+        if bool(wrong.any()):
+            position = int(wrong.nonzero()[0])
+            value = tokens.flatten()[position].item()
+            raise ValueError(
+                f"calibration_sequences[{index}] has token {value} at position {position}; "
+                f"token IDs must be whole numbers {allowed}"
+            )
+    return checked
 
 
 def check_step_equivalence(

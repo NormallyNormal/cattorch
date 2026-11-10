@@ -17,11 +17,11 @@ from typing import Literal
 
 import torch
 from torch import nn
-from torch.utils import _pytree as pytree
-from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.adapters import ModuleAdapter
-from cattorch.autoregressive import row_mismatch
+from cattorch.autoregressive import (
+    EmbeddingLookup, check_calibration_tokens, lookup_vocabulary, row_mismatch,
+)
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.fast import FastConfig
@@ -54,87 +54,14 @@ _LOGITS = "cattorch logits"
 _TOLERANCE = 1e-4
 
 
-class _EmbeddingLookup(TorchDispatchMode):
-    """Record the embedding tables a step looks its token up in.
-
-    A tensor stands for the token when it has one element holding the
-    token's value and was computed from the token alone, by whatever
-    operation: a view, selection, copy, reshape or dtype change of it.
-    """
-
-    def __init__(self, token: torch.Tensor):
-        super().__init__()
-        self.value = int(token)
-        self.token_values = [token]
-        # Rows of the first table looked up with the token.
-        self.rows: int | None = None
-        # Rows of every table looked up with a one-element index.
-        self.tables: set[int] = set()
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        result = func(*args, **kwargs)
-        if func is torch.ops.aten.embedding.default:
-            rows = int(args[0].shape[0])
-            if args[1].numel() == 1:
-                self.tables.add(rows)
-            if self.rows is None and self._token(args[1]):
-                self.rows = rows
-            return result
-        inputs = [
-            value for value in pytree.tree_leaves((args, kwargs)) if isinstance(value, torch.Tensor)
-        ]
-        if inputs and all(self._token(value) for value in inputs):
-            self.token_values.extend(
-                value for value in pytree.tree_leaves(result)
-                if isinstance(value, torch.Tensor) and value.numel() == 1
-                and value.dtype != torch.bool and not value.is_complex()
-                and value.item() == self.value
-            )
-        return result
-
-    def _token(self, value) -> bool:
-        return any(value is token for token in self.token_values)
-
-
-def _vocabulary(
-    model: nn.Module, program: RecurrentGenerationProgram, first: _EmbeddingLookup,
-) -> int:
-    """The rows of the table the token is looked up in.
-
-    ``first`` watched a step on token 0, which can't tell the token from a
-    constant 0 index. So each table size it saw is tried as the vocabulary:
-    with its last token, from the largest. A table larger than the token's
-    makes the step fail or not look the token up.
-    """
-    assert program.states is not None
-    step = getattr(model, program.step)
-    for rows in sorted(first.tables, reverse=True):
-        if rows < 2:
-            break
-        lookup = _EmbeddingLookup(torch.full((1, 1), rows - 1, dtype=torch.long))
-        try:
-            with torch.no_grad(), lookup:
-                step(lookup.token_values[0], *(state.initial for state in program.states))
-        except (IndexError, RuntimeError):
-            continue
-        if lookup.rows is not None:
-            return lookup.rows
-    if first.rows == 1:
-        return 1
-    raise UnsupportedModelError(
-        "the step's token must index an embedding table, so token IDs can be "
-        "checked against the vocabulary"
-    )
-
-
 def _check_step(model: nn.Module, program: RecurrentGenerationProgram) -> tuple[int, int]:
     """Run the step once from the initial states; return its vocabulary and logit count."""
     assert program.states is not None
+    step = getattr(model, program.step)
     token = torch.zeros(1, 1, dtype=torch.long)
-    lookup = _EmbeddingLookup(token)
+    lookup = EmbeddingLookup(token)
     with torch.no_grad(), lookup:
-        returned = getattr(model, program.step)(token, *(state.initial for state in program.states))
+        returned = step(token, *(state.initial for state in program.states))
     leaves = tensor_output_leaves(returned, warn=False)
     if len(leaves) != 1 + len(program.states):
         raise UnsupportedModelError(
@@ -153,7 +80,15 @@ def _check_step(model: nn.Module, program: RecurrentGenerationProgram) -> tuple[
             f"the step's logits must flatten to one vocabulary row, not shape "
             f"{tuple(logits.shape)}"
         )
-    return _vocabulary(model, program, lookup), logits.numel()
+    vocabulary = lookup_vocabulary(
+        lambda token: step(token, *(state.initial for state in program.states)), lookup,
+    )
+    if vocabulary is None:
+        raise UnsupportedModelError(
+            "the step's token must index an embedding table, so token IDs can be "
+            "checked against the vocabulary"
+        )
+    return vocabulary, logits.numel()
 
 
 def _check_reference(
@@ -201,12 +136,12 @@ def _check_reference(
 
 
 def _calibration_calls(
-    sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]],
+    sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]], vocabulary: int,
 ) -> tuple[tuple[ProgramCall, ...], frozenset[int]]:
     """One step call per token, and the calls that start a sequence."""
     calls: list[ProgramCall] = []
     starts = set()
-    for sequence in sequences:
+    for sequence in check_calibration_tokens(sequences, vocabulary):
         if isinstance(sequence, tuple) and len(sequence) == 1:
             sequence = sequence[0]
         if not isinstance(sequence, torch.Tensor) or sequence.ndim != 2 or sequence.shape[0] != 1:
@@ -401,7 +336,7 @@ def transpile_recurrent_generation(
         _check_reference(checked, program, vocabulary, hint)
 
     calls, resets = (
-        _calibration_calls(calibration_sequences)
+        _calibration_calls(calibration_sequences, vocabulary)
         if calibration_sequences is not None else (None, frozenset())
     )
     export = ExportProgram(
@@ -435,6 +370,7 @@ def transpile_recurrent_generation(
             frozenset({f"cattorch {_ENTRY} logits"}) if program.hidden_prefill else frozenset()
         ),
         _calibration_resets=resets,
+        _calibration_name="calibration_sequences",
     )
     (entry,) = result.entrypoints
     return TranspileResult(
