@@ -261,6 +261,22 @@
 
 ## Fixes
 
+- `ExportProgram` and `@entrypoint` sprites had no protection against calls
+  from several scripts at once (Scratch pauses a block after 500 ms and runs
+  other scripts) or stopped part way. A `cattorch reset` or another call made
+  while a call was paused was lost or undone, and the paused call reported
+  `ok`; calls share temporary lists, so even a sprite without state could
+  report `ok` with wrong outputs, and a call paused while decoding the
+  weights could leave them wrong for every later call. A call stopped while
+  writing the states, or filling them in a freshly loaded project, left them
+  partly written. Now a call that another block started during commits
+  nothing and reports `another call ran during this one`. While a call or
+  reset writes the states, and after one was stopped then until
+  `cattorch reset`, entry point calls are refused with `an earlier call or
+  reset was stopped while changing the states, or is still changing them;
+  reset first`. A call stopped before it writes the states changes nothing,
+  as before. Two overlaps are still not caught. See
+  [stopped and overlapping calls](docs/programs-and-moe.md#stopped-and-overlapping-calls).
 - In `GenerationProgram` and `RecurrentGenerationProgram` sprites,
   `cattorch reset` or `cattorch prefill` run from a second script while
   Scratch had paused a decode or prefill (it pauses a block after 500 ms)

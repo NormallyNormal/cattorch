@@ -375,6 +375,8 @@ def transpile_recurrent_generation(
         ),
         _calibration_resets=resets,
         _calibration_name="calibration_sequences",
+        # The generation blocks guard the step and reset.
+        _guard_overlaps=False,
     )
     (entry,) = result.entrypoints
     return TranspileResult(

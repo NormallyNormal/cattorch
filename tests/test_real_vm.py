@@ -336,3 +336,80 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     torch.testing.assert_close(
         values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
     )
+
+
+def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
+    # Scratch pauses the step once it has run for 500 ms, and runs the second
+    # script, which resets: the step must then neither commit nor report ok.
+    from cattorch import (
+        EntryPoint, ExportProgram, Input, Output, ProgramCall, State, StateInput, StateUpdate,
+    )
+    from cattorch.program_runtime import ProgramReplay
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        append, call, change_var, div, eq, for_each, item, length, mod, mul, repeat_until,
+        set_var, sub, var,
+    )
+    from test_program_overlap import OVERTAKEN
+
+    class Slow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(5)
+            self.weight = nn.Parameter(torch.randn(64, 64) / 8)
+
+        def step(self, x, counter):
+            for _ in range(6):
+                x = torch.tanh(x @ self.weight)
+            counter = counter + x.mean(0)[:4]
+            return counter, counter
+
+    program = ExportProgram(
+        states=(State("counter", torch.zeros(4)),),
+        entrypoints=(EntryPoint(
+            "step", method="step",
+            arguments=(Input("x", torch.zeros(64, 64)), StateInput("counter")),
+            returns=(Output("value"), StateUpdate("counter")),
+        ),),
+    )
+    model = Slow().eval()
+    result = transpile(model, program, tmp_path / "slow")
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    first, second, counter = (
+        builder.global_list(name) for name in ("first results", "second results", "counter")
+    )
+    stepping, done = (builder.global_variable(name, 0) for name in ("stepping", "first done"))
+    flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    status, x, state = "cattorch status", "cattorch step x", "cattorch state counter"
+
+    builder.script(sprite, flag, (
+        call("cattorch init"),
+        for_each("index", 4096, (
+            append(x, sub(div(mod(mul(var("index"), 37), 101), 101), 0.5)),
+        )),
+        set_var(stepping, 1),
+        call("cattorch step"), append(first, var(status)),
+        set_var(done, 1),
+    ), lists=(x, first), variables=(status, stepping, done, "index"))
+    builder.script(sprite, flag, (
+        repeat_until(eq(var(stepping), 1), (change_var("waits", 1),)),
+        # 0 if the step was still running.
+        append(second, var(done)),
+        call("cattorch reset"), append(second, var(status)),
+        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
+        # The states as the first step left them.
+        for_each("position", length(state), (append(second, item(state, var("position"))),)),
+        call("cattorch step"), append(second, var(status)),
+        for_each("position", length(state), (append(counter, item(state, var("position"))),)),
+    ), lists=(second, counter, state), variables=(status, stepping, done, "waits", "position"),
+        y=400)
+    path = tmp_path / "overlap.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["first results"] == [OVERTAKEN]
+    assert stage["second results"] == [0, "ok", 0, 0, 0, 0, "ok"]
+    replay = ProgramReplay(model, program)
+    inputs = torch.tensor([((index * 37) % 101) / 101 - 0.5 for index in range(1, 4097)])
+    (expected, _) = replay.run(ProgramCall("step", (inputs.reshape(64, 64),)))
+    torch.testing.assert_close(values(stage, "counter"), expected, atol=1e-4, rtol=0)

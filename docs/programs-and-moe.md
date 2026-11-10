@@ -70,6 +70,47 @@ Rules:
 its `capacity`. A call that fails leaves the outputs and state as they were.
 `cattorch reset` restores every state to its initial value.
 
+### Stopped and overlapping calls
+
+Scratch pauses a block that has run for half a second where it calls a
+procedure or repeats a loop, and runs other scripts meanwhile, so another
+script can call one of the sprite's blocks while one is still running.
+Scratch's stop sign, or a `stop all` block, can stop a block part way.
+
+- Every block takes over as it starts, unless it is refused as below. A call
+  that another block started during reports the last status in the table
+  below and sends no completion broadcast. If that happened before it began
+  writing its results, it writes nothing, and its outputs and states are as
+  the other block left them.
+- A call changes the states at its end, all of them together. While it does,
+  or while `cattorch reset` restores them, another entry point call is
+  refused, as in the table, and changes nothing; the call it found running
+  then finishes as usual.
+- A call stopped before it changes the states changes nothing, and the next
+  call runs as usual. One stopped while changing them, or one that
+  `cattorch reset`, `cattorch init` or `cattorch prepare for save` started
+  during then, leaves them partly changed: every entry point call is refused
+  until `cattorch reset`, which always recovers once nothing else is running.
+  A sprite without state has nothing to reset; its next call simply runs.
+- A call stopped or taken over while it decodes the weights leaves them for
+  the next call to decode again.
+
+| Situation | Result | `cattorch status` |
+|---|---|---|
+| An entry point called after a call or reset was stopped while changing the states, or while one changes them in another script | Outputs and states unchanged | `an earlier call or reset was stopped while changing the states, or is still changing them; reset first` |
+| A call or reset that another block started during, from another script | Commits nothing; if it was changing the states, calls are refused as above until reset | `another call ran during this one` |
+
+Apart from two cases, a call that reports `ok` ran alone. First, as for
+[generation](generation.md#overlapping-calls): if the call that was taken over
+resumes while the newer block is itself paused, and is still unfinished when
+the newer block ends, or is stopped after it resumed, the newer block can
+report `ok` with results from lists the old call changed. Second, an entry
+point that updates no state can be paused while it copies its outputs; if the
+same entry point is called meanwhile, the old call then finishes copying its
+outputs over the new call's, after the new call reported `ok`. Call the
+blocks from one script at a time; to reset from another script, stop the
+calling script first.
+
 Because an append state's first dimension changes at runtime, it is the one
 exception to fixed shapes. This variable-length dimension is called a runtime
 extent. Elementwise, linear, normalization, matrix, and reshaping operations

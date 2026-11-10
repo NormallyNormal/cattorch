@@ -33,12 +33,13 @@ from cattorch.quantization import quantize_model
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
-    _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
+    _BUSY, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
+    _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
-    Program, Statement, add, append, broadcast_and_wait, call, clear, eq, for_each, gt, if_,
-    item, length, lt, mod, repeat, set_var, var,
+    Program, Statement, add, append, argument, broadcast_and_wait, call, change_var, clear, eq,
+    for_each, gt, if_, if_else, item, length, lt, mod, not_, repeat, set_var, var,
 )
 from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.interface import (
@@ -201,7 +202,23 @@ def _copy_list(source: str, destination: str, index_name: str):
 
 
 _ENSURE_STATES = "_cattorch ensure states"
+# With the calling block's epoch.
+_ENSURE_STATES_IN_EPOCH = "_cattorch ensure states %s"
 _STATES_FILLED = "_cattorch states filled"
+_INTERRUPTED = (
+    "an earlier call or reset was stopped while changing the states, or is still "
+    "changing them; reset first"
+)
+_OVERTAKEN = "another call ran during this one"
+
+
+def _overtaken() -> tuple[Statement, ...]:
+    """What a call does on finding that another one started during it.
+
+    It changes the epoch too: a call it resumed during, still running, may
+    have read what it wrote meanwhile, and fails as well.
+    """
+    return (change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, _OVERTAKEN))
 
 
 def _fill_procedure(index: int) -> str:
@@ -293,11 +310,13 @@ def _build_entry_wrapper(
     ensure_states: bool = False,
     hidden: frozenset[int] = frozenset(),
     gate: str = "",
+    guarded: bool = False,
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
-    """The public procedure body that checks, computes and commits one entry point.
+    """The procedure body that checks, computes and commits one entry point.
 
     The ``hidden`` return positions are checked and copied only while the
-    ``gate`` variable is 1.
+    ``gate`` variable is 1. A ``guarded`` body is run by
+    ``_add_epoch_procedure`` and commits nothing once another call started.
     """
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
@@ -308,7 +327,10 @@ def _build_entry_wrapper(
     variables = {status, gate} if hidden else {status}
     body: list[Statement] = [set_var(status, "ok")]
     if ensure_states:
-        body.append(call(_ENSURE_STATES))
+        body.append(
+            call(_ENSURE_STATES_IN_EPOCH, epoch=argument("epoch")) if guarded
+            else call(_ENSURE_STATES)
+        )
 
     for index, (binding, spec) in enumerate(zip(entrypoint.arguments, result.inputs)):
         name = (
@@ -422,9 +444,41 @@ def _build_entry_wrapper(
         else:
             copy = _copy_list(temporary, destination, f"{entrypoint.name} copy {index}")
             commits.extend((if_(eq(var(gate), 1), copy),) if index in hidden else copy)
-    commits.append(broadcast_and_wait(completion))
-    computation.append(if_(eq(var(status), "ok"), tuple(commits)))
-    body.append(if_(eq(var(status), "ok"), tuple(computation)))
+    if not guarded:
+        commits.append(broadcast_and_wait(completion))
+        computation.append(if_(eq(var(status), "ok"), tuple(commits)))
+        body.append(if_(eq(var(status), "ok"), tuple(computation)))
+    else:
+        # The commit is the call's last step, so a call that another one ran
+        # during skips it. One paused part way, or stopped, leaves the states
+        # marked busy until a reset.
+        current = _epoch_current()
+        variables.add(_EPOCH)
+        if any(isinstance(binding, StateUpdate) for binding in entrypoint.returns):
+            variables.add(_BUSY)
+            commits = [
+                set_var(_BUSY, 1), *commits,
+                if_else(
+                    current,
+                    # A call refused meanwhile set the status.
+                    (set_var(_BUSY, 0), set_var(status, "ok"), broadcast_and_wait(completion)),
+                    (set_var(_BUSY, 1), *_overtaken()),
+                ),
+            ]
+        else:
+            commits.append(if_else(
+                current, (broadcast_and_wait(completion),), _overtaken(),
+            ))
+        body.append(if_(eq(var(status), "ok"), tuple(computation)))
+        # Another call may have finished decoding the weights while this one
+        # was, and this one then left them half overwritten.
+        initialized = f"_cattorch {entrypoint.name} initialized"
+        variables.add(initialized)
+        body.append(if_else(
+            current,
+            (if_(eq(var(status), "ok"), tuple(commits)),),
+            (set_var(initialized, 0), *_overtaken()),
+        ))
     return Program(
         f"entrypoint_{entrypoint.name}",
         variables=variables | {
@@ -474,6 +528,7 @@ def transpile_program(
     _hidden_outputs: frozenset[str] = frozenset(),
     _calibration_resets: frozenset[int] = frozenset(),
     _calibration_name: str = "calibration_calls",
+    _guard_overlaps: bool = True,
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -505,6 +560,9 @@ def transpile_program(
       before which GPTQ calibration resets every state.
     - ``_calibration_name`` is the caller's name for ``calibration_calls``,
       for its errors.
+    - ``_guard_overlaps=False`` leaves out the busy flag and epoch that keep
+      stopped and overlapping calls from changing the states unnoticed, for
+      a caller that guards the entry points and ``cattorch reset`` itself.
 
     The renaming and hidden-output hooks can't be combined with
     variable-length inputs, whose export check runs the entry points through
@@ -725,19 +783,27 @@ def transpile_program(
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
             entrypoint, sub_result, program, ensure_states=any_filled,
-            hidden=hidden, gate=_PROJECT_OUTPUT,
+            hidden=hidden, gate=_PROJECT_OUTPUT, guarded=_guard_overlaps,
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(
                 interface_capacities.get(spec.list_name, 0), spec.max_numel or 0,
             )
-        combined = _add_warp_procedure(
-            combined,
-            f"cattorch {entrypoint.name}",
-            wrapper_program,
-            x=640,
-            y=160 + 160 * position,
-        )
+        if _guard_overlaps:
+            combined = _add_epoch_procedure(
+                combined, f"cattorch {entrypoint.name}", wrapper_program,
+                x=640, y=160 + 160 * position,
+                refusal=(set_var(STATUS_VARIABLE, _INTERRUPTED),) if program.states else None,
+                variables=(STATUS_VARIABLE,),
+            )
+        else:
+            combined = _add_warp_procedure(
+                combined,
+                f"cattorch {entrypoint.name}",
+                wrapper_program,
+                x=640,
+                y=160 + 160 * position,
+            )
         _merge_lists_by_name(
             combined,
             set(wrapper_program.lists),
@@ -807,64 +873,97 @@ def transpile_program(
             _state_list(state.name),
             f"cattorch reset {index}",
         ))
+    ensure_call = (
+        call(_ENSURE_STATES_IN_EPOCH, epoch=argument("epoch")) if _guard_overlaps
+        else call(_ENSURE_STATES)
+    )
     if any_filled:
         reset_body.append(set_var(_STATES_FILLED, 1))
         lifecycle_variables.add(_STATES_FILLED)
+        fill_empty = tuple(
+            if_(eq(length(_state_list(state.name)), 0), (call(_fill_procedure(index)),))
+            for index, state in enumerate(program.states)
+            if fills[state.name] is not None
+        )
         # The first call or init fills the constant states still empty in a
         # freshly loaded project. Later, as before, only reset refills them.
-        combined = _add_warp_procedure(
-            combined,
-            _ENSURE_STATES,
-            Program(
+        if _guard_overlaps:
+            # Not over states a stopped or running call left busy.
+            ensure = Program(
+                "program_ensure_states", variables={_STATES_FILLED, _BUSY, _EPOCH},
+                lists={_state_list(state.name) for state in program.states},
+                body=(if_(eq(add(var(_STATES_FILLED), var(_BUSY)), 0), (
+                    set_var(_BUSY, 1), *fill_empty, set_var(_STATES_FILLED, 1),
+                    if_else(_epoch_current(), (set_var(_BUSY, 0),), (set_var(_BUSY, 1),)),
+                )),),
+            )
+            combined = _add_warp_procedure(
+                combined, _ENSURE_STATES_IN_EPOCH, ensure, x=1920, y=0, arguments=("epoch",),
+            )
+        else:
+            ensure = Program(
                 "program_ensure_states", variables={_STATES_FILLED},
                 lists={_state_list(state.name) for state in program.states},
                 body=(if_(eq(var(_STATES_FILLED), 0), (
-                    *(
-                        if_(eq(length(_state_list(state.name)), 0), (call(_fill_procedure(index)),))
-                        for index, state in enumerate(program.states)
-                        if fills[state.name] is not None
-                    ),
-                    set_var(_STATES_FILLED, 1),
+                    *fill_empty, set_var(_STATES_FILLED, 1),
                 )),),
-            ),
-            x=960,
-            y=640,
-        )
-    combined = _add_warp_procedure(
-        combined,
-        "cattorch reset",
-        Program(
-            "program_reset", variables=lifecycle_variables,
-            lists=lifecycle_lists, body=reset_body,
-        ),
-        x=960,
-        y=160,
-    )
-    init_body = [
-        *((call(_ENSURE_STATES),) if any_filled else ()),
-        *(call(f"_cattorch {entry.name} init") for entry in program.entrypoints),
-        broadcast_and_wait("cattorch init complete"),
+            )
+            combined = _add_warp_procedure(combined, _ENSURE_STATES, ensure, x=1920, y=0)
+    initialized = [f"_cattorch {entry.name} initialized" for entry in program.entrypoints]
+    init_body: list[Statement] = [*((ensure_call,) if any_filled else ())]
+    for entry, flag in zip(program.entrypoints, initialized):
+        if _guard_overlaps:
+            # A call running meanwhile decodes the weights itself.
+            init_body.append(set_var(flag, 0))
+        init_body.append(call(f"_cattorch {entry.name} init"))
+    if _guard_overlaps:
+        # A call that ran meanwhile may have left the weights half decoded.
+        init_body.append(if_(not_(_epoch_current()), (
+            *(set_var(flag, 0) for flag in initialized), change_var(_EPOCH, 1),
+        )))
+    init_body.append(broadcast_and_wait("cattorch init complete"))
+    prepare_body: list[Statement] = [
+        call(f"_cattorch {entry.name} prepare for save") for entry in program.entrypoints
     ]
-    combined = _add_warp_procedure(
-        combined,
-        "cattorch init",
-        Program("program_init", body=init_body),
-        x=960,
-        y=320,
+    if _guard_overlaps:
+        lifecycle_variables.add(_EPOCH)
+        if program.states:
+            # A reset that another call ran during, or that is stopped, leaves
+            # the states busy. A call refused meanwhile set the status.
+            lifecycle_variables.add(_BUSY)
+            reset_body.append(if_else(
+                _epoch_current(), (set_var(_BUSY, 0), set_var(STATUS_VARIABLE, "ok")),
+                (set_var(_BUSY, 1), *_overtaken()),
+            ))
+        else:
+            reset_body.append(if_(not_(_epoch_current()), _overtaken()))
+        # Re-encoding the weights takes them from a running call.
+        prepare_body.insert(0, change_var(_EPOCH, 1))
+    epoch = (_EPOCH,) if _guard_overlaps else ()
+    lifecycle = (
+        ("cattorch reset", Program(
+            "program_reset", variables=lifecycle_variables, lists=lifecycle_lists,
+            body=reset_body,
+        )),
+        ("cattorch init", Program(
+            "program_init", variables=(*epoch, *initialized), body=init_body,
+        )),
+        ("cattorch prepare for save", Program(
+            "program_prepare", variables=epoch, body=prepare_body,
+        )),
     )
-    combined = _add_warp_procedure(
-        combined,
-        "cattorch prepare for save",
-        Program(
-            "program_prepare",
-            body=tuple(
-                call(f"_cattorch {entry.name} prepare for save")
-                for entry in program.entrypoints
-            ),
-        ),
-        x=960,
-        y=480,
-    )
+    for position, (procedure, body_program) in enumerate(lifecycle):
+        y = 160 + 160 * position
+        if _guard_overlaps and procedure != "cattorch prepare for save":
+            combined = _add_epoch_procedure(
+                combined, procedure, body_program, x=1280, y=y,
+                take_over=(
+                    (set_var(_BUSY, 1),) if procedure == "cattorch reset" and program.states
+                    else ()
+                ),
+            )
+        else:
+            combined = _add_warp_procedure(combined, procedure, body_program, x=1280, y=y)
     _merge_lists_by_name(combined, lifecycle_lists)
     _merge_variables_by_name(combined, lifecycle_variables | {STATUS_VARIABLE})
     if _hidden_outputs:
@@ -979,7 +1078,7 @@ def transpile_program(
                 lists=[shard.name for shard in layout.shards],
                 body=fill_body,
             ),
-            x=1280,
+            x=1920,
             y=160 + 160 * index,
         )
 

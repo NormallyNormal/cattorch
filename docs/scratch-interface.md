@@ -78,6 +78,10 @@ after it:
 | `cattorch status` | variable | `ok` after a call, or why it failed; a failed call changes nothing. |
 | `cattorch ENTRY complete`, `cattorch init complete` | broadcasts | Sent when a call or `cattorch init` finishes. |
 
+A call made while another script's call is running, or after one was
+stopped part way, can fail with a status saying so; see
+[stopped and overlapping calls](programs-and-moe.md#stopped-and-overlapping-calls).
+
 ## Tokenizer sprites
 
 | Name | Kind | Meaning |
