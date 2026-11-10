@@ -228,6 +228,12 @@
   prompt tokens when layers are shared too, not just the output head. A
   three-layer shared model runs about 18% fewer Scratch operations for an
   8-token prompt.
+- A program `State(mode="replace")` that starts with one value everywhere,
+  such as zeros, is no longer stored in the project, where it was written
+  twice (the state and its initial copy). Its list is saved empty and filled
+  by `cattorch init`, `cattorch reset`, or the first entry point call. A
+  450,000-value zero state now adds almost nothing to the project instead of
+  about 3.6 MB.
 
 ## Fixes
 

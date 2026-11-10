@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import uuid
-from dataclasses import replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -35,8 +36,8 @@ from cattorch.sprite import (
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
-    Program, add, append, broadcast_and_wait, call, clear, eq, for_each, gt, if_,
-    item, length, lt, mod, set_var, var,
+    Program, Statement, add, append, broadcast_and_wait, call, clear, eq, for_each, gt, if_,
+    item, length, lt, mod, repeat, set_var, var,
 )
 from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.interface import (
@@ -192,10 +193,97 @@ def _copy_list(source: str, destination: str, index_name: str):
     )
 
 
+_ENSURE_STATES = "_cattorch ensure states"
+_STATES_FILLED = "_cattorch states filled"
+
+
+def _fill_procedure(index: int) -> str:
+    return f"_cattorch fill state {index}"
+
+
+def _constant_fill(state) -> int | float | None:
+    """The one value a numeric replace state starts with everywhere, if any.
+
+    Only replace states qualify: their list is never validly empty, so an
+    empty one in a freshly loaded project is known to need filling. An empty
+    append state is a valid value.
+    """
+    flat = state.initial.detach().cpu().flatten()
+    if (
+        state.mode != "replace" or flat.numel() == 0
+        or flat.dtype == torch.bool or flat.is_complex()
+    ):
+        return None
+    first = flat[0]
+    same = flat == first
+    if flat.is_floating_point():
+        same &= torch.signbit(flat) == torch.signbit(first)
+    return first.item() if bool(same.all()) else None
+
+
+@dataclass(frozen=True)
+class ProgramAssembly:
+    """What a ``transpile_program(_edit_program=...)`` callback can see and extend.
+
+    ``names`` maps every default interface name (``cattorch <entry>``,
+    ``cattorch <entry> <binding>``, ``cattorch <entry> complete``,
+    ``cattorch state <name>``, and the lifecycle procedures) to its name in
+    the sprite. ``states`` maps each state to its list. The callback may add
+    to ``capacities`` (logical list sizes, for sharding the lists it adds) and
+    to the public name sets, which keep names from being marked internal or
+    compacted; it may also remove names from them.
+    """
+
+    names: Mapping[str, str]
+    states: Mapping[str, str]
+    capacities: dict[str, int]
+    public_data_names: set[str]
+    public_procedures: set[str]
+
+
+def _interface_renames(
+    program: ExportProgram, public_names: Mapping[str, str] | None, private_states: bool,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Validated list, procedure, and broadcast renames for the program interface."""
+    lists: dict[str, str] = {}
+    procedures: dict[str, str] = {}
+    broadcasts: dict[str, str] = {}
+    defaults: dict[str, dict[str, str]] = {}
+    for entrypoint in program.entrypoints:
+        defaults[f"cattorch {entrypoint.name}"] = procedures
+        defaults[f"cattorch {entrypoint.name} complete"] = broadcasts
+        for binding in (*entrypoint.arguments, *entrypoint.returns):
+            if isinstance(binding, (Input, Output)):
+                defaults[_input_list(entrypoint.name, binding.name)] = lists
+    for old, new in (public_names or {}).items():
+        if old not in defaults:
+            raise ValueError(f"_public_names has no entry point name {old!r}")
+        if not isinstance(new, str) or not new.strip():
+            raise ValueError(f"_public_names[{old!r}] must be a non-empty string")
+        if new != old:
+            defaults[old][old] = new
+    if private_states:
+        for state in program.states:
+            lists[_state_list(state.name)] = f"_cattorch state {state.name}"
+    targets = [*lists.values(), *procedures.values(), *broadcasts.values()]
+    taken = set(defaults) | {_state_list(state.name) for state in program.states}
+    if len(targets) != len(set(targets)) or set(targets) & taken:
+        raise ValueError("_public_names must map to distinct, unused names")
+    return lists, procedures, broadcasts
+
+
+def _rename_broadcast(sprite: dict, old: str, new: str) -> None:
+    for identifier, message in sprite.get("broadcasts", {}).items():
+        if message == old:
+            sprite["broadcasts"][identifier] = new
+            refresh_data_display_name(sprite.get("blocks", {}), identifier, new)
+
+
 def _build_entry_wrapper(
     entrypoint: EntryPoint,
     result,
     program: ExportProgram,
+    ensure_states: bool = False,
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
@@ -204,7 +292,9 @@ def _build_entry_wrapper(
     public_outputs = []
     lists = set()
     variables = {status}
-    body = [set_var(status, "ok")]
+    body: list[Statement] = [set_var(status, "ok")]
+    if ensure_states:
+        body.append(call(_ENSURE_STATES))
 
     for index, (binding, spec) in enumerate(zip(entrypoint.arguments, result.inputs)):
         name = (
@@ -362,10 +452,51 @@ def transpile_program(
     codegen: CodegenConfig | None = None,
     adapters: tuple[ModuleAdapter, ...] = (),
     kernels=(),
+    _edit_program: Callable[[dict, ProgramAssembly], None] | None = None,
+    _public_names: Mapping[str, str] | None = None,
+    _private_states: bool = False,
 ) -> ProgramResult:
-    """Compile all explicit program entrypoints into one sprite artifact."""
+    """Compile all explicit program entrypoints into one sprite artifact.
+
+    A replace state whose initial tensor holds one value everywhere is not stored:
+    its list is saved empty and filled by a loop on ``cattorch reset``, on
+    ``cattorch init`` and on the first entry point call if it is still empty.
+
+    Private hooks for exports built on a program (default: no change):
+
+    - ``_edit_program(sprite, assembly)`` runs on the assembled sprite after
+      the entry points and lifecycle procedures exist, with every interface
+      name final, and before lists are sharded and the sprite is written. It
+      may add procedures, lists and variables that use them; ``assembly``
+      (a ``ProgramAssembly``) gives the names, and takes the capacities and
+      public names of what the callback adds.
+    - ``_public_names`` renames entry point procedures (``cattorch <entry>``),
+      their input and output lists (``cattorch <entry> <binding>``) and
+      completion broadcasts (``cattorch <entry> complete``), keyed by the
+      default name. A new name starting with ``_`` is private: it is left out
+      of the public interface and ``ProgramResult.procedures``, and may be
+      compacted, so the entry point results then name it only as built.
+    - ``_private_states`` names state lists ``_cattorch state <name>`` and
+      leaves them out of the public interface and of the result's states.
+
+    The renaming hooks can't be combined with variable-length inputs, whose
+    export check runs the entry points through their default names.
+    """
     if not isinstance(program, ExportProgram):
         raise TypeError("program must be an ExportProgram")
+    list_renames, procedure_renames, broadcast_renames = _interface_renames(
+        program, _public_names, _private_states,
+    )
+    renames = {**list_renames, **procedure_renames, **broadcast_renames}
+    if renames and any(
+        isinstance(binding, Input) and binding.dynamic is not None
+        for entry in program.entrypoints for binding in entry.arguments
+    ):
+        raise ValueError("_public_names and _private_states need fixed-length inputs")
+
+    def name_of(default: str) -> str:
+        return renames.get(default, default)
+
     validate_export_options(
         name=name, optimization=optimization, fast_config=fast_config,
         storage=storage, quantization=quantization, codegen=codegen,
@@ -379,6 +510,8 @@ def transpile_program(
     registry = default_registry().for_export(adapters=adapters, kernels=kernels)
 
     states = {state.name: state for state in program.states}
+    fills = {state.name: _constant_fill(state) for state in program.states}
+    any_filled = any(value is not None for value in fills.values())
     calls = tuple(calibration_calls or ())
     known_entries = {entry.name for entry in program.entrypoints}
     if any(call_value.entrypoint not in known_entries for call_value in calls):
@@ -525,7 +658,7 @@ def transpile_program(
 
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
-            entrypoint, sub_result, program,
+            entrypoint, sub_result, program, ensure_states=any_filled,
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(
@@ -578,26 +711,56 @@ def transpile_program(
     assert combined is not None
     _deduplicate_program_payloads(combined, payload_names)
     for state in program.states:
+        if fills[state.name] is not None:
+            # A constant state is filled by a loop at run time instead.
+            _set_list_contents(combined, _state_list(state.name), [])
+            continue
         values = state.initial.detach().cpu().flatten().tolist()
         _set_list_contents(combined, _state_list(state.name), values)
         _set_list_contents(combined, f"_cattorch initial state {state.name}", values)
 
-    lifecycle_lists = {
-        name
-        for state in program.states
-        for name in (_state_list(state.name), f"_cattorch initial state {state.name}")
+    lifecycle_lists = {_state_list(state.name) for state in program.states} | {
+        f"_cattorch initial state {state.name}"
+        for state in program.states if fills[state.name] is None
     }
     lifecycle_variables = {
-        f"cattorch reset {index}" for index, _state in enumerate(program.states)
+        f"cattorch reset {index}" for index, state in enumerate(program.states)
+        if fills[state.name] is None
     }
-    reset_body = [set_var(STATUS_VARIABLE, "ok")]
+    reset_body: list[Statement] = [set_var(STATUS_VARIABLE, "ok")]
     lifecycle_variables.add(STATUS_VARIABLE)
     for index, state in enumerate(program.states):
+        if fills[state.name] is not None:
+            reset_body.append(call(_fill_procedure(index)))
+            continue
         reset_body.extend(_copy_list(
             f"_cattorch initial state {state.name}",
             _state_list(state.name),
             f"cattorch reset {index}",
         ))
+    if any_filled:
+        reset_body.append(set_var(_STATES_FILLED, 1))
+        lifecycle_variables.add(_STATES_FILLED)
+        # The first call or init fills the constant states still empty in a
+        # freshly loaded project. Later, as before, only reset refills them.
+        combined = _add_warp_procedure(
+            combined,
+            _ENSURE_STATES,
+            Program(
+                "program_ensure_states", variables={_STATES_FILLED},
+                lists={_state_list(state.name) for state in program.states},
+                body=(if_(eq(var(_STATES_FILLED), 0), (
+                    *(
+                        if_(eq(length(_state_list(state.name)), 0), (call(_fill_procedure(index)),))
+                        for index, state in enumerate(program.states)
+                        if fills[state.name] is not None
+                    ),
+                    set_var(_STATES_FILLED, 1),
+                )),),
+            ),
+            x=960,
+            y=640,
+        )
     combined = _add_warp_procedure(
         combined,
         "cattorch reset",
@@ -609,6 +772,7 @@ def transpile_program(
         y=160,
     )
     init_body = [
+        *((call(_ENSURE_STATES),) if any_filled else ()),
         *(call(f"_cattorch {entry.name} init") for entry in program.entrypoints),
         broadcast_and_wait("cattorch init complete"),
     ]
@@ -635,9 +799,32 @@ def transpile_program(
     _merge_lists_by_name(combined, lifecycle_lists)
     _merge_variables_by_name(combined, lifecycle_variables | {STATUS_VARIABLE})
 
-    program_capacities = dict(interface_capacities)
+    for old, new in list_renames.items():
+        _rename_list(combined, old, new)
+    for old, new in procedure_renames.items():
+        _rename_procedure(combined, old, new)
+    for old, new in broadcast_renames.items():
+        _rename_broadcast(combined, old, new)
+    entry_results = [
+        replace(
+            entry_result,
+            procedure=name_of(entry_result.procedure),
+            completion_broadcast=name_of(entry_result.completion_broadcast),
+            inputs=tuple(
+                replace(value, list_name=name_of(value.list_name)) for value in entry_result.inputs
+            ),
+            outputs=tuple(
+                replace(value, list_name=name_of(value.list_name)) for value in entry_result.outputs
+            ),
+            state_inputs=() if _private_states else entry_result.state_inputs,
+            state_updates=() if _private_states else entry_result.state_updates,
+        )
+        for entry_result in entry_results
+    ]
+
+    program_capacities = {name_of(name): size for name, size in interface_capacities.items()}
     program_capacities.update({
-        _state_list(state.name): (
+        name_of(_state_list(state.name)): (
             state.capacity * math.prod(state.initial.shape[1:])
             if state.mode == "append" else state.initial.numel()
         )
@@ -645,23 +832,74 @@ def transpile_program(
     })
     program_capacities.update({
         f"_cattorch initial state {state.name}": state.initial.numel()
-        for state in program.states
+        for state in program.states if fills[state.name] is None
     })
+    public_data_names = {STATUS_VARIABLE}
+    for entry_result in entry_results:
+        public_data_names.update(value.list_name for value in entry_result.inputs)
+        public_data_names.update(value.list_name for value in entry_result.outputs)
+    if not _private_states:
+        public_data_names.update(_state_list(state.name) for state in program.states)
+    lifecycle_procedures = ("cattorch init", "cattorch reset", "cattorch prepare for save")
+    entry_procedures = tuple(name_of(f"cattorch {entry.name}") for entry in program.entrypoints)
+    public_procedures = {*lifecycle_procedures, *entry_procedures}
+    if _edit_program is not None:
+        defaults = [
+            *lifecycle_procedures,
+            *(_state_list(state.name) for state in program.states),
+            *(
+                f"cattorch {entry.name}{suffix}" for entry in program.entrypoints
+                for suffix in ("", " complete")
+            ),
+            *(
+                _input_list(entry.name, binding.name) for entry in program.entrypoints
+                for binding in (*entry.arguments, *entry.returns)
+                if isinstance(binding, (Input, Output))
+            ),
+        ]
+        _edit_program(combined, ProgramAssembly(
+            names={name: name_of(name) for name in defaults},
+            states={state.name: name_of(_state_list(state.name)) for state in program.states},
+            capacities=program_capacities,
+            public_data_names=public_data_names,
+            public_procedures=public_procedures,
+        ))
+    public_data_names = {name for name in public_data_names if not name.startswith("_")}
+    public_procedures = {name for name in public_procedures if not name.startswith("_")}
+
     program_layouts = shard_sprite_lists(combined, program_capacities)
+    sharded_names = {name_of(name) for name in sharded_names}
     sharded_names.update(
         layout.name for layout in program_layouts.values()
         if len(layout.shards) > 1
     )
+    for index, state in enumerate(program.states):
+        value = fills[state.name]
+        if value is None:
+            continue
+        # Built after sharding, so each physical list is filled directly up to
+        # its capacity rather than through the routed append of a logical one.
+        layout = program_layouts[name_of(_state_list(state.name))]
+        remaining = state.initial.numel()
+        fill_body: list[Statement] = []
+        for shard in layout.shards:
+            count = min(shard.capacity, remaining)
+            remaining -= count
+            fill_body.append(clear(shard.name))
+            if count:
+                fill_body.append(repeat(count, (append(shard.name, value),)))
+        combined = _add_warp_procedure(
+            combined,
+            _fill_procedure(index),
+            Program(
+                f"program_fill_{index}",
+                lists=[shard.name for shard in layout.shards],
+                body=fill_body,
+            ),
+            x=1280,
+            y=160 + 160 * index,
+        )
 
-    public_data_names = {STATUS_VARIABLE}
-    for entrypoint in entry_results:
-        public_data_names.update(value.list_name for value in entrypoint.inputs)
-        public_data_names.update(value.list_name for value in entrypoint.outputs)
-    public_data_names.update(_state_list(state.name) for state in program.states)
-    public_procedures = {
-        "cattorch init", "cattorch reset", "cattorch prepare for save",
-        *(f"cattorch {entry.name}" for entry in program.entrypoints),
-    }
     finalized = finalize_sprite(
         combined,
         output_path,
@@ -670,7 +908,7 @@ def transpile_program(
         public_data_names=frozenset(public_data_names),
         public_procedures=frozenset(public_procedures),
     )
-    state_results = tuple(
+    state_results = () if _private_states else tuple(
         StateResult(
             name=state.name,
             list_name=_state_list(state.name),
@@ -681,9 +919,9 @@ def transpile_program(
         )
         for state in program.states
     )
-    procedures = (
-        "cattorch init", "cattorch reset", "cattorch prepare for save",
-        *(f"cattorch {entry.name}" for entry in program.entrypoints),
+    procedures = tuple(
+        name for name in (*lifecycle_procedures, *entry_procedures)
+        if not name.startswith("_")
     )
     result = ProgramResult(
         path=finalized.path,

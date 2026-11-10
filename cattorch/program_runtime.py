@@ -108,7 +108,13 @@ class ProgramReplay:
         self.program = program
         self.entries = {entry.name: entry for entry in program.entrypoints}
         self.declarations = {state.name: state for state in program.states}
-        self.states = {state.name: state.initial.detach().clone() for state in program.states}
+        self.reset()
+
+    def reset(self) -> None:
+        """Restore every state to its initial value, as ``cattorch reset`` does."""
+        self.states = {
+            state.name: state.initial.detach().clone() for state in self.program.states
+        }
 
     def entry(self, invocation):
         entry = self.entries.get(invocation.entrypoint)

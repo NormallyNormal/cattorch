@@ -458,3 +458,270 @@ def test_symmetric_program_verify_handles_right_hand_matmul_weights(tmp_path):
     result = transpile(model, program, tmp_path / "rhs-program", quantization=config)
     comparison = verify(model, program, result, quantization=config, atol=1e-4, rtol=1e-5)
     assert comparison.passed, comparison
+
+
+class _Accumulator(nn.Module):
+    def step(self, delta, total):
+        updated = total + delta
+        return updated * 2, updated
+
+
+def _accumulator_program(initial: torch.Tensor) -> ExportProgram:
+    return ExportProgram(
+        states=(State("total", initial),),
+        entrypoints=(EntryPoint(
+            "step", method="step",
+            arguments=(Input("delta", torch.ones_like(initial)), StateInput("total")),
+            returns=(Output("value"), StateUpdate("total")),
+        ),),
+    )
+
+
+def _stored_lists(result: ProgramResult) -> dict[str, list]:
+    with zipfile.ZipFile(result.path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    return {name: values for name, values in sprite["lists"].values()}
+
+
+def _floats(values) -> list[float]:
+    return [float(value) for value in values]
+
+
+def test_constant_initial_state_is_filled_instead_of_stored(tmp_path):
+    initial = torch.zeros(3)
+    program = _accumulator_program(initial)
+    result = transpile(_Accumulator().eval(), program, tmp_path / "zeros")
+    stored = _stored_lists(result)
+    assert stored["cattorch state total"] == []
+    assert not any(name.startswith("_cattorch initial state") for name in stored)
+
+    emulator = _emulator(result)
+    emulator.run_procedure("cattorch init")
+    assert _floats(emulator.lists["cattorch state total"]) == [0.0, 0.0, 0.0]
+    emulator.lists["cattorch step delta"] = [1.0, 2.0, 3.0]
+    emulator.run_procedure("cattorch step")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert _floats(emulator.lists["cattorch state total"]) == [1.0, 2.0, 3.0]
+    emulator.run_procedure("cattorch init")  # init doesn't reset live state
+    assert _floats(emulator.lists["cattorch state total"]) == [1.0, 2.0, 3.0]
+    emulator.run_procedure("cattorch reset")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert _floats(emulator.lists["cattorch state total"]) == [0.0, 0.0, 0.0]
+
+    # A freshly loaded project works without init, as when the state was stored.
+    calls = tuple(ProgramCall("step", (torch.tensor([1.0, 2.0, 3.0]),)) for _ in range(2))
+    comparison = verify(_Accumulator().eval(), program, result, calls=calls)
+    assert comparison.passed, comparison
+
+
+def test_first_call_keeps_a_constant_state_written_before_it(tmp_path):
+    result = transpile(_Accumulator().eval(), _accumulator_program(torch.zeros(2)), tmp_path / "write")
+    emulator = _emulator(result)
+    emulator.lists["cattorch state total"] = [5.0, 6.0]
+    emulator.lists["cattorch step delta"] = [1.0, 1.0]
+    emulator.run_procedure("cattorch step")
+    assert _floats(emulator.lists["cattorch state total"]) == [6.0, 7.0]
+
+
+def test_non_constant_initial_state_is_still_stored(tmp_path):
+    initial = torch.tensor([1.0, 2.0, 3.0])
+    result = transpile(_Accumulator().eval(), _accumulator_program(initial), tmp_path / "stored")
+    stored = _stored_lists(result)
+    assert stored["cattorch state total"] == [1.0, 2.0, 3.0]
+    assert stored["_cattorch initial state total"] == [1.0, 2.0, 3.0]
+    emulator = _emulator(result)
+    emulator.lists["cattorch step delta"] = [1.0, 1.0, 1.0]
+    emulator.run_procedure("cattorch step")
+    assert emulator.lists["cattorch state total"] == [2.0, 3.0, 4.0]
+    emulator.run_procedure("cattorch reset")
+    assert emulator.lists["cattorch state total"] == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("initial", [
+    torch.full((2, 2), 2.5),
+    torch.full((3,), -1, dtype=torch.int64),
+])
+def test_constant_non_zero_initial_state(tmp_path, initial):
+    program = _accumulator_program(initial)
+    result = transpile(_Accumulator().eval(), program, tmp_path / "fill")
+    assert _stored_lists(result)["cattorch state total"] == []
+    emulator = _emulator(result)
+    emulator.run_procedure("cattorch reset")
+    expected = _floats(initial.flatten().tolist())
+    assert _floats(emulator.lists["cattorch state total"]) == expected
+    comparison = verify(
+        _Accumulator().eval(), program, result,
+        calls=(ProgramCall("step", (torch.ones_like(initial),)),),
+    )
+    assert comparison.passed, comparison
+
+
+def test_mixed_sign_zero_initial_state_is_stored(tmp_path):
+    initial = torch.tensor([0.0, -0.0])
+    result = transpile(_Accumulator().eval(), _accumulator_program(initial), tmp_path / "signed")
+    assert "_cattorch initial state total" in _stored_lists(result)
+
+
+def test_sharded_constant_initial_state(tmp_path, small_list_limit):
+    from cattorch.util.scratch.interface import read_logical_list, write_logical_list
+
+    limit = small_list_limit(100)
+    size = 2 * limit + limit // 2
+    program = _accumulator_program(torch.zeros(size))
+    result = transpile(_Accumulator().eval(), program, tmp_path / "sharded")
+    assert "cattorch state total" in result.sharded_lists
+    stored = _stored_lists(result)
+    shards = ("cattorch state total", "cattorch state total shard 2", "cattorch state total shard 3")
+    assert all(stored[name] == [] for name in shards)
+    assert not any(name.startswith("_cattorch initial state") for name in stored)
+
+    emulator = _emulator(result)
+    emulator.run_procedure("cattorch init")
+    assert [len(emulator.lists[name]) for name in shards] == [limit, limit, limit // 2]
+    assert _floats(read_logical_list(emulator.lists, "cattorch state total")) == [0.0] * size
+    delta = torch.arange(size, dtype=torch.float32)
+    write_logical_list(emulator.lists, "cattorch step delta", delta.tolist())
+    emulator.run_procedure("cattorch step")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert _floats(read_logical_list(emulator.lists, "cattorch state total")) == delta.tolist()
+    emulator.run_procedure("cattorch reset")
+    assert [len(emulator.lists[name]) for name in shards] == [limit, limit, limit // 2]
+    assert _floats(read_logical_list(emulator.lists, "cattorch state total")) == [0.0] * size
+
+    comparison = verify(_Accumulator().eval(), program, result, calls=(ProgramCall("step", (delta,)),))
+    assert comparison.passed, comparison
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_private_states_and_renamed_interface(tmp_path, compact):
+    from cattorch.program_export import transpile_program
+
+    program = ExportProgram(
+        states=(State("total", torch.zeros(2)), State("offset", torch.tensor([1.0, 2.0]))),
+        entrypoints=(EntryPoint(
+            "step", method="step",
+            arguments=(Input("delta", torch.ones(2)), StateInput("total")),
+            returns=(Output("value"), StateUpdate("total")),
+        ),),
+    )
+    result = transpile_program(
+        _Accumulator().eval(), program, tmp_path / "private",
+        codegen=CodegenConfig(compact_internal_names=compact),
+        _private_states=True,
+        _public_names={
+            "cattorch step delta": "cattorch tokens",
+            "cattorch step value": "cattorch logits",
+            "cattorch step": "cattorch run step",
+            "cattorch step complete": "cattorch step done",
+        },
+    )
+    assert result.states == ()
+    (entry,) = result.entrypoints
+    assert entry.procedure == "cattorch run step"
+    assert entry.completion_broadcast == "cattorch step done"
+    assert [value.list_name for value in entry.inputs] == ["cattorch tokens"]
+    assert [value.list_name for value in entry.outputs] == ["cattorch logits"]
+    assert entry.state_inputs == entry.state_updates == ()
+    assert result.procedures == (
+        "cattorch init", "cattorch reset", "cattorch prepare for save", "cattorch run step",
+    )
+    stored = _stored_lists(result)
+    assert not any("state" in name for name in stored if not name.startswith("_"))
+    assert not any(name.startswith("cattorch step") for name in stored)
+    if not compact:
+        assert stored["_cattorch state total"] == []
+        assert stored["_cattorch state offset"] == [1.0, 2.0]
+    with zipfile.ZipFile(result.path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    assert "cattorch step done" in sprite["broadcasts"].values()
+
+    emulator = _emulator(result)
+    emulator.lists["cattorch tokens"] = [1.0, 2.0]
+    emulator.run_procedure("cattorch run step")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert _floats(emulator.lists["cattorch logits"]) == [2.0, 4.0]
+    emulator.run_procedure("cattorch run step")
+    assert _floats(emulator.lists["cattorch logits"]) == [4.0, 8.0]
+    emulator.run_procedure("cattorch reset")
+    emulator.run_procedure("cattorch run step")
+    assert _floats(emulator.lists["cattorch logits"]) == [2.0, 4.0]
+
+
+def test_public_names_reject_unknown_and_colliding_names(tmp_path):
+    from cattorch.program_export import transpile_program
+
+    program = _accumulator_program(torch.zeros(2))
+    with pytest.raises(ValueError, match="no entry point name"):
+        transpile_program(
+            _Accumulator().eval(), program, tmp_path / "unknown",
+            _public_names={"cattorch step missing": "cattorch tokens"},
+        )
+    with pytest.raises(ValueError, match="distinct, unused"):
+        transpile_program(
+            _Accumulator().eval(), program, tmp_path / "collide",
+            _public_names={"cattorch step delta": "cattorch step value"},
+        )
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_edit_program_callback_adds_a_procedure(tmp_path, compact, small_list_limit):
+    from cattorch.program_export import ProgramAssembly, transpile_program
+    from cattorch.sprite import _add_warp_procedure
+    from cattorch.util.scratch.dsl import Program, append, call, clear, item, repeat
+
+    limit = small_list_limit(100)
+    seen: list[ProgramAssembly] = []
+
+    def edit(sprite, assembly):
+        seen.append(assembly)
+        procedure = assembly.names["cattorch step"]
+        output = assembly.names["cattorch step value"]
+        history = "cattorch history"
+        _add_warp_procedure(sprite, "cattorch twice", Program(
+            "twice", lists=(output, history),
+            body=(
+                clear(history),
+                call(procedure),
+                append(history, item(output, 1)),
+                call(procedure),
+                append(history, item(output, 1)),
+                repeat(limit, (append(history, 0),)),
+            ),
+        ), x=0, y=0)
+        assembly.capacities[history] = limit + 2
+        assembly.public_data_names.add(history)
+        assembly.public_procedures.add("cattorch twice")
+
+    result = transpile_program(
+        _Accumulator().eval(), _accumulator_program(torch.zeros(1)), tmp_path / "edit",
+        codegen=CodegenConfig(compact_internal_names=compact),
+        _edit_program=edit,
+        _private_states=True,
+    )
+    (assembly,) = seen
+    assert assembly.states == {"total": "_cattorch state total"}
+    assert assembly.names["cattorch reset"] == "cattorch reset"
+    assert "cattorch history" in result.sharded_lists
+    emulator = _emulator(result)
+    emulator.lists["cattorch step delta"] = [1.5]
+    emulator.run_procedure("cattorch twice")
+    assert emulator.variables["cattorch status"] == "ok"
+    history = emulator.lists["cattorch history"] + emulator.lists["cattorch history shard 2"]
+    assert _floats(history[:2]) == [3.0, 6.0]
+    assert len(history) == limit + 2
+
+
+def test_program_replay_reset_restores_initial_states():
+    from cattorch.program_runtime import ProgramReplay
+
+    program = _accumulator_program(torch.tensor([1.0, 2.0]))
+    replay = ProgramReplay(_Accumulator().eval(), program)
+    call_value = ProgramCall("step", (torch.ones(2),))
+    replay.run(call_value)
+    replay.run(call_value)
+    torch.testing.assert_close(replay.states["total"], torch.tensor([3.0, 4.0]))
+    replay.reset()
+    torch.testing.assert_close(replay.states["total"], torch.tensor([1.0, 2.0]))
+    (value, _state) = replay.run(call_value)
+    torch.testing.assert_close(value, torch.tensor([4.0, 6.0]))
+    assert program.states[0].initial.tolist() == [1.0, 2.0]
