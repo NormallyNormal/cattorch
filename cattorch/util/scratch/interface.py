@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 from cattorch.errors import UnsupportedModelError
 
@@ -48,7 +49,14 @@ def write_sprite_list(sprite: dict, name: str, values: list) -> None:
         entries[physical][1] = chunk
 
 
-def refresh_data_display_name(blocks: dict, identifier: str, name: str) -> None:
+def refresh_data_display_names(blocks: dict, names: Mapping[str, str]) -> None:
+    """Write each ID's name next to it wherever ``blocks`` refers to it.
+
+    ``names`` maps variable, list and broadcast IDs to their names; the
+    blocks are walked once however many there are.
+    """
+    if not names:
+        return
     stack = [blocks]
     while stack:
         value = stack.pop()
@@ -56,32 +64,59 @@ def refresh_data_display_name(blocks: dict, identifier: str, name: str) -> None:
             stack.extend(value.values())
         elif isinstance(value, list):
             for index in range(1, len(value)):
-                if value[index] == identifier and isinstance(value[index - 1], str):
-                    value[index - 1] = name
+                current = value[index]
+                if isinstance(current, str) and current in names and isinstance(value[index - 1], str):
+                    value[index - 1] = names[current]
             stack.extend(value)
 
 
-def rename_variable(sprite: dict, old: str, new: str) -> None:
+def _rename_variable_entry(sprite: dict, old: str, new: str, names: dict[str, str]) -> None:
     for identifier, entry in sprite.get("variables", {}).items():
         if entry[0] == old:
-            entry[0] = new
-            refresh_data_display_name(sprite.get("blocks", {}), identifier, new)
+            entry[0] = names[identifier] = new
 
 
-def rename_list(sprite: dict, old: str, new: str) -> None:
-    """Rename a logical list, all its physical shards, and size metadata."""
+def _rename_list_entries(sprite: dict, old: str, new: str, names: dict[str, str]) -> None:
     pattern = re.compile(re.escape(old) + r"( shard (?:[2-9][0-9]*|1[0-9]+))?$")
     for identifier, entry in sprite.get("lists", {}).items():
         match = pattern.fullmatch(entry[0])
         if match:
-            entry[0] = new + (match.group(1) or "")
-            refresh_data_display_name(sprite.get("blocks", {}), identifier, entry[0])
+            entry[0] = names[identifier] = new + (match.group(1) or "")
     for suffix in ("shard count", "logical length"):
-        rename_variable(
+        _rename_variable_entry(
             sprite,
             f"cattorch {old.removeprefix('cattorch ')} {suffix}",
             f"cattorch {new.removeprefix('cattorch ')} {suffix}",
+            names,
         )
+
+
+def rename_variables(sprite: dict, renames: Mapping[str, str]) -> None:
+    """Rename variables in order, then update the blocks in one walk."""
+    names: dict[str, str] = {}
+    for old, new in renames.items():
+        _rename_variable_entry(sprite, old, new, names)
+    refresh_data_display_names(sprite.get("blocks", {}), names)
+
+
+def rename_lists(sprite: dict, renames: Mapping[str, str]) -> None:
+    """Rename logical lists, all their physical shards, and size metadata.
+
+    The renames apply in order, as separate calls would, and the blocks are
+    updated in one walk.
+    """
+    names: dict[str, str] = {}
+    for old, new in renames.items():
+        _rename_list_entries(sprite, old, new, names)
+    refresh_data_display_names(sprite.get("blocks", {}), names)
+
+
+def rename_variable(sprite: dict, old: str, new: str) -> None:
+    rename_variables(sprite, {old: new})
+
+
+def rename_list(sprite: dict, old: str, new: str) -> None:
+    rename_lists(sprite, {old: new})
 
 
 def rename_procedure(sprite: dict, old: str, new: str) -> None:

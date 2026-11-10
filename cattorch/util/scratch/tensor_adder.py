@@ -20,8 +20,6 @@ Example
     sprite = ta.apply(sprite, ["p_w1", "p_w2"], weights={"p_w1": w1, "p_w2": w2})
 """
 
-import copy
-
 
 def _make_id(name: str) -> str:
     """Derive a stable scratch ID from a tensor display name."""
@@ -68,6 +66,10 @@ class TensorAdder:
         lists section. Tensors that already exist (by display name) are
         left unchanged.
 
+        Only the lists section is copied: the result shares its blocks,
+        variables and other sections with ``sprite``, so a caller that keeps
+        using ``sprite`` must not change them through either dict.
+
         Parameters
         ----------
         sprite : dict
@@ -81,8 +83,10 @@ class TensorAdder:
             list and stored as the initial list contents.
             Tensors not in this dict are added with empty contents.
         """
-        sprite = copy.deepcopy(sprite)
-        lists = sprite.setdefault("lists", {})
+        sprite = dict(sprite)
+        lists = sprite["lists"] = {
+            identifier: list(entry) for identifier, entry in sprite.get("lists", {}).items()
+        }
         weights = weights or {}
 
         # Build a set of existing display names to avoid duplicates

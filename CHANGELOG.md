@@ -258,6 +258,15 @@
   by `cattorch init`, `cattorch reset`, or the first entry point call. A
   450,000-value zero state now adds almost nothing to the project instead of
   about 3.6 MB.
+- Exports of large models are several times faster and write the same
+  sprite as before. Renaming a program's weights and interface lists walks
+  the blocks once instead of once per list, attaching weights no longer
+  copies every block, merging a new procedure's data only remaps its own
+  blocks, and weight quantization and encoding are vectorized. On a 4-core
+  machine, random-weight Mamba2-130m shapes with the 50,288-token vocabulary
+  in int8 took 32 s instead of 258 s for 2 layers and 35 s instead of 300 s
+  for 4; a 2-layer GPT-2 `GenerationProgram` in float32 took 46 s instead of
+  243 s. cattorch now depends on numpy.
 
 ## Fixes
 

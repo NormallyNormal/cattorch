@@ -6,10 +6,11 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Literal, cast
 
+import numpy as np
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from cattorch.storage import quantize_values
+from cattorch.storage import _quantize_arrays
 from cattorch.operator_registry import OperatorRegistry, default_registry
 
 
@@ -228,18 +229,14 @@ def _symmetric_matrix(
 ) -> tuple[torch.Tensor, int]:
     width = matrix.shape[1]
     group = effective_group_size(width, config.group_size)
-    codes, scales = quantize_values(
-        matrix.detach().reshape(-1).tolist(),
+    codes, scales = _quantize_arrays(
+        matrix.detach().cpu().double().reshape(-1).numpy(),
         config.precision,
         group,
         config.scale_precision,
     )
-    reconstructed = torch.tensor(
-        [code * scales[index // group] for index, code in enumerate(codes)],
-        device=matrix.device,
-        dtype=matrix.dtype,
-    ).reshape_as(matrix)
-    return reconstructed, group
+    reconstructed = torch.from_numpy(codes * np.repeat(scales, group)[:codes.size])
+    return reconstructed.to(device=matrix.device, dtype=matrix.dtype).reshape_as(matrix), group
 
 
 def _gptq_matrix(

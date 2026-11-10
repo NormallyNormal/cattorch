@@ -54,7 +54,7 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
-from cattorch.util.scratch.interface import rename_list, rename_variable
+from cattorch.util.scratch.interface import rename_lists, rename_variables
 from cattorch.util.scratch.ids import uniquify_data_ids
 
 # The Scratch interface; see ``docs/scratch-interface.md``.
@@ -142,11 +142,9 @@ class _TokenizerBase(ABC):
 
         sprite = self._build_sprite(tokens)
         # The public interface: one text variable for both directions.
-        rename_variable(sprite, "input", TEXT_VARIABLE)
-        rename_variable(sprite, "output", TEXT_VARIABLE)
+        rename_variables(sprite, {"input": TEXT_VARIABLE, "output": TEXT_VARIABLE})
         _merge_variables_by_name(sprite, {TEXT_VARIABLE})
-        rename_list(sprite, "token_ids", TOKEN_IDS_LIST)
-        rename_list(sprite, "tokens", "_cattorch tokens")
+        rename_lists(sprite, {"token_ids": TOKEN_IDS_LIST, "tokens": "_cattorch tokens"})
 
         uniquify_data_ids(sprite)
         output_path = Path(output_path)

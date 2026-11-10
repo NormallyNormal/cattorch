@@ -19,10 +19,8 @@ from cattorch.storage import (
     StorageConfig,
     build_decoder_programs,
     build_shared_unpack_program,
-    encode_values,
     quantize_values,
     rounded_values,
-    _encode_bytes,
     _float_bytes,
     _quantized_bytes,
 )
@@ -224,23 +222,41 @@ def _apply_tied_static_aliases(
             stack.extend(value)
 
 
-def _merge_lists_by_name(sprite, names: set[str]) -> None:
-    """Unify repeated DSL declarations of persistent generation lists."""
-    lists = sprite.get("lists", {})
+def _merge_slots_by_name(
+    sprite: dict, section: str, names: set[str],
+    added: tuple[frozenset[str], frozenset[str]] | None,
+) -> None:
+    """Keep the first of the slots in ``section`` that share a name in ``names``.
+
+    ``added`` is the IDs of the slots and blocks just added to the sprite.
+    When every merged-away slot is among those slots, only those blocks can
+    refer to one, so only they are remapped.
+    """
+    slots = sprite.get(section, {})
     ids_by_name: dict[str, list[str]] = {}
-    for identifier, entry in lists.items():
+    for identifier, entry in slots.items():
         if entry[0] in names:
             ids_by_name.setdefault(entry[0], []).append(identifier)
     remap = {}
     for ids in ids_by_name.values():
-        if len(ids) < 2:
-            continue
         winner = ids[0]
         for sid in ids[1:]:
             remap[sid] = winner
-            del lists[sid]
-    if remap:
-        sprite["blocks"] = remap_ids(sprite["blocks"], remap)
+            del slots[sid]
+    if not remap:
+        return
+    blocks = sprite["blocks"]
+    if added is not None and remap.keys() <= added[0]:
+        blocks.update(remap_ids({identifier: blocks[identifier] for identifier in added[1]}, remap))
+    else:
+        sprite["blocks"] = remap_ids(blocks, remap)
+
+
+def _merge_lists_by_name(
+    sprite, names: set[str], *, added: tuple[frozenset[str], frozenset[str]] | None = None,
+) -> None:
+    """Unify repeated DSL declarations of persistent generation lists."""
+    _merge_slots_by_name(sprite, "lists", names, added)
 
 
 _LAYER_PATH = re.compile(r"(?:^|\.)blocks\.(\d+)(?:\.|$)")
@@ -674,23 +690,11 @@ def _share_repeated_transformer_layers(
     return True
 
 
-def _merge_variables_by_name(sprite, names: set[str]) -> None:
+def _merge_variables_by_name(
+    sprite, names: set[str], *, added: tuple[frozenset[str], frozenset[str]] | None = None,
+) -> None:
     """Unify repeated DSL declarations of persistent generation variables."""
-    variables = sprite.get("variables", {})
-    ids_by_name: dict[str, list[str]] = {}
-    for identifier, entry in variables.items():
-        if entry[0] in names:
-            ids_by_name.setdefault(entry[0], []).append(identifier)
-    remap = {}
-    for ids in ids_by_name.values():
-        if len(ids) < 2:
-            continue
-        winner = ids[0]
-        for sid in ids[1:]:
-            remap[sid] = winner
-            del variables[sid]
-    if remap:
-        sprite["blocks"] = remap_ids(sprite["blocks"], remap)
+    _merge_slots_by_name(sprite, "variables", names, added)
 
 
 def _remove_unused(sprite):
@@ -804,22 +808,14 @@ def _wrap_optimized_lifecycle(sprite: dict) -> None:
     nested_init_call = f"{prefix}_nested_init_call"
     set_initialized = f"{prefix}_set_initialized"
 
-    call_base = {
-        "next": None, "parent": None, "inputs": {}, "fields": {},
-        "shadow": False, "topLevel": True,
-    }
-    blocks[forward_call] = {
-        **call_base,
-        "opcode": "procedures_call",
-        "mutation": _procedure_mutation(forward_name),
-        "x": 0, "y": 0,
-    }
-    blocks[init_call] = {
-        **call_base,
-        "opcode": "procedures_call",
-        "mutation": _procedure_mutation(init_name),
-        "x": 0, "y": 80,
-    }
+    for call_id, procedure, y in ((forward_call, forward_name, 0), (init_call, init_name, 80)):
+        blocks[call_id] = {
+            "next": None, "parent": None, "inputs": {}, "fields": {},
+            "shadow": False, "topLevel": True,
+            "opcode": "procedures_call",
+            "mutation": _procedure_mutation(procedure),
+            "x": 0, "y": y,
+        }
 
     blocks[forward_def] = {
         "opcode": "procedures_definition", "next": init_check, "parent": None,
@@ -945,8 +941,14 @@ def _add_warp_procedure(
             broadcast_remap[identifier] = winner
     if broadcast_remap:
         sprite["blocks"] = remap_ids(sprite["blocks"], broadcast_remap)
-    _merge_variables_by_name(sprite, declared["variables"])
-    _merge_lists_by_name(sprite, declared["lists"])
+    # Every ID in data carries this call's fresh suffix, so the sprite's
+    # other blocks cannot refer to the slots it added.
+    added = (
+        frozenset((*data.get("variables", {}), *data.get("lists", {}))),
+        frozenset(data.get("blocks", {})),
+    )
+    _merge_variables_by_name(sprite, declared["variables"], added=added)
+    _merge_lists_by_name(sprite, declared["lists"], added=added)
     return sprite
 
 
@@ -1160,14 +1162,15 @@ def _on_integer_codec_grid(
     quantizes the logical order, so undo that permutation first.
     """
     values = tensor.detach().cpu().flatten()
-    for start, rows, inner in interleave_segments:
-        end = start + rows * inner
-        if rows % 4 or start < 0 or end > values.numel():
-            return False
-        physical = values[start:end].reshape(rows // 4, inner, 4)
-        values = torch.cat((
-            values[:start], physical.transpose(1, 2).flatten(), values[end:],
-        ))
+    if interleave_segments:
+        # One gather through the composed segment permutations.
+        order = torch.arange(values.numel())
+        for start, rows, inner in interleave_segments:
+            end = start + rows * inner
+            if rows % 4 or start < 0 or end > values.numel():
+                return False
+            order[start:end] = order[start:end].reshape(rows // 4, inner, 4).transpose(1, 2).flatten()
+        values = values[order]
     group_size = _static_storage_group_size(tensor, storage)
     if values.numel() == 0 or values.numel() % group_size:
         return False
@@ -1513,19 +1516,18 @@ def _apply_static_storage(
                     storage.scale_precision,
                 )
                 raw_payload = _quantized_bytes(codes, shard_precision)
-                payload = _encode_bytes(raw_payload)
-                scale_payload = encode_values(scales, storage.scale_precision)
                 scale_number = len(specs) + 1
+                # With payload_bytes on every spec the unpacker encodes whole
+                # banks itself, so the per-list Base92 payloads stay empty.
                 specs.append(EncodedList(
                     shard.name,
                     payload_name,
-                    payload,
+                    "",
                     shard_precision,
                     value_count=len(contents),
                     group_size=group_size,
                     scale_list_name=f"cattorch quant scales {scale_number}",
                     scale_payload_name=f"cattorch scale payload {scale_number}",
-                    scale_payload=scale_payload,
                     scale_precision=storage.scale_precision,
                     payload_bytes=raw_payload,
                     scale_values=tuple(scales),
@@ -1535,7 +1537,7 @@ def _apply_static_storage(
                 specs.append(EncodedList(
                     shard.name,
                     payload_name,
-                    encode_values(encoded_contents, shard_precision),
+                    "",
                     shard_precision,
                     payload_bytes=raw_payload,
                 ))

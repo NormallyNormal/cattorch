@@ -90,7 +90,7 @@ from cattorch.util.scratch.block_manager import BlockManager
 from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.ids import uniquify_data_ids
 from cattorch.util.scratch.interface import (
-    rename_list as _rename_list, rename_procedure as _rename_procedure,
+    rename_lists as _rename_lists, rename_procedure as _rename_procedure,
 )
 from cattorch.util.scratch.dsl import (
     Program, call, clear, eq, gt, if_, length, set_var, unroll_factor_limit, var,
@@ -2363,8 +2363,7 @@ def _transpile(
         output_name(index)
         for index in range(len(output_lists))
     )
-    for old_name, public_name in zip(output_lists, output_names):
-        _rename_list(sprite, old_name, public_name)
+    _rename_lists(sprite, dict(zip(output_lists, output_names)))
     output = output_lists[0] if output_lists else None
 
     logical_sizes = _logical_list_sizes(
@@ -2483,16 +2482,13 @@ def _transpile(
             _rename_procedure(
                 sprite, "cattorch reset cache", "_cattorch reset state",
             )
-            _rename_list(sprite, "input", "cattorch tokens")
-            _rename_list(sprite, "output", "cattorch logits")
-            _rename_list(
-                sprite, "cattorch prefill buffer", "_cattorch prefill buffer",
-            )
-            for old, new in (
-                ("input", "cattorch tokens"),
-                ("output", "cattorch logits"),
-                ("cattorch prefill buffer", "_cattorch prefill buffer"),
-            ):
+            public_lists = {
+                "input": "cattorch tokens",
+                "output": "cattorch logits",
+                "cattorch prefill buffer": "_cattorch prefill buffer",
+            }
+            _rename_lists(sprite, public_lists)
+            for old, new in public_lists.items():
                 if old in logical_sizes:
                     logical_sizes[new] = logical_sizes.pop(old)
 

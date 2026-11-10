@@ -43,8 +43,9 @@ from cattorch.util.scratch.dsl import (
 )
 from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.interface import (
-    rename_list as _rename_list, rename_variable as _rename_variable,
-    rename_procedure as _rename_procedure, refresh_data_display_name,
+    rename_lists as _rename_lists, rename_variable as _rename_variable,
+    rename_variables as _rename_variables, rename_procedure as _rename_procedure,
+    refresh_data_display_names,
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
@@ -123,8 +124,7 @@ def _namespace_entry_storage(sprite: dict, namespace: str) -> dict[str, str]:
         for entry in sprite.get("lists", {}).values()
         if entry[0].startswith(("W_", "cattorch payload ", "cattorch scale payload "))
     ]
-    for old in names:
-        _rename_list(sprite, old, f"_cattorch {namespace} {old}")
+    _rename_lists(sprite, {old: f"_cattorch {namespace} {old}" for old in names})
     variable_names = [
         entry[0]
         for entry in sprite.get("variables", {}).values()
@@ -134,8 +134,7 @@ def _namespace_entry_storage(sprite: dict, namespace: str) -> dict[str, str]:
             and entry[0].endswith((" payload", " table"))
         )
     ]
-    for old in variable_names:
-        _rename_variable(sprite, old, f"_cattorch {namespace} {old}")
+    _rename_variables(sprite, {old: f"_cattorch {namespace} {old}" for old in variable_names})
     names.extend(variable_names)
     return {old: f"_cattorch {namespace} {old}" for old in names}
 
@@ -176,8 +175,9 @@ def _deduplicate_program_payloads(sprite: dict, payload_names: set[str]) -> None
         if not remap:
             continue
         sprite["blocks"] = remap_ids(sprite.get("blocks", {}), remap)
-        for winner in set(remap.values()):
-            refresh_data_display_name(sprite["blocks"], winner, slots[winner][0])
+        refresh_data_display_names(
+            sprite["blocks"], {winner: slots[winner][0] for winner in set(remap.values())},
+        )
         for identifier in remap:
             slots.pop(identifier, None)
 
@@ -296,11 +296,13 @@ def _interface_renames(
     return lists, procedures, broadcasts
 
 
-def _rename_broadcast(sprite: dict, old: str, new: str) -> None:
-    for identifier, message in sprite.get("broadcasts", {}).items():
-        if message == old:
-            sprite["broadcasts"][identifier] = new
-            refresh_data_display_name(sprite.get("blocks", {}), identifier, new)
+def _rename_broadcasts(sprite: dict, renames: dict[str, str]) -> None:
+    names: dict[str, str] = {}
+    for old, new in renames.items():
+        for identifier, message in sprite.get("broadcasts", {}).items():
+            if message == old:
+                sprite["broadcasts"][identifier] = names[identifier] = new
+    refresh_data_display_names(sprite.get("blocks", {}), names)
 
 
 def _build_entry_wrapper(
@@ -751,13 +753,14 @@ def transpile_program(
             f"_cattorch {entrypoint.name} initialized",
         )
         _namespace_entry_procedures(sprite, entrypoint.name)
+        interface_renames: dict[str, str] = {}
         for index, binding in enumerate(entrypoint.arguments):
             old = input_name(index)
             new = (
                 _input_list(entrypoint.name, binding.name)
                 if isinstance(binding, Input) else _state_list(binding.name)
             )
-            _rename_list(sprite, old, new)
+            interface_renames[old] = new
             spec = sub_result.inputs[index]
             interface_capacities[new] = max(
                 interface_capacities.get(new, 0), spec.max_numel or 0,
@@ -777,8 +780,9 @@ def transpile_program(
                 # The compiler may have used the output's list as scratch
                 # space for a larger intermediate first.
                 capacity = max(sub_result.outputs[index].max_numel or 0, deferred_sizes.get(old, 0))
-            _rename_list(sprite, old, temporary)
+            interface_renames[old] = temporary
             interface_capacities[temporary] = capacity
+        _rename_lists(sprite, interface_renames)
 
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
@@ -972,12 +976,10 @@ def transpile_program(
             if entry[0] == _PROJECT_OUTPUT:
                 entry[1] = 1
 
-    for old, new in list_renames.items():
-        _rename_list(combined, old, new)
+    _rename_lists(combined, list_renames)
     for old, new in procedure_renames.items():
         _rename_procedure(combined, old, new)
-    for old, new in broadcast_renames.items():
-        _rename_broadcast(combined, old, new)
+    _rename_broadcasts(combined, broadcast_renames)
     entry_results = [
         replace(
             entry_result,

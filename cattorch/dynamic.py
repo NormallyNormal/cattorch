@@ -309,7 +309,7 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
         Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
         gt, if_, item, length, lt, mod, mul, set_var, var,
     )
-    from cattorch.util.scratch.interface import rename_list, rename_procedure
+    from cattorch.util.scratch.interface import rename_lists, rename_procedure
 
     ((index, (_, minimum, maximum, _)),) = spec.items()
     names = {entry[0] for entry in sprite.get("lists", {}).values()}
@@ -322,14 +322,12 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     rename_procedure(sprite, "cattorch forward", "_cattorch forward unit")
     # The new forward reports completion once, after every unit.
     _remove_completion_broadcast(sprite, "cattorch forward complete")
-    rename_list(sprite, public_input, private_input)
     input_size = math.prod(input_shapes[index])
     outputs = []
     for position_index in range(output_count):
         public = output_name(position_index)
-        private = f"_cattorch unit {public}"
-        rename_list(sprite, public, private)
-        outputs.append((public, private))
+        outputs.append((public, f"_cattorch unit {public}"))
+    rename_lists(sprite, {public_input: private_input, **dict(outputs)})
     run_units = (
         set_var(unit, 0),
         for_each("_cattorch units", div(length(public_input), input_size), (

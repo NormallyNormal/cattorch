@@ -481,3 +481,148 @@ def test_compact_unrolling_emits_fewer_blocks(tmp_path):
     )
     assert compact.block_count < speed.block_count
     assert compact.expanded_json_bytes < speed.expanded_json_bytes
+
+
+def test_batched_renames_apply_in_order_and_walk_the_blocks_once(monkeypatch):
+    import cattorch.util.scratch.interface as interface
+
+    walks = []
+    original = interface.refresh_data_display_names
+    monkeypatch.setattr(
+        interface, "refresh_data_display_names",
+        lambda blocks, names: (walks.append(dict(names)), original(blocks, names)),
+    )
+    sprite = {
+        "lists": {"a": ["x", []], "b": ["x shard 2", []], "c": ["y", []]},
+        "variables": {"n": ["cattorch x shard count", 2], "v": ["value", 0]},
+        "blocks": {
+            "read": {"fields": {"LIST": ["x shard 2", "b"]}},
+            "show": {"inputs": {"VALUE": [3, [12, "value", "v"], [10, ""]]}},
+        },
+    }
+    # Later renames see earlier ones, as separate calls would.
+    interface.rename_lists(sprite, {"x": "y2", "y": "z", "y2": "w"})
+    interface.rename_variables(sprite, {"value": "total"})
+    assert len(walks) == 2
+    assert [entry[0] for entry in sprite["lists"].values()] == ["w", "w shard 2", "z"]
+    assert sprite["variables"]["n"][0] == "cattorch w shard count"
+    assert sprite["blocks"]["read"]["fields"]["LIST"] == ["w shard 2", "b"]
+    assert sprite["blocks"]["show"]["inputs"]["VALUE"][1] == [12, "total", "v"]
+
+
+def test_program_export_walks_the_blocks_independently_of_the_weight_count(tmp_path, monkeypatch):
+    import cattorch.program_export as program_export
+    import cattorch.util.scratch.interface as interface
+    from cattorch import EntryPoint, ExportProgram, Input, Output
+
+    class Stack(torch.nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = torch.nn.Sequential(*(torch.nn.Linear(4, 4) for _ in range(layers)))
+
+        def run(self, value):
+            return self.layers(value)
+
+    walks = []
+    original = interface.refresh_data_display_names
+    for module in (interface, program_export):
+        monkeypatch.setattr(
+            module, "refresh_data_display_names",
+            lambda blocks, names: (walks.append(names), original(blocks, names)),
+        )
+
+    def count(layers):
+        walks.clear()
+        program = ExportProgram(entrypoints=(EntryPoint(
+            "run", method="run", arguments=(Input("value", torch.ones(4)),),
+            returns=(Output("out"),),
+        ),))
+        transpile(Stack(layers).eval(), program, tmp_path / f"stack{layers}")
+        return len(walks)
+
+    assert count(2) == count(8)
+
+
+def test_tensor_adder_copies_only_the_lists():
+    from cattorch.util.scratch.tensor_adder import TensorAdder
+
+    sprite = {"blocks": {"b": {"opcode": "x"}}, "lists": {"l": ["W_a", [1.0]]}, "variables": {}}
+    result = TensorAdder().apply(sprite, ["W_a", "W_b"], weights={"W_a": torch.tensor([2.0])})
+    assert sprite["lists"] == {"l": ["W_a", [1.0]]}
+    assert result["lists"]["l"] == ["W_a", [2.0]]
+    assert result["lists"]["cattorch_tensor_W_b"] == ["W_b", []]
+    assert result["blocks"] is sprite["blocks"]
+
+
+def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monkeypatch):
+    # A merge that only remaps the blocks just added is equivalent to
+    # remapping every block only if the others are already what remap_ids
+    # makes of them: copied (no sub-object shared between blocks) and in
+    # normal form.
+    import cattorch.sprite as sprite_module
+    from cattorch import (
+        EntryPoint, ExportProgram, GenerationProgram, Input, Output, RecurrentGenerationProgram,
+        State, StateInput, StateUpdate,
+    )
+    from cattorch.util.scratch.remap import _remap_blocks
+
+    checked = 0
+    original = sprite_module._merge_slots_by_name
+
+    def checked_merge(sprite, section, names, added):
+        nonlocal checked
+        if added is not None:
+            others = {key: block for key, block in sprite["blocks"].items() if key not in added[1]}
+            assert _remap_blocks(others, {"unused": "unused"}) == others
+            seen = set()
+            stack = list(others.values())
+            while stack:
+                value = stack.pop()
+                if isinstance(value, (list, dict)):
+                    assert id(value) not in seen, value
+                    seen.add(id(value))
+                    stack.extend(value.values() if isinstance(value, dict) else value)
+            checked += 1
+        original(sprite, section, names, added)
+
+    monkeypatch.setattr(sprite_module, "_merge_slots_by_name", checked_merge)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.gru = torch.nn.GRU(4, 4, batch_first=True)
+            self.head = torch.nn.Linear(4, 8)
+
+        def forward(self, tokens):
+            return self.head(self.gru(self.embed(tokens))[0])
+
+        def step(self, token, hidden):
+            output, hidden = self.gru(self.embed(token), hidden)
+            return self.head(output), hidden
+
+        def accumulate(self, value, total):
+            updated = total + self.head(value)
+            return updated.sum().reshape(1), updated
+
+    torch.manual_seed(0)
+    model = Model().eval()
+    program = ExportProgram(
+        states=(State("total", torch.zeros(8)),),
+        entrypoints=(EntryPoint(
+            "add", method="accumulate", arguments=(Input("value", torch.ones(4)), StateInput("total")),
+            returns=(Output("sum"), StateUpdate("total")),
+        ),),
+    )
+    transpile(model, program, tmp_path / "program")
+    transpile(
+        model, RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 4)),)),
+        tmp_path / "recurrent",
+    )
+    from test_autoregressive import NanoGPT
+
+    transpile(
+        NanoGPT(layers=1, width=8, heads=2, context=4).eval(), GenerationProgram(max_context=4),
+        tmp_path / "generation",
+    )
+    assert checked
