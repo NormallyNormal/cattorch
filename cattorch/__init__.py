@@ -1,3 +1,11 @@
+from importlib import metadata as _metadata
+
+try:
+    # The one version number is in pyproject.toml.
+    __version__ = _metadata.version("cattorch")
+except _metadata.PackageNotFoundError:  # A source tree that isn't installed.
+    __version__ = "0+unknown"
+
 from cattorch.transpiler import transpile
 from cattorch.tokenizer import (
     BPETokenizer,

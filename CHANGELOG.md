@@ -258,6 +258,10 @@
   with float64 PyTorch to about 1e-14 over the whole domain, including
   negative arguments, and is exactly zero at 1 and 2 with full
   relative accuracy around them; poles and both infinities give Infinity.
+- `cattorch --version` and `cattorch.__version__` give the installed
+  version. `cattorch generate --help` now explains `--top-k`,
+  `--max-new-tokens`, and `--temperature`, `analyze-benchmark --help` its
+  `PROJECT`, and the help shows each option's default.
 
 ## Performance
 

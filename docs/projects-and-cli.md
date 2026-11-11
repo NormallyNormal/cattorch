@@ -137,7 +137,9 @@ Both commands take:
 `generate` takes `--max-new-tokens`, `--temperature`, and `--eos` (defaulting
 to the tokenizer's end token). `cattorch analyze-benchmark PROJECT` prints a
 saved [benchmark project's](verification-and-benchmarking.md) timings, like
-`cattorch-benchmark`.
+`cattorch-benchmark`. `cattorch --version` prints the installed version, which
+Python code can read as `cattorch.__version__`, and `--help` after a command
+lists its options with their defaults.
 
 ## Examples
 

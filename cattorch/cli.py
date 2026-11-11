@@ -22,6 +22,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from cattorch import __version__
 from cattorch.errors import CattorchError
 from cattorch.util.scratch.archive import dumps
 
@@ -327,6 +328,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cattorch", description="Export PyTorch models to Scratch.",
     )
+    parser.add_argument("--version", action="version", version=f"cattorch {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def options(command):
@@ -339,7 +341,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--fast", action="store_true", help="use approximate kernels")
         command.add_argument(
             "--precision", choices=("float32", "float16", "int8", "int4"), default="float32",
-            help="weight storage; int8 and int4 quantize matrices",
+            help="weight storage; int8 and int4 quantize matrices (default: float32)",
         )
         command.add_argument(
             "--project", action="store_true",
@@ -356,7 +358,10 @@ def _parser() -> argparse.ArgumentParser:
         "--tokens", type=_shape, action="append", default=[],
         help="a token-ID input of this shape, after the --shape inputs",
     )
-    export.add_argument("--vocab", type=_positive, default=2, help="token IDs range below this")
+    export.add_argument(
+        "--vocab", type=_positive, default=2,
+        help="--tokens IDs are random, below this (default: 2)",
+    )
     export.add_argument(
         "--dynamic", type=_dynamic, action="append", default=[],
         help="let an input's length vary: INPUT[.DIM]=MIN:MAX, such as 0=1:32",
@@ -375,20 +380,36 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--tokenizer", help="a Hugging Face tokenizer name or directory")
     generate.add_argument(
         "--max-context", type=int,
-        help="the most tokens the generator takes between resets (default 64; "
+        help="the most tokens the generator takes between resets (default: 64; "
         "unlimited for a Mamba, Mamba-2 or RWKV model)",
     )
-    generate.add_argument("--top-k", type=int)
-    generate.add_argument("--max-new-tokens", type=int, default=40)
-    generate.add_argument("--temperature", type=float, default=0.8)
-    generate.add_argument("--eos", type=int, help="token ID that ends a continuation")
+    generate.add_argument(
+        "--top-k", type=int, metavar="K",
+        help="also list the K largest logits and their token IDs, 1 to 64, in the "
+        "sprite's top k lists (default: none)",
+    )
+    generate.add_argument(
+        "--max-new-tokens", type=int, default=40, metavar="N",
+        help="the most tokens the project's demo adds to a prompt (default: 40)",
+    )
+    generate.add_argument(
+        "--temperature", type=float, default=0.8,
+        help="the demo's starting sampling temperature; 0 always picks the likeliest "
+        "token (default: 0.8)",
+    )
+    generate.add_argument(
+        "--eos", type=int, metavar="ID",
+        help="token ID that ends a continuation (default: the tokenizer's end token)",
+    )
     options(generate)
     generate.set_defaults(run=_generate)
 
     analyze = commands.add_parser(
         "analyze-benchmark", help="print a saved benchmark project's timings",
     )
-    analyze.add_argument("project")
+    analyze.add_argument(
+        "project", help="a benchmark .sb3 saved from Scratch after it ran",
+    )
     analyze.set_defaults(run=_analyze)
     return parser
 

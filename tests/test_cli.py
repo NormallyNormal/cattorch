@@ -109,6 +109,25 @@ def test_errors_are_reported_without_a_traceback(models, capsys):
         main(["export", "models.py:Marked", "--dynamic", "zero"])
 
 
+def test_version_and_help(capsys):
+    from importlib.metadata import version
+
+    import cattorch
+
+    assert cattorch.__version__ == version("cattorch")
+    with pytest.raises(SystemExit):
+        main(["--version"])
+    assert capsys.readouterr().out.strip() == f"cattorch {cattorch.__version__}"
+    for command, expected in (
+        ("generate", ("--top-k K", "(default: 40)", "(default: 0.8)", "(default: float32)")),
+        ("analyze-benchmark", ("saved from Scratch",)),
+    ):
+        with pytest.raises(SystemExit):
+            main([command, "--help"])
+        text = " ".join(capsys.readouterr().out.split())
+        assert all(part in text for part in expected), text
+
+
 def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path_factory):
     import subprocess
     import sys
