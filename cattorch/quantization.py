@@ -836,12 +836,18 @@ def _gptq_matrix(
         raise ValueError("GPTQ calibration Hessian has no usable diagonal")
     indices = torch.arange(width)
     hessian[indices, indices] += damp
+    # On one thread: torch's thread pool makes these factorizations ten
+    # times slower on a busy machine, and gains little on an idle one.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
     try:
         chol = torch.linalg.cholesky(hessian)
         inverse = torch.cholesky_inverse(chol)
         inverse_factor = torch.linalg.cholesky(inverse, upper=True)
     except torch.linalg.LinAlgError as error:
         raise ValueError("GPTQ calibration Hessian is not positive definite") from error
+    finally:
+        torch.set_num_threads(threads)
 
     qmax = (1 << (config.bits - 1)) - 1
     # NumPy rather than torch for the many small per-column steps: torch's
@@ -854,38 +860,48 @@ def _gptq_matrix(
     # to the columns after the block once, as one matrix product. Blocks
     # hold whole groups, so each group's scale is chosen from its columns
     # with every earlier column's feedback applied, as without blocking.
+    # Rows are quantized independently, so a few at a time keep each
+    # block's working set in cache, as for an output head of 50,000 rows.
     block = max(group, config.block_size - config.block_size % group)
-    for block_start in range(0, width, block):
-        block_end = min(width, block_start + block)
-        count = block_end - block_start
-        columns = values[:, block_start:block_end].copy()
-        errors = np.empty_like(columns)
-        local = factor[block_start:block_end, block_start:block_end]
-        scales = np.ones(columns.shape[0])
-        for index in range(count):
-            if index % group == 0:
-                # Storage's own scale rule: a group whose largest code stays
-                # the largest after error feedback is stored exactly as chosen.
-                scales = group_scales(
-                    np.abs(columns[:, index:index + group]).max(axis=1), qmax,
-                    config.scale_precision,
-                )
-                if not np.isfinite(scales).all():
-                    raise ValueError(
-                        "GPTQ scale is outside the selected scale precision"
+    row_step = max(1, _GPTQ_CHUNK_VALUES // block)
+    for row_start in range(0, values.shape[0], row_step):
+        rows = slice(row_start, row_start + row_step)
+        for block_start in range(0, width, block):
+            block_end = min(width, block_start + block)
+            count = block_end - block_start
+            columns = values[rows, block_start:block_end].copy()
+            errors = np.empty_like(columns)
+            local = factor[block_start:block_end, block_start:block_end]
+            scales = np.ones(columns.shape[0])
+            for index in range(count):
+                if index % group == 0:
+                    # Storage's own scale rule: a group whose largest code
+                    # stays the largest after error feedback is stored
+                    # exactly as chosen.
+                    scales = group_scales(
+                        np.abs(columns[:, index:index + group]).max(axis=1), qmax,
+                        config.scale_precision,
                     )
-            column = columns[:, index]
-            quantized = np.clip(np.rint(column / scales), -qmax, qmax) * scales
-            result[:, block_start + index] = quantized
-            feedback = (column - quantized) / local[index, index]
-            errors[:, index] = feedback
-            if index + 1 < count:
-                columns[:, index + 1:] -= np.outer(feedback, local[index, index + 1:])
-        if block_end < width:
-            values[:, block_end:] -= errors @ factor[block_start:block_end, block_end:]
+                    if not np.isfinite(scales).all():
+                        raise ValueError(
+                            "GPTQ scale is outside the selected scale precision"
+                        )
+                column = columns[:, index]
+                quantized = np.clip(np.rint(column / scales), -qmax, qmax) * scales
+                result[rows, block_start + index] = quantized
+                feedback = (column - quantized) / local[index, index]
+                errors[:, index] = feedback
+                if index + 1 < count:
+                    columns[:, index + 1:] -= np.outer(feedback, local[index, index + 1:])
+            if block_end < width:
+                values[rows, block_end:] -= errors @ factor[block_start:block_end, block_end:]
     return (
         torch.from_numpy(result).to(device=original_device, dtype=original_dtype), group,
     )
+
+
+# Values of one block GPTQ works on at a time: 2 MiB of doubles.
+_GPTQ_CHUNK_VALUES = 1 << 18
 
 
 def expert_bank_effective_ndims(model: torch.nn.Module) -> dict[int, int]:
