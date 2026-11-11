@@ -134,6 +134,10 @@ The variables and lists you use are:
 
 `top_k` can be `None` (the default) or an integer from 1 to 64. With `None`,
 no top-k work is done. Top-k only sorts candidates; it doesn't pick a token.
+Like `torch.topk`, it always gives `top_k` real token IDs, including tokens
+whose logit is `-Infinity`, and ranks a NaN logit first. Equal logits are
+listed lowest token ID first; `torch.topk` doesn't specify their order, so
+the IDs of tied logits can differ from it.
 Sampling, temperature, repetition penalties, stopping at EOS, and turning
 tokens into text are up to your Scratch project.
 

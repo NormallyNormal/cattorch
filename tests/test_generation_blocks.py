@@ -52,6 +52,36 @@ def toy_emulator(*, capacity=None, hidden_prefill=False, top_k=2):
     return emulator, sprite
 
 
+@pytest.mark.parametrize("compact", [True, False])
+def test_top_k_matches_torch_with_infinite_nan_and_tied_logits(compact):
+    import math
+
+    import torch
+
+    from cattorch.sprite import _build_compact_top_k_program, _build_top_k_program
+
+    build = _build_compact_top_k_program if compact else _build_top_k_program
+    emulator = ScratchEmulator(build(5, logits="output").compile())
+    inf = math.inf
+    for logits in (
+        # Fewer finite logits than top_k: -inf logits still get their IDs.
+        [0.5, -inf, 2.0, -inf, 0.5, -1.0, -inf],
+        # NaN ranks first, as in torch.topk.
+        [1.0, math.nan, -inf, 3.0, 1.0, 0.0],
+    ):
+        emulator.lists["output"] = list(logits)
+        emulator.run()
+        # Ties keep the lower token ID first: a stable descending sort.
+        expected = torch.sort(
+            torch.tensor(logits, dtype=torch.float64), descending=True, stable=True,
+        )
+        assert emulator.lists["cattorch top k ids"] == expected.indices[:5].tolist()
+        torch.testing.assert_close(
+            torch.tensor(emulator.lists["cattorch top k values"], dtype=torch.float64),
+            expected.values[:5], equal_nan=True,
+        )
+
+
 def decode(emulator, tokens):
     emulator.lists["input"] = list(tokens)
     emulator.run_procedure("cattorch decode")

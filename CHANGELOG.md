@@ -836,6 +836,11 @@
   `key_padding_mask` held in a buffer failed with an internal
   `KeyError: 'tensor_meta'`. `zeros_like` and `ones_like` of a buffer now
   fold to a constant of the right shape and dtype.
+- Generation top-k reported an ID of -1 and a value of `-Infinity`, with
+  status ok, when fewer than `top_k` logits were finite. It now always lists
+  `top_k` real token IDs, as `torch.topk` does, ranks a NaN logit first, and
+  lists equal logits lowest token ID first (documented in
+  [generation](docs/generation.md)).
 
 ## Deprecations
 

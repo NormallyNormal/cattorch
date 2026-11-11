@@ -2379,6 +2379,25 @@ def _guard_plain_calls(sprite: dict, outputs: Sequence[str]) -> dict:
     return sprite
 
 
+# An empty slot of the top-k lists. Scratch compares a number with an empty
+# string as text, and every number's text, -Infinity and NaN included, sorts
+# after "", so the first ``top_k`` logits always fill the empty slots, with
+# the same strict comparison that keeps the lower token ID first among
+# equal logits. A -Infinity placeholder would never be replaced by a
+# -Infinity logit, leaving an ID of -1. NaN's text also sorts after every
+# number's, so a NaN logit ranks first, as in ``torch.topk``.
+_TOP_K_EMPTY = ""
+
+
+def _top_k_placeholders(top_k: int) -> list:
+    from cattorch.util.scratch.dsl import append, clear
+
+    initialize = [clear(_TOP_K_VALUES), clear(_TOP_K_IDS)]
+    for _ in range(top_k):
+        initialize.extend((append(_TOP_K_VALUES, _TOP_K_EMPTY), append(_TOP_K_IDS, -1)))
+    return initialize
+
+
 def _top_k_insertion(rank: int, top_k: int):
     """Shift a fixed sorted prefix and insert the current logit at ``rank``."""
     from cattorch.util.scratch.dsl import item, replace, sub, var
@@ -2415,13 +2434,11 @@ def _top_k_decision(rank: int, top_k: int):
 def _build_top_k_program(top_k: int, *, logits: str = "output"):
     """Select sorted top-k logits in one pass without mutating ``logits``."""
     from cattorch.util.scratch.dsl import (
-        Program, append, clear, for_each, gt, if_, item, length,
+        Program, for_each, gt, if_, item, length,
         set_var, var,
     )
 
-    initialize = [clear(_TOP_K_VALUES), clear(_TOP_K_IDS)]
-    for _ in range(top_k):
-        initialize.extend((append(_TOP_K_VALUES, "-Infinity"), append(_TOP_K_IDS, -1)))
+    initialize = _top_k_placeholders(top_k)
     return Program(
         "generation_top_k",
         variables=("top k index", "top k current"),
@@ -2442,13 +2459,11 @@ def _build_top_k_program(top_k: int, *, logits: str = "output"):
 def _build_compact_top_k_program(top_k: int, *, logits: str = "output"):
     """Select top-k with constant-size dynamic insertion loops."""
     from cattorch.util.scratch.dsl import (
-        Program, append, change_var, clear, gt, if_, item, for_each, length,
+        Program, change_var, gt, if_, item, for_each, length,
         repeat, repeat_until, replace, set_var, sub, var,
     )
 
-    initialize = [clear(_TOP_K_VALUES), clear(_TOP_K_IDS)]
-    for _ in range(top_k):
-        initialize.extend((append(_TOP_K_VALUES, "-Infinity"), append(_TOP_K_IDS, -1)))
+    initialize = _top_k_placeholders(top_k)
     return Program(
         "generation_top_k_compact",
         variables=(
