@@ -278,6 +278,44 @@ def test_broadcast_that_adds_a_dimension_follows_the_length(tmp_path):
     _check(tmp_path, _FeatureTokens().eval(), torch.randn(2, 3), {0: (1, 8)}, (1, 4, 8))
 
 
+class _BatchedWeight(nn.Module):
+    def __init__(self, shape, function=torch.matmul):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(shape))
+        self.function = function
+
+    def forward(self, x):
+        return self.function(x, self.weight)
+
+
+@pytest.mark.parametrize(("shape", "output"), [
+    ((3, 4, 5), (3, "n", 5)),
+    # Trailing size-1 batch dimensions are added after the rows are placed.
+    ((2, 3, 1, 4, 5), (2, 3, 1, "n", 5)),
+])
+def test_rows_times_a_batched_weight_keep_their_items(tmp_path, shape, output):
+    torch.manual_seed(0)
+    result = _check(tmp_path, _BatchedWeight(shape).eval(), torch.randn(2, 4), {0: (1, 6)}, (1, 6))
+    bounded = BoundedDimension("input", 1, 6)
+    assert result.output.shape == tuple(bounded if size == "n" else size for size in output)
+    assert not result.warnings
+
+
+def test_a_variable_batch_against_a_batched_weight_runs_once_per_item(tmp_path):
+    # The batched kernel can't follow the length of [n, 1, 3, 4].
+    torch.manual_seed(0)
+    result = _check(
+        tmp_path, _BatchedWeight((3, 4, 5)).eval(), torch.randn(2, 1, 3, 4), {0: (1, 6)}, (1, 6),
+    )
+    assert any("once per item" in warning for warning in result.warnings)
+
+
+def test_rows_inside_a_batch_against_a_batched_weight_are_rejected(tmp_path):
+    model = _BatchedWeight((3, 4, 5), lambda x, weight: x.transpose(0, 1) @ weight).eval()
+    with pytest.raises(UnsupportedModelError, match="batched right side"):
+        transpile(model, torch.randn(2, 3, 4), tmp_path / "m", dynamic={0: (1, 6)})
+
+
 def test_length_check_reaches_the_maximum(tmp_path):
     # Correct up to 20 items, wrong past them.
     model = Lambda(lambda x: x.sum(0) / min(x.shape[0], 20)).eval()

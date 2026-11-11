@@ -246,6 +246,13 @@
   `nn.Embedding` table, and a 2D input's number of bags can be
   [variable-length](docs/supported-models.md#variable-length-inputs).
   `max_norm` on an embedding is rejected with a message naming it.
+- A variable-length input times a batched weight, such as `[n, 4] @
+  [3, 4, 5]` or `[n, 4] @ [2, 3, 4, 5]`, follows the length: the weight's
+  batches are folded into its columns, so one matmul keeps the items as
+  rows, at the cost of the fixed-shape product. A variable batch against a
+  batched weight, such as `[n, 1, 3, 4] @ [3, 4, 5]`, runs once per item
+  instead of failing the length check, and rows inside a batch against a
+  batched weight are rejected with a message saying so.
 
 ## Performance
 

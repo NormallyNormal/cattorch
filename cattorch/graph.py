@@ -629,13 +629,96 @@ def _normalize_linear_shapes(graph) -> None:
         node.kwargs = {}
 
 
-def _broadcast_matmul_batches(graph) -> None:
+def _varying_nodes(graph, varying) -> set[str]:
+    """Names of the nodes computed from the placeholders named in ``varying``."""
+    found: set[str] = set()
+    for node in graph.nodes:
+        if node.name in varying or any(value.name in found for value in node.all_input_nodes):
+            found.add(node.name)
+    return found
+
+
+def _varying_rows_over_batches(left_shape, right_shape) -> bool:
+    """Whether a variable-length left side can only vary along its rows.
+
+    It is traced with one item, so a size-1 dimension of it could hold the
+    items. Batch dimensions of size 1 against right batch dimensions larger
+    than 1 can't, or the product would fail for two items.
+    """
+    batch, right_batch = left_shape[:-2], right_shape[:-2]
+    return (
+        len(left_shape) >= 2 and len(right_shape) > 2 and math.prod(batch) == 1
+        and len(batch) <= len(right_batch)
+        and all(extent != 1 for extent in right_batch[len(right_batch) - len(batch):])
+    )
+
+
+def _fold_right_batches(graph, node, left, right, left_shape, right_shape) -> None:
+    """``rows @ [*batch, K, N]`` as ``rows @ [K, batch * N]``, moved back.
+
+    A variable-length left side broadcast over the batches would move its
+    items away from the front. Folding the right side's batches into its
+    columns keeps one matmul with the items as rows, whose kernel follows the
+    length; a permute then puts the batches first, as ``matmul`` returns them.
+    """
+    dtype = node.meta["val"].dtype
+    reshape, permute = torch.ops.aten.reshape.default, torch.ops.aten.permute.default
+    rows, inner, columns = left_shape[-2], right_shape[-2], right_shape[-1]
+    batch = right_shape[:-2]
+    count = math.prod(batch)
+    right_dtype = _get_dtype(right)
+    order = [len(batch), *range(len(batch)), len(batch) + 1]
+    folded = _insert(
+        graph, node, permute, (right, order), (inner, *batch, columns), right_dtype,
+    )
+    folded = _insert(
+        graph, node, reshape, (folded, [inner, count * columns]), (inner, count * columns),
+        right_dtype,
+    )
+    product = _insert(
+        graph, node, torch.ops.aten.matmul.default, (left, folded),
+        (*left_shape[:-1], count * columns), dtype,
+    )
+    output_shape = tuple(_get_shape(node))
+    if count == 1:
+        node.target = reshape
+        node.args, node.kwargs = (product, list(output_shape)), {}
+        return
+    # Trailing size-1 batch dimensions are added one at a time, so the rows
+    # can't be taken for one of them.
+    outer = output_shape[:-2]
+    trailing = 0
+    while trailing < len(outer) and outer[len(outer) - trailing - 1] == 1:
+        trailing += 1
+    kept = outer[:len(outer) - trailing]
+    steps = [
+        (reshape, [rows, count, columns], (rows, count, columns)),
+        (permute, [1, 0, 2], (count, rows, columns)),
+    ]
+    if kept != (count,):
+        steps.append((reshape, [*kept, rows, columns], (*kept, rows, columns)))
+    steps += [
+        (torch.ops.aten.unsqueeze.default, len(kept), (*kept, *[1] * (number + 1), rows, columns))
+        for number in range(trailing)
+    ]
+    # The last step reuses ``node``: outputs are recorded by node name.
+    for target, argument, shape in steps[:-1]:
+        product = _insert(graph, node, target, (product, argument), shape, dtype)
+    node.target = steps[-1][0]
+    node.args, node.kwargs = (product, steps[-1][1]), {}
+
+
+def _broadcast_matmul_batches(graph, varying=frozenset()) -> None:
     """Give both operands of a broadcasting ``matmul`` the same batch dimensions.
 
     The matmul kernel needs identical batches. A vector becomes a one-row or
     one-column matrix, both operands are expanded to the broadcast batch
     shape, and the result is reshaped back to what ``matmul`` returns.
+    A left side computed from a variable-length input (``varying`` names
+    those inputs) multiplied by a fixed batched right side keeps its items
+    as rows instead.
     """
+    varies = _varying_nodes(graph, varying) if varying else set()
     for node in list(graph.nodes):
         if node.op != "call_function" or str(node.target) != "aten.matmul.default":
             continue
@@ -643,6 +726,12 @@ def _broadcast_matmul_batches(graph) -> None:
         if not (isinstance(left, torch.fx.Node) and isinstance(right, torch.fx.Node)):
             continue
         left_shape, right_shape = tuple(_get_shape(left)), tuple(_get_shape(right))
+        if (
+            left.name in varies and right.name not in varies
+            and _varying_rows_over_batches(left_shape, right_shape)
+        ):
+            _fold_right_batches(graph, node, left, right, left_shape, right_shape)
+            continue
         if len(right_shape) <= 2 and len(left_shape) >= 1:
             continue  # The kernel handles any left batch over a matrix.
         if len(left_shape) >= 2 and left_shape[:-2] == right_shape[:-2]:
@@ -801,17 +890,28 @@ _ROTARY_PARTS = frozenset({
 })
 
 
-def _normalize_graph(graph, protected=frozenset()) -> None:
+def _dynamic_placeholders(captured, dynamic_inputs) -> frozenset[str]:
+    """Names of the placeholders of the ``dynamic=`` inputs."""
+    if not dynamic_inputs:
+        return frozenset()
+    placeholders = [
+        node.name for node in captured.graph.nodes
+        if node.op == "placeholder" and node.name in captured.user_input_names
+    ]
+    return frozenset(placeholders[index] for index in dynamic_inputs if index < len(placeholders))
+
+
+def _normalize_graph(graph, protected=frozenset(), varying=frozenset()) -> None:
     """Rewrites every captured graph gets before analysis.
 
     The traces at other lengths get them too, so their nodes line up.
     ``protected`` operations run a kernel passed to the export, so no rewrite
-    may consume them.
+    may consume them. ``varying`` names the variable-length inputs.
     """
     _drop_empty_cat_inputs(graph)
     _normalize_linear_shapes(graph)
     _drop_identity_permutes(graph)
-    _broadcast_matmul_batches(graph)
+    _broadcast_matmul_batches(graph, varying)
     if not protected & _ROTARY_PARTS:
         _fuse_rotate_half(graph)
 
@@ -852,7 +952,7 @@ def _length_literals(
         )
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
-    _normalize_graph(longer.graph, protected)
+    _normalize_graph(longer.graph, protected, _dynamic_placeholders(longer, dynamic_inputs))
     first, second = list(captured.graph.nodes), list(longer.graph.nodes)
     if len(first) != len(second) or any(
         (a.op, str(a.target)) != (b.op, str(b.target)) for a, b in zip(first, second)
@@ -1306,6 +1406,14 @@ def _follow_runtime_axis(
             )
         if parent is not node.args[0] or axis == len(input_shape) - 1:
             raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+        if len(_get_shape(node.args[1])) > 2:
+            # The batched kernel takes its batches and rows from the traced
+            # shapes.
+            raise UnsupportedModelError(
+                "matmul with a batched right side can't take a variable-length left "
+                "side, except one that varies along its rows with no batch "
+                "dimensions of its own, such as [n, 4] @ [3, 4, 5]"
+            )
     elif target in {"cattorch.recurrent_scan.default", "cattorch.recurrent_final.default"}:
         if len(dynamic_parents) != 1 or parent is not node.args[0] or axis != 0 or unit != 1:
             raise UnsupportedModelError(
@@ -2353,7 +2461,7 @@ def _prepare_graph(
             model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
         )
     protected = registry.replaced_targets(fast=fast, config=fast_config)
-    _normalize_graph(captured.graph, protected)
+    _normalize_graph(captured.graph, protected, _dynamic_placeholders(captured, dynamic_inputs))
     if generation is not None:
         # The wrapper tracks the length, so the step module's position
         # increment has nothing to lower.

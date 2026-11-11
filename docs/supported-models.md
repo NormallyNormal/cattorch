@@ -190,6 +190,12 @@ length too:
 - Fixed slices at either end, such as `x[0]`, `x[-1]` or `x[:, -1]`.
 - Arithmetic with the length itself, as in `x.sum(0) / x.shape[0]`.
 - Recurrent layers, whose final state (`h_n`) has a fixed shape.
+- Rows times a batched weight, such as `[n, 4] @ [3, 4, 5]` or
+  `[n, 4] @ [2, 3, 4, 5]`, whose result holds the items after the batch
+  dimensions (`[3, n, 5]`). A variable batch against a batched weight, such
+  as `[n, 1, 3, 4] @ [3, 4, 5]` or a weight on the left, runs once per item.
+  Rows inside a batch against a batched weight (`x.transpose(0, 1) @ w` for
+  an `[n, 3, 4]` input) are rejected.
 - `nn.EmbeddingBag` over a 2D input, along its bags, or along the indices of
   a `(1, indices)` input. A 1D input with offsets can't vary.
 
