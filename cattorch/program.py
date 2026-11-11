@@ -141,8 +141,6 @@ class EntryPoint:
         object.__setattr__(self, "method", _name(self.method, "entrypoint method"))
         object.__setattr__(self, "arguments", tuple(self.arguments))
         object.__setattr__(self, "returns", tuple(self.returns))
-        if not self.arguments:
-            raise ValueError("an entrypoint must declare at least one argument")
         if not self.returns:
             raise ValueError("an entrypoint must declare at least one return binding")
         if any(not isinstance(value, (Input, StateInput)) for value in self.arguments):

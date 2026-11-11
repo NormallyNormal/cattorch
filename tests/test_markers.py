@@ -99,6 +99,28 @@ def test_a_quantized_entry_point_that_assigns_its_buffer(tmp_path):
     assert verify(model, None, result, calls=calls, quantization=quantization).passed
 
 
+def test_an_entry_point_without_arguments(tmp_path):
+    # It computes from weights alone; nothing requires an input or state.
+    class Summary(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(3, 2)
+
+        @entrypoint(example=())
+        def norms(self):
+            return self.linear.weight.norm(dim=1) + self.linear.bias
+
+        @entrypoint(example=lambda: (torch.ones(3),))
+        def apply(self, x):
+            return self.linear(x)
+
+    torch.manual_seed(0)
+    model = Summary().eval()
+    result = transpile(model, None, tmp_path / "summary")
+    calls = (ProgramCall("norms", ()), ProgramCall("apply", (torch.randn(3),)))
+    assert verify(model, None, result, calls=calls).passed
+
+
 def test_marked_program_builds_the_explicit_form():
     exported, program = marked_program(Accumulator().eval())
     assert {entry.name for entry in program.entrypoints} == {"add", "recall", "remember"}

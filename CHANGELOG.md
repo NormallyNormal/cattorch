@@ -885,6 +885,11 @@
   only the initial copy is still left out, and reset refills them with a
   loop. Private states, such as a `RecurrentGenerationProgram`'s, are still
   saved empty. A 100,000-value zero state adds about 0.5 KB to the archive.
+- An entry point with no arguments, such as `@entrypoint(example=())` on a
+  method that computes from the weights alone, or an `EntryPoint` with
+  `arguments=()` that writes a state, was rejected with "an entrypoint must
+  declare at least one argument". Nothing needed the rule; such entry points
+  now export.
 
 ## Deprecations
 

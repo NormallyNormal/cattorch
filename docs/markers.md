@@ -60,7 +60,8 @@ interface from the markers. Each entry point becomes a block named
 (`cattorch add value`) and a list per output (`cattorch score scores`).
 
 - `example=` gives the arguments to export with: a tuple, a tensor, or a
-  function returning one. They must be tensors.
+  function returning one. They must be tensors. `example=()` exports a
+  method with no arguments, computed from the weights and the state.
 - `name=` names the block, `inputs=` and `outputs=` name its lists. Outputs
   default to `output`, `output_1`, and so on. Only the method's tensor
   results become outputs, as with `forward`; other results, such as `None`,
