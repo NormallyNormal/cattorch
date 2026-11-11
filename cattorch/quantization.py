@@ -1409,7 +1409,7 @@ def _storage_quantization_report(
     values are stored. ``deduplicated`` are lists storage shares with an
     identical one; they are stored as that one is.
     """
-    if storage.precision not in {"int8", "int6", "int4"} or storage.grouping != "row":
+    if storage.precision not in {"int8", "int6", "int4"}:
         return (), _stored_quantization_report(report, {})
     stored = _stored_precisions(
         static_tensors, storage, sprite=sprite, layouts=layouts,
