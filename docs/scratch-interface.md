@@ -34,6 +34,11 @@ A sprite from [`transpile`](getting-started.md) with an example input:
 | `cattorch initialized` | variable | `1` once the weights are decoded, `0` before. |
 | `cattorch init complete`, `cattorch forward complete` | broadcasts | Sent when each block finishes. |
 
+A forward that another script's block started during clears its outputs,
+reports `another call ran during this one` in `cattorch status`, and sends
+no completion broadcast; see
+[overlapping calls](getting-started.md#overlapping-calls).
+
 `TranspileResult.inputs` and `outputs` record each list's tensor shape. A
 [variable-length](supported-models.md#variable-length-inputs) input or output
 takes any whole number of items within its bounds.

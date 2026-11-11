@@ -95,6 +95,39 @@ finishes it sets `cattorch status` to `ok` and broadcasts
 [Scratch interface](scratch-interface.md) lists every name a sprite offers;
 they won't change within cattorch 1.x.
 
+### Overlapping calls
+
+Scratch pauses a block that has run for half a second where it calls a
+procedure or repeats a loop, and runs other scripts meanwhile, so another
+script can call `cattorch forward` while one is still running. Calls share
+the sprite's working lists and decoded weights. Scratch's stop sign, or a
+`stop all` block, can stop a block part way.
+
+- Every block runs as it starts; none is refused. A `cattorch forward` that
+  another `cattorch forward`, `cattorch init` or `cattorch prepare for save`
+  started during sets `cattorch status` to `another call ran during this one`
+  when it ends, clears its outputs, and sends no `cattorch forward complete`
+  broadcast. If a forward it then resumed during is still running, that one
+  fails the same way.
+- A `cattorch init` that another block started during, or a forward taken
+  over while it decoded the weights, leaves them for the next forward to
+  decode again. A forward started while `cattorch init` decodes the weights
+  decodes them itself.
+- A forward stopped part way leaves nothing for the next call to fix, but its
+  outputs are partly written and `cattorch status` keeps its earlier value.
+
+Apart from two cases, a forward that reports `ok` ran alone and its outputs
+are right when it ends. First, as for
+[generation](generation.md#overlapping-calls): if the forward that was taken
+over resumes while the newer block is itself paused, and is still unfinished
+when the newer block ends, or is stopped after it resumed, the newer block
+can report `ok` with results from lists the old forward changed. Second, a
+forward writes its outputs as it computes, not at its end: if the forward
+that was taken over resumes after the newer one ended, it overwrites the
+newer one's outputs, and then clears them, after the newer one reported
+`ok`. Call `cattorch forward` from one script at a time; to call it from
+another script, stop the calling script first.
+
 ## Connect another sprite
 
 My Blocks and sprite-local lists belong to one Scratch sprite. A controller

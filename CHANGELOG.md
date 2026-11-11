@@ -332,6 +332,23 @@
   later block, reset and prefill included; it now leaves them for the next
   block to decode again. One overlap is still not caught. See
   [overlapping calls](docs/generation.md#overlapping-calls).
+- Sprites from `transpile(model, example)`, with fixed or variable-length
+  inputs, had no such protection either. A `cattorch forward` that Scratch
+  paused, then resumed after another script's forward, finished with that
+  call's temporary values and reported `ok` with wrong outputs, overwriting
+  the other call's. A `cattorch init` paused while it decoded the weights
+  let a forward meanwhile use them half decoded and report `ok`, and, if it
+  resumed after a forward had decoded them, left them wrong for every later
+  call. Now a forward that another `cattorch forward`, `cattorch init` or
+  `cattorch prepare for save` started during reports `another call ran during
+  this one`, as program calls do, clears its outputs, sends no completion
+  broadcast and fails a forward it resumed during, and an init that another
+  call started during leaves the weights for the next forward to decode
+  again. A sprite has about 24 more blocks, and a forward runs 3 more. The
+  clickable forward on the canvas of a variable-length export ran the
+  procedure it wraps, without the length checks; it runs `cattorch forward`.
+  Two overlaps are still not caught. See
+  [overlapping calls](docs/getting-started.md#overlapping-calls).
 - Generation, recurrent generation and `ExportProgram` sprites had loose call
   blocks on the canvas that ran private procedures directly. The one in a
   `GenerationProgram` sprite ran a step without checking its token or marking

@@ -60,6 +60,7 @@ from cattorch.sprite import (
     _deduplicate_static_tensors,
     _find_procedure_definition,
     _gate_chain,
+    _guard_plain_calls,
     _logical_list_sizes,
     _merge_duplicate_lists,
     _remove_canvas_calls,
@@ -2967,6 +2968,14 @@ def _transpile(
     # come before finalization, so it sees the sprite whole.
     if _edit_sprite is not None:
         sprite = _edit_sprite(sprite)
+    if generation is None and not _defer_interface_sharding:
+        sprite = _guard_plain_calls(sprite, [
+            shard
+            for name in dict.fromkeys(output_names)
+            for shard in (
+                [shard.name for shard in layouts[name].shards] if name in layouts else [name]
+            )
+        ])
     finalized = _finalize(
         sprite,
         output_path,

@@ -413,3 +413,77 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
     inputs = torch.tensor([((index * 37) % 101) / 101 - 0.5 for index in range(1, 4097)])
     (expected, _) = replay.run(ProgramCall("step", (inputs.reshape(64, 64),)))
     torch.testing.assert_close(values(stage, "counter"), expected, atol=1e-4, rtol=0)
+
+
+def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
+    # Scratch pauses the long forward once it has run for 500 ms, and runs the
+    # second script, whose short forward uses the same temporary lists: the
+    # long one must then neither report ok nor leave its outputs.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        append, call, change_var, clear, div, eq, for_each, item, length, mod, mul,
+        repeat_until, set_var, sub, var,
+    )
+    from test_program_overlap import OVERTAKEN
+
+    class Deep(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(6)
+            self.layers = nn.ModuleList(nn.Linear(64, 64) for _ in range(6))
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = torch.tanh(layer(x))
+            return x
+
+    model = Deep().eval()
+    result = transpile(model, torch.zeros(2, 64), tmp_path / "deep", dynamic={0: (1, 64)})
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    first, second, outputs = (
+        builder.global_list(name) for name in ("first results", "second results", "outputs")
+    )
+    started, done = (builder.global_variable(name, 0) for name in ("started", "first done"))
+    flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    status = "cattorch status"
+
+    def fill(rows, step):
+        return (clear("input"), for_each("index", 64 * rows, (
+            append("input", sub(div(mod(mul(var("index"), step), 101), 101), 0.5)),
+        )))
+
+    # The short call, and recording it, in a warp block, which the first
+    # forward can't resume during.
+    for step in (53, 41):
+        builder.procedure(sprite, f"short forward {step}", (
+            *fill(1, step), call("cattorch forward"), append(second, var(status)),
+            for_each("position", length("output"), (
+                append(outputs, item("output", var("position"))),
+            )),
+        ), lists=("input", "output", second, outputs), variables=(status, "index", "position"))
+    builder.script(sprite, flag, (
+        call("cattorch init"), *fill(64, 37), set_var(started, 1),
+        call("cattorch forward"), append(first, var(status)), append(first, length("output")),
+        set_var(done, 1),
+    ), lists=("input", "output", first), variables=(status, started, done, "index"))
+    builder.script(sprite, flag, (
+        repeat_until(eq(var(started), 1), (change_var("waits", 1),)),
+        # 0 if the long forward was still running.
+        append(second, var(done)),
+        call("short forward 53"),
+        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
+        # The next call runs as usual.
+        call("short forward 41"),
+    ), lists=(second,), variables=(started, done, "waits"), y=400)
+    path = tmp_path / "overlap.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["first results"] == [OVERTAKEN, 0]
+    assert stage["second results"] == [0, "ok", "ok"]
+
+    def row(step):
+        return torch.tensor([((index * step) % 101) / 101 - 0.5 for index in range(1, 65)])
+
+    expected = torch.cat([model(row(step)[None]).detach().flatten() for step in (53, 41)])
+    torch.testing.assert_close(values(stage, "outputs"), expected, atol=1e-4, rtol=0)

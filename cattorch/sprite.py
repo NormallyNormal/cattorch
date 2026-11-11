@@ -1755,16 +1755,187 @@ def _add_epoch_procedure(
     runs first; with a ``refusal``, that runs instead while ``_BUSY`` is 1.
     ``variables`` and ``lists`` are what those two use.
     """
+    sprite = _add_warp_procedure(
+        sprite, _epoch_procedure(name), body, x=x + 320, y=y, arguments=("epoch",),
+    )
+    return _add_epoch_entry(
+        sprite, name, f"{body.name}_public", x=x, y=y, take_over=take_over, refusal=refusal,
+        variables=(_BUSY, _EPOCH, *variables), lists=lists,
+    )
+
+
+def _epoch_procedure(name: str) -> str:
+    """The internal procedure, with an ``epoch`` argument, that the public ``name`` runs."""
+    return f"_cattorch {name.removeprefix('cattorch ')} in epoch %s"
+
+
+def _add_epoch_entry(
+    sprite: dict, name: str, program_name: str, *, x: int, y: int, take_over=(), refusal=None,
+    variables: Sequence[str] = (), lists: Sequence[str] = (),
+) -> dict:
+    """Add the public ``name``, which changes the epoch and runs its epoch procedure.
+
+    As ``_add_epoch_procedure``, for an epoch procedure the sprite already has;
+    ``variables`` are all the ones the public block uses.
+    """
     from cattorch.util.scratch.dsl import Program, call, change_var, eq, if_else, var
 
-    inner = f"_cattorch {name.removeprefix('cattorch ')} in epoch %s"
-    sprite = _add_warp_procedure(sprite, inner, body, x=x + 320, y=y, arguments=("epoch",))
-    start = (*take_over, change_var(_EPOCH, 1), call(inner, epoch=var(_EPOCH)))
+    start = (*take_over, change_var(_EPOCH, 1), call(_epoch_procedure(name), epoch=var(_EPOCH)))
     public = Program(
-        f"{body.name}_public", variables=dict.fromkeys((_BUSY, _EPOCH, *variables)), lists=lists,
+        program_name, variables=dict.fromkeys(variables), lists=lists,
         body=start if refusal is None else (if_else(eq(var(_BUSY), 1), refusal, start),),
     )
     return _add_warp_procedure(sprite, name, public, x=x, y=y)
+
+
+# What a program entry point or a plain forward reports when another call
+# started while it ran.
+_CALL_OVERTAKEN = "another call ran during this one"
+
+
+def _unlink_broadcasts(sprite: dict, message: str) -> None:
+    """Remove every ``broadcast and wait`` of ``message``; each must end its chain."""
+    blocks = sprite["blocks"]
+    for identifier, block in list(blocks.items()):
+        if block.get("opcode") != "event_broadcastandwait":
+            continue
+        menu = block.get("inputs", {}).get("BROADCAST_INPUT", [None, None])[1]
+        if not (isinstance(menu, list) and len(menu) > 1 and menu[1] == message):
+            continue
+        if block.get("next") is not None:
+            raise ValueError(f"the {message!r} broadcast doesn't end its chain")
+        parent = blocks[block["parent"]]
+        if parent.get("next") == identifier:
+            parent["next"] = None
+        else:
+            # The only block of an ``if`` branch.
+            inputs = parent.get("inputs", {})
+            for key in ("SUBSTACK", "SUBSTACK2"):
+                if inputs.get(key, [None, None])[1] == identifier:
+                    del inputs[key]
+        del blocks[identifier]
+
+
+def _take_epoch_argument(sprite: dict, name: str) -> str:
+    """Rename procedure ``name`` to its epoch procedure, which has an ``epoch`` argument.
+
+    Only its definition is renamed, not the calls to it. Returns the new name.
+    """
+    from cattorch.util.scratch.dsl import argument_id
+
+    blocks = sprite["blocks"]
+    inner = _epoch_procedure(name)
+    prototype = blocks[_find_procedure_definition(sprite, name)]["inputs"]["custom_block"][1]
+    blocks[prototype]["mutation"] = _procedure_mutation(inner, warp=True, arguments=("epoch",))
+    reporter = f"{prototype}_{argument_id('epoch')}"
+    blocks[prototype]["inputs"] = {argument_id("epoch"): [1, reporter]}
+    blocks[reporter] = {
+        "opcode": "argument_reporter_string_number", "next": None,
+        "parent": prototype, "inputs": {}, "fields": {"VALUE": ["epoch", None]},
+        "shadow": True, "topLevel": False,
+    }
+    return inner
+
+
+def _add_to_procedure(sprite: dict, name: str, program, *, first: bool = False) -> None:
+    """Run ``program``'s statements at the end of procedure ``name``, or ``first``."""
+    temporary = f"_cattorch adding to {name}"
+    _add_warp_procedure(sprite, temporary, program, x=0, y=0)
+    blocks = sprite["blocks"]
+    definition = _find_procedure_definition(sprite, temporary)
+    head = blocks[definition]["next"]
+    del blocks[blocks[definition]["inputs"]["custom_block"][1]]
+    del blocks[definition]
+    tail = head
+    while blocks[tail].get("next") is not None:
+        tail = blocks[tail]["next"]
+    target = _find_procedure_definition(sprite, name)
+    if first:
+        rest = blocks[target]["next"]
+        blocks[target]["next"], blocks[head]["parent"] = head, target
+        blocks[tail]["next"] = rest
+        if rest is not None:
+            blocks[rest]["parent"] = tail
+        return
+    last = target
+    while blocks[last].get("next") is not None:
+        last = blocks[last]["next"]
+    blocks[last]["next"], blocks[head]["parent"] = head, last
+
+
+def _guard_plain_calls(sprite: dict, outputs: Sequence[str]) -> dict:
+    """Keep stopped and overlapping calls of a plain export from reporting ok wrongly.
+
+    Scratch can pause a warp block and run other scripts meanwhile, and calls
+    share temporary lists and the decoded weights. As program entry points
+    do, ``cattorch forward`` and ``cattorch init`` change the epoch and run in
+    an epoch procedure, and ``cattorch prepare for save`` changes the epoch.
+    A forward that another call started during clears ``outputs``, every
+    output list and shard, reports so in ``cattorch status``, sends no
+    completion broadcast, and changes the epoch, so that a call it resumed
+    during fails too. An init that another call started during, the forward's
+    own included, leaves the weights for the next call to decode again.
+    """
+    from cattorch.util.scratch.dsl import (
+        Program, argument_id, broadcast_and_wait, change_var, clear, if_, if_else, not_,
+        set_var,
+    )
+
+    forward, init, initialized = "cattorch forward", "cattorch init", "cattorch initialized"
+    complete = f"{forward} complete"
+    current = _epoch_current()
+    # Sent at the end instead, only by a call that ran alone.
+    _unlink_broadcasts(sprite, complete)
+    _add_to_procedure(sprite, forward, Program(
+        "plain_forward_end", variables=(_EPOCH, STATUS_VARIABLE), lists=outputs,
+        body=(if_else(current, (broadcast_and_wait(complete),), (
+            change_var(_EPOCH, 1), *(clear(name) for name in outputs),
+            set_var(STATUS_VARIABLE, _CALL_OVERTAKEN),
+        )),),
+    ))
+    # A forward that starts meanwhile decodes the weights itself.
+    _add_to_procedure(sprite, init, Program(
+        "plain_init_start", variables=(initialized,), body=(set_var(initialized, 0),),
+    ), first=True)
+    # That forward may have finished decoding them while this init was, and
+    # this one then left them half overwritten.
+    _add_to_procedure(sprite, init, Program(
+        "plain_init_end", variables=(initialized, _EPOCH),
+        body=(if_(not_(current), (set_var(initialized, 0), change_var(_EPOCH, 1))),),
+    ))
+    _take_epoch_argument(sprite, forward)
+    inner_init = _take_epoch_argument(sprite, init)
+    sprite = _add_epoch_entry(
+        sprite, forward, "plain_forward_public", x=0, y=320, variables=(_EPOCH,),
+    )
+    sprite = _add_epoch_entry(sprite, init, "plain_init_public", x=0, y=480, variables=(_EPOCH,))
+    # The forward's init check runs init's epoch procedure with the epoch as
+    # it is then, so that init checks itself as when it's called directly.
+    epoch_id = next(
+        identifier for identifier, entry in sprite["variables"].items() if entry[0] == _EPOCH
+    )
+    for block in sprite["blocks"].values():
+        if block.get("opcode") != "procedures_call":
+            continue
+        if block.get("topLevel"):
+            # A variable-length export renamed the loose forward block on the
+            # canvas with the procedure it wraps, so it ran that unchecked.
+            if block["mutation"].get("proccode") in (
+                "_cattorch checked forward", "_cattorch forward unit",
+            ):
+                block["mutation"] = _procedure_mutation(forward)
+        elif block["mutation"].get("proccode") == init:
+            block["mutation"] = _procedure_mutation(inner_init, arguments=("epoch",))
+            block["inputs"] = {argument_id("epoch"): [3, [12, _EPOCH, epoch_id], [10, ""]]}
+    try:
+        _find_procedure_definition(sprite, "cattorch prepare for save")
+    except ValueError:
+        return sprite
+    # Re-encoding the weights takes them from a running call.
+    _add_to_procedure(sprite, "cattorch prepare for save", Program(
+        "plain_prepare_start", variables=(_EPOCH,), body=(change_var(_EPOCH, 1),),
+    ), first=True)
+    return sprite
 
 
 def _top_k_insertion(rank: int, top_k: int):

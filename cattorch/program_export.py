@@ -33,7 +33,7 @@ from cattorch.quantization import quantize_model
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
-    _BUSY, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
+    _BUSY, _CALL_OVERTAKEN, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
     _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
@@ -209,7 +209,7 @@ _INTERRUPTED = (
     "an earlier call or reset was stopped while changing the states, or is still "
     "changing them; reset first"
 )
-_OVERTAKEN = "another call ran during this one"
+_OVERTAKEN = _CALL_OVERTAKEN
 
 
 def _overtaken() -> tuple[Statement, ...]:
