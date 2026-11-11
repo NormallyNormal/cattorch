@@ -327,7 +327,7 @@ def test_symmetric_matrix_matches_the_scalar_implementation(dtype, bits):
     for shape in ((7, 96), (5, 30), (1, 1)):
         matrix = (torch.randn(shape) * 3).to(dtype)
         matrix[0, 0] = 0
-        reconstructed, group = _symmetric_matrix(matrix, config)
+        reconstructed, group, _ = _symmetric_matrix(matrix, config)
         expected, expected_group = _reference_symmetric_matrix(matrix, config)
         assert group == expected_group
         assert reconstructed.dtype == dtype

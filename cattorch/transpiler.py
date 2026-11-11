@@ -49,6 +49,7 @@ from cattorch.quantization import (
     QuantizationConfig,
     _StaticSourceRecorder,
     _storage_quantization_report,
+    effective_group_size,
     expert_bank_effective_ndims,
     quantize_model,
 )
@@ -76,7 +77,6 @@ from cattorch.sprite import (
     _merge_variables_by_name,
     _remove_unused,
     _share_repeated_transformer_layers,
-    _static_storage_group_size,
     _static_storage_shard_limits,
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
@@ -1994,7 +1994,9 @@ def _select_unroll_factor(
             precision = "float16"
         payload_chars += tensor.numel() * density[precision]
         if precision.startswith("int"):
-            group_size = _static_storage_group_size(tensor, storage)
+            group_size = effective_group_size(
+                max(1, int(tensor.shape[-1])) if tensor.ndim else 1, storage.group_size,
+            )
             scale_chars = 32 / 13 if storage.scale_precision == "float16" else 64 / 13
             payload_chars += math.ceil(tensor.numel() / group_size) * scale_chars
 

@@ -10,6 +10,7 @@ from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
 from cattorch.quantization import _symmetric_matrix, effective_group_size, quantize_model
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.interface import TOKEN_IDS
+from cattorch.verify import round_as_stored
 
 
 def _load(path):
@@ -788,38 +789,57 @@ def test_gptq_calibrates_recurrent_and_fused_attention_weights(module, names):
 
 
 @torch.no_grad()
-def test_quantized_weights_kept_in_float16_are_reported(tmp_path):
-    # Weights computed from parameters by arithmetic are stored as computed,
-    # in float16. Their parameters are not rounded first, and the report and
-    # warnings name the weight by the parameters it comes from.
+def test_weights_computed_from_parameters_are_quantized_as_computed(tmp_path, monkeypatch):
+    # A weight computed from parameters is quantized as the matrix product
+    # reads it, with GPTQ; its parameters stay unrounded, the sprite stores
+    # it in integers, and PyTorch then computes with the stored values.
+    from torch.nn.utils import parametrizations
+
     torch.manual_seed(13)
-    copied = _Functional(lambda s, x: F.linear(x, s.w.t() * 1), w=(32, 24)).eval()
-    scaled = _Functional(lambda s, x: F.linear(x, s.w * s.g), w=(24, 32), g=(24, 1)).eval()
-    plain = _Functional(lambda s, x: F.linear(x, s.w), w=(24, 32)).eval()
-    config = QuantizationConfig(bits=8, min_quantized_values=1)
-    owned = copy.deepcopy(scaled)
-    quantize_model(owned, config, None, orientation_inputs=[torch.randn(2, 32)])
-    assert torch.equal(owned.w, scaled.w) and torch.equal(owned.g, scaled.g)
-    warned = transpile(copied, torch.randn(2, 32), tmp_path / "copied", quantization=config)
-    assert [warning for warning in warned.warnings if "float16" in warning] == [
-        "weight computed from w (24, 32) is stored as float16, not int8: export "
-        "computes it from parameters, and quantization only rounds parameters the "
-        "model reads directly"
-    ]
-    (item,) = warned.quantization.tensors
-    assert (item.name, item.method, item.bits, item.values) == (
-        "weight computed from w", "float16", None, 768,
+    models = {
+        "scaled": (_Functional(lambda s, x: F.linear(x, s.w * s.g), w=(24, 32), g=(24, 1)),
+                   "weight computed from g, w", ("g", "w")),
+        # LoRA: the sum is computed, and ``w`` is also read on its own.
+        "lora": (_Functional(
+            lambda s, x: F.linear(x, s.w + s.b @ s.a) + x @ s.w.T, w=(24, 32), a=(2, 32), b=(24, 2),
+        ), "weight computed from a, b, w", ("a", "b", "w")),
+        "weight-norm": (_Functional(
+            lambda s, x: s.l(x), l=parametrizations.weight_norm(torch.nn.Linear(32, 24)),
+        ), "l.weight", ("l.parametrizations.weight.original0", "l.parametrizations.weight.original1")),
+    }
+    config = QuantizationConfig(
+        bits=4, method="gptq", group_size=8, min_quantized_values=1, min_calibration_rows=16,
     )
-    assert warned.quantization.quantized_values == warned.quantization.symmetric_values == 0
-    report = transpile(
-        scaled, torch.randn(2, 32), tmp_path / "scaled", quantization=config,
-    ).quantization
-    assert [(item.name, item.method) for item in report.tensors] == [
-        ("weight computed from g, w", "float16"),
-    ]
-    quiet = transpile(plain, torch.randn(2, 32), tmp_path / "plain", quantization=config)
-    assert not [warning for warning in quiet.warnings if "quantized weight" in warning]
-    assert [item.method for item in quiet.quantization.tensors] == ["symmetric"]
+    example = torch.randn(2, 32)
+    calibration = [torch.randn(4, 32) for _ in range(8)]
+    for case, (model, name, sources) in models.items():
+        model.eval()
+        original = copy.deepcopy(model.state_dict())
+        precisions = _record_matrix_precisions(monkeypatch)
+        result = transpile(
+            model, example, tmp_path / case, quantization=config, calibration_inputs=calibration,
+        )
+        assert all(torch.equal(value, model.state_dict()[key]) for key, value in original.items())
+        computed = [item for item in result.quantization.tensors if item.sources]
+        assert [(item.name, item.method, item.sources) for item in computed] == [
+            (name, "gptq", sources),
+        ], case
+        assert {precision for _, precision in precisions} == {"int4"}, case
+        assert not [warning for warning in result.warnings if "float16" in warning], case
+
+        reference = copy.deepcopy(model)
+        quantize_model(reference, config, calibration)
+        for key in ("g", "a", "b", "l.parametrizations.weight.original1"):
+            if key in original:
+                assert torch.equal(reference.state_dict()[key], original[key]), (case, key)
+        round_as_stored(reference, StorageConfig(), quantization=config)
+        emulator = ScratchEmulator(_load(result.path))
+        emulator.lists["input"] = example.flatten().tolist()
+        emulator.run_procedure("cattorch forward")
+        torch.testing.assert_close(
+            torch.tensor([float(value) for value in emulator.lists["output"]]),
+            reference(example).flatten(), atol=1e-5, rtol=1e-5,
+        )
 
 
 @torch.no_grad()
@@ -852,9 +872,10 @@ def test_einsum_and_bilinear_weights_are_stored_as_integers_in_export_programs(
 @torch.no_grad()
 def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypatch):
     # A convolution maps every input window linearly, so GPTQ calibrates
-    # each group of kernels over its windows. Storage groups a kernel along
-    # its last dimension, so GPTQ's groups run along it too and the kernels
-    # stay integers.
+    # each group of kernels over its windows. Its groups run over each
+    # output channel's whole fan-in (2 x 3 x 3 here, so 6 of at most 8), and
+    # a transposed convolution's within one kernel (3), as storage reads
+    # them, so the kernels stay integers.
     import cattorch.sprite as sprite_module
 
     torch.manual_seed(15)
@@ -878,7 +899,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
     }
     for name, item in weights.items():
         assert (item.method, item.fallback_reason, item.effective_group_size) == (
-            "gptq", None, 3,
+            "gptq", None, 3 if name == "up.weight" else 6,
         )
         # A window per output position: 4 x 4, and 33 from the transpose.
         assert item.calibration_rows == 8 * (33 if name == "up.weight" else 16)
@@ -1031,7 +1052,7 @@ def test_quantized_values_are_a_fixed_point_of_the_storage_codec(bits, scale_pre
                 bits=bits, group_size=group, scale_precision=scale_precision,
             )
             values = torch.randn(16, group * 2, generator=generator) * 2.0 ** exponent
-            quantized, size = _symmetric_matrix(values, config)
+            quantized, size, _ = _symmetric_matrix(values, config)
             storage = quantized_storage(StorageConfig(), config)
             assert _check_integer_codec_grid(quantized, storage, size, ()), (exponent, group)
 
@@ -1065,8 +1086,11 @@ def test_vectors_stay_float16_and_derived_weights_leave_parameters_unrounded():
         orientation_inputs=[torch.randn(1, 2, 16)],
     )
     # ``bias_k`` and ``bias_v`` are (1, 1, 16) vectors and the weight norm's
-    # gain a (32, 1) one; the weight norm's direction is only an ingredient.
-    assert {item.name for item in report.tensors} == {"a.in_proj_weight", "a.out_proj.weight"}
+    # gain a (32, 1) one; the weight norm's direction is only an ingredient
+    # of the weight it computes, which is what is quantized.
+    assert {item.name for item in report.tensors} == {
+        "a.in_proj_weight", "a.out_proj.weight", "n.weight",
+    }
     for name in (
         "a.bias_k", "a.bias_v", "n.parametrizations.weight.original0",
         "n.parametrizations.weight.original1",

@@ -72,6 +72,11 @@ class StorageConfig:
     scale_precision: Literal["float32", "float16"] = field(
         default="float32", init=False, repr=False,
     )
+    # Every (integer precision, maximum group size) quantization may use,
+    # with per-weight overrides; empty means ``(precision, group_size)``.
+    integer_formats: tuple[tuple[str, int], ...] = field(
+        default=(), init=False, repr=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.compression, bool):
@@ -95,6 +100,7 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
         ("group_size", quantization.group_size),
         ("min_quantized_values", quantization.min_quantized_values),
         ("scale_precision", quantization.scale_precision),
+        ("integer_formats", quantization._integer_formats()),
     ):
         object.__setattr__(result, name, value)
     return result
@@ -323,6 +329,34 @@ def _quantized_bytes(
         return packed.astype(np.uint8).tobytes()[:math.ceil(codes.size * 6 / 8)]
     pair = np.pad(centered, (0, centered.size % 2), constant_values=7).reshape(-1, 2)
     return (pair[:, 0] * 16 + pair[:, 1]).astype(np.uint8).tobytes()
+
+
+def integer_storage_bytes(
+    counts, precision: Literal["int8", "int6", "int4"], group_size: int,
+    scale_precision: Literal["float32", "float16"], *, groups: int | None = None,
+) -> int:
+    """The payload and scale bytes integer storage spends on one tensor.
+
+    ``counts`` says how often each code occurs, the most negative first; for
+    int8 and int6 only its total matters. The cost is what the encoder
+    writes: packed codes (for int4, a Huffman stream with a code built for
+    this tensor alone) and a scale per group, ``groups`` of them or one per
+    ``group_size`` values. Base92 text grows every format by the same
+    ratio, so this compares directly with two bytes per value for float16.
+    """
+    counts = np.asarray(counts, dtype=np.int64).reshape(-1)
+    values = int(counts.sum())
+    if groups is None:
+        groups = math.ceil(values / group_size)
+    scale_bytes = groups * (4 if scale_precision == "float32" else 2)
+    if precision == "int8":
+        return values + scale_bytes
+    if precision == "int6":
+        return math.ceil(values * 6 / 8) + scale_bytes
+    frequencies = Counter({symbol: int(count) for symbol, count in enumerate(counts) if count})
+    lengths = _length_limited_huffman_lengths(frequencies)
+    bits = sum(frequencies[symbol] * length_ for symbol, length_ in lengths.items())
+    return math.ceil(bits / 8) + scale_bytes
 
 
 def _int4_symbols(spec: EncodedList):

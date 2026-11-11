@@ -196,6 +196,7 @@ def _verify_program(
             None,
             orientation_inputs=[torch.zeros(1) for _ in observed_calls],
             _registry=registry,
+            _names_from=owned,
         )
     if lossy:
         round_as_stored(

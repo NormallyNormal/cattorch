@@ -1165,22 +1165,86 @@ def _static_storage_precision(
     """
     if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
         return "float32"
+    if storage.precision not in {"int8", "int6", "int4"}:
+        return storage.precision
     ndim = tensor.ndim if effective_ndim is None else effective_ndim
-    if storage.precision in {"int8", "int6", "int4"} and ndim < 2:
+    if ndim < 2:
         return "float16"
-    if storage.precision in {"int8", "int6", "int4"} and (
-        # Quantization leaves matrices below the threshold unquantized.
-        (source_numel or tensor.numel()) < storage.min_quantized_values
-        or not _on_integer_codec_grid(tensor, storage, interleave_segments)
-    ):
-        # QuantizationConfig decides which weights are lossy. Storage must not
-        # quantize anything it did not reconstruct, such as buffers (RoPE
-        # tables, masks) or values derived from weights by other arithmetic.
-        finite = tensor.detach()[torch.isfinite(tensor.detach())]
-        if finite.numel() and float(finite.abs().max()) > 65504:
-            return "float32"
-        return "float16"
-    return storage.precision
+    # Quantization leaves matrices below the threshold unquantized.
+    if (source_numel or tensor.numel()) >= storage.min_quantized_values:
+        encoding = _integer_codec_encoding(tensor, storage, interleave_segments)
+        if encoding is not None:
+            return cast(_StoragePrecision, encoding[0])
+    # QuantizationConfig decides which weights are lossy. Storage must not
+    # quantize anything it did not reconstruct, such as buffers (RoPE
+    # tables, masks) or values derived from weights by other arithmetic.
+    finite = tensor.detach()[torch.isfinite(tensor.detach())]
+    if finite.numel() and float(finite.abs().max()) > 65504:
+        return "float32"
+    return "float16"
+
+
+def _integer_encodings(
+    tensor: torch.Tensor, storage: StorageConfig,
+) -> tuple[tuple[str, int], ...]:
+    """The integer encodings storage tries for ``tensor``, smallest first.
+
+    Each is a precision quantization may use (``storage.integer_formats``)
+    with groups of consecutive values within one row of the tensor's
+    trailing dimensions: a convolution's kernels are grouped over their
+    whole fan-in, a transposed convolution's within each kernel, and a
+    matrix's along its rows. Quantization chose one of them; only that one
+    reproduces the values, unless several do exactly, as for zeros.
+    """
+    formats = storage.integer_formats or ((storage.precision, storage.group_size),)
+    shape = [int(size) for size in tensor.shape] or [1]
+    extents = {math.prod(shape[start:]) for start in range(1, len(shape))} or {shape[-1]}
+    scale_bits = 32 if storage.scale_precision == "float32" else 16
+    candidates = {
+        (precision, effective_group_size(extent, maximum))
+        for precision, maximum in formats for extent in extents if extent >= 1
+    }
+    return tuple(sorted(
+        candidates,
+        key=lambda item: (_INTEGER_BITS[item[0]] + scale_bits / item[1], item[0], -item[1]),
+    ))
+
+
+_INTEGER_BITS = {"int8": 8, "int6": 6, "int4": 4}
+
+
+def _integer_codec_encoding(
+    tensor: torch.Tensor,
+    storage: StorageConfig,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
+) -> tuple[str, int] | None:
+    """The smallest integer encoding that reproduces ``tensor`` exactly.
+
+    Grouped kernels keep static tensors in a four-row physical order. Storage
+    quantizes the logical order, so undo that permutation first.
+    """
+    # Compilation, sharding and storage each ask about the same tensors.
+    key = (
+        storage.precision, storage.integer_formats, storage.group_size,
+        storage.scale_precision, tuple(interleave_segments), tensor._version,
+    )
+    cached = _CODEC_GRID_CACHE.get(id(tensor))
+    if cached is not None and cached[0]() is tensor and cached[1] == key:
+        return cached[2]
+    result = next(
+        (
+            (precision, group_size)
+            for precision, group_size in _integer_encodings(tensor, storage)
+            if _check_integer_codec_grid(
+                tensor, storage, group_size, interleave_segments, precision=precision,
+            )
+        ),
+        None,
+    )
+    if cached is None or cached[0]() is not tensor:
+        weakref.finalize(tensor, _CODEC_GRID_CACHE.pop, id(tensor), None)
+    _CODEC_GRID_CACHE[id(tensor)] = (weakref.ref(tensor), key, result)
+    return result
 
 
 def _on_integer_codec_grid(
@@ -1188,29 +1252,12 @@ def _on_integer_codec_grid(
     storage: StorageConfig,
     interleave_segments: tuple[tuple[int, int, int], ...] = (),
 ) -> bool:
-    """Return whether integer storage reproduces ``tensor`` exactly.
-
-    Grouped kernels keep static tensors in a four-row physical order. Storage
-    quantizes the logical order, so undo that permutation first.
-    """
-    group_size = _static_storage_group_size(tensor, storage)
-    # Compilation, sharding and storage each ask about the same tensors.
-    key = (
-        storage.precision, storage.scale_precision, group_size,
-        tuple(interleave_segments), tensor._version,
-    )
-    cached = _CODEC_GRID_CACHE.get(id(tensor))
-    if cached is not None and cached[0]() is tensor and cached[1] == key:
-        return cached[2]
-    result = _check_integer_codec_grid(tensor, storage, group_size, interleave_segments)
-    if cached is None or cached[0]() is not tensor:
-        weakref.finalize(tensor, _CODEC_GRID_CACHE.pop, id(tensor), None)
-    _CODEC_GRID_CACHE[id(tensor)] = (weakref.ref(tensor), key, result)
-    return result
+    """Return whether some integer encoding reproduces ``tensor`` exactly."""
+    return _integer_codec_encoding(tensor, storage, interleave_segments) is not None
 
 
 # id(tensor) -> (weak reference, the question's key, answer).
-_CODEC_GRID_CACHE: dict[int, tuple[weakref.ref, tuple, bool]] = {}
+_CODEC_GRID_CACHE: dict[int, tuple[weakref.ref, tuple, tuple[str, int] | None]] = {}
 # Groups checked per step, to bound the float64 temporaries for large tables.
 _CODEC_GRID_CHUNK_GROUPS = 1 << 13
 
@@ -1220,6 +1267,8 @@ def _check_integer_codec_grid(
     storage: StorageConfig,
     group_size: int,
     interleave_segments: tuple[tuple[int, int, int], ...],
+    *,
+    precision: str | None = None,
 ) -> bool:
     # NumPy rather than torch: these are many small passes, and torch's
     # thread pool makes each one much slower on a busy machine.
@@ -1233,7 +1282,7 @@ def _check_integer_codec_grid(
             return False
     if values.size == 0 or values.size % group_size:
         return False
-    maximum_code = {"int8": 127, "int6": 31, "int4": 7}[storage.precision]
+    maximum_code = {"int8": 127, "int6": 31, "int4": 7}[precision or storage.precision]
     # Every group is checked on its own, so whole groups at a time, in
     # logical order, give the same answer as all of them at once.
     for groups in _logical_group_chunks(values, interleave_segments, group_size):
@@ -1311,11 +1360,20 @@ def _logical_pieces(
 def _static_storage_group_size(
     tensor: torch.Tensor | None,
     storage: StorageConfig,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
 ) -> int:
-    """The quantization group width of one logical matrix, as quantization
-    chose it: groups never cross a row."""
+    """The quantization group width storage encodes ``tensor`` with.
+
+    It is the group of the integer encoding that reproduces the tensor (see
+    ``_integer_encodings``); otherwise a matrix's groups run along its rows,
+    never crossing one.
+    """
     if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2 or tensor.shape[-1] < 1:
         return storage.group_size
+    if storage.precision in {"int8", "int6", "int4"} and tensor.is_floating_point():
+        encoding = _integer_codec_encoding(tensor, storage, interleave_segments)
+        if encoding is not None:
+            return encoding[1]
     return effective_group_size(int(tensor.shape[-1]), storage.group_size)
 
 
@@ -1337,7 +1395,9 @@ def _static_storage_shard_limits(
             (interleaved_layouts or {}).get(key, ()),
             (source_numels or {}).get(key),
         )
-        group_size = _static_storage_group_size(tensor, storage)
+        group_size = _static_storage_group_size(
+            tensor, storage, (interleaved_layouts or {}).get(key, ()),
+        )
         if precision == "float32":
             limit = SCRATCH_LIST_LIMIT // 4
         elif precision == "float16":
@@ -1572,7 +1632,10 @@ def _apply_static_storage(
                     interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
                     source_numels.get(logical_name.removeprefix("W_")),
                 )
-                group_size = _static_storage_group_size(tensor, storage)
+                group_size = _static_storage_group_size(
+                    tensor, storage,
+                    interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+                )
                 for shard in layouts.get(logical_name, ListLayout(logical_name, 0, ())).shards:
                     contents = sprite["lists"][shard.identifier][1]
                     segments = physical_interleaves.get(shard.name, ())
@@ -1607,7 +1670,9 @@ def _apply_static_storage(
             interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
             source_numels.get(logical_name.removeprefix("W_")),
         )
-        group_size = _static_storage_group_size(tensor, storage)
+        group_size = _static_storage_group_size(
+            tensor, storage, interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+        )
         for position, shard in enumerate(layout.shards, 1):
             contents = sprite["lists"][shard.identifier][1]
             if not contents:

@@ -336,13 +336,26 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 |---|---:|---|
 | `bits` | required | Integer weight width: `4`, `6`, or `8`. |
 | `method` | `"symmetric"` | `"symmetric"` (round to nearest) or `"gptq"` (uses calibration data). |
-| `group_size` | `64` | Maximum group size. The actual size is the largest divisor of the matrix input width that doesn't exceed this. |
+| `group_size` | `64` | Maximum group size. The actual size is the largest divisor of the matrix input width (for a convolution, its fan-in) that doesn't exceed this. A matrix whose integer storage wouldn't be smaller than float16 stays float16. |
 | `scale_precision` | `"float16"` | `"float16"` or `"float32"` scales. |
 | `min_quantized_values` | `16384` | Matrices with fewer values stay float16. |
 | `damp_percent` | `0.01` | GPTQ damping added to the Hessian diagonal, as a fraction of its mean. GPTQ only. |
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
 | `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses `fallback`. |
 | `fallback` | `"symmetric"` | Method for matrices without enough calibration data. Only `"symmetric"` is supported, so the field has no effect yet. |
+| `overrides` | `{}` | Other settings for some weights: a module path or parameter name mapped to bits (`4`, `6`, `8`), `None` for float16, or a `QuantizationOverride`. See [per-weight settings](storage.md#per-weight-settings). |
+
+### `QuantizationOverride`
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `bits` | required | `4`, `6`, `8`, or `None` to keep the selected weights float16. |
+| `method` | `None` | `"symmetric"`, `"gptq"` (only within a GPTQ config), or `None` for the config's. |
+| `group_size` | `None` | Maximum group size, or `None` for the config's. |
+
+The longest key that matches a parameter's name wins; a weight read under
+several names, such as a tied embedding and output head, takes the highest
+precision they select. A key that matches no parameter is an error.
 
 GPTQ needs a model in evaluation mode and at least one calibration example,
 passed as `calibration_inputs`, `calibration_calls`, or `calibration_sequences`
@@ -466,12 +479,18 @@ quantized and then kept in float16 doesn't count as quantized.
 
 One weight tensor, or one part of a tensor the model uses as a separate
 matrix (`name[offset=...,shape=...]`): `name`, the `method` used, `bits`,
-number of `values`, `calibration_rows` seen, `effective_group_size`, and
-`fallback_reason` if GPTQ wasn't used. A `method` of `"float16"` means the
-values are stored in float16, and `fallback_reason` says why: the tensor was
-smaller than `min_quantized_values`, storage reads it grouped along a
-different axis than it was quantized in, or it is a weight computed from
-parameters during export (named `weight computed from <parameters>`).
+number of `values`, `calibration_rows` seen, `effective_group_size`,
+`fallback_reason` if GPTQ wasn't used, `sources`, the parameters a weight
+computed from parameters is computed from (empty otherwise), and
+`override`, the `QuantizationConfig.overrides` key whose settings it used,
+if any. A weight computed from parameters is named by its attribute, such
+as a parametrized `fc.weight`, or `weight computed from <parameters>`. A
+`method` of `"float16"` means the values are stored in float16, and
+`fallback_reason` says why: the tensor was smaller than
+`min_quantized_values`, integer storage wouldn't be smaller, an override
+keeps it float16, storage reads it grouped along a different axis than it
+was quantized in, or it is a weight computed from parameters where
+quantization couldn't compute it from quantized values instead.
 Values of a quantized entry that are also, or only, stored in float16, such
 as the copy a second use reads in another layout, are reported in a
 `name[float16]` entry. `name[remaining]` holds a parameter's values that no

@@ -60,6 +60,13 @@ matrix input width that doesn't exceed it, such as 56 for a width of 112.
 Smaller groups usually reduce error but store more scales. Scales are float16 by
 default.
 
+A matrix whose integer storage wouldn't be smaller than float16 stays float16,
+unrounded: the codes and a scale per group would take 16 bits per value or
+more, as with `group_size=1`, a prime input width such as 97 (whose only
+divisor up to 64 is 1), or int8 with float32 scales and groups of 4 or fewer.
+The cost is the storage codec's own for that tensor (for int4, its Huffman
+code). The report gives such a matrix `method="float16"` and says why.
+
 cattorch runs the model once to find each matrix's input width. A weight read
 by `nn.Linear` or `F.linear`, on either side of a matrix product (`x @ weight`,
 `weight @ x`, `torch.mm`, `torch.bmm`, `torch.mv`), by `torch.addmm` (as in
@@ -71,13 +78,18 @@ projection when the call passes no mask, and the input and hidden weights of
 every layer and direction of `nn.RNN`, `nn.LSTM` and `nn.GRU`. A projected
 LSTM's projection (`weight_hr_l*`) reads a value no output shows, so it uses
 symmetric quantization, and so does every layer but the first when the
-module runs with dropout in training mode. Convolution kernels are grouped
-along their last dimension, the kernel width, which is how storage reads
-them, so a 3x3 kernel has a scale for every 3 values. GPTQ calibrates each
-group of kernels over the input windows it reads, for 1D, 2D and 3D,
-grouped, depthwise and transposed convolutions. Other matrices, such as
-embeddings, are grouped along their last dimension and use symmetric
-quantization; with GPTQ, `result.warnings` names each of them.
+module runs with dropout in training mode. A 1D or 2D convolution is a
+linear map of each input window, so its kernels are grouped like a linear
+layer's, over each output channel's fan-in (input channels times kernel
+positions): a 3x3 convolution from 64 channels has groups of 64 of its 576
+inputs. A 3D convolution is lowered to a 2D convolution per kernel depth,
+and a transposed convolution to a plain one with flipped kernels, so their
+groups stay within the last two kernel dimensions (the last one, in 1D),
+such as 9 values of a 3x3x3 kernel. GPTQ calibrates each group of kernels
+over the input windows it reads, for 1D, 2D and 3D, grouped, depthwise and
+transposed convolutions. Other matrices, such as embeddings, are grouped
+along their last dimension and use symmetric quantization; with GPTQ,
+`result.warnings` names each of them.
 
 Each part of a parameter that a use reads, such as the slices of a fused
 QKV weight, even and odd rows, or one half read by `F.linear` and the other
@@ -93,15 +105,31 @@ integers: the larger use's, or the first one's.
 
 A weight the model copies before using it, such as
 `F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is quantized
-and calibrated as the copy is used, and the copy is stored in integers. A
-weight computed from parameters, such as `weight_norm` and `spectral_norm`
-weights or `F.linear(x, w * g)`, is computed during export and stored in
-float16: its parameters are not rounded, and the report has an entry named
-`weight computed from <parameters>` with `method="float16"`.
+and calibrated as the copy is used, and the copy is stored in integers.
+
+A weight computed from parameters before any input arrives, such as a
+`weight_norm` or `spectral_norm` weight (`torch.nn.utils.parametrizations` or
+the older `torch.nn.utils.spectral_norm`), `F.linear(x, w * g)`, a LoRA sum
+`w + b @ a`, `w.clamp(...)`, a masked `w * mask`, a scaled tied embedding or
+an average of a weight and a buffer, is quantized as computed: grouped as
+the matrix product reads it and calibrated by GPTQ like a parameter, while
+the parameters it is computed from stay unrounded. The model then computes
+with the quantized weight in place of the computation, both in the sprite
+and in every PyTorch comparison cattorch makes (`verify` with an
+`ExportProgram`, the length check of `dynamic=`). The report names a
+parametrized or `spectral_norm` weight by its attribute (`fc.weight`), and
+any other one `weight computed from <parameters>`, and lists the
+parameters in `sources`. A weight computed outside the forward of any of the
+model's modules, as in an `ExportProgram` entry point method, or within an
+operation that also reads an input, is stored as computed, in float16, with
+a warning and a `method="float16"` entry. The older
+`torch.nn.utils.weight_norm` usually can't be exported, because PyTorch
+can't copy a module that uses it; use
+`torch.nn.utils.parametrizations.weight_norm`.
 
 The report says what storage stores. Storage keeps a list in integers only
-when it is on the integer grid along its own last dimension, so a quantized
-value read in another layout is kept in float16. Each stored list is traced
+when one of the integer encodings quantization uses reproduces it exactly, so
+a quantized value read in another layout is kept in float16. Each stored list is traced
 back to the parameter values it holds: an entry whose values are all stored
 in float16 is reported with `method` `"float16"` and the reason, and
 values also or only stored in float16 elsewhere get a `name[float16]` entry.
@@ -119,6 +147,41 @@ Values that can't safely be stored lossily stay float32.
 
 Inspect `result.warnings` and `result.quantization.tensors`, then verify
 model-level output or generation quality.
+
+## Per-weight settings
+
+`QuantizationConfig.overrides` gives some weights other settings. Each key
+is a module path or a parameter name, as `model.named_parameters()` spells
+it, or a computed attribute such as a parametrized `fc.weight`; the value is
+bits (4, 6 or 8), `None` to keep the weights float16, or a
+`QuantizationOverride` with `bits`, `method` and `group_size`:
+
+```python
+from cattorch import QuantizationConfig, QuantizationOverride
+
+QuantizationConfig(
+    bits=4,
+    method="gptq",
+    overrides={
+        "lm_head": 8,                      # the output head in int8
+        "transformer.h.0": QuantizationOverride(bits=6, group_size=32),
+        "transformer.h.11.mlp.c_proj": None,  # float16
+    },
+)
+```
+
+A key selects the parameters under it, and the longest matching key wins.
+A key that selects no parameter is an error. A weight read under several
+names, such as GPT-2's token embedding `transformer.wte.weight` and its tied
+output head `lm_head.weight`, takes the highest precision its names select
+(float16 above 8 bits above 6 and 4), so `{"lm_head": 8}` keeps the shared
+table in int8. A weight computed from parameters takes the highest precision
+of the overrides that select its parameters or its attribute name.
+`method="gptq"` needs a GPTQ config; `method="symmetric"` within one skips
+calibration for those weights. Each `TensorQuantizationReport` names the
+`override` it used. One sprite can hold several integer formats: each is
+decoded by its own bank, and the int4 Huffman decoder is added only when
+some weight uses int4.
 
 ## GPTQ calibration
 
@@ -152,8 +215,15 @@ Calibration data is read once, so a generator works. For cached generation,
 calibrate with realistic full sequences of up to `max_context` tokens.
 
 A matrix that saw too little calibration data, such as an expert the router
-never picked, falls back to symmetric quantization. Small matrices stay
-float16. The quantization report shows which method each tensor used.
+never picked, falls back to symmetric quantization, and so does one with
+more than 8,192 inputs, whose GPTQ statistics would take over 512 MiB. Small
+matrices stay float16. The quantization report shows which method each
+tensor used.
+
+GPTQ applies its error feedback within a block of `block_size` columns
+column by column, and to the columns after the block as one matrix product
+(the lazy batch update of the GPTQ paper), which makes wide matrices several
+times faster to calibrate.
 
 The [`QuantizationConfig` reference](api-reference.md#quantizationconfig)
 lists the GPTQ settings. GPTQ reduces per-layer error, but that doesn't always

@@ -4,17 +4,49 @@ from __future__ import annotations
 
 import itertools
 import math
+import weakref
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Literal, cast
+from typing import Iterable, Literal, Mapping, cast
 
 import numpy as np
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree as pytree
+from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from cattorch.storage import _quantize_arrays, group_scales
+from cattorch.storage import _quantize_arrays, group_scales, integer_storage_bytes
 from cattorch.operator_registry import OperatorRegistry, default_registry
+
+
+@dataclass(frozen=True)
+class QuantizationOverride:
+    """Quantization settings for the weights one ``QuantizationConfig.overrides``
+    key selects.
+
+    ``bits=None`` keeps the selected weights in float16, unquantized.
+    ``method`` and ``group_size`` default to the config's own; ``method``
+    can be ``"symmetric"`` within a GPTQ config, but ``"gptq"`` needs a
+    GPTQ config, whose calibration data it uses.
+    """
+
+    bits: Literal[4, 6, 8] | None
+    method: Literal["symmetric", "gptq"] | None = None
+    group_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.bits is not None and (isinstance(self.bits, bool) or self.bits not in {4, 6, 8}):
+            raise ValueError("override bits must be 4, 6, 8, or None for float16")
+        if self.method is not None and self.method not in {"symmetric", "gptq"}:
+            raise ValueError("override method must be 'symmetric', 'gptq', or None")
+        if self.group_size is not None and (
+            isinstance(self.group_size, bool)
+            or not isinstance(self.group_size, int)
+            or self.group_size < 1
+        ):
+            raise ValueError("override group_size must be a positive integer or None")
+        if self.bits is None and (self.method is not None or self.group_size is not None):
+            raise ValueError("an override with bits=None keeps float16; it takes no method or group_size")
 
 
 @dataclass(frozen=True)
@@ -32,6 +64,14 @@ class QuantizationConfig:
     ``min_calibration_rows`` before accepting captured statistics. The only
     current fallback for an eligible matrix without compatible statistics is
     symmetric quantization.
+
+    ``overrides`` maps a module path or parameter name, as
+    ``model.named_parameters()`` spells it, to other settings for the
+    weights under it: bits (4, 6 or 8), ``None`` to keep them float16, or a
+    ``QuantizationOverride``. The longest matching key wins. A weight read
+    under several names, such as an embedding tied to the output head,
+    takes the highest precision any of its names selects, and a weight
+    computed from parameters the highest precision of its parameters.
     """
 
     bits: Literal[4, 6, 8]
@@ -43,6 +83,7 @@ class QuantizationConfig:
     block_size: int = 128
     min_calibration_rows: int = 128
     fallback: Literal["symmetric"] = "symmetric"
+    overrides: Mapping[str, int | QuantizationOverride | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if isinstance(self.bits, bool) or self.bits not in {4, 6, 8}:
@@ -70,6 +111,29 @@ class QuantizationConfig:
             raise ValueError("damp_percent must be a positive finite number")
         if self.fallback != "symmetric":
             raise ValueError("fallback must be 'symmetric'")
+        if not isinstance(self.overrides, Mapping):
+            raise TypeError("overrides must be a mapping of names to settings")
+        normalized: dict[str, QuantizationOverride] = {}
+        for key, value in self.overrides.items():
+            if not isinstance(key, str) or not key or key != key.strip(". "):
+                raise ValueError(
+                    f"quantization override key {key!r} must be a module path or "
+                    "parameter name"
+                )
+            if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+                value = QuantizationOverride(bits=value)
+            elif not isinstance(value, QuantizationOverride):
+                raise TypeError(
+                    f"quantization override {key!r} must be bits (4, 6 or 8), None, "
+                    "or a QuantizationOverride"
+                )
+            if value.method == "gptq" and self.method != "gptq":
+                raise ValueError(
+                    f"quantization override {key!r} uses method='gptq', which needs "
+                    "a QuantizationConfig with method='gptq' and its calibration data"
+                )
+            normalized[key] = value
+        object.__setattr__(self, "overrides", normalized)
 
     @property
     def precision(self) -> Literal["int4", "int6", "int8"]:
@@ -78,10 +142,83 @@ class QuantizationConfig:
             {4: "int4", 6: "int6", 8: "int8"}[self.bits],
         )
 
+    def _integer_formats(self) -> tuple[tuple[str, int], ...]:
+        """Every (precision, maximum group size) the config may store."""
+        formats = [(self.precision, self.group_size)]
+        for override in cast(dict, self.overrides).values():
+            if override.bits is not None:
+                item = (f"int{override.bits}", override.group_size or self.group_size)
+                if item not in formats:
+                    formats.append(item)
+        return tuple(formats)
+
+    def _settings(self, names: Iterable[str], *, every_name: bool = True) -> _WeightSettings:
+        """The settings for a weight read under ``names``.
+
+        Each name takes its longest matching override key, or the config's
+        own settings; the weight takes the highest precision among them.
+        With ``every_name`` false, as for a weight computed from parameters
+        and selected by any of their names, only names an override selects
+        count, unless none is.
+        """
+        found: list[_WeightSettings] = []
+        for name in names:
+            keys = [
+                key for key in cast(dict, self.overrides)
+                if name == key or name.startswith(f"{key}.")
+            ]
+            if not keys:
+                if every_name:
+                    found.append(_WeightSettings(self.bits, self.method, self.group_size, None))
+                continue
+            key = max(keys, key=len)
+            override = cast(dict, self.overrides)[key]
+            found.append(_WeightSettings(
+                override.bits,
+                override.method or self.method,
+                override.group_size or self.group_size,
+                key,
+            ))
+        if not found:
+            return _WeightSettings(self.bits, self.method, self.group_size, None)
+        return max(
+            found,
+            key=lambda item: (
+                16 if item.bits is None else item.bits, -item.group_size,
+                item.method == "gptq",
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _WeightSettings:
+    """How one weight is quantized: ``bits`` None keeps it float16; ``key``
+    is the override that chose these settings, if one did."""
+
+    bits: int | None
+    method: str
+    group_size: int
+    key: str | None
+
+    def config(self, base: QuantizationConfig) -> QuantizationConfig:
+        """``base`` with these settings, for one weight's quantization."""
+        if (self.bits, self.method, self.group_size) == (base.bits, base.method, base.group_size):
+            return base
+        assert self.bits is not None
+        return replace(
+            base, bits=cast(Literal[4, 6, 8], self.bits),
+            method=cast(Literal["symmetric", "gptq"], self.method),
+            group_size=self.group_size, overrides={},
+        )
+
 
 @dataclass(frozen=True)
 class TensorQuantizationReport:
-    """Quantization decision for one parameter or parameter view."""
+    """Quantization decision for one parameter or parameter view.
+
+    A weight computed from parameters names them in ``sources``; ``override``
+    is the ``QuantizationConfig.overrides`` key whose settings it used.
+    """
 
     name: str
     method: Literal["gptq", "symmetric", "float16"]
@@ -90,6 +227,8 @@ class TensorQuantizationReport:
     calibration_rows: int
     effective_group_size: int | None
     fallback_reason: str | None = None
+    sources: tuple[str, ...] = ()
+    override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +248,8 @@ class QuantizationReport:
     # report found so far. Neither is part of the public report.
     _regions: tuple[_Region, ...] = field(default=(), repr=False, compare=False)
     _stored: dict = field(default_factory=dict, repr=False, compare=False)
+    # Weights computed from parameters, by storage, which regions may sit in.
+    _computed: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -256,10 +397,21 @@ def _physical_weight(
 def _storage_group_width(weight: torch.Tensor, orientation: str) -> int | None:
     """The run of a logical row which storage groups together, if not all.
 
-    Storage groups a convolution kernel along its last dimension, which is
-    also the last in each logical row.
+    Storage groups consecutive values of the kernels the compiler stores.
+    A 1D or 2D convolution stores its kernels as they are: an output
+    channel's fan-in, every input channel and kernel position, is
+    consecutive, so groups run over it as a linear layer's do. A 3D
+    convolution is lowered to a 2D one per kernel depth, and a transposed
+    convolution to a plain one with its kernels flipped, so their groups
+    stay within the last two kernel dimensions (the last one, in 1D), which
+    every such slice keeps consecutive and a flip only reverses.
     """
-    return int(weight.shape[-1]) if orientation in {"conv", "conv_transpose"} else None
+    dimensions = weight.ndim - 2
+    if orientation == "conv" and dimensions <= 2:
+        return None
+    if orientation in {"conv", "conv_transpose"}:
+        return math.prod(int(size) for size in weight.shape[-min(2, dimensions):])
+    return None
 
 
 def _storage_key(value: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
@@ -452,33 +604,35 @@ class _GPTQCaptureMode(TorchDispatchMode):
         width = _matrix_width(weight, orientation)
         if name is None or not width:
             return
+        # A Hessian is width x width doubles: past a bound, the matrix
+        # falls back to symmetric quantization rather than build it.
+        collect = self.collect_hessian and width <= _GPTQ_MAX_WIDTH
+        slices: Iterable[torch.Tensor] = ()
         if orientation in {"conv", "conv_transpose"}:
             # Windows ``[batch, *positions, channels, *kernel]``: only GPTQ
             # reads them. They are copied a few rows of positions at a time,
             # so the copies stay far smaller than every window at once.
             trailing = weight.ndim - 1
-            if (
-                not self.collect_hessian
-                or value.ndim <= trailing
-                or math.prod(value.shape[-trailing:]) != width
-            ):
+            if value.ndim <= trailing or math.prod(value.shape[-trailing:]) != width:
                 return
             windows = value.detach()
             leading = windows.shape[:-trailing]
             rows_seen = math.prod(leading)
-            if len(leading) == 1:
-                windows, leading = windows.unsqueeze(1), (1, *leading)
-            per_position = math.prod(leading[2:]) * width
-            step = max(1, _WINDOW_CHUNK_VALUES // max(1, per_position))
-            slices: Iterable[torch.Tensor] = (
-                windows[batch, start:start + step].reshape(-1, width)
-                for batch in range(leading[0])
-                for start in range(0, leading[1], step)
-            )
+            if collect:
+                if len(leading) == 1:
+                    windows, leading = windows.unsqueeze(1), (1, *leading)
+                per_position = math.prod(leading[2:]) * width
+                step = max(1, _WINDOW_CHUNK_VALUES // max(1, per_position))
+                slices = (
+                    windows[batch, start:start + step].reshape(-1, width)
+                    for batch in range(leading[0])
+                    for start in range(0, leading[1], step)
+                )
         elif value.shape[-1] != width:
             return
         else:
-            slices = (value.detach().reshape(-1, width),)
+            if collect:
+                slices = (value.detach().reshape(-1, width),)
             rows_seen = int(value.numel()) // width
         if rows_seen == 0:
             return
@@ -494,11 +648,11 @@ class _GPTQCaptureMode(TorchDispatchMode):
                 orientation=orientation,  # type: ignore[arg-type]
                 hessian=(
                     torch.zeros((width, width), dtype=torch.float64)
-                    if self.collect_hessian else torch.empty(0)
+                    if collect else torch.empty(0)
                 ),
             )
             self.stats[key] = stat
-        if self.collect_hessian:
+        if collect:
             for rows in slices:
                 rows = rows.to(device="cpu", dtype=torch.float64)
                 if not bool(torch.isfinite(rows).all()):
@@ -580,11 +734,13 @@ def _normalize_batch(batch) -> tuple[torch.Tensor, ...]:
 
 def _symmetric_matrix(
     matrix: torch.Tensor, config: QuantizationConfig, group_width: int | None = None,
-) -> tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int, np.ndarray]:
     """Quantize an output-major matrix in groups along its rows.
 
     ``group_width`` is a run of each row that groups must not cross, when
-    storage groups less than a whole row together.
+    storage groups less than a whole row together. Returns the
+    reconstructed matrix, the group size, and how often each code occurs
+    (index 0 is the most negative), which decides what storage would cost.
     """
     width = matrix.shape[1] if group_width is None else group_width
     group = effective_group_size(width, config.group_size)
@@ -594,6 +750,8 @@ def _symmetric_matrix(
     # embedding. Check finiteness first, as one pass over everything would.
     if not bool(torch.isfinite(source).all()):
         raise ValueError("integer weight quantization requires finite values")
+    maximum_code = (1 << (config.bits - 1)) - 1
+    counts = np.zeros(2 * maximum_code + 1, dtype=np.int64)
     reconstructed = torch.empty(source.shape, dtype=matrix.dtype)
     row_values = max(1, source[:1].numel())
     step = max(1, _SYMMETRIC_CHUNK_VALUES // row_values)
@@ -605,11 +763,112 @@ def _symmetric_matrix(
             group,
             config.scale_precision,
         )
+        counts += np.bincount(codes + maximum_code, minlength=counts.size)
         values = torch.from_numpy(codes * np.repeat(scales, group)[:codes.size])
         reconstructed[start:start + step] = values.to(matrix.dtype).reshape(rows.shape)
-    return reconstructed.to(device=matrix.device), group
+    return reconstructed.to(device=matrix.device), group, counts
 
 
+@dataclass(frozen=True)
+class _Quantized:
+    """One matrix region's quantization: ``reconstructed`` is ``None`` when
+    it stays float16 (``method`` ``"float16"``), and ``reason`` says why
+    GPTQ wasn't used or why integers weren't."""
+
+    reconstructed: torch.Tensor | None
+    group: int | None
+    method: Literal["gptq", "symmetric", "float16"]
+    reason: str | None = None
+
+
+def _float16_reason(
+    config: QuantizationConfig, group: int, values: int, counts: np.ndarray | None = None,
+    groups: int | None = None,
+) -> str | None:
+    """Why storing ``values`` in integers would not be smaller than float16.
+
+    The cost is the storage codec's own (see ``integer_storage_bytes``):
+    packed codes and a scale per group, ``groups`` of them if given. For
+    int4 the Huffman stream depends on the codes, ``counts``; without them
+    a lower bound, one bit per value, is used. ``None`` means integers are
+    smaller.
+    """
+    if counts is None:
+        if config.precision == "int4":
+            counts = np.zeros(15, dtype=np.int64)
+            counts[7] = values
+        else:
+            counts = np.array([values])
+    stored = integer_storage_bytes(
+        counts, config.precision, group, config.scale_precision, groups=groups,
+    )
+    if stored < 2 * values:
+        return None
+    scale_bits = 32 if config.scale_precision == "float32" else 16
+    return (
+        f"int{config.bits} storage would take {stored * 8 / values:.3g} bits per value "
+        f"(groups of {group}, each with a {scale_bits}-bit scale), no fewer than float16's 16"
+    )
+
+
+def _quantize_matrix(
+    logical: torch.Tensor,
+    config: QuantizationConfig,
+    group_width: int | None = None,
+    stat: _ActivationStats | None = None,
+) -> _Quantized:
+    """Quantize an output-major matrix, with GPTQ when ``stat`` is given.
+
+    A matrix whose integer storage would not be smaller than float16, such
+    as one with a scale for every value, is left as it is.
+    """
+    width = logical.shape[1]
+    group = effective_group_size(width if group_width is None else group_width, config.group_size)
+    values = logical.numel()
+    reason = _float16_reason(config, group, values)
+    if reason is not None:
+        return _Quantized(None, group, "float16", reason)
+    method: Literal["gptq", "symmetric"] = "symmetric"
+    reconstructed = None
+    if stat is not None:
+        method = "gptq"
+        if stat.hessian.numel() == 0:
+            method = "symmetric"
+            reason = (
+                f"input width {width} is above {_GPTQ_MAX_WIDTH}; its GPTQ "
+                f"Hessian would take {width * width * 8 / 2**30:.1f} GiB"
+            )
+        elif stat.rows < config.min_calibration_rows:
+            method = "symmetric"
+            reason = (
+                f"only {stat.rows} calibration rows; "
+                f"requires {config.min_calibration_rows}"
+            )
+        if method == "gptq":
+            try:
+                reconstructed, group = _gptq_matrix(logical, stat.hessian, config, group_width)
+                # GPTQ fixes each group's scale before error feedback
+                # changes the group's later columns, so a group can end
+                # up without a largest code. Rounding through the
+                # storage codec, whose scale rule is a fixed point,
+                # puts every group on the grid storage reproduces.
+                reconstructed, group, counts = _symmetric_matrix(
+                    reconstructed, config, group_width,
+                )
+            except ValueError as error:
+                method = "symmetric"
+                reason = str(error)
+                reconstructed = None
+    if reconstructed is None:
+        reconstructed, group, counts = _symmetric_matrix(logical, config, group_width)
+    late = _float16_reason(config, group, values, counts)
+    if late is not None:
+        return _Quantized(None, group, "float16", late)
+    return _Quantized(reconstructed, group, method, reason)
+
+
+# The widest input GPTQ builds a Hessian for: 8192 x 8192 doubles are 512 MiB.
+_GPTQ_MAX_WIDTH = 8192
 # Values quantized per step by _symmetric_matrix.
 _SYMMETRIC_CHUNK_VALUES = 1 << 21
 # Convolution window values copied per step by GPTQ calibration.
@@ -649,37 +908,49 @@ def _gptq_matrix(
     except torch.linalg.LinAlgError as error:
         raise ValueError("GPTQ calibration Hessian is not positive definite") from error
 
-    result = torch.empty_like(work)
     qmax = (1 << (config.bits - 1)) - 1
-    scales_by_group: dict[int, torch.Tensor] = {}
-    for block_start in range(0, width, config.block_size):
-        block_end = min(width, block_start + config.block_size)
-        for column in range(block_start, block_end):
-            group_start = column - column % group
-            group_end = min(width, group_start + group)
-            scales = scales_by_group.get(group_start)
-            if scales is None:
-                maximum = work[:, group_start:group_end].abs().amax(dim=1)
+    # NumPy rather than torch for the many small per-column steps: torch's
+    # thread pool makes each one far slower on a busy machine.
+    values = work.numpy()
+    factor = inverse_factor.numpy()
+    result = np.empty_like(values)
+    # Lazy batch updates (GPTQ, Frantar et al. 2022, section 3): error
+    # feedback within a block of columns is applied column by column, and
+    # to the columns after the block once, as one matrix product. Blocks
+    # hold whole groups, so each group's scale is chosen from its columns
+    # with every earlier column's feedback applied, as without blocking.
+    block = max(group, config.block_size - config.block_size % group)
+    for block_start in range(0, width, block):
+        block_end = min(width, block_start + block)
+        count = block_end - block_start
+        columns = values[:, block_start:block_end].copy()
+        errors = np.empty_like(columns)
+        local = factor[block_start:block_end, block_start:block_end]
+        scales = np.ones(columns.shape[0])
+        for index in range(count):
+            if index % group == 0:
                 # Storage's own scale rule: a group whose largest code stays
                 # the largest after error feedback is stored exactly as chosen.
-                scales = torch.from_numpy(group_scales(
-                    maximum.numpy(), qmax, config.scale_precision,
-                ))
-                if not bool(torch.isfinite(scales).all()):
+                scales = group_scales(
+                    np.abs(columns[:, index:index + group]).max(axis=1), qmax,
+                    config.scale_precision,
+                )
+                if not np.isfinite(scales).all():
                     raise ValueError(
                         "GPTQ scale is outside the selected scale precision"
                     )
-                scales_by_group[group_start] = scales
-            quantized = torch.round(work[:, column] / scales).clamp(-qmax, qmax)
-            quantized = quantized * scales
-            result[:, column] = quantized
-            divisor = inverse_factor[column, column]
-            quant_error = (work[:, column] - quantized) / divisor
-            if column + 1 < width:
-                work[:, column + 1:] -= quant_error.unsqueeze(1) * inverse_factor[
-                    column, column + 1:
-                ].unsqueeze(0)
-    return result.to(device=original_device, dtype=original_dtype), group
+            column = columns[:, index]
+            quantized = np.clip(np.rint(column / scales), -qmax, qmax) * scales
+            result[:, block_start + index] = quantized
+            error = (column - quantized) / local[index, index]
+            errors[:, index] = error
+            if index + 1 < count:
+                columns[:, index + 1:] -= np.outer(error, local[index, index + 1:])
+        if block_end < width:
+            values[:, block_end:] -= errors @ factor[block_start:block_end, block_end:]
+    return (
+        torch.from_numpy(result).to(device=original_device, dtype=original_dtype), group,
+    )
 
 
 def expert_bank_effective_ndims(model: torch.nn.Module) -> dict[int, int]:
@@ -789,12 +1060,13 @@ class _Use:
 
 def _quantize_remaining(
     parameter: torch.Tensor, mask: torch.Tensor, config: QuantizationConfig,
-) -> tuple[int, int | None]:
+) -> _Quantized:
     """Quantize the masked elements of ``parameter`` along its last dimension.
 
     Groups run along rows as storage reads a parameter. A group only part of
     which is masked is quantized over its masked elements alone: the rest
-    already belong to a region quantized in another layout.
+    already belong to a region quantized in another layout. Elements whose
+    integer storage would not be smaller than float16 are left as they are.
     """
     width = int(parameter.shape[-1])
     group = effective_group_size(width, config.group_size)
@@ -808,6 +1080,8 @@ def _quantize_remaining(
     partial = chosen.any(dim=1) & ~full
     if not bool(torch.isfinite(rows[selected]).all()):
         raise ValueError("integer weight quantization requires finite values")
+    maximum_code = (1 << (config.bits - 1)) - 1
+    counts = np.zeros(2 * maximum_code + 1, dtype=np.int64)
     result = grouped.clone()
     if bool(full.any()):
         values = grouped[full]
@@ -815,6 +1089,7 @@ def _quantize_remaining(
             values.double().reshape(-1).numpy(), config.precision, group,
             config.scale_precision,
         )
+        counts += np.bincount(codes + maximum_code, minlength=counts.size)
         result[full] = torch.from_numpy(
             codes * np.repeat(scales, group),
         ).to(parameter.dtype).reshape(values.shape)
@@ -824,9 +1099,38 @@ def _quantize_remaining(
         codes, scales = _quantize_arrays(
             values.double().numpy(), config.precision, values.numel(), config.scale_precision,
         )
+        counts += np.bincount(codes + maximum_code, minlength=counts.size)
         result[index, keep] = torch.from_numpy(codes * scales[0]).to(parameter.dtype)
+    group_count = int(full.sum()) + int(partial.sum())
+    reason = _float16_reason(config, group, int(counts.sum()), counts, groups=group_count)
+    if reason is not None:
+        return _Quantized(None, group, "float16", reason)
     parameter.copy_(result.reshape(parameter.shape))
-    return int(selected.sum()), None if bool(partial.any()) else group
+    return _Quantized(parameter, None if bool(partial.any()) else group, "symmetric")
+
+
+def _unwrapped(model: torch.nn.Module) -> torch.nn.Module:
+    """The caller's model inside an export's method wrapper, for its names."""
+    if type(model).__name__ in {"MethodModule", "MethodLeaves"}:
+        return getattr(model, "model", model)
+    return model
+
+
+def _check_override_keys(
+    config: QuantizationConfig, all_names: dict[int, list[str]], aliases: Iterable[str] = (),
+) -> None:
+    """Reject override keys that select no parameter."""
+    names = {name for found in all_names.values() for name in found} | set(aliases)
+    unknown = sorted(
+        key for key in config.overrides
+        if not any(name == key or name.startswith(f"{key}.") for name in names)
+    )
+    if unknown:
+        raise ValueError(
+            f"unknown quantization override key(s) {', '.join(map(repr, unknown))}: "
+            "each must be a module path or parameter name of the model, as "
+            "named_parameters() spells it"
+        )
 
 
 def _named(name: str, quantize):
@@ -835,6 +1139,380 @@ def _named(name: str, quantize):
         return quantize()
     except ValueError as error:
         raise ValueError(f"{error} (parameter {name!r})") from error
+
+
+# ── Weights computed from parameters ─────────────────────────────────────────
+#
+# Export folds every operation on known tensors alone into a constant, so a
+# weight computed from parameters, such as ``weight_norm``'s or
+# ``F.linear(x, w * g)``'s, reaches the matrix product as a computed tensor.
+# Quantization quantizes that tensor as the product reads it, and the model
+# then computes with the quantized tensor in place of the computation: a
+# torch-function mode on the module that computes it returns the stored
+# tensor for the operation that made it. Export traces the returned tensor
+# as a constant, and every PyTorch reference computes with the same values.
+#
+# Operations are recognised by a recipe: the function and its arguments,
+# each tensor argument by the parameter or buffer it is, or by its own
+# recipe. Recipes don't depend on values, so a weight is recognised however
+# its parameters have been rounded since.
+
+
+def _argument_recipe(value, recipe_of):
+    """A hashable stand-in for one argument, or ``_UNKNOWN``."""
+    if isinstance(value, torch.Tensor):
+        recipe = recipe_of(value)
+        return _UNKNOWN if recipe is None else recipe
+    if isinstance(value, (list, tuple)):
+        items = tuple(_argument_recipe(item, recipe_of) for item in value)
+        return _UNKNOWN if any(item is _UNKNOWN for item in items) else (type(value).__name__, items)
+    if isinstance(value, slice):
+        return ("slice", value.start, value.stop, value.step)
+    if value is None or isinstance(value, (bool, int, float, complex, str, torch.dtype,
+                                           torch.device, torch.memory_format, torch.layout)):
+        return value
+    if value is Ellipsis:
+        return "..."
+    return ("object", type(value).__qualname__, repr(value))
+
+
+_UNKNOWN = object()
+
+
+class _RecipeTracker:
+    """Recipes of the tensors known before any input arrives.
+
+    ``leaves`` maps the model's own tensors, by object, to their names.
+    Every result of a function whose tensor arguments are all known is known
+    too; a function without tensor arguments makes nothing known, since it
+    may be random. A function that writes to a known tensor with an unknown
+    one makes it unknown. A known tensor is computed when some function on
+    the way changed values rather than rearranged or copied them.
+    """
+
+    def __init__(self, leaves: Iterable[tuple[str, torch.Tensor]]):
+        self.recipes: dict[int, tuple[weakref.ref, object, bool]] = {}
+        self._leaves = []
+        for name, tensor in leaves:
+            self._leaves.append(tensor)
+            self.recipes.setdefault(id(tensor), (weakref.ref(tensor), ("leaf", name), False))
+
+    def _entry(self, tensor: torch.Tensor):
+        entry = self.recipes.get(id(tensor))
+        if entry is None or entry[0]() is not tensor:
+            return None
+        return entry
+
+    def recipe_of(self, tensor: torch.Tensor):
+        entry = self._entry(tensor)
+        return None if entry is None else entry[1]
+
+    def remember(self, tensor: torch.Tensor, recipe, computed: bool) -> None:
+        self.recipes[id(tensor)] = (weakref.ref(tensor), recipe, computed)
+        weakref.finalize(tensor, self._forget, id(tensor))
+
+    def _forget(self, identity: int) -> None:
+        entry = self.recipes.get(identity)
+        if entry is not None and entry[0]() is None:
+            del self.recipes[identity]
+
+    def call_recipe(self, func, args, kwargs, result) -> tuple[object, bool] | None:
+        """The recipe of ``func(*args, **kwargs)``, and whether it computes
+        new values, if all its tensor arguments are known."""
+        tensors = [
+            item for item in pytree.tree_leaves((args, kwargs)) if isinstance(item, torch.Tensor)
+        ]
+        entries = [self._entry(item) for item in tensors]
+        name = getattr(func, "__name__", "")
+        writes = name.endswith("_") or name == "__setitem__" or "out" in kwargs
+        if not tensors or any(entry is None for entry in entries):
+            if writes:
+                # A known tensor written with unknown values is no longer known.
+                for item in tensors:
+                    self.recipes.pop(id(item), None)
+            return None
+        if writes:
+            return None
+        arguments = _argument_recipe(args, self.recipe_of)
+        keywords = _argument_recipe(tuple(sorted(kwargs.items())), self.recipe_of)
+        if arguments is _UNKNOWN or keywords is _UNKNOWN:
+            return None
+        outputs = [
+            item for item in pytree.tree_leaves(result) if isinstance(item, torch.Tensor)
+        ]
+        computed = (
+            any(entry is not None and entry[2] for entry in entries)
+            or name not in _RECIPE_REARRANGEMENTS
+            or any(item.dtype not in {tensor.dtype for tensor in tensors} for item in outputs)
+        )
+        return (func, arguments, keywords), computed
+
+    def remember_result(self, result, recipe, computed: bool) -> None:
+        # A function that returns its argument itself, as ``flatten`` of a
+        # tensor already flat does, leaves the argument's recipe.
+        if isinstance(result, torch.Tensor):
+            if self.recipe_of(result) is None:
+                self.remember(result, recipe, computed)
+        elif isinstance(result, (list, tuple)):
+            for index, item in enumerate(result):
+                if isinstance(item, torch.Tensor) and self.recipe_of(item) is None:
+                    self.remember(item, (recipe, index), computed)
+
+
+# Functions, by name, that only rearrange, select or copy their arguments'
+# values. A weight made by them alone is the parameter read in another
+# layout, which quantization follows as such (``_GPTQCaptureMode``).
+_RECIPE_REARRANGEMENTS = frozenset({
+    "clone", "contiguous", "detach", "t", "T", "mT", "transpose", "swapaxes", "swapdims",
+    "permute", "movedim", "moveaxis", "reshape", "reshape_as", "view", "view_as", "flatten",
+    "unflatten", "squeeze", "unsqueeze", "expand", "expand_as", "narrow", "select",
+    "__getitem__", "chunk", "split", "tensor_split", "unbind", "cat", "concat",
+    "concatenate", "stack", "flip", "fliplr", "flipud", "roll", "repeat", "tile",
+    "index_select", "as_strided", "to", "type", "float", "double", "half", "bfloat16",
+    "__get__",
+})
+
+
+def _recipe_leaves(recipe) -> set[str]:
+    """The names of the model's tensors a recipe reads."""
+    found: set[str] = set()
+    pending = [recipe]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, tuple):
+            if len(item) == 2 and item[0] == "leaf" and isinstance(item[1], str):
+                found.add(item[1])
+            else:
+                pending.extend(item)
+    return found
+
+
+def _relative_recipe(recipe, prefix: str):
+    """``recipe`` with leaf names relative to the module at ``prefix``."""
+    if not prefix:
+        return recipe
+    if isinstance(recipe, tuple):
+        if len(recipe) == 2 and recipe[0] == "leaf" and isinstance(recipe[1], str):
+            return ("leaf", recipe[1].removeprefix(f"{prefix}."))
+        return tuple(_relative_recipe(item, prefix) for item in recipe)
+    return recipe
+
+
+def _module_leaves(module: torch.nn.Module) -> list[tuple[str, torch.Tensor]]:
+    return [
+        *module.named_parameters(remove_duplicate=False),
+        *module.named_buffers(remove_duplicate=False),
+    ]
+
+
+@dataclass
+class _DerivedWeight:
+    """A weight computed from parameters, as the first call computed it."""
+
+    tensor: torch.Tensor
+    recipe: object
+    owner: torch.nn.Module | None
+    owner_path: str
+    sources: frozenset[int]
+
+
+class _ComputedWeightCapture(TorchFunctionMode):
+    """Give every weight computed from parameters one tensor across calls.
+
+    While quantization observes the model, the first computation of a tensor
+    from known tensors alone is kept, and later computations with the same
+    recipe return it, so every calibration call reads one tensor, as it
+    reads a parameter. The innermost module of ``owners`` computing it that
+    holds every tensor it reads is where its quantized value is later put
+    back; ``owners`` is the caller's model, not a wrapper export replaces.
+    """
+
+    def __init__(self, model: torch.nn.Module, owners: torch.nn.Module, on_new):
+        super().__init__()
+        self.tracker = _RecipeTracker(_module_leaves(model))
+        self.owners = {id(module) for module in owners.modules()}
+        self.paths: dict[int, str] = {}
+        for path, module in model.named_modules(remove_duplicate=False):
+            self.paths.setdefault(id(module), path)
+        self.stack: list[torch.nn.Module] = []
+        self.computed: dict[object, _DerivedWeight] = {}
+        self.leaf_storages = {
+            name: tensor.untyped_storage().data_ptr() for name, tensor in _module_leaves(model)
+        }
+        self.on_new = on_new
+        self._hooks: list = []
+
+    def __enter__(self):
+        from torch.nn.modules.module import (
+            register_module_forward_hook, register_module_forward_pre_hook,
+        )
+        self._hooks = [
+            register_module_forward_pre_hook(lambda module, _args: self.stack.append(module)),
+            register_module_forward_hook(
+                lambda module, _args, _output: self._leave(module), always_call=True,
+            ),
+        ]
+        return super().__enter__()
+
+    def __exit__(self, *exc):
+        for handle in self._hooks:
+            handle.remove()
+        self._hooks = []
+        self.stack.clear()
+        return super().__exit__(*exc)
+
+    def _leave(self, module) -> None:
+        if self.stack and self.stack[-1] is module:
+            self.stack.pop()
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        found = self.tracker.call_recipe(func, args, kwargs, result)
+        if found is None:
+            return result
+        recipe, computed_values = found
+        if isinstance(result, torch.Tensor) and result.is_floating_point() and computed_values:
+            computed = self.computed.get(recipe)
+            if computed is not None:
+                result = computed.tensor
+            elif not any(
+                result.untyped_storage().data_ptr() == item.untyped_storage().data_ptr()
+                for item in pytree.tree_leaves((args, kwargs)) if isinstance(item, torch.Tensor)
+            ):
+                # A tensor of its own, not a view. Kept outside inference
+                # mode, so quantization can write it.
+                with torch.inference_mode(False):
+                    result = result.clone()
+                leaves = _recipe_leaves(recipe)
+                owner, path = None, ""
+                for module in reversed(self.stack):
+                    candidate = self.paths.get(id(module))
+                    if id(module) in self.owners and candidate is not None and all(
+                        not candidate or leaf.startswith(f"{candidate}.") for leaf in leaves
+                    ):
+                        owner, path = module, candidate
+                        break
+                computed = _DerivedWeight(
+                    tensor=result, recipe=recipe, owner=owner, owner_path=path,
+                    sources=frozenset(
+                        self.leaf_storages[leaf] for leaf in leaves if leaf in self.leaf_storages
+                    ),
+                )
+                self.computed[recipe] = computed
+                self.on_new(computed)
+        self.tracker.remember_result(result, recipe, computed_values)
+        return result
+
+
+class _ComputedWeights(TorchFunctionMode):
+    """Compute a module's weights from parameters as the stored tensors."""
+
+    def __init__(self, module: torch.nn.Module, table: dict):
+        super().__init__()
+        self.table = table
+        self.tracker = _RecipeTracker(_module_leaves(module))
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        found = self.tracker.call_recipe(func, args, kwargs, result)
+        if found is None:
+            return result
+        recipe, computed = found
+        stored = self.table.get(recipe) if computed else None
+        if stored is not None and isinstance(result, torch.Tensor):
+            result = stored
+        self.tracker.remember_result(result, recipe, computed)
+        return result
+
+
+class _ComputedWeightHooks:
+    """Forward hooks that put a module's stored computed weights in place.
+
+    The table maps each weight's recipe, its tensor names relative to the
+    module, to the tensor the module computes with instead. Copies of the
+    module copy the hooks and their table.
+    """
+
+    def __init__(self, table: dict):
+        self.table = table
+        self.modes: list[_ComputedWeights] = []
+
+    def enter(self, module, _args) -> None:
+        mode = _ComputedWeights(module, self.table)
+        mode.__enter__()
+        self.modes.append(mode)
+
+    def leave(self, module, _args, _output) -> None:
+        if self.modes:
+            self.modes.pop().__exit__(None, None, None)
+
+
+def _install_computed_weights(weights: Iterable[_DerivedWeight]) -> None:
+    """Make each weight's module compute it as its tensor."""
+    tables: dict[int, tuple[torch.nn.Module, str, dict]] = {}
+    for weight in weights:
+        if weight.owner is None:
+            continue
+        entry = tables.setdefault(id(weight.owner), (weight.owner, weight.owner_path, {}))
+        entry[2][_relative_recipe(weight.recipe, weight.owner_path)] = weight.tensor
+    for module, _, table in tables.values():
+        hooks = _ComputedWeightHooks(table)
+        module.register_forward_pre_hook(hooks.enter, prepend=True)
+        module.register_forward_hook(hooks.leave, always_call=True)
+
+
+def _computed_weight_name(
+    model: torch.nn.Module, weight: _DerivedWeight, source_names: list[str],
+) -> str:
+    """The name a weight computed from ``source_names`` is reported under.
+
+    A parametrized attribute, or one ``torch.nn.utils.weight_norm`` or
+    ``spectral_norm`` computes, is named as the attribute; any other weight
+    after the parameters it is computed from.
+    """
+    import re
+    parametrized = {
+        match.groups() for match in (
+            re.fullmatch(r"(?:(.*)\.)?parametrizations\.([^.]+)\.original\d*", name)
+            for name in source_names
+        ) if match
+    }
+    if len(parametrized) == 1 and all("parametrizations." in name for name in source_names):
+        prefix, attribute = next(iter(parametrized))
+        return f"{prefix}.{attribute}" if prefix else attribute
+    for prefix, attribute in _hooked_attributes(model):
+        sources = {f"{prefix}{attribute}{suffix}" for suffix in ("_g", "_v", "_orig")}
+        if source_names and set(source_names) <= sources:
+            return f"{prefix}{attribute}"
+    return f"weight computed from {', '.join(sorted(source_names))}"
+
+
+def _hooked_attributes(model: torch.nn.Module) -> list[tuple[str, str]]:
+    """``(module prefix, attribute)`` of each ``weight_norm``/``spectral_norm`` hook."""
+    from torch.nn.utils.spectral_norm import SpectralNorm
+    from torch.nn.utils.weight_norm import WeightNorm
+    found = []
+    for path, module in model.named_modules():
+        for hook in module._forward_pre_hooks.values():
+            if isinstance(hook, (WeightNorm, SpectralNorm)):
+                found.append((f"{path}." if path else "", hook.name))
+    return found
+
+
+def _parameter_aliases(model: torch.nn.Module) -> list[str]:
+    """Names of computed attributes that overrides may select, as
+    ``fc.weight`` for a parametrized or ``weight_norm`` module."""
+    from torch.nn.utils import parametrize
+    aliases = [
+        f"{prefix}{attribute}" for prefix, attribute in _hooked_attributes(model)
+    ]
+    for path, module in model.named_modules():
+        if parametrize.is_parametrized(module):
+            prefix = f"{path}." if path else ""
+            aliases.extend(f"{prefix}{attribute}" for attribute in module.parametrizations)
+    return aliases
 
 
 def quantize_model(
@@ -870,17 +1548,20 @@ def quantize_model(
     def effective_ndim(value: torch.Tensor) -> int:
         return effective_ndims.get(value.untyped_storage().data_ptr(), value.ndim)
 
-    display_names: dict[int, str] = {}
-    if _names_from is not None:
-        for name, parameter in _names_from.named_parameters():
-            display_names.setdefault(parameter.untyped_storage().data_ptr(), name)
+    # Every name of every parameter, as the caller's model spells it: tied
+    # weights have several, and overrides may select any of them.
+    names_module = _names_from if _names_from is not None else _unwrapped(model)
+    all_names: dict[int, list[str]] = {}
+    for name, parameter in names_module.named_parameters(remove_duplicate=False):
+        all_names.setdefault(parameter.untyped_storage().data_ptr(), []).append(name)
     parameters_by_storage: dict[int, str] = {}
     base_parameters: dict[int, tuple[str, torch.Tensor]] = {}
     for name, parameter in model.named_parameters():
         pointer = parameter.untyped_storage().data_ptr()
-        name = display_names.get(pointer, name)
-        parameters_by_storage.setdefault(pointer, name)
-        base_parameters.setdefault(pointer, (name, parameter))
+        names = all_names.setdefault(pointer, [name])
+        parameters_by_storage.setdefault(pointer, names[0])
+        base_parameters.setdefault(pointer, (names[0], parameter))
+    _check_override_keys(config, all_names, _parameter_aliases(names_module))
 
     registry = _registry or default_registry()
     observing = config.method == "gptq" or orientation_inputs is not None
@@ -901,6 +1582,21 @@ def quantize_model(
             buffer.untyped_storage().data_ptr() for buffer in model.buffers()
         ],
     )
+    # Weights computed from parameters, by storage, with their name and the
+    # names of the parameters they are computed from.
+    computed: dict[int, tuple[_DerivedWeight, str, tuple[str, ...]]] = {}
+
+    def computed_weight(weight: _DerivedWeight) -> None:
+        pointer = weight.tensor.untyped_storage().data_ptr()
+        sources = tuple(sorted({
+            all_names[source][0] for source in weight.sources if source in all_names
+        }))
+        name = _computed_weight_name(names_module, weight, list(sources))
+        computed[pointer] = (weight, name, sources)
+        capture.parameters[pointer] = name
+        capture.bases[pointer] = weight.tensor
+
+    computed_capture = _ComputedWeightCapture(model, names_module, computed_weight)
     batches = 0
     if config.method == "gptq":
         if calibration_inputs is None:
@@ -912,7 +1608,10 @@ def quantize_model(
         observed_inputs = orientation_inputs or ()
     if observing:
         from cattorch.experts import _expert_family_context
-        with torch.inference_mode(), _expert_family_context(registry.expert_families), capture:
+        with (
+            torch.inference_mode(), _expert_family_context(registry.expert_families),
+            capture, computed_capture,
+        ):
             for raw_batch in observed_inputs:
                 batch = _normalize_batch(raw_batch)
                 try:
@@ -938,6 +1637,23 @@ def quantize_model(
     regions: list[_Region] = []
     gptq = config.method == "gptq"
     total_rows = sum(stat.rows for stat in capture.stats.values()) if gptq else 0
+    settings_by_storage = {
+        pointer: config._settings(all_names[pointer]) for pointer in base_parameters
+    }
+    # A computed weight read as a matrix is quantized like a parameter, and
+    # takes the settings of the parameters it is computed from.
+    read = {stat.weight.untyped_storage().data_ptr() for stat in capture.stats.values()}
+    computed = {
+        pointer: entry for pointer, entry in computed.items()
+        if pointer in read and entry[0].owner is not None
+    }
+    sources_by_storage: dict[int, tuple[str, ...]] = {}
+    for pointer, (weight, name, sources) in computed.items():
+        base_parameters[pointer] = (name, weight.tensor)
+        sources_by_storage[pointer] = sources
+        settings_by_storage[pointer] = config._settings([
+            name, *(alias for source in weight.sources for alias in all_names.get(source, ())),
+        ], every_name=False)
 
     def report(item: TensorQuantizationReport, pointer: int | None = None, views=(), remaining=False):
         if pointer is not None:
@@ -947,6 +1663,12 @@ def quantize_model(
                 views=tuple(views), remaining=remaining,
             ))
         reports.append(item)
+
+    def kept_float16(name: str, values: int, reason: str, rows: int = 0) -> TensorQuantizationReport:
+        return TensorQuantizationReport(
+            name=name, method="float16", bits=None, values=values,
+            calibration_rows=rows, effective_group_size=None, fallback_reason=reason,
+        )
 
     with torch.no_grad():
         # Every region of a parameter that a use reads as a matrix. Uses that
@@ -974,7 +1696,7 @@ def quantize_model(
                 None,
             )
             if same is not None:
-                if gptq:
+                if gptq and same.stat.hessian.numel():
                     same.stat.hessian += stat.hessian
                 same.stat.rows += stat.rows
                 continue
@@ -990,63 +1712,57 @@ def quantize_model(
         quantized_storage: set[int] = set()
         for pointer, uses in uses_by_storage.items():
             taken = torch.zeros_like(uses[0].mask)
+            settings = settings_by_storage[pointer]
             for use in sorted(uses, key=lambda use: -int(use.mask.sum())):
                 if bool((taken & use.mask).any()):
                     continue
                 taken |= use.mask
                 stat = use.stat
                 name = base_parameters[pointer][0]
-                method: Literal["gptq", "symmetric"] = "gptq"
-                fallback_reason = None
-                if not gptq:
-                    method = "symmetric"
-                elif stat.rows < config.min_calibration_rows:
-                    method = "symmetric"
-                    fallback_reason = (
-                        f"only {stat.rows} calibration rows; "
-                        f"requires {config.min_calibration_rows}"
-                    )
-                if method == "gptq":
-                    try:
-                        reconstructed, group = _gptq_matrix(
-                            use.logical, stat.hessian, config, use.group_width,
-                        )
-                        # GPTQ fixes each group's scale before error feedback
-                        # changes the group's later columns, so a group can end
-                        # up without a largest code. Rounding through the
-                        # storage codec, whose scale rule is a fixed point,
-                        # puts every group on the grid storage reproduces.
-                        reconstructed, group = _symmetric_matrix(
-                            reconstructed, config, use.group_width,
-                        )
-                    except ValueError as error:
-                        method = "symmetric"
-                        fallback_reason = str(error)
-                if method == "symmetric":
-                    reconstructed, group = _named(name, lambda: _symmetric_matrix(
-                        use.logical, config, use.group_width,
-                    ))
-                stat.weight.copy_(_physical_weight(reconstructed, stat.weight, stat.orientation))
                 quantized_storage.add(pointer)
+                views = (_canonical_spec(stat.weight),)
+                rows = stat.rows if gptq else 0
+                described = dict(
+                    sources=sources_by_storage.get(pointer, ()), override=settings.key,
+                )
+                if settings.bits is None:
+                    report(replace(kept_float16(
+                        stat.name, stat.weight.numel(),
+                        f"override {settings.key!r} keeps it in float16", rows,
+                    ), **described), pointer, views)
+                    continue
+                weight_config = settings.config(config)
+                outcome = _named(name, lambda: _quantize_matrix(
+                    use.logical, weight_config, use.group_width,
+                    stat if weight_config.method == "gptq" else None,
+                ))
+                if outcome.reconstructed is None:
+                    report(replace(kept_float16(
+                        stat.name, stat.weight.numel(), str(outcome.reason), rows,
+                    ), **described), pointer, views)
+                    continue
+                stat.weight.copy_(_physical_weight(
+                    outcome.reconstructed, stat.weight, stat.orientation,
+                ))
                 report(TensorQuantizationReport(
                     name=stat.name,
-                    method=method,
-                    bits=config.bits,
+                    method=outcome.method,
+                    bits=weight_config.bits,
                     values=stat.weight.numel(),
-                    calibration_rows=stat.rows if gptq else 0,
-                    effective_group_size=group,
-                    fallback_reason=fallback_reason,
-                ), pointer, (_canonical_spec(stat.weight),))
+                    calibration_rows=rows,
+                    effective_group_size=outcome.group,
+                    fallback_reason=outcome.reason,
+                    **described,
+                ), pointer, views)
 
         # Elements no use reads as a matrix, such as an untied embedding, are
         # grouped along the parameter's last dimension with the documented
         # symmetric fallback. Parameters only combined into other weights,
         # such as ``weight_norm``'s, are left as they are: the weight export
         # computes from them is what storage stores.
-        fallback_reason = "no compatible linear activation statistics" if gptq else None
         for name, parameter in model.named_parameters():
             pointer = parameter.untyped_storage().data_ptr()
-            name = display_names.get(pointer, name)
+            name = base_parameters[pointer][0]
             if parameter.numel() < config.min_quantized_values:
                 continue
             if pointer not in quantized_storage and (
@@ -1060,6 +1776,7 @@ def quantize_model(
             if pointer in quantized_storage and pointer not in uses_by_storage:
                 continue
             quantized_storage.add(pointer)
+            settings = settings_by_storage[pointer]
             numel = _storage_numel(parameter)
             taken = _view_mask(numel, (
                 view for region in regions
@@ -1081,27 +1798,47 @@ def quantize_model(
                 matrix_name = name if not index else (
                     f"{name}[offset={matrix.storage_offset()},shape={tuple(matrix.shape)}]"
                 )
-                if count == matrix.numel():
-                    reconstructed, group = _named(
-                        name, lambda: _symmetric_matrix(matrix, config),
-                    )
-                    matrix.copy_(reconstructed)
-                else:
+                remaining = count != matrix.numel()
+                if remaining:
                     # Other elements belong to regions quantized for their uses.
                     matrix_name = f"{matrix_name}[remaining]"
-                    count, group = _named(
-                        name, lambda: _quantize_remaining(matrix, rest, config),
+                if settings.bits is None:
+                    report(replace(kept_float16(
+                        matrix_name, count, f"override {settings.key!r} keeps it in float16",
+                    ), override=settings.key), pointer, (spec,), remaining=remaining)
+                    continue
+                weight_config = settings.config(config)
+                if remaining:
+                    outcome = _named(
+                        name, lambda: _quantize_remaining(matrix, rest, weight_config),
                     )
+                else:
+                    outcome = _named(name, lambda: _quantize_matrix(matrix, weight_config))
+                    if outcome.reconstructed is not None:
+                        matrix.copy_(outcome.reconstructed)
+                if outcome.method == "float16":
+                    report(replace(
+                        kept_float16(matrix_name, count, str(outcome.reason)),
+                        override=settings.key,
+                    ), pointer, (spec,), remaining=remaining)
+                    continue
                 report(TensorQuantizationReport(
                     name=matrix_name,
                     method="symmetric",
-                    bits=config.bits,
+                    bits=weight_config.bits,
                     values=count,
                     calibration_rows=0,
-                    effective_group_size=group,
-                    fallback_reason=fallback_reason,
-                ), pointer, (spec,), remaining=count != matrix.numel())
+                    effective_group_size=outcome.group,
+                    fallback_reason=(
+                        "no compatible linear activation statistics"
+                        if weight_config.method == "gptq" else None
+                    ),
+                    override=settings.key,
+                ), pointer, (spec,), remaining=remaining)
 
+        # The model now computes each computed weight as its tensor, quantized
+        # where a use reads it, and so does every copy of the model.
+        _install_computed_weights(weight for weight, _, _ in computed.values())
 
         reported_names = {item.name.split("[", 1)[0] for item in reports}
         used_storage = {
@@ -1109,7 +1846,7 @@ def quantize_model(
         }
         for name, parameter in model.named_parameters():
             pointer = parameter.untyped_storage().data_ptr()
-            name = display_names.get(pointer, name)
+            name = base_parameters[pointer][0]
             if (
                 parameter.numel() < config.min_quantized_values
                 and name not in reported_names
@@ -1119,16 +1856,9 @@ def quantize_model(
                 )
             ):
                 reported_names.add(name)
-                reports.append(TensorQuantizationReport(
-                    name=name,
-                    method="float16",
-                    bits=None,
-                    values=parameter.numel(),
-                    calibration_rows=0,
-                    effective_group_size=None,
-                    fallback_reason=(
-                        f"below min_quantized_values={config.min_quantized_values}"
-                    ),
+                reports.append(kept_float16(
+                    name, parameter.numel(),
+                    f"below min_quantized_values={config.min_quantized_values}",
                 ))
 
     gptq_values = sum(item.values for item in reports if item.method == "gptq")
@@ -1143,6 +1873,7 @@ def quantize_model(
         symmetric_values=symmetric_values,
         tensors=tuple(reports),
         _regions=tuple(regions),
+        _computed={pointer: weight.tensor for pointer, (weight, _, _) in computed.items()},
     )
 
 
@@ -1361,6 +2092,15 @@ class _GraphProvenance:
         return masks, frozenset(derived)
 
 
+# Why a weight computed from parameters stays float16 when quantization
+# couldn't quantize it as computed.
+_UNFOLLOWED_COMPUTATION = (
+    "export computes it from parameters where quantization can't compute it from "
+    "quantized values instead: outside the forward of any of the model's modules "
+    "(as in an entry point method), or within an operation that also reads an input"
+)
+
+
 def _stored_precisions(
     static_tensors, storage, *, sprite, layouts, effective_ndims, interleaved_layouts,
 ):
@@ -1420,13 +2160,16 @@ def _storage_quantization_report(
         effective_ndims=effective_ndims, interleaved_layouts=interleaved_layouts,
     ))
     tensors = {**deduplicated, **static_tensors}
-    names_module = getattr(model, "model", model) if type(model).__name__ == "MethodModule" else model
+    names_module = _unwrapped(model)
     parameter_names: dict[int, str] = {}
     parameters: dict[int, torch.Tensor] = {}
     for name, parameter in names_module.named_parameters():
         pointer = parameter.untyped_storage().data_ptr()
         parameter_names.setdefault(pointer, name)
         parameters.setdefault(pointer, parameter)
+    # A computed weight is stored as the tensor quantization made of it.
+    for pointer, tensor in report._computed.items():
+        parameters.setdefault(pointer, tensor)
     provenance = _GraphProvenance(recorder.graph, parameters, recorder.resolve)
     regions = report._regions
     region_pointers = {region.pointer for region in regions}
@@ -1472,7 +2215,7 @@ def _storage_quantization_report(
     if float16_masks:
         masks = _region_masks(region for region in regions if region.pointer in float16_masks)
         for region in regions:
-            if region.entry not in masks:
+            if region.entry not in masks or report.tensors[region.entry].method == "float16":
                 continue
             mask = masks[region.entry]
             float16 = float16_masks[region.pointer] & mask
@@ -1527,19 +2270,17 @@ def _storage_quantization_report(
             values=values,
             calibration_rows=0,
             effective_group_size=None,
-            fallback_reason=(
-                "computed from parameters during export; quantization only rounds "
-                "parameters the model reads directly"
-            ),
+            fallback_reason=_UNFOLLOWED_COMPUTATION,
+            sources=names,
         ))
         warnings_found.append(
             f"{description} {shape} is stored as float16, not {storage.precision}: "
-            "export computes it from parameters, and quantization only rounds "
-            "parameters the model reads directly"
+            f"{_UNFOLLOWED_COMPUTATION}"
         )
     return tuple(warnings_found), _stored_quantization_report(report, found, derived_items)
 
 
 __all__ = [
-    "QuantizationConfig", "QuantizationReport", "TensorQuantizationReport",
+    "QuantizationConfig", "QuantizationOverride", "QuantizationReport",
+    "TensorQuantizationReport",
 ]

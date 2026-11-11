@@ -17,6 +17,7 @@ from cattorch.fast import FastConfig, FastLayerConfig
 from cattorch.storage import StorageConfig
 from cattorch.quantization import (
     QuantizationConfig,
+    QuantizationOverride,
     QuantizationReport,
     TensorQuantizationReport,
 )
@@ -61,7 +62,7 @@ __all__ = [
     "SentencePieceBPETokenizer",
     "FastConfig", "FastLayerConfig", "GenerationProgram", "RecurrentGenerationProgram",
     "BoundedDimension",
-    "StorageConfig", "QuantizationConfig", "QuantizationReport",
+    "StorageConfig", "QuantizationConfig", "QuantizationOverride", "QuantizationReport",
     "TensorQuantizationReport",
     "CodegenConfig", "rotary_embedding",
     "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",

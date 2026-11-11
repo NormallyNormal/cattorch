@@ -17,7 +17,8 @@ import cattorch.experimental
 STABLE = {
     "transpile", "transpile_tokenizer", "verify", "build_project",
     "CharTokenizer", "BPETokenizer", "SentencePieceBPETokenizer",
-    "FastConfig", "FastLayerConfig", "StorageConfig", "QuantizationConfig", "CodegenConfig",
+    "FastConfig", "FastLayerConfig", "StorageConfig", "QuantizationConfig",
+    "QuantizationOverride", "CodegenConfig",
     "GenerationProgram", "RecurrentGenerationProgram", "BoundedDimension", "rotary_embedding",
     "ExportProgram", "EntryPoint", "Input", "Output", "State", "StateInput", "StateUpdate",
     "ProgramCall", "ModuleAdapter", "AdapterContext", "CustomMoEWarning",
