@@ -17,6 +17,7 @@ For persistent state, use [`@entrypoint` markers](markers.md) or an
 | Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
 | Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
 | Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item |
+| Embeddings | `nn.Embedding`; `nn.EmbeddingBag` and `F.embedding_bag` in `sum`, `mean` and `max` modes, with `per_sample_weights`, `padding_idx` and `include_last_offset`, and a 2D input or offsets that are fixed in the model or passed as an input. The offsets' shape fixes the number of bags, and offsets passed as an input must be valid for PyTorch (start at 0, never decrease, and end with the number of indices under `include_last_offset`); only the bags are computed, not `offset2bag` or the other results of `torch.ops.aten.embedding_bag`. `max_norm` is rejected: rescale the table before export |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
 | Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
@@ -189,6 +190,8 @@ length too:
 - Fixed slices at either end, such as `x[0]`, `x[-1]` or `x[:, -1]`.
 - Arithmetic with the length itself, as in `x.sum(0) / x.shape[0]`.
 - Recurrent layers, whose final state (`h_n`) has a fixed shape.
+- `nn.EmbeddingBag` over a 2D input, along its bags, or along the indices of
+  a `(1, indices)` input. A 1D input with offsets can't vary.
 
 A tensor can have only one dimension that varies, so self-attention across
 the items (`x @ x.T`, `nn.TransformerEncoderLayer` over a variable sequence)

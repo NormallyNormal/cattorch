@@ -70,7 +70,7 @@ _SKIPPED_NAMES = frozenset({
     "triangular_solve", "symeig", "eig", "eigvals", "torch._scaled_mm",
     "jiterator_unary", "jiterator_binary", "jiterator_binary_return_by_ref",
     "jiterator_4inputs_with_extra_args", "jiterator_2inputs_2outputs",
-    "view_as_complex", "view_as_real", "complex", "polar", "nn.functional.embedding_bag",
+    "view_as_complex", "view_as_real", "complex", "polar",
     "byte", "char", "short", "int", "long", "half", "bfloat16", "chalf",
     "cdouble", "cfloat", "double", "float", "bool", "cpu", "cuda", "to",
     "data_ptr", "nn.functional.multi_head_attention_forward",

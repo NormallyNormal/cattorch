@@ -12,10 +12,10 @@ an argument a model rarely uses, so a partial or failing operator may
 still work in your model; see [supported models](supported-models.md)
 for what cattorch is designed to handle.
 
-Of 1551 samples tried with PyTorch 2.14, 1392 pass.
+Of 1555 samples tried with PyTorch 2.14, 1396 pass.
 Samples were skipped when their output is random, complex, or not a tensor.
 
-## Every sample passes (401)
+## Every sample passes (402)
 
 `H`, `T`, `__getitem__`, `__radd__`, `__rdiv__`, `__rmatmul__`, `__rmod__`,
 `__rmul__`, `__rpow__`, `__rsub__`, `_chunk_cat`, `_softmax_backward_data`,
@@ -63,14 +63,15 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `nn.functional.conv_transpose1d`, `nn.functional.conv_transpose2d`,
 `nn.functional.conv_transpose3d`, `nn.functional.cosine_embedding_loss`,
 `nn.functional.cosine_similarity`, `nn.functional.cross_entropy`,
-`nn.functional.elu`, `nn.functional.embedding`, `nn.functional.gelu`,
-`nn.functional.glu`, `nn.functional.grid_sample`, `nn.functional.group_norm`,
-`nn.functional.hardshrink`, `nn.functional.hardsigmoid`,
-`nn.functional.hardswish`, `nn.functional.hardtanh`,
-`nn.functional.hinge_embedding_loss`, `nn.functional.huber_loss`,
-`nn.functional.interpolate.area`, `nn.functional.interpolate.bicubic`,
-`nn.functional.interpolate.bilinear`, `nn.functional.interpolate.linear`,
-`nn.functional.interpolate.nearest`, `nn.functional.interpolate.nearest-exact`,
+`nn.functional.elu`, `nn.functional.embedding`, `nn.functional.embedding_bag`,
+`nn.functional.gelu`, `nn.functional.glu`, `nn.functional.grid_sample`,
+`nn.functional.group_norm`, `nn.functional.hardshrink`,
+`nn.functional.hardsigmoid`, `nn.functional.hardswish`,
+`nn.functional.hardtanh`, `nn.functional.hinge_embedding_loss`,
+`nn.functional.huber_loss`, `nn.functional.interpolate.area`,
+`nn.functional.interpolate.bicubic`, `nn.functional.interpolate.bilinear`,
+`nn.functional.interpolate.linear`, `nn.functional.interpolate.nearest`,
+`nn.functional.interpolate.nearest-exact`,
 `nn.functional.interpolate.trilinear`, `nn.functional.kl_div`,
 `nn.functional.l1_loss`, `nn.functional.layer_norm`,
 `nn.functional.leaky_relu`, `nn.functional.linear`,

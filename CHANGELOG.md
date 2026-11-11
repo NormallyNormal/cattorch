@@ -238,6 +238,14 @@
   with a warning, as they are for `forward`, instead of silently.
 - `torch.matmul` with broadcast batch dimensions, such as `[3, 4] @ [2, 4, 5]`
   or `[2, 1, 3, 4] @ [5, 4, 6]`, and a vector times a batch of matrices.
+- `nn.EmbeddingBag` and `F.embedding_bag`, in `sum`, `mean` and `max` modes,
+  with `per_sample_weights`, `padding_idx` and `include_last_offset`. Bags
+  of one size, such as a 2D input, cost about as much as an embedding and a
+  reduction; other offsets, fixed in the model or passed as an input, add a
+  scatter into the bags. The table is stored and quantized like an
+  `nn.Embedding` table, and a 2D input's number of bags can be
+  [variable-length](docs/supported-models.md#variable-length-inputs).
+  `max_norm` on an embedding is rejected with a message naming it.
 
 ## Performance
 

@@ -881,6 +881,189 @@ def _put(value, index, source, accumulate=False):
     return _aten.reshape.default(updated, list(value.shape))
 
 
+_BAG_MODES = ("sum", "mean", "max")
+
+
+def _static_values(value) -> list | None:
+    """The values of a tensor that doesn't depend on the model inputs.
+
+    A tensor the tracer doesn't know is a constant of the model.
+    """
+    import torch.fx.experimental.proxy_tensor as proxy_tensor
+
+    if traced_from_input(value):
+        return None
+    with proxy_tensor.disable_proxy_modes_tracing():
+        return value.tolist()
+
+
+def _bag_ends(starts, count):
+    return [*starts[1:], count]
+
+
+def _bag_segments(offsets, starts, count, bags):
+    """The bag each looked-up row goes to.
+
+    Static offsets give a table. Offsets computed at run time count, for each
+    position, the bag starts at or before it.
+    """
+    if starts is not None:
+        segment = [0] * count
+        for bag, (start, end) in enumerate(zip(starts, _bag_ends(starts, count))):
+            for position in range(max(start, 0), min(end, count)):
+                segment[position] = bag
+        return torch.tensor(segment, dtype=torch.long, device=offsets.device)
+    column = _aten.reshape.default(
+        torch.arange(count, dtype=torch.long, device=offsets.device), [count, 1],
+    )
+    starts = _aten.slice.Tensor(_aten.to.dtype(offsets, torch.long), 0, 0, bags)
+    started = _aten.le.Tensor(_aten.reshape.default(starts, [1, bags]), column)
+    return _aten.sub.Tensor(_aten.sum.dim_IntList(_aten.to.dtype(started, torch.long), [1]), 1)
+
+
+def _equal_bags(starts, count) -> int | None:
+    """The size every bag has, if static offsets split the input evenly."""
+    if not starts or count % len(starts):
+        return None
+    size = count // len(starts)
+    if size and starts == list(range(0, count, size)):
+        return size
+    return None
+
+
+def _reduce_equal_bags(rows, keep, mode, bags, size):
+    """Bags of one size, such as a 2D input: reduce a ``[bags, size, D]`` view."""
+    grouped = _aten.reshape.default(rows, [bags, size, rows.shape[-1]])
+    if keep is None:
+        if mode == "sum":
+            return _aten.sum.dim_IntList(grouped, [1])
+        if mode == "mean":
+            return _aten.mean.dim(grouped, [1])
+        return _aten.amax.default(grouped, [1])
+    keep = _aten.reshape.default(keep, [bags, size, 1])
+    kept = _aten.sum.dim_IntList(_aten.to.dtype(keep, rows.dtype), [1])
+    if mode == "max":
+        largest = _aten.amax.default(
+            _aten.where.self(keep, grouped, _aten.full_like.default(grouped, -math.inf)), [1],
+        )
+        return _aten.where.ScalarOther(_aten.gt.Scalar(kept, 0), largest, 0.0)
+    total = _aten.sum.dim_IntList(_aten.where.ScalarOther(keep, grouped, 0.0), [1])
+    if mode == "sum":
+        return total
+    return _aten.div.Tensor(total, _aten.clamp_min.default(kept, 1))
+
+
+def _reduce_segments(rows, segment, mode, bags):
+    """Combine each row into its bag. Rows of no bag go to an extra bag that
+    is dropped, and bags nothing reaches stay zero, as in PyTorch."""
+    count, width = rows.shape
+    index = _aten.expand.default(_aten.reshape.default(segment, [count, 1]), [count, width])
+    base = _aten.zeros.default([bags + 1, width], dtype=rows.dtype, device=rows.device)
+    if mode == "max":
+        result = _aten.scatter_reduce.two(base, 0, index, rows, "amax", include_self=False)
+    else:
+        result = _aten.scatter_add.default(base, 0, index, rows)
+    if mode == "mean":
+        static = _static_values(segment)
+        if static is not None:
+            sizes = [max(static.count(bag), 1) for bag in range(bags + 1)]
+            counts = torch.tensor(sizes, dtype=rows.dtype, device=rows.device)
+        else:
+            counts = _aten.clamp_min.default(_aten.scatter_add.default(
+                _aten.zeros.default([bags + 1], dtype=rows.dtype, device=rows.device),
+                0, segment, _aten.ones.default([count], dtype=rows.dtype, device=rows.device),
+            ), 1)
+        result = _aten.div.Tensor(result, _aten.reshape.default(counts, [bags + 1, 1]))
+    return _aten.slice.Tensor(result, 0, 0, bags)
+
+
+def _embedding_bag(operator):
+    """``embedding_bag`` as an embedding lookup reduced over each bag.
+
+    Bags of one static size, such as a 2D input, reduce a reshaped lookup.
+    Other bags scatter each looked-up row into its bag. Only the bags are
+    computed: the other results are the operation's own, so a model that
+    reads them reports the operation as unsupported.
+    """
+    def decomposition(
+        weight, indices, offsets, scale_grad_by_freq=False, mode=0, sparse=False,
+        per_sample_weights=None, include_last_offset=False, padding_idx=-1,
+    ):
+        from cattorch.errors import UnsupportedModelError
+
+        if indices.ndim != 1 or weight.ndim != 2 or mode not in range(len(_BAG_MODES)):
+            return NotImplemented
+        mode = _BAG_MODES[mode]
+        if per_sample_weights is not None and mode != "sum":
+            raise UnsupportedModelError(
+                f"embedding_bag: per_sample_weights is only supported with mode='sum', "
+                f"not mode={mode!r}"
+            )
+        count = indices.numel()
+        bags = offsets.numel() - (1 if include_last_offset else 0)
+        starts = _static_values(offsets)
+        if starts is not None:
+            if starts and starts[0] != 0:
+                raise UnsupportedModelError(
+                    f"embedding_bag: offsets[0] has to be 0, got {starts[0]}"
+                )
+            if include_last_offset and starts and starts[-1] != count:
+                raise UnsupportedModelError(
+                    "embedding_bag: with include_last_offset=True the last offset must be "
+                    f"the number of indices, {count}, not {starts[-1]}"
+                )
+            starts = starts[:bags]
+        rows = _aten.embedding.default(weight, indices)
+        if per_sample_weights is not None:
+            rows = _aten.mul.Tensor(rows, _aten.reshape.default(
+                _aten.to.dtype(per_sample_weights, rows.dtype), [count, 1],
+            ))
+        padded = padding_idx is not None and padding_idx >= 0
+        keep = _aten.ne.Scalar(indices, padding_idx) if padded else None
+        size = _equal_bags(starts, count) if starts is not None else None
+        if size is not None:
+            result = _reduce_equal_bags(rows, keep, mode, bags, size)
+        else:
+            segment = _bag_segments(offsets, starts, count, bags)
+            if keep is not None:
+                segment = _aten.where.ScalarOther(keep, segment, bags)
+            result = _reduce_segments(rows, segment, mode, bags)
+        # Traced as the operation itself, and dropped unless something reads it.
+        whole = operator(
+            weight, indices, offsets, scale_grad_by_freq, _BAG_MODES.index(mode), sparse,
+            per_sample_weights, include_last_offset, padding_idx,
+        )
+        return (result, *whole[1:])
+    return decomposition
+
+
+def _embedding_renorm(weight, indices, max_norm, norm_type):
+    from cattorch.errors import UnsupportedModelError
+
+    raise UnsupportedModelError(
+        "embedding max_norm is not supported: it rescales the table's rows during the "
+        "forward pass. Rescale every row before export instead, with "
+        "torch.embedding_renorm_(weight, torch.arange(len(weight)), max_norm, norm_type) "
+        "under torch.no_grad(), and drop max_norm; the outputs are the same"
+    )
+
+
+def _embedding_bag_call(
+    weight, indices, offsets, scale_grad_by_freq=False, mode=0, sparse=False,
+    per_sample_weights=None, include_last_offset=False, padding_idx=None,
+):
+    """The public ``embedding_bag`` overloads, which count a negative
+    ``padding_idx`` from the end; ``_embedding_bag`` reads it as none."""
+    if padding_idx is None:
+        padding_idx = -1
+    elif padding_idx < 0:
+        padding_idx += weight.shape[0]
+    return _aten._embedding_bag.default(
+        weight, indices, offsets, scale_grad_by_freq, mode, sparse, per_sample_weights,
+        include_last_offset, padding_idx,
+    )
+
+
 def _sort(value, dim=-1, descending=False, *, stable=False):
     """A full-length ``topk``, whose ties keep their order like a stable sort."""
     if value.ndim == 0:
@@ -1144,6 +1327,13 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.index_fill.int_Tensor: _index_fill,
     _aten.index_put.default: _index_put,
     _aten.put.default: _put,
+    _aten.embedding_renorm_.default: _embedding_renorm,
+    _aten.embedding_bag.default: _embedding_bag_call,
+    _aten.embedding_bag.padding_idx: _embedding_bag_call,
+    _aten._embedding_bag.default: _embedding_bag(_aten._embedding_bag.default),
+    _aten._embedding_bag_forward_only.default: _embedding_bag(
+        _aten._embedding_bag_forward_only.default,
+    ),
     _aten.sort.default: _sort,
     _aten.sort.stable: _stable_sort,
     _aten.argsort.default: _argsort,
