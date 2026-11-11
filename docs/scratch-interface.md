@@ -38,7 +38,9 @@ a piece of state, NAME for a sprite in a project.
   never waits forever, and checks `cattorch status` before reading the
   outputs. A broadcast doesn't say which call sent it: a script that needs
   the result of its own call runs the block itself, which returns when the
-  block ends, and reads `cattorch status` right after.
+  block ends, and reads `cattorch status` right after. When another script's
+  call overlaps, that status can be the other call's, as the outputs then
+  are; see [overlapping calls](#overlapping-calls).
 - A block that fails writes none of its output lists and changes no state:
   the outputs keep the values of the last call that succeeded. A block never
   changes its input lists.
@@ -67,9 +69,12 @@ that happens:
 
 - The block that was running reports `another call ran during this one`
   when it ends. It writes no output, so the newer call's outputs stay, and it
-  still sends its completion broadcast. The status it reports is the one a
-  listener of that broadcast reads, set just before it, so a listener that
-  checks `cattorch status` never uses wrong results. If a block it resumed
+  still sends its completion broadcast, and a listener of that broadcast
+  that checks `cattorch status` doesn't use its results. But while a block's
+  completion broadcast runs its listeners, Scratch can resume another
+  script, so a listener, or the script that ran the block, can read the
+  failure of a call that was taken over, or another call's status, instead
+  of its own. If a block it resumed
   during is still running, that one fails the same way. Only a block taken
   over while it copies its results to the output lists, which leaves them
   mixed, empties them.

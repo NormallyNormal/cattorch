@@ -496,7 +496,9 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
     # Scratch pauses the long forward once it has run for 500 ms, and runs the
     # second script, whose short forward uses the same temporary lists: the
     # long one must then neither report ok nor write its outputs over the
-    # short one's, and still send its completion broadcast.
+    # short one's. (No script listens for the completion broadcasts: a
+    # listener's thread would let the long one resume, and set the status,
+    # before the short one's script reads it; see test_plain_overlap.)
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
         append, call, change_var, clear, div, eq, for_each, item, length, mod, mul,
@@ -523,12 +525,7 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
         builder.global_list(name) for name in ("first results", "second results", "outputs")
     )
     started, done = (builder.global_variable(name, 0) for name in ("started", "first done"))
-    received = builder.global_variable("completions", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    builder.script(builder.stage, {
-        "opcode": "event_whenbroadcastreceived",
-        "fields": {"BROADCAST_OPTION": ["cattorch forward complete", "forward_complete"]},
-    }, (change_var(received, 1),), variables=(received,), y=800)
     status = "cattorch status"
 
     def fill(rows, step):
@@ -565,7 +562,6 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
     # The short forward's 64 outputs stay.
     assert stage["first results"] == [OVERTAKEN, 64]
     assert stage["second results"] == [0, "ok", "ok"]
-    assert stage["completions"] == 3
 
     def row(step):
         return torch.tensor([((index * step) % 101) / 101 - 0.5 for index in range(1, 65)])
