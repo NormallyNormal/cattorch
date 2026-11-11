@@ -61,10 +61,22 @@ Smaller groups usually reduce error but store more scales. Scales are float16 by
 default.
 
 cattorch runs the model once to find each matrix's input width. A weight read
-by `nn.Linear` or `F.linear`, on the right of a matrix product (`x @ weight`,
-`torch.mm`), or by `torch.addmm` (as in GPT-2's `Conv1D` layers) is grouped
-over its inputs, and GPTQ calibrates it. Other matrices, such as embeddings,
-are grouped along their last dimension and use symmetric quantization.
+by `nn.Linear` or `F.linear`, on either side of a matrix product (`x @ weight`,
+`weight @ x`, `torch.mm`, `torch.bmm`, `torch.mv`), by `torch.addmm` (as in
+GPT-2's `Conv1D` layers), `torch.baddbmm` or `torch.addmv`, by a two-operand
+`torch.einsum` or `torch.tensordot` that contracts it over one dimension, or
+by `F.bilinear` and `nn.Bilinear` is grouped over its inputs, and GPTQ
+calibrates it. So are `nn.MultiheadAttention`'s input projection, its output
+projection when the call passes no mask, and the input
+weights of `nn.RNN`, `nn.LSTM` and `nn.GRU`, plus their hidden weights when
+there is one layer in one direction. Other matrices, such as embeddings and
+convolution kernels, are grouped along their last dimension and use symmetric
+quantization; with GPTQ, `result.warnings` names each of them.
+
+Storage keeps a quantized matrix in integers only in the layout it was
+quantized in. A weight the model copies into another layout itself, such as
+`F.linear(x, weight.t().contiguous())`, is stored in float16 instead, and
+`result.warnings` says so.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set

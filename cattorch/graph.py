@@ -134,18 +134,38 @@ def _is_foldable(node) -> bool:
     return torch.Tag.nondeterministic_seeded not in tags
 
 
-_TRANSPOSES = frozenset({"aten.t.default", "aten.transpose.int", "aten.numpy_T.default"})
+# Operations that only rearrange a tensor's values.
+_LAYOUT_OPS = frozenset({
+    "aten.t.default", "aten.transpose.int", "aten.numpy_T.default",
+    "aten.permute.default", "aten.reshape.default", "aten.view.default",
+    "aten._unsafe_view.default", "aten.unsqueeze.default",
+    "aten.squeeze.dim", "aten.squeeze.dims", "aten.squeeze.default",
+})
 
 
-def _linear_weight_transposes(nodes, state: dict[str, torch.Tensor]) -> set[str]:
-    """Transposes of a stored matrix read only by them, as linear weights.
+def _reads_as_matrix(user, node) -> bool:
+    """Whether ``user`` reads ``node`` only as a matrix product operand."""
+    target = str(user.target)
+    if node in user.kwargs.values():
+        return False
+    if target == "aten.linear.default":
+        return len(user.args) > 1 and user.args[1] is node and node not in (
+            user.args[:1] + user.args[2:]
+        )
+    return target in MATMUL_OPS and node not in user.args[2:]
+
+
+def _matrix_operand_layouts(nodes, state: dict[str, torch.Tensor]) -> set[str]:
+    """Rearrangements of a stored tensor read only as a matrix operand.
 
     ``torch.addmm(bias, x, weight)``, as in GPT-2's ``Conv1D``, becomes a
-    linear layer reading ``weight.t()``. Folding that transpose, at any size,
-    stores the weight output-major like any other linear weight, the layout
-    quantization groups it in, and spares Scratch a transposed copy at run
-    time. When nothing else reads the matrix, the folded copy replaces it, so
-    it adds no stored values.
+    linear layer reading ``weight.t()``; ``torch.einsum``, ``tensordot`` and
+    ``F.bilinear`` permute and reshape their weight into a matrix product.
+    Folding the whole chain, at any size, stores the matrix the product
+    reads, the layout quantization groups it in, and spares Scratch a
+    rearranged copy at run time. The stored tensor, and then each step,
+    must have no other reader, so the folded matrix replaces the tensor and
+    adds no stored values.
     """
     # Each use may have its own ``get_attr`` name; count readers per tensor.
     readers: dict[int, int] = {}
@@ -159,7 +179,7 @@ def _linear_weight_transposes(nodes, state: dict[str, torch.Tensor]) -> set[str]
     for node in nodes:
         if (
             node.op != "call_function"
-            or str(node.target) not in _TRANSPOSES
+            or str(node.target) not in _LAYOUT_OPS
             or not node.args
             or not hasattr(node.args[0], "name")
         ):
@@ -167,19 +187,19 @@ def _linear_weight_transposes(nodes, state: dict[str, torch.Tensor]) -> set[str]
         source = state.get(node.args[0].name)
         if (
             not isinstance(source, torch.Tensor)
-            or source.ndim != 2
             or readers.get(source.untyped_storage().data_ptr()) != 1
         ):
             continue
-        users = list(node.users)
-        if users and all(
-            str(user.target) == "aten.linear.default"
-            and len(user.args) > 1 and user.args[1] is node
-            and node not in user.args[:1] + user.args[2:]
-            and node not in user.kwargs.values()
-            for user in users
-        ):
-            names.add(node.name)
+        chain = [node]
+        while len(chain[-1].users) == 1:
+            (user,) = chain[-1].users
+            if str(user.target) not in _LAYOUT_OPS or user.args[0] is not chain[-1]:
+                break
+            chain.append(user)
+        last = chain[-1]
+        users = list(last.users)
+        if users and all(_reads_as_matrix(user, last) for user in users):
+            names.update(step.name for step in chain)
     return names
 
 
@@ -196,9 +216,9 @@ def fold_static_values(
     ``state`` maps get_attr names to tensors and ``seed`` holds values already
     generated for other nodes. Returns the newly folded tensors by node name,
     without ``seed``. Results above ``element_limit`` elements are skipped
-    (``None`` folds them all), except a stored matrix transposed only to be
-    read as a linear weight (see ``_linear_weight_transposes``). A node whose target is
-    in ``passthrough``
+    (``None`` folds them all), except a stored tensor rearranged only to be
+    read as a matrix product operand (see ``_matrix_operand_layouts``). A
+    node whose target is in ``passthrough``
     takes its first argument's value without being called, for aliasing
     operations such as ``detach_`` that are not otherwise foldable.
     """
@@ -206,7 +226,7 @@ def fold_static_values(
     known = dict(seed or {})
     missing = object()
     unlimited = (
-        _linear_weight_transposes(nodes, state) if element_limit is not None else set()
+        _matrix_operand_layouts(nodes, state) if element_limit is not None else set()
     )
     static_results: dict[str, object] = {}
 

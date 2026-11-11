@@ -294,6 +294,26 @@
   int4, and at width 768 from 24.8 MB to 20.7 MB in int8 and from 15.3 MB to
   10.3 MB in int4, with about a third of the blocks. Quantized GPT-2 exports
   compute slightly different outputs than before.
+- With `quantization`, more weights that storage kept in float16 are stored
+  in int8 or int4 as requested: those of `torch.einsum` with the weight's
+  input dimension last (`'bi,oi->bo'`, per-head `'bhi,hoi->bho'`, and their
+  batched and `...` forms), `torch.tensordot(x, weight, dims=([1], [0]))`,
+  and `F.bilinear` and `nn.Bilinear`. In small test models, an int4
+  `nn.Bilinear(64, 32, 16)` export shrinks from 82.6 KB to 36.5 KB and two
+  einsum layers from 34.0 KB to 25.1 KB. Weights on the right of `torch.bmm`
+  or a batched matmul, and of einsums such as `'bi,io->bo'` that were
+  already stored in integers, are now grouped over their inputs like other
+  weights. GPTQ now calibrates all of these, and weights used through
+  `torch.mv`, `torch.addmv`, `weight @ x`, `torch.bmm` with the weight on
+  either side, `torch.baddbmm`, `nn.MultiheadAttention`'s fused inference
+  path, and the input weights of `nn.RNN`, `nn.LSTM` and `nn.GRU` (and their
+  hidden weights with one layer in one direction), instead of falling back
+  to symmetric quantization. An einsum, `tensordot` or bilinear weight larger
+  than 1,048,576 values is now rearranged at export instead of in Scratch at
+  run time, also without quantization. A quantized weight that storage still
+  keeps in float16, because the model copies it into another layout itself,
+  such as `F.linear(x, weight.t().contiguous())`, now gets a warning in
+  `result.warnings`.
 - A quantized export could fail with `grouped weight sharding must preserve
   complete four-row groups` when compressed storage keeps a weight that runs
   four output rows at a time in float16 or float32, whose lists hold fewer

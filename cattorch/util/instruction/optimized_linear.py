@@ -304,10 +304,13 @@ class _MatMulLayout:
         left_shape, right_shape = self.left.shape, self.right.shape
         self.inner = left_shape[-1]
         self.tensor_rhs = len(right_shape) > 2
+        # A stored right side kept as [batch, columns, inner], each matrix
+        # transposed, so integer storage groups it over its inputs.
+        self.transposed = bool(ctx.options.get("transposed_right", False))
         if self.tensor_rhs:
             self.batches = math.prod(right_shape[:-2])
             self.rows = left_shape[-2]
-            self.columns = right_shape[-1]
+            self.columns = right_shape[-2] if self.transposed else right_shape[-1]
         else:
             self.batches = 1
             self.rows = (
@@ -328,7 +331,7 @@ def _emit_matmul(ctx: KernelContext):
     out = ctx.output.list
     left, right, inner = layout.left.list, layout.right.list, layout.inner
 
-    def dot_body(right_step):
+    def dot_body(right_step, advance=1):
         if right_step == 1:
             setup = (
                 set_var("left_index", var("left_start")),
@@ -346,7 +349,10 @@ def _emit_matmul(ctx: KernelContext):
                 inner, left_list=left, right_list=right, right_index="right_index",
                 right_step=right_step,
             )
-        return (set_var("sum", 0), *setup, *dot, append(out, var("sum")), change_var("right_start", 1))
+        return (
+            set_var("sum", 0), *setup, *dot, append(out, var("sum")),
+            change_var("right_start", advance),
+        )
 
     if layout.tensor_rhs:
         return (
@@ -356,7 +362,10 @@ def _emit_matmul(ctx: KernelContext):
             repeat(layout.batches, (
                 repeat(layout.rows, (
                     set_var("right_start", var("right_batch_start")),
-                    repeat(layout.columns, dot_body(layout.columns)),
+                    repeat(
+                        layout.columns,
+                        dot_body(1, inner) if layout.transposed else dot_body(layout.columns),
+                    ),
                     change_var("left_start", inner),
                 )),
                 change_var("right_batch_start", inner * layout.columns),

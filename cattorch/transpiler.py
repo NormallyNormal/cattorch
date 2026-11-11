@@ -71,6 +71,7 @@ from cattorch.sprite import (
     _remove_unused,
     _share_repeated_transformer_layers,
     _static_storage_group_size,
+    _static_storage_precision,
     _static_storage_shard_limits,
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
@@ -1211,6 +1212,15 @@ class _Compiler:
             rhs = self.graph.resolve_weight(node.args[1].name)
             if (
                 isinstance(rhs, torch.Tensor)
+                and rhs.ndim > 2
+                and math.prod(rhs.shape[:-2]) == 1
+                and self.row_aligned_weights
+            ):
+                # A batch of one matrix, as ``torch.einsum`` lowers a product
+                # with a weight on the right: one matrix, stored like one.
+                rhs = rhs.reshape(rhs.shape[-2:])
+            if (
+                isinstance(rhs, torch.Tensor)
                 and rhs.ndim == 2
                 and rhs.is_floating_point()
                 # Quantization groups every matrix over its input width, so
@@ -1222,6 +1232,30 @@ class _Compiler:
                     instruction, matrix_inputs = large
                     self._emit(instruction, matrix_inputs, target_list)
                     return
+            if (
+                isinstance(rhs, torch.Tensor)
+                and rhs.ndim > 2
+                and rhs.is_floating_point()
+                and self.row_aligned_weights
+                and len(args[0].shape) == rhs.ndim
+                and tuple(args[0].shape[:-2]) == tuple(rhs.shape[:-2])
+            ):
+                # A stored batch of matrices on the right, such as per-head
+                # einsum weights: keep each one transposed, output-major,
+                # so integer storage groups it over its inputs like any
+                # other quantized matrix.
+                key = f"matmul_{node.name}_weight_t"
+                weight = rhs.transpose(-1, -2).contiguous()
+                self.static_lists[key] = weight
+                instruction = self._kernel_instruction(
+                    matmul_kernel(aten_op),
+                    target_list,
+                    args[0],
+                    Argument(f"W_{key}", weight.shape, static=True),
+                    options={"transposed_right": True},
+                )
+                self._emit(instruction, [input_lists[0], f"W_{key}"], target_list)
+                return
         kernel = self.graph.registry.kernel(
             aten_op,
             fast=self.graph.fast,
@@ -1869,6 +1903,60 @@ class _Compiler:
         dim_size = input_shape[dim]
         start, end, step = slice(start, end, step).indices(dim_size)
         return start == 0 and end == dim_size and step == 1
+
+
+def _misgrouped_quantized_weights(
+    static_tensors: dict[str, torch.Tensor | None],
+    storage: StorageConfig,
+    model: torch.nn.Module,
+    *,
+    effective_ndims: dict[str, int],
+    interleaved_layouts: dict[str, tuple[tuple[int, int, int], ...]],
+) -> tuple[str, ...]:
+    """Warnings for quantized weights that integer storage keeps in float16.
+
+    Storage keeps a matrix in integers only when it finds it on the integer
+    grid along its own last dimension. A quantized weight stored transposed
+    relative to the grouping quantization gave it falls off that grid, and
+    is stored in float16 at two to four times the requested size.
+    """
+    if storage.precision not in {"int8", "int6", "int4"} or storage.grouping != "row":
+        return ()
+    parameters = [
+        (name, parameter.detach().reshape(-1))
+        for name, parameter in model.named_parameters()
+        if parameter.ndim >= 2
+    ]
+    warnings_found = []
+    for key, tensor in static_tensors.items():
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or not tensor.is_floating_point()
+            or tensor.numel() < storage.min_quantized_values
+        ):
+            continue
+        ndim = effective_ndims.get(key, tensor.ndim)
+        if ndim < 2 or tensor.ndim < 2 or _static_storage_precision(
+            tensor, storage, ndim, interleaved_layouts.get(key, ()),
+        ) != "float16":
+            continue
+        transposed = tensor.transpose(-1, -2).contiguous()
+        if _static_storage_precision(transposed, storage, ndim) != storage.precision:
+            continue
+        flat = transposed.reshape(-1)
+        name = next(
+            (
+                parameter_name for parameter_name, values in parameters
+                if values.numel() == flat.numel() and torch.equal(values, flat)
+            ),
+            key,
+        )
+        warnings_found.append(
+            f"quantized weight {name!r} {tuple(tensor.shape)} is stored as float16, "
+            f"not {storage.precision}: it is quantized in groups along a different "
+            f"axis than storage reads it in"
+        )
+    return tuple(warnings_found)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -2875,6 +2963,13 @@ def _transpile(
         for table, reason in compiler.tied_storage_copies.items()
         if table in layouts
     )
+    misgrouped = _misgrouped_quantized_weights(
+        compiler.static_lists,
+        storage,
+        model,
+        effective_ndims=compiler.static_effective_ndims,
+        interleaved_layouts=compiler.interleaved_static_layouts,
+    )
     static_names = _apply_static_storage(
         sprite,
         layouts,
@@ -3070,6 +3165,7 @@ def _transpile(
             for item in (quantization_report.tensors if quantization_report else ())
             if item.method == "symmetric" and item.fallback_reason is not None
         )
+        + misgrouped
         + tuple(
             f"tied weight {table.removeprefix('W_')!r} is stored twice: {reason}"
             for table, reason in tied_copies.items()

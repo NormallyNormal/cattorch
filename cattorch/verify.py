@@ -151,11 +151,11 @@ def _verify_program(
                     value, storage,
                     effective_ndims.get(value.untyped_storage().data_ptr()),
                 )
-                if precision == "float16" and value.ndim == 2:
-                    # Weights used on the right of a matmul are stored
-                    # transposed, so check that layout too.
+                if precision == "float16" and value.ndim >= 2:
+                    # Weights used on the right of a matmul, and bilinear
+                    # weights, are stored transposed, so check that layout too.
                     precision = _static_storage_precision(
-                        value.T.contiguous(), storage,
+                        value.transpose(-1, -2).contiguous(), storage,
                         effective_ndims.get(value.untyped_storage().data_ptr()),
                     )
                 if value.numel() < quantization.min_quantized_values:

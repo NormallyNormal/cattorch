@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import itertools
+import math
 import warnings
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Literal, cast
@@ -204,7 +206,7 @@ class OperatorRegistry:
         rule = self.operation(target)
         observer = (
             _DECOMPOSED_OBSERVERS.get(target)
-            if rule is None else rule.observer
+            if rule is None or rule.observer is None else rule.observer
         )
         return () if observer is None else tuple(
             observer(func, args, kwargs, result)
@@ -463,12 +465,6 @@ def _observe_linear(_func, args, _kwargs, _result):
     return ((args[0], args[1], "linear"),)
 
 
-def _observe_rhs_matmul(_func, args, _kwargs, _result):
-    if len(args) < 2:
-        return ()
-    return ((args[0], args[1], "rhs_matmul"),)
-
-
 def _observe_addmm(_func, args, _kwargs, _result):
     """``bias + left @ right``, as in GPT-2's ``Conv1D``: ``right`` is the weight."""
     if len(args) < 3:
@@ -476,10 +472,299 @@ def _observe_addmm(_func, args, _kwargs, _result):
     return ((args[1], args[2], "rhs_matmul"),)
 
 
+def _matrix_products(left, right) -> list[Observation]:
+    """Either side of ``left @ right`` as a weight, one matrix at a time.
+
+    A matrix on the right maps ``left``'s rows; one on the left maps
+    ``right``'s columns, as a linear weight would. Batched matrices are
+    observed one per batch, with every row their batch broadcasts to them.
+    The capture keeps only parameters.
+    """
+    if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+        return []
+    if left.ndim == 0 or right.ndim == 0:
+        return []
+    rows = left if left.ndim > 1 else left.unsqueeze(0)
+    columns = right if right.ndim > 1 else right.unsqueeze(-1)
+    try:
+        batch = torch.broadcast_shapes(rows.shape[:-2], columns.shape[:-2])
+    except RuntimeError:
+        return []
+    observations: list[Observation] = []
+    if right.ndim > 1:
+        observations.extend(_batched_matrices(rows, right, batch, "rhs_matmul"))
+    if left.ndim > 1:
+        observations.extend(
+            _batched_matrices(columns.transpose(-1, -2), left, batch, "linear")
+        )
+    return observations
+
+
+def _batched_matrices(value, weight, batch, orientation) -> list[Observation]:
+    """``weight``'s matrices, each with the rows of ``value`` it maps."""
+    if weight.ndim == 2:
+        return [(value, weight, orientation)]
+    leading = (1,) * (len(batch) - (weight.ndim - 2)) + tuple(weight.shape[:-2])
+    weight = weight.reshape(*leading, *weight.shape[-2:])
+    value = value.expand(*batch, *value.shape[-2:])
+    observations = []
+    for index in itertools.product(*map(range, leading)):
+        # A matrix broadcast along a dimension maps every row along it.
+        rows = value[tuple(
+            slice(None) if size == 1 and full > 1 else position
+            for position, size, full in zip(index, leading, batch)
+        )]
+        observations.append((rows, weight[index], orientation))
+    return observations
+
+
+def _observe_matmul(_func, args, _kwargs, _result):
+    """``x @ weight``, ``weight @ x``, and their batched forms."""
+    return _matrix_products(*args[:2]) if len(args) >= 2 else ()
+
+
+def _observe_baddbmm(_func, args, _kwargs, _result):
+    return _matrix_products(*args[1:3]) if len(args) >= 3 else ()
+
+
+def _observe_mv(_func, args, _kwargs, _result):
+    """``weight @ vector``: a linear layer on one row."""
+    if len(args) < 2 or not isinstance(args[1], torch.Tensor):
+        return ()
+    return ((args[1].unsqueeze(0), args[0], "linear"),)
+
+
+def _observe_addmv(_func, args, _kwargs, _result):
+    if len(args) < 3 or not isinstance(args[2], torch.Tensor):
+        return ()
+    return ((args[2].unsqueeze(0), args[1], "linear"),)
+
+
+def _einsum_subscripts(equation: str, operands) -> tuple[list[str], str] | None:
+    """Operand and output subscripts, with each ``...`` spelled out."""
+    equation = equation.replace(" ", "")
+    inputs, arrow, output = equation.partition("->")
+    terms = inputs.split(",")
+    if len(terms) != len(operands):
+        return None
+    spare = iter(sorted(
+        set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") - set(equation)
+    ))
+    widest = max(
+        (operand.ndim - len(term.replace("...", "")) for term, operand in zip(terms, operands)
+         if "..." in term),
+        default=0,
+    )
+    broadcast = "".join(next(spare) for _ in range(widest))
+    spelled = []
+    for term, operand in zip(terms, operands):
+        if "..." in term:
+            count = operand.ndim - len(term.replace("...", ""))
+            term = term.replace("...", broadcast[widest - count:])
+        if len(term) != operand.ndim or not term.isalpha():
+            return None
+        spelled.append(term)
+    if not arrow:
+        counts = {letter: inputs.count(letter) for letter in "".join(spelled)}
+        output = broadcast + "".join(
+            sorted(letter for letter, count in counts.items() if count == 1 and letter not in broadcast)
+        )
+    else:
+        output = output.replace("...", broadcast)
+    return spelled, output
+
+
+def _einsum_weight(x, x_terms: str, weight, weight_terms: str, output: str):
+    """Observations of ``weight`` as one matrix per batch in an einsum.
+
+    ``weight`` must contract exactly one index with ``x``, put indices
+    shared with ``x`` and the output first, and keep the rest, all outputs,
+    on one side of the contracted index.
+    """
+    if len(set(x_terms)) != len(x_terms) or len(set(weight_terms)) != len(weight_terms):
+        return []
+    contracted = [c for c in weight_terms if c in x_terms and c not in output]
+    batch = [c for c in weight_terms if c in x_terms and c in output]
+    outputs = [c for c in weight_terms if c not in x_terms]
+    if (
+        len(contracted) != 1 or not outputs
+        or any(c not in output for c in outputs)
+        or any(c not in weight_terms and c not in output for c in x_terms)
+        or weight_terms[:len(batch)] != "".join(batch)
+        or any(x.shape[x_terms.index(c)] != weight.shape[weight_terms.index(c)] for c in batch)
+    ):
+        return []
+    (inner,) = contracted
+    matrix_terms = weight_terms[len(batch):]
+    if matrix_terms[0] == inner:
+        orientation = "rhs_matmul"
+    elif matrix_terms[-1] == inner:
+        orientation = "linear"
+    else:
+        return []
+    width = x.shape[x_terms.index(inner)]
+    rows = [c for c in x_terms if c not in batch and c != inner]
+    ordered = x.permute([x_terms.index(c) for c in (*batch, *rows, inner)])
+    observations = []
+    batches = [weight.shape[index] for index in range(len(batch))]
+    for flat in range(math.prod(batches)):
+        index = []
+        for size in reversed(batches):
+            index.append(flat % size)
+            flat //= size
+        position = tuple(reversed(index))
+        matrix = weight[position]
+        if matrix.ndim > 2:
+            shape = (width, -1) if orientation == "rhs_matmul" else (-1, width)
+            try:
+                matrix = matrix.view(shape)
+            except RuntimeError:
+                return []
+        observations.append((ordered[position].reshape(-1, width), matrix, orientation))
+    return observations
+
+
+def _observe_einsum(_func, args, _kwargs, _result):
+    """A two-operand einsum that applies one operand to the other as a matrix."""
+    if len(args) < 2 or not isinstance(args[0], str) or len(args[1]) != 2:
+        return ()
+    operands = args[1]
+    if not all(isinstance(operand, torch.Tensor) for operand in operands):
+        return ()
+    spelled = _einsum_subscripts(args[0], operands)
+    if spelled is None:
+        return ()
+    (left_terms, right_terms), output = spelled
+    left, right = operands
+    return (
+        *_einsum_weight(left, left_terms, right, right_terms, output),
+        *_einsum_weight(right, right_terms, left, left_terms, output),
+    )
+
+
+def _observe_tensordot(_func, args, _kwargs, _result):
+    """A matrix contracted over one of its dimensions with the other operand."""
+    if len(args) < 4:
+        return ()
+    left, right, left_dims, right_dims = args[:4]
+    observations = []
+    for x, x_dims, weight, weight_dims in (
+        (left, left_dims, right, right_dims), (right, right_dims, left, left_dims),
+    ):
+        if (
+            not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2 or len(weight_dims) != 1 or len(x_dims) != 1
+        ):
+            continue
+        inner = weight_dims[0] % 2
+        rows = x.movedim(x_dims[0], -1)
+        observations.append((rows, weight, "rhs_matmul" if inner == 0 else "linear"))
+    return observations
+
+
+def _observe_bilinear(_func, args, _kwargs, _result):
+    """``left`` applied to each output's ``[left, right]`` matrix.
+
+    cattorch lowers the product as one matrix product of ``left`` with every
+    output's matrix side by side, so each matrix is grouped over ``left``.
+    """
+    if len(args) < 3 or not isinstance(args[2], torch.Tensor) or args[2].ndim != 3:
+        return ()
+    left, weight = args[0], args[2]
+    return tuple((left, weight[output], "rhs_matmul") for output in range(weight.shape[0]))
+
+
+def _observe_native_attention(_func, args, _kwargs, result):
+    """``nn.MultiheadAttention``'s fused inference path.
+
+    The packed input projection sees the query, key and value. The output
+    projection's input is reconstructed when there is no mask, and kept only
+    if it reproduces the operation's result.
+    """
+    if len(args) < 9:
+        return ()
+    query, key, value, embed_dim, heads, qkv_weight, qkv_bias, proj_weight, proj_bias = args[:9]
+    if not all(
+        isinstance(item, torch.Tensor)
+        for item in (query, key, value, qkv_weight, proj_weight)
+    ):
+        return ()
+    if query is key and key is value:
+        observations = [(query, qkv_weight, "linear")]
+    else:
+        observations = [
+            (source, qkv_weight[index * embed_dim:(index + 1) * embed_dim], "linear")
+            for index, source in enumerate((query, key, value))
+        ]
+    mask = args[9] if len(args) > 9 else None
+    if mask is None and query.ndim == 3 and embed_dim % heads == 0:
+        biases = (
+            qkv_bias.chunk(3) if isinstance(qkv_bias, torch.Tensor) else (None,) * 3
+        )
+        projected = [
+            torch.nn.functional.linear(source, weight, bias)
+            for source, weight, bias in zip(
+                (query, key, value), qkv_weight.chunk(3), biases,
+            )
+        ]
+        batch = query.shape[0]
+        q, k, v = (
+            item.reshape(batch, item.shape[1], heads, -1).transpose(1, 2) for item in projected
+        )
+        attended = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        attended = attended.transpose(1, 2).reshape(batch, query.shape[1], embed_dim)
+        output = result[0] if isinstance(result, tuple) else result
+        replay = torch.nn.functional.linear(attended, proj_weight, proj_bias)
+        if (
+            isinstance(output, torch.Tensor) and output.shape == replay.shape
+            and torch.allclose(output, replay, rtol=1e-4, atol=1e-5)
+        ):
+            observations.append((attended, proj_weight, "linear"))
+    return tuple(observations)
+
+
+def _observe_recurrent(_func, args, _kwargs, result):
+    """``nn.RNN``, ``nn.LSTM`` and ``nn.GRU`` weights that see known inputs.
+
+    Every first-layer input weight reads the sequence. A single-layer,
+    one-direction hidden weight reads the previous hidden states, which are
+    the output shifted by one step after the initial state.
+    """
+    if len(args) < 9 or not isinstance(args[0], torch.Tensor):
+        return ()
+    sequence, hidden, params, biases, layers, _dropout, _train, bidirectional, batch_first = args[:9]
+    directions = 2 if bidirectional else 1
+    per_layer = 4 if biases else 2
+    if len(params) != layers * directions * per_layer:
+        return ()  # Projected LSTMs carry another weight per layer.
+    observations = [
+        (sequence, params[direction * per_layer], "linear") for direction in range(directions)
+    ]
+    output = result[0] if isinstance(result, tuple) else result
+    initial = hidden[0] if isinstance(hidden, (list, tuple)) else hidden
+    if layers == 1 and directions == 1 and isinstance(output, torch.Tensor):
+        time = 1 if batch_first and sequence.ndim == 3 else 0
+        first = initial[0].unsqueeze(time)
+        steps = output.narrow(time, 0, output.shape[time] - 1)
+        observations.append((torch.cat((first, steps), time), params[1], "linear"))
+    return tuple(observations)
+
+
 # Operations the frontend rewrites before lowering, so they have no rule of
 # their own, but which eager calibration still sees under their own name.
 _DECOMPOSED_OBSERVERS: dict[str, Observer] = {
     "aten.addmm.default": _observe_addmm,
+    "aten.baddbmm.default": _observe_baddbmm,
+    "aten.mv.default": _observe_mv,
+    "aten.addmv.default": _observe_addmv,
+    "aten.einsum.default": _observe_einsum,
+    "aten.tensordot.default": _observe_tensordot,
+    "aten.bilinear.default": _observe_bilinear,
+    "aten._native_multi_head_attention.default": _observe_native_attention,
+    "aten.lstm.input": _observe_recurrent,
+    "aten.gru.input": _observe_recurrent,
+    "aten.rnn_tanh.input": _observe_recurrent,
+    "aten.rnn_relu.input": _observe_recurrent,
 }
 
 
@@ -668,8 +953,9 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.expert_family_moe.default": _observe_expert_family,
         "cattorch.routed_experts.default": _observe_routed_experts,
         "aten.linear.default": _observe_linear,
-        "aten.mm.default": _observe_rhs_matmul,
-        "aten.matmul.default": _observe_rhs_matmul,
+        "aten.mm.default": _observe_matmul,
+        "aten.matmul.default": _observe_matmul,
+        "aten.bmm.default": _observe_matmul,
     }
     fast: dict[
         str,

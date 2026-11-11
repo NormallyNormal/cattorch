@@ -589,3 +589,208 @@ def test_addmm_weights_are_stored_as_integers_in_export_programs(tmp_path, monke
     assert {precision for _, precision in precisions} == {"int8"}
     comparison = verify(model, program, result, atol=2e-3, quantization=config)
     assert comparison.passed, comparison
+
+
+class _Functional(torch.nn.Module):
+    """Parameters used through ``forward(self, value)``, a plain function."""
+
+    def __init__(self, forward, **parameters):
+        super().__init__()
+        self._forward = forward
+        for name, value in parameters.items():
+            if isinstance(value, torch.nn.Module):
+                setattr(self, name, value)
+            else:
+                setattr(self, name, torch.nn.Parameter(torch.randn(*value) * 0.3))
+
+    def forward(self, value):
+        return self._forward(self, value)
+
+
+_MATRIX_PRODUCTS = {
+    "einsum-bi,oi": (lambda s, x: torch.einsum("bi,oi->bo", x, s.w), {"w": (24, 32)}, (4, 32)),
+    "einsum-bi,io": (lambda s, x: torch.einsum("bi,io->bo", x, s.w), {"w": (32, 24)}, (4, 32)),
+    "einsum-...i,oi": (
+        lambda s, x: torch.einsum("...i,oi->...o", x, s.w), {"w": (24, 32)}, (2, 3, 32),
+    ),
+    "einsum-bhi,hoi": (
+        lambda s, x: torch.einsum("bhi,hoi->bho", x.view(4, 2, 16), s.w),
+        {"w": (2, 24, 16)}, (4, 32),
+    ),
+    "tensordot": (
+        lambda s, x: torch.tensordot(x, s.w, dims=([1], [0])), {"w": (32, 24)}, (4, 32),
+    ),
+    "bilinear": (
+        lambda s, x: s.bilinear(x, x[:, :16]),
+        {"bilinear": torch.nn.Bilinear(32, 16, 8)}, (4, 32),
+    ),
+    "bmm": (lambda s, x: torch.bmm(torch.stack((x, -x)), s.w), {"w": (2, 32, 24)}, (4, 32)),
+    "matmul-broadcast": (
+        lambda s, x: (x @ s.w).sum(0) + (s.v @ x.T).transpose(-1, -2).sum(0),
+        {"w": (2, 32, 24), "v": (3, 24, 32)}, (4, 32),
+    ),
+    "weight-on-left": (
+        lambda s, x: (s.w @ x.T).T + torch.mv(s.w, x[0]) + torch.addmv(s.b, s.w, x[1]),
+        {"w": (24, 32), "b": (24,)}, (4, 32),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("case", "bits", "method", "fold_limit"),
+    [
+        *((case, bits, method, None) for case in _MATRIX_PRODUCTS
+          for bits, method in ((8, "symmetric"), (4, "gptq"))),
+        ("einsum-bi,io", 8, "symmetric", 100),
+        ("bilinear", 8, "symmetric", 100),
+    ],
+    ids=str,
+)
+@torch.no_grad()
+def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs(
+    tmp_path, monkeypatch, case, bits, method, fold_limit,
+):
+    # einsum, tensordot, bilinear, bmm and products with the weight on the
+    # left each read a weight as matrices. Each is quantized over its input
+    # width, the axis storage groups it along, so it is stored in integers,
+    # and GPTQ calibrates it. A weight above the folding size limit is still
+    # rearranged at export, not in Scratch.
+    import cattorch.sprite as sprite_module
+
+    if fold_limit is not None:
+        import cattorch.graph as graph_module
+
+        monkeypatch.setitem(
+            graph_module.fold_static_values.__kwdefaults__, "element_limit", fold_limit,
+        )
+    forward, parameters, shape = _MATRIX_PRODUCTS[case]
+    torch.manual_seed(11)
+    model = _Functional(forward, **parameters).eval()
+    example = torch.randn(*shape)
+    calibration = [torch.randn(*shape) for _ in range(8)] if method == "gptq" else None
+    config = QuantizationConfig(
+        bits=bits, method=method, group_size=8, min_quantized_values=1,
+        min_calibration_rows=16,
+    )
+    expected_model = copy.deepcopy(model)
+    report = quantize_model(expected_model, config, calibration, orientation_inputs=[(example,)])
+    assert report.tensors
+    for item in report.tensors:
+        assert (item.method, item.fallback_reason) == (method, None), item
+    for parameter in expected_model.parameters():
+        if parameter.ndim == 1:
+            # Storage keeps vectors such as biases in float16.
+            parameter.copy_(parameter.half().float())
+
+    precisions = []
+    original = sprite_module._static_storage_precision
+
+    def record(tensor, storage, *args):
+        precision = original(tensor, storage, *args)
+        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 2:
+            precisions.append((tuple(tensor.shape), precision))
+        return precision
+
+    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    result = transpile(
+        model, example, tmp_path / "product", quantization=config,
+        calibration_inputs=calibration,
+    )
+    assert precisions
+    assert {precision for _, precision in precisions} == {f"int{bits}"}, precisions
+    assert not [warning for warning in result.warnings if "quantized weight" in warning]
+    assert [item.method for item in result.quantization.tensors] == [
+        item.method for item in report.tensors
+    ]
+
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    torch.testing.assert_close(
+        torch.tensor([float(value) for value in emulator.lists["output"]]),
+        expected_model(example).flatten(),
+        atol=1e-4, rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "names"),
+    [
+        (torch.nn.LSTM(16, 8, batch_first=True), ("r.weight_ih_l0", "r.weight_hh_l0")),
+        (torch.nn.GRU(16, 8), ("r.weight_ih_l0", "r.weight_hh_l0")),
+        (torch.nn.RNN(16, 8, batch_first=True), ("r.weight_ih_l0", "r.weight_hh_l0")),
+        (torch.nn.LSTM(16, 8, num_layers=2, batch_first=True), ("r.weight_ih_l0",)),
+        (
+            torch.nn.MultiheadAttention(16, 2, batch_first=True),
+            ("r.in_proj_weight", "r.out_proj.weight"),
+        ),
+    ],
+    ids=["lstm", "gru", "rnn", "lstm-2-layers", "multihead-attention"],
+)
+@torch.no_grad()
+def test_gptq_calibrates_recurrent_and_fused_attention_weights(module, names):
+    # In inference mode each of these runs as one fused operation. Weights
+    # whose inputs the operation shows are calibrated; the rest fall back,
+    # and say so.
+    torch.manual_seed(12)
+    model = _Functional(
+        (lambda s, x: s.r(x, x, x, need_weights=False)[0])
+        if isinstance(module, torch.nn.MultiheadAttention) else (lambda s, x: s.r(x)[0]),
+        r=copy.deepcopy(module),
+    ).eval()
+    config = QuantizationConfig(
+        bits=4, method="gptq", group_size=8, min_quantized_values=1, min_calibration_rows=16,
+    )
+    reference = copy.deepcopy(model)
+    report = quantize_model(model, config, [torch.randn(2, 5, 16) for _ in range(4)])
+    by_name = {item.name: item for item in report.tensors}
+    assert {name for name, item in by_name.items() if item.method == "gptq"} == set(names)
+    for item in report.tensors:
+        assert (item.method == "gptq") == (item.fallback_reason is None), item
+    value = torch.randn(2, 5, 16)
+    torch.testing.assert_close(model(value), reference(value), atol=0.3, rtol=0)
+
+
+@torch.no_grad()
+def test_quantized_weights_kept_in_float16_are_reported(tmp_path):
+    # A weight transposed into a fresh copy is quantized over the parameter's
+    # own rows; the copy storage reads is grouped the other way, so storage
+    # keeps it in float16. That must not pass silently.
+    torch.manual_seed(13)
+    copied = _Functional(lambda s, x: F.linear(x, s.w.t().contiguous()), w=(32, 24)).eval()
+    plain = _Functional(lambda s, x: F.linear(x, s.w), w=(24, 32)).eval()
+    config = QuantizationConfig(bits=8, min_quantized_values=1)
+    warned = transpile(copied, torch.randn(2, 32), tmp_path / "copied", quantization=config)
+    assert [warning for warning in warned.warnings if "quantized weight" in warning] == [
+        "quantized weight 'w' (24, 32) is stored as float16, not int8: it is quantized "
+        "in groups along a different axis than storage reads it in"
+    ]
+    quiet = transpile(plain, torch.randn(2, 32), tmp_path / "plain", quantization=config)
+    assert not [warning for warning in quiet.warnings if "quantized weight" in warning]
+
+
+@torch.no_grad()
+def test_einsum_and_bilinear_weights_are_stored_as_integers_in_export_programs(
+    tmp_path, monkeypatch,
+):
+    from cattorch import EntryPoint, ExportProgram, Input, Output, verify
+
+    torch.manual_seed(14)
+    model = _Functional(
+        lambda s, x: s.bilinear(torch.einsum("bi,oi->bo", x, s.w), x),
+        w=(24, 32), bilinear=torch.nn.Bilinear(24, 32, 8),
+    ).eval()
+    program = ExportProgram(entrypoints=(
+        EntryPoint(
+            "run", method="forward",
+            arguments=(Input("value", torch.randn(3, 32)),),
+            returns=(Output("result"),),
+        ),
+    ))
+    config = QuantizationConfig(bits=8, group_size=8, min_quantized_values=1)
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(model, program, tmp_path / "program", quantization=config)
+    assert {shape for shape, _ in precisions} == {(24, 32), (256, 24)}
+    assert {precision for _, precision in precisions} == {"int8"}
+    comparison = verify(model, program, result, atol=1e-4, quantization=config)
+    assert comparison.passed, comparison
