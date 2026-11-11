@@ -324,6 +324,12 @@
   1.4% to 0.8% for plain 3x3 convolutions, 4.5% to 1.2% with grouped ones,
   3.5% to 1.1% with depthwise ones, 4.0% to 0.6% for a 1D network and 10.7%
   to 4.0% for an autoencoder with transposed convolutions.
+- With `quantization`, a weight the model copies before using it, as in
+  `F.linear(x, weight.t().contiguous())`, `weight.T.clone()` or
+  `x @ weight.T.contiguous().T`, is now quantized over the inputs of the
+  copy and stored in int8 or int4 as requested, instead of in float16 with
+  a warning, and GPTQ calibrates it. The model's own copy is made from the
+  quantized weight, so PyTorch and Scratch compute with the same values.
 - A quantized export could fail with `grouped weight sharding must preserve
   complete four-row groups` when compressed storage keeps a weight that runs
   four output rows at a time in float16 or float32, whose lists hold fewer

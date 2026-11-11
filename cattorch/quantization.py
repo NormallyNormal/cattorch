@@ -8,6 +8,7 @@ from typing import Iterable, Literal, cast
 
 import numpy as np
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.storage import _quantize_arrays
@@ -200,6 +201,7 @@ class _GPTQCaptureMode(TorchDispatchMode):
         registry: OperatorRegistry,
         *,
         collect_hessian: bool = True,
+        bases: dict[int, torch.Tensor] | None = None,
     ):
         super().__init__()
         self.parameters = parameters
@@ -207,9 +209,86 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # Symmetric quantization only needs to know how each matrix is used.
         self.collect_hessian = collect_hessian
         self.stats: dict[tuple, _ActivationStats] = {}
+        self.bases = dict(bases or {})
+        # A copy's storage -> (a weak reference to it, the copy's layout in
+        # it, the parameter view it copied), for weights a model copies
+        # before using them. Views made in inference mode don't keep the
+        # copy itself alive, only its storage. An operation that writes to a
+        # copy forgets it.
+        self.copies: dict[int, tuple[StorageWeakRef, tuple, torch.Tensor]] = {}
 
     def _parameter_name(self, weight: torch.Tensor) -> str | None:
         return self.parameters.get(weight.untyped_storage().data_ptr())
+
+    def _track_copy(self, source: torch.Tensor, copy: torch.Tensor) -> None:
+        """Remember ``copy`` as the parameter values ``source`` holds."""
+        pointer = copy.untyped_storage().data_ptr()
+        if (
+            copy.shape != source.shape or copy.dtype != source.dtype
+            or not copy.is_floating_point()
+            or pointer == source.untyped_storage().data_ptr()
+            or pointer in self.parameters
+        ):
+            return
+        view = self._parameter_view(source)
+        if view is None:
+            return
+        self.copies = {
+            key: entry for key, entry in self.copies.items() if not entry[0].expired()
+        }
+        self.copies[pointer] = (
+            StorageWeakRef(copy.untyped_storage()), _storage_key(copy), view,
+        )
+
+    def _parameter_view(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """``tensor`` as a view of a parameter, through any copies of one.
+
+        A model can copy a weight into another layout before using it, as in
+        ``F.linear(x, weight.t().contiguous())``. Quantizing the parameter
+        through the view the copy was made from groups it as it is used, and
+        the copy the model makes from it then holds the quantized values.
+        """
+        pointer = tensor.untyped_storage().data_ptr()
+        if pointer in self.parameters:
+            return tensor
+        entry = self.copies.get(pointer)
+        if entry is None:
+            return None
+        storage, layout, view = entry
+        if storage.expired():
+            return None
+        if _storage_key(tensor) == layout:
+            return view
+        _, copy_offset, copy_shape, copy_stride = layout
+        # A view of the copy reads the parameter positions the copy holds at
+        # the places it reads.
+        base = self.bases.get(view.untyped_storage().data_ptr())
+        if base is None:
+            return None
+        values = base.untyped_storage().nbytes() // base.element_size()
+        positions = torch.arange(values).as_strided(
+            view.shape, view.stride(), view.storage_offset(),
+        )
+        held = torch.full(
+            (tensor.untyped_storage().nbytes() // tensor.element_size(),), -1,
+            dtype=torch.long,
+        )
+        held.as_strided(copy_shape, copy_stride, copy_offset).copy_(positions)
+        read = held.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
+        if read.numel() == 0 or bool((read < 0).any()):
+            return None
+        origin = int(read[(0,) * read.ndim])
+        strides = []
+        for dimension, size in enumerate(read.shape):
+            step = [0] * read.ndim
+            step[dimension] = min(1, size - 1)
+            strides.append(int(read[tuple(step)]) - origin if size > 1 else 1)
+        last = origin + sum((size - 1) * stride for size, stride in zip(read.shape, strides))
+        if min(strides, default=1) < 0 or last >= values or not torch.equal(
+            torch.arange(values).as_strided(read.shape, strides, origin), read,
+        ):
+            return None
+        return base.as_strided(read.shape, strides, origin)
 
     def _record(self, value: torch.Tensor, weight: torch.Tensor, orientation: str) -> None:
         if not value.is_floating_point() or not weight.is_floating_point():
@@ -283,15 +362,32 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # selected-expert activations without recursively observing themselves.
         with torch._C._DisableTorchDispatch():
             observations = self.registry.observe(target, func, args, kwargs, result)
-        for observation in observations:
-            value, weight, orientation = observation
+            if self.copies and func._schema.is_mutable:
+                for argument in (*args, *kwargs.values()):
+                    if isinstance(argument, torch.Tensor):
+                        self.copies.pop(argument.untyped_storage().data_ptr(), None)
             if (
-                isinstance(value, torch.Tensor)
-                and isinstance(weight, torch.Tensor)
-                and self._parameter_name(weight) is not None
+                target in _COPY_TARGETS and args
+                and isinstance(args[0], torch.Tensor) and isinstance(result, torch.Tensor)
             ):
-                self._record(value, weight, orientation)
+                self._track_copy(args[0], result)
+            views = [
+                (value, self._parameter_view(weight), orientation)
+                for value, weight, orientation in observations
+                if isinstance(value, torch.Tensor) and isinstance(weight, torch.Tensor)
+            ]
+        for value, view, orientation in views:
+            if view is not None:
+                self._record(value, view, orientation)
         return result
+
+
+# Operations whose result is a copy of their first argument's values, when it
+# has the same shape and dtype.
+_COPY_TARGETS = frozenset({
+    "aten.clone.default", "aten.contiguous.default", "aten._to_copy.default",
+    "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.to.other",
+})
 
 
 def _normalize_batch(batch) -> tuple[torch.Tensor, ...]:
@@ -497,6 +593,7 @@ def quantize_model(
     capture = _GPTQCaptureMode(
         parameters_by_storage, registry,
         collect_hessian=config.method == "gptq",
+        bases={pointer: parameter for pointer, (_, parameter) in base_parameters.items()},
     )
     batches = 0
     if config.method == "gptq":

@@ -77,10 +77,13 @@ depthwise and transposed convolutions. Other matrices, such as embeddings,
 are grouped along their last dimension and use symmetric quantization; with
 GPTQ, `result.warnings` names each of them.
 
+A weight the model copies before using it, such as
+`F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is quantized
+and calibrated as the copy is used, and the copy is stored in integers.
 Storage keeps a quantized matrix in integers only in the layout it was
-quantized in. A weight the model copies into another layout itself, such as
-`F.linear(x, weight.t().contiguous())`, is stored in float16 instead, and
-`result.warnings` says so.
+quantized in, so a weight rearranged by arithmetic, such as
+`F.linear(x, weight.t() * 1)`, or only part of which is used through a
+transposed view, is stored in float16 instead, and `result.warnings` says so.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set

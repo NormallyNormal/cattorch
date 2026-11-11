@@ -753,11 +753,11 @@ def test_gptq_calibrates_recurrent_and_fused_attention_weights(module, names):
 
 @torch.no_grad()
 def test_quantized_weights_kept_in_float16_are_reported(tmp_path):
-    # A weight transposed into a fresh copy is quantized over the parameter's
-    # own rows; the copy storage reads is grouped the other way, so storage
+    # A weight transposed by arithmetic is quantized over the parameter's own
+    # rows; the result storage reads is grouped the other way, so storage
     # keeps it in float16. That must not pass silently.
     torch.manual_seed(13)
-    copied = _Functional(lambda s, x: F.linear(x, s.w.t().contiguous()), w=(32, 24)).eval()
+    copied = _Functional(lambda s, x: F.linear(x, s.w.t() * 1), w=(32, 24)).eval()
     plain = _Functional(lambda s, x: F.linear(x, s.w), w=(24, 32)).eval()
     config = QuantizationConfig(bits=8, min_quantized_values=1)
     warned = transpile(copied, torch.randn(2, 32), tmp_path / "copied", quantization=config)
@@ -852,6 +852,46 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
     assert kernels <= {shape for shape, _ in precisions}
     assert {precision for shape, precision in precisions if shape in kernels} == {"int4"}
     assert not [warning for warning in result.warnings if "GPTQ fallback" in warning]
+
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    torch.testing.assert_close(
+        torch.tensor([float(value) for value in emulator.lists["output"]]),
+        expected_model(example).flatten(),
+        atol=1e-4, rtol=1e-5,
+    )
+
+
+@torch.no_grad()
+def test_weights_copied_into_another_layout_are_stored_as_integers(tmp_path, monkeypatch):
+    # A model can copy a weight into the layout it uses, or use a view of
+    # such a copy. The parameter is quantized as the copy is used, so the
+    # copy the model makes from it is on storage's grid, and GPTQ calibrates
+    # it.
+    torch.manual_seed(16)
+    model = _Functional(
+        lambda s, x: torch.relu(F.linear(x, s.w.t().contiguous())) @ s.v.T.contiguous().T,
+        w=(32, 24), v=(24, 16),
+    ).eval()
+    example = torch.randn(4, 32)
+    calibration = [torch.randn(4, 32) for _ in range(8)]
+    config = QuantizationConfig(
+        bits=4, method="gptq", group_size=8, min_quantized_values=1, min_calibration_rows=16,
+    )
+    expected_model = copy.deepcopy(model)
+    report = quantize_model(expected_model, config, calibration)
+    assert [(item.name, item.method, item.fallback_reason) for item in report.tensors] == [
+        ("w", "gptq", None), ("v", "gptq", None),
+    ]
+
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(
+        model, example, tmp_path / "copies", quantization=config,
+        calibration_inputs=calibration,
+    )
+    assert sorted(set(precisions)) == [((16, 24), "int4"), ((24, 32), "int4")]
+    assert not [warning for warning in result.warnings if "quantized weight" in warning]
 
     emulator = ScratchEmulator(_load(result.path))
     emulator.lists["input"] = example.flatten().tolist()
