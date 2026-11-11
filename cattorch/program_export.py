@@ -71,7 +71,17 @@ class _ProgramCalibrationModule(nn.Module):
             self.replay.reset()
         invocation = self.calls[self.position]
         self.position += 1
-        return self.replay.run(invocation)
+        # A method may assign its module's buffers, as a marked entry point
+        # installs each state as one. Calibration only observes: the calls
+        # run under inference mode, and a buffer they replaced would stay an
+        # inference tensor that later in-place updates can't touch.
+        buffers = [(module, dict(module._buffers)) for module in self.model.modules()]
+        try:
+            return self.replay.run(invocation)
+        finally:
+            for module, saved in buffers:
+                module._buffers.clear()
+                module._buffers.update(saved)
 
 
 def _merge_sprite_targets(left: dict, right: dict) -> dict:

@@ -825,6 +825,12 @@
   `prims.var`'s `correction`. The OpInfo conformance run also tries later
   samples whose non-tensor arguments differ from the first four, which all
   used `p=1` for `cdist`.
+- A marked program whose entry point assigns a buffer (`self.h = ...`)
+  failed with "Inplace update to inference tensor outside InferenceMode" when
+  exported with `quantization=` and a variable-length entry point, or
+  verified with `quantization=`. Calibration runs the entry points under
+  inference mode, and the buffers they assigned stayed inference tensors;
+  each calibration call now leaves the model's buffers as it found them.
 
 ## Deprecations
 

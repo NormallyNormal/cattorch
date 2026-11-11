@@ -73,6 +73,32 @@ def test_entrypoints_with_state_export_and_verify(tmp_path):
     assert model.add(torch.ones(2)).tolist() == [2.0, 2.0]
 
 
+class Decaying(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.project = nn.Linear(4, 6)
+        self.register_buffer("memory", torch.zeros(6))
+
+    @entrypoint(example=lambda: (torch.ones(2, 4),), dynamic={"rows": (1, 3)})
+    def step(self, rows):
+        self.memory = 0.5 * self.memory + self.project(rows).sum(0)
+        return self.memory.clone()
+
+
+def test_a_quantized_entry_point_that_assigns_its_buffer(tmp_path):
+    # Quantization calibrates under inference mode; the buffers the entry
+    # point assigns there must not stay inference tensors, which the length
+    # check and verify then update in place.
+    from cattorch import QuantizationConfig
+
+    quantization = QuantizationConfig(bits=8, min_quantized_values=1)
+    torch.manual_seed(0)
+    model = Decaying().eval()
+    result = transpile(model, None, tmp_path / "decaying", quantization=quantization)
+    calls = (ProgramCall("step", (torch.randn(3, 4),)), ProgramCall("step", (torch.randn(1, 4),)))
+    assert verify(model, None, result, calls=calls, quantization=quantization).passed
+
+
 def test_marked_program_builds_the_explicit_form():
     exported, program = marked_program(Accumulator().eval())
     assert {entry.name for entry in program.entrypoints} == {"add", "recall", "remember"}
