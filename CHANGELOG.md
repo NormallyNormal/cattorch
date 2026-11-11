@@ -912,6 +912,11 @@
   an error about mixing tokens outside causal attention that never mentioned
   `RecurrentGenerationProgram`; the error now says the layer is recurrent
   and points to it.
+- A `GenerationProgram` model with a branch on the prompt's length that the
+  two traced lengths don't tell apart is rejected at the export-time check;
+  that error now says something depends on the prompt's length, names the
+  usual causes (a Python branch on `tokens.shape[1]`, positions scaled by
+  the length) and what to do.
 
 ## Deprecations
 

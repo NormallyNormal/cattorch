@@ -1697,8 +1697,11 @@ def check_step_equivalence(
             ):
                 raise UnsupportedModelError(
                     f"the model's output for token {count} changes when more tokens "
-                    "follow it, so it can't be generated one token at a time; for "
-                    "example, its positions are scaled by the prompt length"
+                    "follow it, so it can't be generated one token at a time: "
+                    "something in it depends on the prompt's length, such as a "
+                    "Python branch on tokens.shape[1] or positions scaled by the "
+                    "length (dynamic NTK RoPE). Compute each token from itself and "
+                    "earlier tokens only"
                 )
 
 

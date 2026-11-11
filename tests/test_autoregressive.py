@@ -506,6 +506,24 @@ def test_broken_table_trips_the_equivalence_check():
     assert "max error" in str(raised.value)
 
 
+def test_a_branch_on_the_prompt_length_is_explained():
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(10, 8)
+            self.head = nn.Linear(8, 10)
+
+        def forward(self, tokens):
+            x = self.embed(tokens)
+            x = x + F.scaled_dot_product_attention(x, x, x, is_causal=True)
+            if tokens.shape[1] > 4:
+                x = x * 2
+            return self.head(x)
+
+    with pytest.raises(UnsupportedModelError, match=r"depends on the prompt's length.*shape\[1\]"):
+        build_generation_step(Branch().eval(), 8)
+
+
 def test_positions_scaled_by_the_prompt_length_are_rejected():
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(0)
