@@ -341,6 +341,28 @@ def test_rows_times_a_batched_weight_keep_their_items(tmp_path, shape, output):
     assert not result.warnings
 
 
+@pytest.mark.parametrize("after", [
+    lambda y, bias, scale: torch.relu(y + bias) * scale,
+    lambda y, bias, scale: (bias - y).softmax(0),
+    lambda y, bias, scale: y.sum(-1) + y.amax(0, keepdim=True).sum(),
+])
+def test_operations_after_rows_times_a_batched_weight(tmp_path, after):
+    # The items are the middle dimension of [3, n, 5], not one contiguous
+    # block each, so these run as runtime kernels rather than once per item.
+    class Heads(_BatchedWeight):
+        def __init__(self):
+            super().__init__((3, 4, 5))
+            self.bias = nn.Parameter(torch.randn(3, 1, 5))
+            self.scale = nn.Parameter(torch.randn(3, 1, 1))
+
+        def forward(self, x):
+            return after(x @ self.weight, self.bias, self.scale)
+
+    torch.manual_seed(0)
+    result = _check(tmp_path, Heads(), torch.randn(2, 4), {0: (1, 6)}, (1, 2, 6))
+    assert not result.warnings
+
+
 def test_a_variable_batch_against_a_batched_weight_runs_once_per_item(tmp_path):
     # The batched kernel can't follow the length of [n, 1, 3, 4].
     torch.manual_seed(0)

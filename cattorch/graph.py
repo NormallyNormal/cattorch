@@ -1034,6 +1034,11 @@ def _mix_runtime_axis(
     """
     dtype = node.meta["val"].dtype
     reshape = torch.ops.aten.reshape.default
+    # Fixed items before the runtime axis, as in the [3, n, 5] of
+    # [n, 4] @ [3, 4, 5]: each item isn't one contiguous block, so the
+    # operation can't run once per item, and runtime kernels that read the
+    # layout around the axis from the list's length take it instead.
+    inside = math.prod(input_shape[:axis]) != 1
     reduction = _reduction(node)
     if reduction is not None:
         kind, dims, keepdim = reduction
@@ -1041,6 +1046,25 @@ def _mix_runtime_axis(
         dims = tuple(range(len(input_shape))) if dims is None else tuple(
             sorted({value % rank for value in dims})
         )
+        if axis not in dims and inside and not offset and not (
+            # The mean kernel takes trailing dimensions after the axis.
+            target == "aten.mean.dim" and axis < min(dims)
+        ):
+            # Reduce the fixed dimensions one at a time, keeping them, then
+            # view the result as the operation's.
+            kept = list(input_shape)
+            last = parent
+            for dim in dims:
+                kept[dim] = 1
+                last = _insert(graph, node, runtime.runtime_reduce.default, (last, dim, kind), kept, dtype)
+                mark(last.name, axis, parent.name, 0)
+            if not keepdim:
+                node.target, node.args, node.kwargs = reshape, (last, list(output_shape)), {}
+                mark(node.name, axis - sum(dim < axis for dim in dims), parent.name, 0)
+            else:
+                node.target, node.args, node.kwargs = torch.ops.aten.alias.default, (last,), {}
+                mark(node.name, axis, parent.name, 0)
+            return True
         if axis not in dims:
             return False
         kept = list(input_shape)
@@ -1055,12 +1079,48 @@ def _mix_runtime_axis(
         node.target, node.args, node.kwargs = reshape, (last, list(output_shape)), {}
         return True
     if target in _SOFTMAXES:
-        if int(node.args[1]) % len(input_shape) != axis:
+        dim = int(node.args[1]) % len(input_shape)
+        if dim != axis and not (inside and dim < axis and not offset):
             return False
+        # Along the runtime axis, or along a fixed one before it, whose
+        # positions are a runtime number of items apart.
         node.target = runtime.runtime_softmax.default
-        node.args, node.kwargs = (parent, axis, _SOFTMAXES[target]), {}
+        node.args, node.kwargs = (parent, dim, _SOFTMAXES[target]), {}
         mark(node.name, axis, parent.name, offset)
         return True
+    if (
+        target in _RUNTIME_POINTWISE and inside and not offset
+        and output_shape == input_shape and len(output_shape) > axis
+    ):
+        # A fixed operand that repeats along the runtime axis, such as a
+        # per-head bias [3, 1, 5] after [n, 4] @ [3, 4, 5]: repeat it to the
+        # runtime extent, so the operands line up item for item.
+        fixed = [
+            value for value in node.all_input_nodes
+            if value.name not in dynamic_axes and _broadcasts_along(value, axis, output_shape)
+        ]
+        if not fixed or any(
+            tuple(_get_shape(value)) != output_shape
+            for value in node.all_input_nodes if value.name in dynamic_axes
+        ):
+            return False
+        for value in fixed:
+            shape = (1,) * (len(output_shape) - len(_get_shape(value))) + tuple(_get_shape(value))
+            if shape[axis] != 1:
+                return False
+        expand = torch.ops.aten.expand.default
+        for value in fixed:
+            whole = _insert(
+                graph, node, expand, (value, list(output_shape)), output_shape,
+                value.meta["val"].dtype,
+            )
+            repeated = _insert(
+                graph, node, runtime.runtime_expand.default, (whole, parent, axis),
+                output_shape, value.meta["val"].dtype,
+            )
+            mark(repeated.name, axis, parent.name, 0)
+            node.replace_input_with(value, repeated)
+        return False
     if target in MATMUL_OPS:
         left, right = node.args[0], node.args[1]
         left_shape, right_shape = _get_shape(left), _get_shape(right)
@@ -1617,9 +1677,18 @@ def _propagate_runtime_axes(
             math.prod(_get_shape(value)[:dynamic_axes[value.name]]) != 1
             for value in dynamic_parents
         )):
+            if offset:
+                raise UnsupportedModelError(
+                    f"{target} runs once per item of the runtime extent, which needs "
+                    "the extent to lead its tensor, without fixed items joined to it"
+                )
             raise UnsupportedModelError(
-                f"{target} runs once per item of the runtime extent, which needs "
-                "the extent to lead its tensor, without fixed items joined to it"
+                f"{target} would run once per item of the variable-length dimension, "
+                "but fixed dimensions come before it, so its items aren't contiguous. "
+                "There, a fixed operand can repeat along that dimension (a per-head "
+                "bias after [n, 4] @ [3, 4, 5]), but a variable-length operand can't "
+                "be broadcast, and only reductions and softmax can mix values; "
+                "transpose the variable-length dimension to the front first"
             )
         mark(node.name, axis, parent.name, offset)
         if unit != 1:

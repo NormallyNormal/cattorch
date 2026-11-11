@@ -876,6 +876,29 @@ def _emit_runtime_length(ctx: KernelContext):
     return (clear(out), append(out, extent))
 
 
+def _emit_runtime_expand(ctx: KernelContext):
+    """Repeat a fixed tensor's one item along ``dim`` to a runtime extent."""
+    value, like = ctx.inputs["value"], ctx.inputs["like"]
+    dim = int(ctx.scalars["dim"]) % len(like.shape)
+    outer, extent, inner = _runtime_layout(like, dim)
+    base, position = ctx.temp_var("expand base"), ctx.temp_var("expand position")
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(base, 1),
+        repeat(outer, (
+            repeat(extent, (
+                set_var(position, var(base)),
+                repeat(inner, (
+                    append(out, item(value.list, var(position))),
+                    change_var(position, 1),
+                )),
+            )),
+            change_var(base, inner),
+        )),
+    )
+
+
 def _emit_runtime_reduce(ctx: KernelContext):
     """Reduce along a runtime axis, one output per position around it."""
     value = ctx.inputs["value"]
@@ -1156,6 +1179,9 @@ BUILTIN_KERNELS = (
     ),
     Kernel(
         "cattorch.runtime_reduce.default", _emit_runtime_reduce, name="runtime_reduce",
+    ),
+    Kernel(
+        "cattorch.runtime_expand.default", _emit_runtime_expand, name="runtime_expand",
     ),
     Kernel(
         "cattorch.runtime_softmax.default", _emit_runtime_softmax, name="runtime_softmax",

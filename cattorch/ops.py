@@ -247,6 +247,16 @@ def _runtime_slice(value: torch.Tensor, dim: int, start: int, end: int) -> torch
     return _sliced(value, dim, start, end).clone()
 
 
+@op(
+    name="cattorch::runtime_expand",
+    fake=lambda value, like, dim: torch.empty(like.shape, dtype=value.dtype),
+)
+def _runtime_expand(value: torch.Tensor, like: torch.Tensor, dim: int) -> torch.Tensor:
+    """``value``, of ``like``'s shape but one item along ``dim``, repeated
+    to ``like``'s runtime extent there."""
+    return value.expand(like.shape).clone()
+
+
 # ── Private ops for the automatic generation step module ────────────────────
 # These are not exported: ``cattorch.autoregressive.build_step_module`` inserts
 # them, and the generation lowering gives them dedicated Scratch kernels.

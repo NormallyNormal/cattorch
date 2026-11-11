@@ -865,6 +865,14 @@
   viewed as `[1, 1, 1]`, and the variable-length dimension was taken to be
   the last of those; the shape traced at two indices now tells which one
   grows.
+- After rows times a batched weight with `dynamic=` (`[n, 4] @ [3, 4, 5]`,
+  giving `[3, n, 5]`), a per-head bias `[3, 1, 5]` or scale `[3, 1, 1]`, a
+  softmax over the heads, and sums or maxima over a fixed dimension were
+  rejected, with no fallback to running once per item. Fixed operands are
+  now repeated to the variable length, and reductions and softmax over a
+  fixed dimension run as runtime kernels. Broadcasting a variable-length
+  operand there is still rejected, with an error that says why and suggests
+  transposing the items to the front.
 
 ## Deprecations
 

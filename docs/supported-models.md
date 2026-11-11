@@ -192,7 +192,11 @@ length too:
 - Recurrent layers, whose final state (`h_n`) has a fixed shape.
 - Rows times a batched weight, such as `[n, 4] @ [3, 4, 5]` or
   `[n, 4] @ [2, 3, 4, 5]`, whose result holds the items after the batch
-  dimensions (`[3, n, 5]`). A variable batch against a batched weight, such
+  dimensions (`[3, n, 5]`). What follows can repeat fixed operands along
+  the items, such as a per-head bias `[3, 1, 5]` or scale `[3, 1, 1]`, and
+  reduce or softmax over any dimension, but can't broadcast a variable-length
+  operand, as in `y.amax(-1, keepdim=True) + bias`; transpose the items to
+  the front first for that. A variable batch against a batched weight, such
   as `[n, 1, 3, 4] @ [3, 4, 5]` or a weight on the left, runs once per item.
   Rows inside a batch against a batched weight (`x.transpose(0, 1) @ w` for
   an `[n, 3, 4]` input) are rejected.
