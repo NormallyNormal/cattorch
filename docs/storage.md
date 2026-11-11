@@ -147,9 +147,11 @@ which one causes a drop in accuracy.
 
 ## Preserve processor costumes
 
-Compressed weights are stored in the generated sprite's costume names. Don't
-rename, reorder, remove, or add costumes on that sprite, or the weights will
-load incorrectly. Put any visible costumes on a different sprite.
+Compressed weights are stored in lists as text. To decode them, the sprite
+switches to the costume named after each character and reads the costume
+number, so its costumes are a lookup table for the decoder. Don't rename,
+reorder, remove, or add costumes on that sprite, or the weights will load
+incorrectly. Put any visible costumes on a different sprite.
 
 ## List sharding
 

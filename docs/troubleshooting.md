@@ -89,7 +89,7 @@ lists by ID, so they keep using the original.
 ## Preserve processor costumes
 
 If the model runs but gives wrong output, check whether the generated sprite's
-costumes were changed. They store the compressed weights; see
+costumes were changed. The sprite uses them to decode the compressed weights; see
 [preserve processor costumes](storage.md#preserve-processor-costumes).
 
 ## Generate with a recurrent model

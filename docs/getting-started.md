@@ -178,7 +178,8 @@ so the saved project doesn't store both. Input lists and a program's state are
 kept. The next forward call initializes the
 sprite again.
 
-Don't edit the generated sprite's costumes: they store the compressed weights.
+Don't edit the generated sprite's costumes: the sprite uses them to decode the
+compressed weights.
 See [preserve processor costumes](storage.md#preserve-processor-costumes).
 
 ## Add export options
