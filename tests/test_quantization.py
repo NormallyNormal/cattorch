@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
-from cattorch.quantization import effective_group_size, quantize_model
+from cattorch.quantization import _symmetric_matrix, effective_group_size, quantize_model
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 
@@ -410,3 +410,182 @@ def test_same_shaped_matmul_weights_are_each_sharded_at_their_own_storage_cap(tm
         atol=1e-3,
         rtol=1e-4,
     )
+
+
+class _Conv1D(torch.nn.Module):
+    """Transformers' ``Conv1D``: an ``(in, out)`` weight used through ``addmm``."""
+
+    def __init__(self, width, outputs):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(width, outputs) * 0.2)
+        self.bias = torch.nn.Parameter(torch.randn(outputs) * 0.2)
+
+    def forward(self, value):
+        shape = value.shape[:-1] + (self.weight.shape[-1],)
+        flat = value.reshape(-1, value.shape[-1])
+        return torch.addmm(self.bias, flat, self.weight).view(shape)
+
+
+class _Conv1DPair(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up = _Conv1D(64, 96)
+        self.down = _Conv1D(96, 48)
+
+    def forward(self, value):
+        return self.down(torch.relu(self.up(value)))
+
+
+def _record_matrix_precisions(monkeypatch):
+    import cattorch.sprite as sprite_module
+
+    precisions = []
+    original = sprite_module._static_storage_precision
+
+    def record(tensor, storage, *args):
+        precision = original(tensor, storage, *args)
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            precisions.append((tuple(tensor.shape), precision))
+        return precision
+
+    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    return precisions
+
+
+@pytest.mark.parametrize(
+    ("bits", "method", "fold_limit"),
+    [(8, "symmetric", None), (4, "symmetric", None), (4, "gptq", None), (8, "symmetric", 1000)],
+    ids=["int8", "int4", "int4-gptq", "int8-above-fold-limit"],
+)
+@torch.no_grad()
+def test_addmm_weights_are_stored_as_integers_grouped_over_their_inputs(
+    tmp_path, monkeypatch, bits, method, fold_limit,
+):
+    # ``addmm(bias, x, weight)`` is a linear layer whose weight is stored
+    # transposed. It must be quantized over its input width, the layout it is
+    # stored in, or storage cannot hold it in integers. A weight above the
+    # constant-folding size limit (GPT-2's at full width) is still stored
+    # transposed instead of transposed at run time.
+    if fold_limit is not None:
+        import cattorch.graph as graph_module
+
+        monkeypatch.setitem(
+            graph_module.fold_static_values.__kwdefaults__, "element_limit", fold_limit,
+        )
+    torch.manual_seed(6)
+    model = _Conv1DPair().eval()
+    example = torch.randn(1, 3, 64)
+    calibration = [torch.randn(1, 16, 64) for _ in range(8)] if method == "gptq" else None
+    config = QuantizationConfig(
+        bits=bits, method=method, group_size=32, min_quantized_values=1,
+        min_calibration_rows=64,
+    )
+    expected_model = copy.deepcopy(model)
+    report = quantize_model(
+        expected_model, config, calibration, orientation_inputs=[(example,)],
+    )
+    expected_method = "gptq" if method == "gptq" else "symmetric"
+    weights = {item.name: item for item in report.tensors if item.name.endswith("weight")}
+    assert set(weights) == {"up.weight", "down.weight"}
+    for name, item in weights.items():
+        assert (item.method, item.fallback_reason) == (expected_method, None), name
+        assert item.effective_group_size == 32
+    # Every group runs along an input row of the stored (out, in) matrix.
+    for module in (expected_model.up, expected_model.down):
+        stored = module.weight.T
+        assert torch.equal(_symmetric_matrix(stored, config)[0], stored)
+        # Biases are vectors; storage keeps them in float16.
+        module.bias.copy_(module.bias.half().float())
+
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(
+        model, example, tmp_path / f"conv1d-{bits}-{method}",
+        quantization=config, calibration_inputs=calibration,
+    )
+    assert {shape for shape, _ in precisions} == {(96, 64), (48, 96)}
+    assert {precision for _, precision in precisions} == {f"int{bits}"}
+    assert [item.method for item in result.quantization.tensors if item.name.endswith("weight")] == [
+        expected_method, expected_method,
+    ]
+
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    torch.testing.assert_close(
+        torch.tensor([float(value) for value in emulator.lists["output"]]),
+        expected_model(example).flatten(),
+        atol=1e-4, rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("method", ["symmetric", "gptq"])
+@torch.no_grad()
+def test_gpt2_conv1d_weights_are_stored_as_integers_in_generation(
+    tmp_path, monkeypatch, method,
+):
+    transformers = pytest.importorskip("transformers")
+    from cattorch import GenerationProgram
+
+    torch.manual_seed(2)
+    model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
+        vocab_size=96, n_positions=8, n_embd=32, n_layer=1, n_head=2,
+        bos_token_id=0, eos_token_id=0,
+    )).eval()
+    assert model.lm_head.weight is model.transformer.wte.weight
+    config = QuantizationConfig(
+        bits=8, method=method, min_quantized_values=512, min_calibration_rows=32,
+    )
+    calibration = (
+        [torch.randint(0, 96, (1, 8)) for _ in range(8)] if method == "gptq" else None
+    )
+    expected_model = copy.deepcopy(model)
+    quantize_model(
+        expected_model, config, calibration,
+        orientation_inputs=[(torch.zeros(1, 8, dtype=torch.long),)],
+    )
+
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(
+        model, GenerationProgram(max_context=8), tmp_path / f"gpt2-{method}",
+        quantization=config, calibration_sequences=calibration,
+    )
+    # c_attn, c_proj, c_fc and the MLP's c_proj, the tied table and positions.
+    assert {precision for _, precision in precisions} == {"int8"}, precisions
+    by_name = {item.name: item for item in result.quantization.tensors}
+    for name in ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"):
+        item = by_name[f"transformer.h.0.{name}.weight"]
+        assert item.method == ("gptq" if method == "gptq" else "symmetric"), item
+        assert item.fallback_reason is None, item
+
+    tokens = [3, 1, 95]
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.run_procedure("cattorch init")
+    emulator.lists["cattorch tokens"] = tokens
+    emulator.run_procedure("cattorch prefill")
+    assert emulator.variables["cattorch status"] == "ok"
+    logits = torch.tensor([float(value) for value in emulator.lists["cattorch logits"]])
+    expected = expected_model(torch.tensor([tokens])).logits[0, -1]
+    # Biases and layer norms are stored in float16.
+    torch.testing.assert_close(logits, expected, atol=2e-3, rtol=0)
+
+
+@torch.no_grad()
+def test_addmm_weights_are_stored_as_integers_in_export_programs(tmp_path, monkeypatch):
+    from cattorch import EntryPoint, ExportProgram, Input, Output, verify
+
+    torch.manual_seed(7)
+    model = _Conv1DPair().eval()
+    program = ExportProgram(entrypoints=(
+        EntryPoint(
+            "run", method="forward",
+            arguments=(Input("value", torch.randn(1, 2, 64)),),
+            returns=(Output("result"),),
+        ),
+    ))
+    config = QuantizationConfig(bits=8, min_quantized_values=1)
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(model, program, tmp_path / "conv1d-program", quantization=config)
+    assert {shape for shape, _ in precisions} == {(96, 64), (48, 96)}
+    assert {precision for _, precision in precisions} == {"int8"}
+    comparison = verify(model, program, result, atol=2e-3, quantization=config)
+    assert comparison.passed, comparison

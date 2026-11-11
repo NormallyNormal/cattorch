@@ -270,13 +270,24 @@
 
 ## Fixes
 
+- With `quantization`, the weight of `torch.addmm(bias, x, weight)`, which
+  GPT-2's `Conv1D` layers use, was quantized along its outputs instead of
+  its inputs, so storage couldn't hold it in integers and kept it in float16,
+  and GPTQ skipped it. It is now quantized and calibrated like any linear
+  weight and stored in int8 or int4 as requested. Such a weight larger than
+  1,048,576 values, as in GPT-2 at full width, was also transposed in Scratch
+  at run time; it is now stored transposed. In a random-weight 2-layer GPT-2
+  `GenerationProgram` with a 1,000-token vocabulary, `sprite.json` at width
+  256 shrinks from 4.9 MB to 3.0 MB in int8 and from 4.8 MB to 1.8 MB in
+  int4, and at width 768 from 24.8 MB to 20.7 MB in int8 and from 15.3 MB to
+  10.3 MB in int4, with about a third of the blocks. Quantized GPT-2 exports
+  compute slightly different outputs than before.
 - A quantized export could fail with `grouped weight sharding must preserve
   complete four-row groups` when compressed storage keeps a weight that runs
   four output rows at a time in float16 or float32, whose lists hold fewer
-  values than Scratch's limit, such as a GPT-2-shaped `GenerationProgram`
-  in int8 or a model with a quantized and an unquantized matrix product
-  weight of the same shape. Such weights are now cut into lists at the
-  size storage gives each one.
+  values than Scratch's limit, such as a model with a quantized and an
+  unquantized matrix product weight of the same shape. Such weights are now
+  cut into lists at the size storage gives each one.
 - An export failed with `RecursionError` when it read a stored tensor split
   into several hundred lists into a list larger than Scratch's limit,
   for example an embedding of 31 million values in float32 storage looked up

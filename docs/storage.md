@@ -60,6 +60,12 @@ matrix input width that doesn't exceed it, such as 56 for a width of 112.
 Smaller groups usually reduce error but store more scales. Scales are float16 by
 default.
 
+cattorch runs the model once to find each matrix's input width. A weight read
+by `nn.Linear` or `F.linear`, on the right of a matrix product (`x @ weight`,
+`torch.mm`), or by `torch.addmm` (as in GPT-2's `Conv1D` layers) is grouped
+over its inputs, and GPTQ calibrates it. Other matrices, such as embeddings,
+are grouped along their last dimension and use symmetric quantization.
+
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set
 `min_quantized_values=1` to quantize every eligible matrix. Biases,

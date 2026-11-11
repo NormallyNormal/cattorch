@@ -202,8 +202,12 @@ class OperatorRegistry:
         self, target: str, func: object, args: tuple, kwargs: dict, result: object,
     ):
         rule = self.operation(target)
-        return () if rule is None or rule.observer is None else tuple(
-            rule.observer(func, args, kwargs, result)
+        observer = (
+            _DECOMPOSED_OBSERVERS.get(target)
+            if rule is None else rule.observer
+        )
+        return () if observer is None else tuple(
+            observer(func, args, kwargs, result)
         )
 
     def register_module_adapter(
@@ -457,6 +461,20 @@ def _observe_rhs_matmul(_func, args, _kwargs, _result):
     if len(args) < 2:
         return ()
     return ((args[0], args[1], "rhs_matmul"),)
+
+
+def _observe_addmm(_func, args, _kwargs, _result):
+    """``bias + left @ right``, as in GPT-2's ``Conv1D``: ``right`` is the weight."""
+    if len(args) < 3:
+        return ()
+    return ((args[1], args[2], "rhs_matmul"),)
+
+
+# Operations the frontend rewrites before lowering, so they have no rule of
+# their own, but which eager calibration still sees under their own name.
+_DECOMPOSED_OBSERVERS: dict[str, Observer] = {
+    "aten.addmm.default": _observe_addmm,
+}
 
 
 def _observe_stacked_swiglu(_func, args, _kwargs, _result):
