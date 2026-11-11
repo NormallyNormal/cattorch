@@ -131,6 +131,24 @@ def test_id_remap_preserves_literal_strings_and_list_payloads():
     assert remapped["lists"]["ctL"] == ["characters", ["a", "b", "v", "l"]]
 
 
+def test_remap_can_share_the_blocks_it_leaves_unchanged():
+    blocks = {
+        "a": {"opcode": "data_addtolist", "next": "b", "parent": None,
+              "inputs": {"ITEM": [1, [10, "x"]]}, "fields": {"LIST": ["items", "old"]}},
+        "b": {"opcode": "data_addtolist", "next": None, "parent": "a",
+              "inputs": {"ITEM": [1, [10, "y"]]}, "fields": {"LIST": ["items", "kept"]}},
+    }
+    snapshot = json.loads(json.dumps(blocks))
+    copied = remap_ids(blocks, {"old": "kept"})
+    shared = remap_ids(blocks, {"old": "kept"}, share_unchanged=True)
+    assert shared == copied
+    assert list(shared) == list(copied)
+    assert blocks == snapshot
+    assert shared["b"] is blocks["b"]
+    assert shared["a"] is not blocks["a"]
+    assert copied["b"] is not blocks["b"]
+
+
 def test_codegen_config_validates_new_compaction_controls():
     with pytest.raises(TypeError, match="compact_internal_names"):
         CodegenConfig(compact_internal_names=1)

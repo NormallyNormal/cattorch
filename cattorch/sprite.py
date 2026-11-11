@@ -77,7 +77,7 @@ def _merge_duplicate_lists(sprite):
     if not remap:
         return
 
-    sprite["blocks"] = remap_ids(sprite["blocks"], remap)
+    sprite["blocks"] = remap_ids(sprite["blocks"], remap, share_unchanged=True)
 
     base_counts: dict[str, int] = {}
     for entry in lists.values():
@@ -151,7 +151,7 @@ def _deduplicate_static_tensors(
             id_remap[duplicate_id] = winner_id
             lists.pop(duplicate_id, None)
     if id_remap:
-        sprite["blocks"] = remap_ids(sprite["blocks"], id_remap)
+        sprite["blocks"] = remap_ids(sprite["blocks"], id_remap, share_unchanged=True)
 
         # Scratch fields redundantly store a display name next to the ID.
         stack = [sprite["blocks"]]
@@ -212,7 +212,7 @@ def _apply_tied_static_aliases(
 
     if not remap:
         return copies
-    sprite["blocks"] = remap_ids(sprite["blocks"], remap)
+    sprite["blocks"] = remap_ids(sprite["blocks"], remap, share_unchanged=True)
     stack = [sprite["blocks"]]
     while stack:
         value = stack.pop()
@@ -256,7 +256,7 @@ def _merge_slots_by_name(
     if added is not None and remap.keys() <= added[0]:
         blocks.update(remap_ids({identifier: blocks[identifier] for identifier in added[1]}, remap))
     else:
-        sprite["blocks"] = remap_ids(blocks, remap)
+        sprite["blocks"] = remap_ids(blocks, remap, share_unchanged=True)
 
 
 def _merge_lists_by_name(
@@ -951,7 +951,7 @@ def _add_warp_procedure(
         else:
             broadcast_remap[identifier] = winner
     if broadcast_remap:
-        sprite["blocks"] = remap_ids(sprite["blocks"], broadcast_remap)
+        sprite["blocks"] = remap_ids(sprite["blocks"], broadcast_remap, share_unchanged=True)
     # Every ID in data carries this call's fresh suffix, so the sprite's
     # other blocks cannot refer to the slots it added.
     added = (
