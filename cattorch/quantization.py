@@ -229,14 +229,30 @@ def _symmetric_matrix(
 ) -> tuple[torch.Tensor, int]:
     width = matrix.shape[1]
     group = effective_group_size(width, config.group_size)
-    codes, scales = _quantize_arrays(
-        matrix.detach().cpu().double().reshape(-1).numpy(),
-        config.precision,
-        group,
-        config.scale_precision,
-    )
-    reconstructed = torch.from_numpy(codes * np.repeat(scales, group)[:codes.size])
-    return reconstructed.to(device=matrix.device, dtype=matrix.dtype).reshape_as(matrix), group
+    source = matrix.detach().cpu()
+    # Rows hold whole groups, so a few rows at a time quantize exactly as the
+    # whole matrix does, without float64 temporaries the size of a large
+    # embedding. Check finiteness first, as one pass over everything would.
+    if not bool(torch.isfinite(source).all()):
+        raise ValueError("integer weight quantization requires finite values")
+    reconstructed = torch.empty(source.shape, dtype=matrix.dtype)
+    row_values = max(1, source[:1].numel())
+    step = max(1, _SYMMETRIC_CHUNK_VALUES // row_values)
+    for start in range(0, source.shape[0], step):
+        rows = source[start:start + step]
+        codes, scales = _quantize_arrays(
+            rows.double().reshape(-1).numpy(),
+            config.precision,
+            group,
+            config.scale_precision,
+        )
+        values = torch.from_numpy(codes * np.repeat(scales, group)[:codes.size])
+        reconstructed[start:start + step] = values.to(matrix.dtype).reshape(rows.shape)
+    return reconstructed.to(device=matrix.device), group
+
+
+# Values quantized per step by _symmetric_matrix.
+_SYMMETRIC_CHUNK_VALUES = 1 << 21
 
 
 def _gptq_matrix(
