@@ -25,7 +25,7 @@ from test_optimization import CachedLM  # noqa: E402
 from test_recurrent_generation import make, reference_rows  # noqa: E402
 
 TOLERANCE = 1e-4
-OVERTAKEN = "another reset, prefill or decode ran during this one; reset or prefill first"
+OVERTAKEN = "another reset, prefill, decode or init ran during this one; reset or prefill first"
 SETUP = [1, 2, 3, 4]
 
 

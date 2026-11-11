@@ -487,3 +487,63 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
 
     expected = torch.cat([model(row(step)[None]).detach().flatten() for step in (53, 41)])
     torch.testing.assert_close(values(stage, "outputs"), expected, atol=1e-4, rtol=0)
+
+
+def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
+    # In a freshly loaded project the first decode decodes the weights, and
+    # Scratch pauses it once it has run for 500 ms. An init run by another
+    # script meanwhile shares the decoder's variables: the decode must then
+    # not report ok, and the weights must be right for the next blocks.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
+        set_var, var,
+    )
+    from test_autoregressive import NanoGPT
+    from test_generation_automatic import logits_of
+    from test_generation_overlap import OVERTAKEN
+
+    torch.manual_seed(4)
+    model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
+    result = transpile(model, GenerationProgram(max_context=32), tmp_path / "lm")
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    first, second, logits = (
+        builder.global_list(name) for name in ("first results", "second results", "logits")
+    )
+    done = builder.global_variable("first done", 0)
+    flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    status, busy, initialized = "cattorch status", "_cattorch busy", "cattorch initialized"
+    tokens = "cattorch tokens"
+
+    def run(procedure, values, results):
+        return (
+            clear(tokens), *(append(tokens, value) for value in values),
+            call(procedure), append(results, var(status)),
+        )
+
+    builder.script(sprite, flag, (
+        *run("cattorch decode", [4], first),
+        set_var(done, 1),
+    ), lists=(tokens, first), variables=(status, done))
+    builder.script(sprite, flag, (
+        repeat_until(gt(add(var(busy), var(done)), 0), (change_var("waits", 1),)),
+        # 0 and 0 if the decode was still running, decoding the weights.
+        append(second, var(done)), append(second, var(initialized)),
+        call("cattorch init"),
+        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
+        *run("cattorch prefill", [5, 3], second),
+        *run("cattorch decode", [7], second),
+        for_each("index", length("cattorch logits"), (
+            append(logits, item("cattorch logits", var("index"))),
+        )),
+    ), lists=(tokens, second, logits, "cattorch logits"),
+        variables=(status, busy, done, initialized, "waits", "index"), y=400)
+    path = tmp_path / "overlap.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["first results"] == [OVERTAKEN]
+    assert stage["second results"] == [0, 0, "ok", "ok"]
+    torch.testing.assert_close(
+        values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
+    )

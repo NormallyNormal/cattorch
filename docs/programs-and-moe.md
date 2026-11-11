@@ -100,16 +100,19 @@ Scratch's stop sign, or a `stop all` block, can stop a block part way.
 | An entry point called after a call or reset was stopped while changing the states, or while one changes them in another script | Outputs and states unchanged | `an earlier call or reset was stopped while changing the states, or is still changing them; reset first` |
 | A call or reset that another block started during, from another script | Commits nothing; if it was changing the states, calls are refused as above until reset | `another call ran during this one` |
 
-Apart from two cases, a call that reports `ok` ran alone. First, as for
+Apart from three cases, a call that reports `ok` ran alone. First, as for
 [generation](generation.md#overlapping-calls): if the call that was taken over
 resumes while the newer block is itself paused, and is still unfinished when
 the newer block ends, or is stopped after it resumed, the newer block can
 report `ok` with results from lists the old call changed. Second, an entry
 point that updates no state can be paused while it copies its outputs; if the
 same entry point is called meanwhile, the old call then finishes copying its
-outputs over the new call's, after the new call reported `ok`. Call the
-blocks from one script at a time; to reset from another script, stop the
-calling script first.
+outputs over the new call's, after the new call reported `ok`. Third, if a
+`cattorch init` that was taken over while it decoded the weights resumes
+after the newer block ended, a call that starts and ends while that init is
+still decoding can report `ok` with weights it half overwrote; the next call
+after the init decodes them again. Call the blocks from one script at a
+time; to reset from another script, stop the calling script first.
 
 Because an append state's first dimension changes at runtime, it is the one
 exception to fixed shapes. This variable-length dimension is called a runtime

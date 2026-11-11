@@ -60,6 +60,7 @@ from cattorch.sprite import (
     _deduplicate_static_tensors,
     _find_procedure_definition,
     _gate_chain,
+    _guard_generation_init,
     _guard_plain_calls,
     _logical_list_sizes,
     _merge_duplicate_lists,
@@ -2972,7 +2973,9 @@ def _transpile(
     # come before finalization, so it sees the sprite whole.
     if _edit_sprite is not None:
         sprite = _edit_sprite(sprite)
-    if generation is None and not _defer_interface_sharding:
+    if generation is not None:
+        sprite = _guard_generation_init(sprite)
+    elif not _defer_interface_sharding:
         sprite = _guard_plain_calls(sprite, [
             shard
             for name in dict.fromkeys(output_names)

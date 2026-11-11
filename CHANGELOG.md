@@ -335,14 +335,14 @@
   Scratch had paused a decode or prefill (it pauses a block after 500 ms)
   let the paused block resume and write into the new caches or states, and
   it and later decodes reported `ok` with wrong logits. Such a block now
-  reports `another reset, prefill or decode ran during this one; reset or
-  prefill first`, and decode fails until the next reset or prefill. A decode
-  refused because another block is running stops that block too; its status
-  now reads `an earlier reset, prefill or decode was stopped or is still
-  running; reset or prefill first`. A block taken over while it decoded the
-  weights, in a freshly loaded project, could leave them wrong for every
-  later block, reset and prefill included; it now leaves them for the next
-  block to decode again. One overlap is still not caught. See
+  reports `another reset, prefill, decode or init ran during this one; reset
+  or prefill first`, and decode fails until the next reset or prefill. A
+  decode refused because another block is running stops that block too; its
+  status now reads `an earlier reset, prefill or decode was stopped or is
+  still running; reset or prefill first`. A block taken over while it
+  decoded the weights, in a freshly loaded project, could leave them wrong
+  for every later block, reset and prefill included; it now leaves them for
+  the next block to decode again. One overlap is still not caught. See
   [overlapping calls](docs/generation.md#overlapping-calls).
 - Sprites from `transpile(model, example)`, with fixed or variable-length
   inputs, had no such protection either. A `cattorch forward` that Scratch
@@ -361,6 +361,26 @@
   procedure it wraps, without the length checks; it runs `cattorch forward`.
   Two overlaps are still not caught. See
   [overlapping calls](docs/getting-started.md#overlapping-calls).
+- `cattorch init` in `GenerationProgram` and `RecurrentGenerationProgram`
+  sprites with compressed weights (the default, and quantized ones) had no
+  such protection. An init paused while it decoded the weights let a
+  prefill or decode meanwhile use them half decoded and report `ok` with
+  wrong logits; resumed after a block had decoded them, or run twice at
+  once, or stopped part way, it left them wrong for every later block. In a
+  freshly loaded project, a decode or prefill paused while it decoded the
+  weights, then resumed after an init from another script, reported `ok`
+  with wrong logits and left the weights wrong; in scratch-vm the next
+  prefill and decode were off by up to 1.4. Now init marks the weights
+  undecoded while it decodes them, and a reset, prefill or decode that an
+  init started during fails as one that another of them started during
+  does; that status now reads `another reset, prefill, decode or init ran
+  during this one; reset or prefill first`. A sprite has 12 more blocks;
+  reset, prefill and decode run no more blocks, init 6 more.
+  Uncompressed sprites decode nothing, so they had no such problem, and
+  `ExportProgram` sprites already guarded init. One more overlap, in these
+  sprites, plain exports and programs alike, is still not caught: a block
+  that runs while a taken-over init, resumed, still decodes the weights. See
+  [overlapping calls](docs/generation.md#overlapping-calls).
 - Generation, recurrent generation and `ExportProgram` sprites had loose call
   blocks on the canvas that ran private procedures directly. The one in a
   `GenerationProgram` sprite ran a step without checking its token or marking

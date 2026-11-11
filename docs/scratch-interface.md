@@ -63,6 +63,11 @@ A sprite from a [`GenerationProgram`](generation.md#scratch-interface) has no
 | `cattorch initialized` | variable | `1` once the weights are decoded. |
 | `cattorch init complete`, `cattorch reset complete`, `cattorch prefill complete`, `cattorch decode complete` | broadcasts | Sent when each block finishes. |
 
+A reset, prefill or decode that another script's block started during,
+`cattorch init` included, clears the logits, reports so in
+`cattorch status`, and leaves decode failing until the next reset or
+prefill; see [overlapping calls](generation.md#overlapping-calls).
+
 A sprite from a [`RecurrentGenerationProgram`](recurrent-generation.md#scratch-interface)
 has the same names. It has no cache: `cattorch reset` restores the model's
 initial state, `cattorch cache length` counts the tokens read since then, and

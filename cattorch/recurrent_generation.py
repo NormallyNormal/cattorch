@@ -39,7 +39,7 @@ from cattorch.quantization import QuantizationConfig
 from cattorch.results import TranspileResult
 from cattorch.sprite import (
     _TOP_K_IDS, _TOP_K_VALUES, _add_generation_blocks, _add_procedure_completion_broadcast,
-    _add_warp_procedure, _remove_completion_broadcast,
+    _add_warp_procedure, _guard_generation_init, _remove_completion_broadcast,
 )
 from cattorch.storage import StorageConfig
 from cattorch.util.scratch.dsl import Program, call, clear, eq, if_, not_, set_var, var
@@ -256,6 +256,7 @@ def _generation_interface(
         _add_procedure_completion_broadcast(
             sprite, "cattorch init", "cattorch init complete", status="ok",
         )
+        _guard_generation_init(sprite)
         for procedure in ("cattorch reset", "cattorch prefill", "cattorch decode"):
             _add_procedure_completion_broadcast(sprite, procedure, f"{procedure} complete")
 

@@ -207,13 +207,17 @@ states. `cattorch init` doesn't clear the condition. `cattorch cache length`
 keeps whatever value the stopped block left.
 
 Calls from several scripts at once behave as for a K/V cache: see
-[overlapping calls](generation.md#overlapping-calls). A block that another
-block ran during reports the last status below, and decode then fails until
-reset or prefill, which always recover once nothing else is running. The same
-case isn't caught: a block that was
-taken over, resumed while the newer block is paused, and unfinished when it
-ends, or stopped after resuming, can leave the newer block or a later decode
-reporting `ok` with logits from states it changed.
+[overlapping calls](generation.md#overlapping-calls). A reset, prefill or
+decode that another block ran during, `cattorch init` included, reports the
+last status below, and decode then fails until reset or prefill, which always
+recover once nothing else is running. An init that another block started
+during, or one stopped part way, leaves the weights for the next block to
+decode again. The same two cases aren't caught: a block that was taken over,
+resumed while the newer block is paused, and unfinished when it ends, or
+stopped after resuming, can leave the newer block or a later decode reporting
+`ok` with logits from states it changed; and a block that runs while a
+taken-over `cattorch init` still decodes the weights, after the block that
+took it over ended, can report `ok` with weights that init half overwrote.
 
 | Situation | Result | `cattorch status` |
 |---|---|---|
@@ -223,7 +227,7 @@ reporting `ok` with logits from states it changed.
 | Prefill longer than `max_tokens` | States restored; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: states restored, logits empty. Decode: states unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
 | Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | States unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
-| A reset, prefill or decode that another one ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill or decode ran during this one; reset or prefill first` |
+| A reset, prefill or decode that another one, or `cattorch init`, ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill, decode or init ran during this one; reset or prefill first` |
 
 ## Hugging Face models
 

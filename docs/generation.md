@@ -190,7 +190,7 @@ reaches `cattorch max context`.
 | Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
 | Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | Cache unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
-| A reset, prefill or decode that another one ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill or decode ran during this one; reset or prefill first` |
+| A reset, prefill or decode that another one, or `cattorch init`, ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill, decode or init ran during this one; reset or prefill first` |
 
 ## Cache behavior
 
@@ -208,29 +208,38 @@ whatever value the stopped block left.
 
 Scratch pauses a block that has run for half a second where it calls a
 procedure or repeats a loop, and runs other scripts meanwhile, so another
-script can call `cattorch reset`, `cattorch prefill` or `cattorch decode`
-while one is still running:
+script can call `cattorch init`, `cattorch reset`, `cattorch prefill` or
+`cattorch decode` while one is still running:
 
-- `cattorch reset` and `cattorch prefill` take over and run; they can't tell
-  a paused block from a stopped one.
+- `cattorch init`, `cattorch reset` and `cattorch prefill` take over and run;
+  they can't tell a paused block from a stopped one.
 - `cattorch decode` refuses, as after a stop, and the block it found running
   then fails too.
-- A block that another one ran during reports the last status in the table
-  instead of `ok` when it ends, clears the logits, and leaves every decode
-  failing until the next reset or prefill; it still sends its completion
-  broadcast. A reset or prefill running at that moment fails the same way.
-  If it was decoding the weights, in a freshly loaded project, it leaves
-  them for the next block to decode again.
+- A reset, prefill or decode that another block ran during, `cattorch init`
+  included, reports the last status in the table instead of `ok` when it
+  ends, clears the logits, and leaves every decode failing until the next
+  reset or prefill; it still sends its completion broadcast. A reset or
+  prefill running at that moment fails the same way. If it was decoding the
+  weights, in a freshly loaded project, it leaves them for the next block to
+  decode again.
+- `cattorch init` marks the weights undecoded while it decodes them, so a
+  block started meanwhile decodes them itself. An init that another block
+  started during, or one stopped part way, leaves them for the next block to
+  decode again. Init doesn't touch the cache, and still reports `ok`.
 
 `cattorch reset` or `cattorch prefill`, run once nothing else is running,
-always recovers, and apart from one case a block that reports `ok` ran alone.
-That case: if the block that was taken over resumes while the newer
+always recovers, and apart from two cases a block that reports `ok` ran
+alone. First, if the block that was taken over resumes while the newer
 block is itself paused, and is still unfinished when the newer block ends, or
 is stopped after it resumed, the newer block or a later decode can report
-`ok` with logits from caches the old block changed. A Scratch block can't
-stop another script's paused block, and checking at every loop would slow
-every step. Call the generation blocks from one script at a time; to reset
-from another script, stop the generating script first.
+`ok` with logits from caches the old block changed. Second, if a
+`cattorch init` that was taken over while it decoded the weights resumes
+after the newer block ended, a block that starts and ends while that init is
+still decoding can report `ok` with weights it half overwrote; the next block
+after the init decodes them again. A Scratch block can't stop another
+script's paused block, and checking at every loop would slow every step.
+Call the generation blocks from one script at a time; to reset from another
+script, stop the generating script first.
 
 Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
 shrink the sprite, see layer sharing in
