@@ -119,6 +119,19 @@ def test_the_length_check_compares_with_the_stored_weights(tmp_path):
         )
 
 
+@pytest.mark.parametrize("mode", ["sum", "max"])
+def test_an_embedding_bag_with_padding_along_variable_indices(tmp_path, mode):
+    # Traced with one index, the padding mask [1] is viewed as [1, 1, 1];
+    # the trace at two indices tells which of those dimensions grows.
+    torch.manual_seed(0)
+    model = nn.EmbeddingBag(10, 4, mode=mode, padding_idx=0).eval()
+    result = transpile(
+        model, torch.tensor([[1, 2, 3]]), tmp_path / "bag", dynamic={0: {1: (1, 8)}},
+    )
+    for indices in ([[1, 0, 0, 5, 9]], [[0]], [[4, 2, 0, 1, 1, 7, 8, 0]]):
+        assert verify(model, torch.tensor(indices), result).passed
+
+
 def test_a_model_with_two_runtime_dimensions_is_rejected(tmp_path):
     with pytest.raises(UnsupportedModelError, match="two runtime dimensions"):
         transpile(

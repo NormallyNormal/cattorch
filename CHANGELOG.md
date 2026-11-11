@@ -859,6 +859,12 @@
   export, for plain models and entry points alike. Only fast kernels and
   GPTQ, whose effect it can't reproduce, still use the shortest length's
   difference.
+- `nn.EmbeddingBag` with a `padding_idx`, varying along the indices of a
+  `(1, indices)` input, failed with "aten.sum.dim_IntList mixes values across
+  the runtime extent". Traced with one index, the padding mask `[1]` is
+  viewed as `[1, 1, 1]`, and the variable-length dimension was taken to be
+  the last of those; the shape traced at two indices now tells which one
+  grows.
 
 ## Deprecations
 

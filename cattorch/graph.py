@@ -1268,13 +1268,15 @@ _SHAPE_ONLY = _NOOP_OPS | {"aten.to.dtype", "aten.dropout.default"}
 def _follow_runtime_axis(
     node, target, parent, dynamic_parents, axis, unit, offset, input_shape, output_shape, *,
     dynamic_axes, dynamic_units, row_loops, registry, fast, fast_config, runtime,
+    literals=None,
 ) -> tuple[int, int] | None:
     """Where an operation puts its input's runtime axis: ``(axis, unit)``.
 
     ``unit`` is how many items along the axis make one unit of runtime
     length. Operations that treat items independently are added to
     ``row_loops``; ones that can't follow the axis raise. ``None`` means the
-    result has no runtime axis.
+    result has no runtime axis. ``literals`` are the node's arguments that
+    change with the length, from a trace at another length.
     """
     if target == "aten.transpose.int":
         left = int(node.args[1]) % len(input_shape)
@@ -1317,7 +1319,16 @@ def _follow_runtime_axis(
             position for position, extent in enumerate(output_shape)
             if extent == 1 and math.prod(output_shape[position + 1:]) == block
         ]
-        if candidates:
+        # Traced with one item, several size-1 dimensions can hold it, as
+        # [1] viewed as [1, 1, 1] can. The shape argument traced at another
+        # length shows which one grows.
+        grown = [
+            location[2] for location in (literals or {})
+            if len(location) == 3 and location[:2] == ("args", 1)
+        ]
+        if len(grown) == 1 and grown[0] in candidates:
+            axis, unit = grown[0], 1
+        elif candidates:
             axis, unit = candidates[-1], 1
         else:
             axis = next(
@@ -1593,7 +1604,7 @@ def _propagate_runtime_axes(
             node, target, parent, dynamic_parents, axis, unit, offset, input_shape,
             output_shape, dynamic_axes=dynamic_axes, dynamic_units=dynamic_units,
             row_loops=row_loops, registry=registry, fast=fast, fast_config=fast_config,
-            runtime=runtime,
+            runtime=runtime, literals=(length_literals or {}).get(node.name, {}),
         )
         if followed is None:
             continue
