@@ -765,8 +765,17 @@ def test_quantized_weights_kept_in_float16_are_reported(tmp_path):
         "quantized weight 'w' (24, 32) is stored as float16, not int8: it is quantized "
         "in groups along a different axis than storage reads it in"
     ]
+    # The report says what is stored, not the rounding applied first.
+    (item,) = warned.quantization.tensors
+    assert (item.method, item.bits, item.effective_group_size) == ("float16", None, None)
+    assert item.fallback_reason == (
+        "symmetric int8 values are stored as float16: storage reads them in groups "
+        "along a different axis than they were quantized in"
+    )
+    assert warned.quantization.quantized_values == warned.quantization.symmetric_values == 0
     quiet = transpile(plain, torch.randn(2, 32), tmp_path / "plain", quantization=config)
     assert not [warning for warning in quiet.warnings if "quantized weight" in warning]
+    assert [item.method for item in quiet.quantization.tensors] == ["symmetric"]
 
 
 @torch.no_grad()

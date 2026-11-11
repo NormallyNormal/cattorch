@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Literal, cast
 
 import numpy as np
@@ -102,6 +102,43 @@ class QuantizationReport:
     gptq_values: int
     symmetric_values: int
     tensors: tuple[TensorQuantizationReport, ...]
+
+
+def _report_float16_storage(
+    report: QuantizationReport, names: Iterable[str],
+) -> QuantizationReport:
+    """``report`` with the named parameters reported as stored in float16.
+
+    Storage keeps a quantized weight in float16 when it reads it grouped
+    along another axis than quantization grouped it. The report then says
+    what is stored, and why, rather than the rounding applied to it.
+    """
+    names = frozenset(names)
+    if not names:
+        return report
+    tensors = tuple(
+        replace(
+            item,
+            method="float16",
+            bits=None,
+            effective_group_size=None,
+            fallback_reason=(
+                f"{item.method} int{item.bits} values are stored as float16: storage "
+                "reads them in groups along a different axis than they were quantized in"
+            ),
+        )
+        if item.method != "float16" and item.name.split("[", 1)[0] in names else item
+        for item in report.tensors
+    )
+    gptq_values = sum(item.values for item in tensors if item.method == "gptq")
+    symmetric_values = sum(item.values for item in tensors if item.method == "symmetric")
+    return replace(
+        report,
+        quantized_values=gptq_values + symmetric_values,
+        gptq_values=gptq_values,
+        symmetric_values=symmetric_values,
+        tensors=tensors,
+    )
 
 
 def effective_group_size(width: int, maximum: int) -> int:

@@ -83,7 +83,9 @@ and calibrated as the copy is used, and the copy is stored in integers.
 Storage keeps a quantized matrix in integers only in the layout it was
 quantized in, so a weight rearranged by arithmetic, such as
 `F.linear(x, weight.t() * 1)`, or only part of which is used through a
-transposed view, is stored in float16 instead, and `result.warnings` says so.
+transposed view, is stored in float16 instead. `result.warnings` says so, and
+`result.quantization.tensors` reports the weight's `method` as `"float16"`,
+with the reason.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set

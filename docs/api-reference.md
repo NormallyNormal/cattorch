@@ -460,7 +460,10 @@ One weight tensor, or one part of a tensor the model uses as a separate
 matrix: `name`, the
 `method` used, `bits`, number of `values`, `calibration_rows` seen,
 `effective_group_size`, and `fallback_reason` if GPTQ wasn't used. A `method`
-of `"float16"` means the tensor was smaller than `min_quantized_values`.
+of `"float16"` means the tensor is stored in float16, and `fallback_reason`
+says why: it was smaller than `min_quantized_values`, or storage reads it
+grouped along a different axis than it was quantized in, so it couldn't keep
+it in integers.
 
 ## Benchmark API
 

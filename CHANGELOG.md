@@ -330,6 +330,11 @@
   copy and stored in int8 or int4 as requested, instead of in float16 with
   a warning, and GPTQ calibrates it. The model's own copy is made from the
   quantized weight, so PyTorch and Scratch compute with the same values.
+- `result.quantization.tensors` reported a quantized weight that storage
+  keeps in float16, because it reads it grouped along another axis, as
+  `"symmetric"` or `"gptq"`. It now reports `method="float16"`, with a
+  `fallback_reason` naming the rounding applied and why it is stored in
+  float16, and leaves it out of `quantized_values`.
 - A quantized export could fail with `grouped weight sharding must preserve
   complete four-row groups` when compressed storage keeps a weight that runs
   four output rows at a time in float16 or float32, whose lists hold fewer

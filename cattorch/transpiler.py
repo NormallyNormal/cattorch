@@ -46,6 +46,7 @@ from cattorch.kernel_api import (
 )
 from cattorch.quantization import (
     QuantizationConfig,
+    _report_float16_storage,
     expert_bank_effective_ndims,
     quantize_model,
 )
@@ -1912,22 +1913,24 @@ def _misgrouped_quantized_weights(
     *,
     effective_ndims: dict[str, int],
     interleaved_layouts: dict[str, tuple[tuple[int, int, int], ...]],
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], frozenset[str]]:
     """Warnings for quantized weights that integer storage keeps in float16.
 
     Storage keeps a matrix in integers only when it finds it on the integer
     grid along its own last dimension. A quantized weight stored transposed
     relative to the grouping quantization gave it falls off that grid, and
-    is stored in float16 at two to four times the requested size.
+    is stored in float16 at two to four times the requested size. Also
+    returns the names of the parameters found stored so.
     """
     if storage.precision not in {"int8", "int6", "int4"} or storage.grouping != "row":
-        return ()
+        return (), frozenset()
     parameters = [
         (name, parameter.detach().reshape(-1))
         for name, parameter in model.named_parameters()
         if parameter.ndim >= 2
     ]
     warnings_found = []
+    found: set[str] = set()
     for key, tensor in static_tensors.items():
         if (
             not isinstance(tensor, torch.Tensor)
@@ -1949,14 +1952,16 @@ def _misgrouped_quantized_weights(
                 parameter_name for parameter_name, values in parameters
                 if values.numel() == flat.numel() and torch.equal(values, flat)
             ),
-            key,
+            None,
         )
+        if name is not None:
+            found.add(name)
         warnings_found.append(
-            f"quantized weight {name!r} {tuple(tensor.shape)} is stored as float16, "
+            f"quantized weight {name or key!r} {tuple(tensor.shape)} is stored as float16, "
             f"not {storage.precision}: it is quantized in groups along a different "
             f"axis than storage reads it in"
         )
-    return tuple(warnings_found)
+    return tuple(warnings_found), frozenset(found)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -2963,7 +2968,7 @@ def _transpile(
         for table, reason in compiler.tied_storage_copies.items()
         if table in layouts
     )
-    misgrouped = _misgrouped_quantized_weights(
+    misgrouped, float16_weights = _misgrouped_quantized_weights(
         compiler.static_lists,
         storage,
         model,
@@ -3171,7 +3176,10 @@ def _transpile(
             for table, reason in tied_copies.items()
         )
         + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
-        quantization=quantization_report,
+        quantization=(
+            None if quantization_report is None
+            else _report_float16_storage(quantization_report, float16_weights)
+        ),
         fallback_operations=graph.fallbacks(),
         approximate_operations=tuple(sorted(compiler.approximate.items())),
     )
