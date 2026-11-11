@@ -6,6 +6,7 @@ import dataclasses
 import tempfile
 import warnings
 from pathlib import Path
+from typing import Literal
 
 import torch
 from torch.utils import _pytree as pytree
@@ -63,7 +64,7 @@ def check_kernel(
         if operator is None:
             raise ValueError(f"cannot call kernel target {kernel.target_name!r}")
     names = [argument.name for argument in operator._schema.arguments]
-    optimization = "fast" if kernel.approximate else "exact"
+    optimization: Literal["exact", "fast"] = "fast" if kernel.approximate else "exact"
     emitted = []
 
     def emit(context):

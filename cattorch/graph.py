@@ -7,7 +7,7 @@ import math
 import operator
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Literal, NamedTuple
+from typing import Callable, Literal, NamedTuple
 
 import torch
 
@@ -348,7 +348,7 @@ class _GenerationInfo:
 class _GraphInfo:
     """Pre-processed captured PyTorch graph, ready for compilation."""
     nodes: list
-    resolve_weight: object  # callable
+    resolve_weight: Callable[[str], torch.Tensor | None]
     input_names: dict
     outputs: tuple[tuple[str, torch.Size, torch.dtype], ...]
     aliases: dict            # node_name → source_name for no-op ops

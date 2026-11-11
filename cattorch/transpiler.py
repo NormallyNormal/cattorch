@@ -208,7 +208,7 @@ def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> No
     """
     from cattorch.util.scratch.dsl import broadcast_and_wait, if_else, lt, mod
 
-    checks = []
+    checks: list = []
     for node in graph.nodes:
         name = graph.input_names.get(node.name)
         if name is None or node.name not in graph.dynamic_bounds:
@@ -382,6 +382,18 @@ def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: froz
 
 class _LayerSharingUnavailable(Exception):
     """Banked caches were requested but the layers could not be factored."""
+
+
+# A variable-length input: its name, minimum and maximum length, and the
+# axis that varies when it isn't the first.
+_DynamicBound = tuple[str, int, int] | tuple[str, int, int, int]
+
+
+def _public_dynamic_bound(bound: _DynamicBound | None) -> tuple[int, tuple] | None:
+    """A variable-length input's axis and ``(name, minimum, maximum)``."""
+    if bound is None:
+        return None
+    return (bound[3] if len(bound) == 4 else 0, tuple(bound[:3]))
 
 
 def _tensor_identity(tensor: torch.Tensor) -> tuple:
@@ -723,6 +735,8 @@ class _Compiler:
             self._compile_node(node)
         self.node_roots = len(self.emitted_roots)
         self._materialize_output_if_needed()
+        # The output is always materialized into the sprite.
+        assert self.sprite is not None
         return self.sprite
 
     @property
@@ -1896,7 +1910,7 @@ class _Compiler:
             argument = tensor_args[position - 1] if position <= len(tensor_args) else None
             if name in dynamic:
                 rows[f"T{position}"] = dynamic[name]
-            elif getattr(argument, "dynamic_axis", None) is not None:
+            elif argument is not None and getattr(argument, "dynamic_axis", None) is not None:
                 rows[f"T{position}"] = math.prod(argument.shape)
         if not rows:
             raise _unsupported_operation(
@@ -2598,7 +2612,7 @@ def _transpile(
     _registry: OperatorRegistry | None = None,
     _prepared_model: bool = False,
     _prepared_quantization_report=None,
-    _dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
+    _dynamic_inputs: dict[int, _DynamicBound] | None = None,
     _defer_interface_sharding: bool = False,
     _edit_sprite: Callable[[dict], dict] | None = None,
     _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
@@ -3063,14 +3077,7 @@ def _transpile(
             ),
             tuple(value.shape),
             value.dtype,
-            (
-                (
-                    _dynamic_inputs[index][3] if len(_dynamic_inputs[index]) > 3 else 0,
-                    tuple(_dynamic_inputs[index][:3]),
-                )
-                if _dynamic_inputs is not None and index in _dynamic_inputs
-                else None
-            ),
+            _public_dynamic_bound((_dynamic_inputs or {}).get(index)),
         )
         for index, value in enumerate(flat_example_inputs(example_inputs, example_kwargs))
     )

@@ -10,7 +10,7 @@ import re
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AbstractSet, Literal, cast
 
 import numpy as np
 import torch
@@ -435,14 +435,14 @@ def _share_repeated_transformer_layers(
     list_ids = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
     role_names = []
     for owned in owned_groups:
-        names = []
+        found = []
         for identifier, block in blocks.items():
             if identifier not in owned:
                 continue
             field = block.get("fields", {}).get("LIST")
-            if field and field[0] in static_names and field[0] not in names:
-                names.append(field[0])
-        role_names.append(names)
+            if field and field[0] in static_names and field[0] not in found:
+                found.append(field[0])
+        role_names.append(found)
     if not role_names[0] or any(len(names) != len(role_names[0]) for names in role_names):
         log.info("Repeated layer static roles: %s", role_names)
         return reject("static role counts differ")
@@ -487,7 +487,7 @@ def _share_repeated_transformer_layers(
         for layer in layers
     ]
     output_nodes = []
-    for index, names in enumerate(layer_names):
+    for index, members in enumerate(layer_names):
         consumers = layer_names[index + 1] if index + 1 < len(layer_names) else {
             node.name for node in compiler.graph.nodes if _graph_layer(node) is None
         }
@@ -495,7 +495,7 @@ def _share_repeated_transformer_layers(
             arg.name
             for consumer in compiler.graph.nodes if consumer.name in consumers
             for arg in consumer.all_input_nodes
-            if arg.name in names and arg.name in compiler.scope.assignments
+            if arg.name in members and arg.name in compiler.scope.assignments
         }
         if not used:
             return reject("could not identify a carried layer output")
@@ -639,7 +639,7 @@ def _share_repeated_transformer_layers(
             blocks.pop(identifier, None)
 
     from cattorch.util.scratch.dsl import Program, append, call, clear, for_each, item, length, set_var, var
-    body = []
+    body: list = []
     copy_index = "cattorch shared layer copy index"
     cache_base = (
         "cattorch layer cache base"
@@ -1144,13 +1144,16 @@ def _insert_init_call(sprite: dict, procedure: str) -> None:
         blocks[old_root]["parent"] = identifier
 
 
+_StoragePrecision = Literal["float32", "float16", "int8", "int6", "int4"]
+
+
 def _static_storage_precision(
     tensor: torch.Tensor | None,
     storage: StorageConfig,
     effective_ndim: int | None = None,
     interleave_segments: tuple[tuple[int, int, int], ...] = (),
     source_numel: int | None = None,
-) -> str:
+) -> _StoragePrecision:
     """How storage keeps ``tensor``: decided once for the whole tensor.
 
     A row shard the compiler cut from a weight gives that weight's size as
@@ -1402,7 +1405,7 @@ def _deinterleave_static_values(
         if rows % 4 or start < 0 or start + rows * inner > len(values):
             raise ValueError("malformed grouped static-weight layout")
         source = values[start:start + rows * inner]
-        logical = []
+        logical: list = []
         for group_start in range(0, len(source), 4 * inner):
             group = source[group_start:group_start + 4 * inner]
             for lane in range(4):
@@ -1419,7 +1422,7 @@ def _interleave_static_values(
     result = list(values)
     for start, rows, inner in segments:
         source = values[start:start + rows * inner]
-        physical = []
+        physical: list = []
         for group_start in range(0, len(source), 4 * inner):
             group = source[group_start:group_start + 4 * inner]
             for column in range(inner):
@@ -1586,7 +1589,7 @@ def _apply_static_storage(
         _materialize_static_values(sprite)
         return static_names
 
-    specs = []
+    specs: list[EncodedList] = []
     runtime_interleaves = []
     for logical_name in sorted(static_names):
         layout = layouts.get(logical_name)
@@ -1611,7 +1614,7 @@ def _apply_static_storage(
                 _deinterleave_static_values(contents, segments)
                 if segments else contents
             )
-            if precision in {"int8", "int6", "int4"}:
+            if precision in ("int8", "int6", "int4"):
                 codes, scales = _quantize_arrays(
                     encoded_contents,
                     precision,
@@ -1636,7 +1639,9 @@ def _apply_static_storage(
                     scale_values=tuple(scales.tolist()),
                 ))
             else:
-                raw_payload = _float_bytes(encoded_contents, precision)
+                raw_payload = _float_bytes(
+                    encoded_contents, cast(Literal["float32", "float16"], precision),
+                )
                 specs.append(EncodedList(
                     shard.name,
                     payload_name,
@@ -1727,7 +1732,7 @@ def _add_prepare_for_save(
     *,
     static_names: set[str],
     compressed: bool,
-    inputs: set[str] = frozenset(),
+    inputs: AbstractSet[str] = frozenset(),
 ) -> None:
     """Add a public procedure that drops rebuildable runtime list contents.
 
@@ -2378,7 +2383,7 @@ def _top_k_insertion(rank: int, top_k: int):
     """Shift a fixed sorted prefix and insert the current logit at ``rank``."""
     from cattorch.util.scratch.dsl import item, replace, sub, var
 
-    shifts = []
+    shifts: list = []
     for position in range(top_k, rank, -1):
         shifts.extend((
             replace(_TOP_K_VALUES, position, item(_TOP_K_VALUES, position - 1)),
@@ -2687,7 +2692,7 @@ def _add_generation_blocks(
             clear(tokens),
     )
     if hidden_prefill:
-        valid_prefill = (
+        valid_prefill: tuple = (
                 if_(current, (set_var("cattorch project output", 0),)),
                 for_each("prefill index", sub(length(buffer), 1), (if_(current, (
                     append(tokens, item(buffer, var("prefill index"))),
@@ -2701,7 +2706,7 @@ def _add_generation_blocks(
                     clear(tokens),
                 )),
         )
-        prefill_variables = (
+        prefill_variables: tuple[str, ...] = (
             "prefill index", "cattorch project output", STATUS_VARIABLE, *token_variables,
         )
     else:
