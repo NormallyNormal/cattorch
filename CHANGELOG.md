@@ -797,6 +797,9 @@
   smaller weights stored in float16, such as a 25,600 x 96 buffer. Such a
   weight is now read through the generic list sharder, kept output-major
   under integer storage.
+- Initialization left the last compressed weight bank in a variable, so a
+  project saved after `cattorch prepare for save` still stored the
+  compressed weights twice. Initialization now clears it when done.
 
 ## Deprecations
 

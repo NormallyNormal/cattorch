@@ -1214,9 +1214,10 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                 body.extend(_copy_decoded(spec.name))
                 byte_offset += len(spec.payload_bytes)
 
+    # Leave no copy of a payload behind: a saved project would store it.
     body.extend((
         clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES),
-        clear(_HUFFMAN_TABLE),
+        clear(_HUFFMAN_TABLE), set_var(_ACTIVE_PAYLOAD, 0),
     ))
     return Program(
         "unpack_banked_weights",

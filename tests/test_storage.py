@@ -797,3 +797,36 @@ def test_int4_huffman_banks_split_when_compressed_stream_exceeds_list_limit():
     for payload in banks:
         decoded = 13 * ((len(payload) - 1) // 16) - BASE92_ALPHABET.index(payload[0])
         assert decoded <= SCRATCH_LIST_LIMIT
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"storage": StorageConfig(precision="float16")},
+        {"quantization": QuantizationConfig(bits=8, min_quantized_values=1024)},
+        {"quantization": QuantizationConfig(bits=4, min_quantized_values=1024)},
+        {"storage": StorageConfig(compression=False)},
+    ],
+    ids=["float32", "float16", "int8", "int4", "uncompressed"],
+)
+def test_prepare_for_save_leaves_the_data_of_a_fresh_export(tmp_path, options):
+    # Init left the last weight bank's payload in a variable, so a project
+    # saved after a forward and prepare for save stored the weights twice.
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(200, 128), torch.nn.ReLU(), torch.nn.Linear(128, 10),
+    ).eval()
+    example = torch.randn(1, 200)
+    sprite = _load(transpile(model, example, tmp_path / "m", **options).path)
+    emulator = ScratchEmulator(sprite)
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    emulator.run_procedure("cattorch prepare for save")
+
+    for identifier, (name, values) in sprite["lists"].items():
+        if name != "input":
+            assert len(emulator._lists[identifier]) == len(values), name
+    for identifier, (name, value) in sprite["variables"].items():
+        # Counters and other numbers change; nothing grows past one.
+        assert len(str(emulator._vars[identifier])) <= max(len(str(value)), 24), name
