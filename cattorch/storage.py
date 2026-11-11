@@ -185,11 +185,7 @@ def _quantize_arrays(
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
     starts = np.arange(0, numbers.size, group_size)
     maxima = np.maximum.reduceat(np.abs(numbers), starts)
-    ideal = np.where(maxima != 0, maxima / maximum_code, 1.0)
-    with np.errstate(over="ignore"):
-        scales = ideal.astype(
-            np.float32 if scale_precision == "float32" else np.float16,
-        ).astype(np.float64)
+    scales = group_scales(maxima, maximum_code, scale_precision)
     overflow = ~np.isfinite(scales)
     if overflow.any():
         scale_guidance = (
@@ -198,15 +194,53 @@ def _quantize_arrays(
             else "rescale the tensor before export"
         )
         raise ValueError(
-            f"quantization scale {float(ideal[overflow][0])!r} is outside the finite "
-            f"{scale_precision} range; {scale_guidance}"
+            f"quantization scale {float(maxima[overflow][0] / maximum_code)!r} is outside "
+            f"the finite {scale_precision} range; {scale_guidance}"
         )
-    # Preserve a finite reconstruction for groups whose ideal scale falls
-    # below the selected IEEE format's smallest subnormal.
-    smallest = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
-    scales[(maxima != 0) & (scales == 0)] = smallest
     codes = np.rint(numbers / np.repeat(scales, group_size)[:numbers.size])
     return np.clip(codes, -maximum_code, maximum_code).astype(np.int64), scales
+
+
+def group_scales(
+    maxima: np.ndarray,
+    maximum_code: int,
+    scale_precision: Literal["float32", "float16"],
+) -> np.ndarray:
+    """Each group's scale, as float64, from its largest absolute value.
+
+    This is the one scale rule of integer storage: quantization rounds with
+    it, the encoder encodes with it, and storage checks values against it.
+    Storage only sees reconstructed values, so the rule is a fixed point:
+    applied to a group reconstructed with its scale, it gives that scale
+    back. The scale nearest ``maximum / maximum_code`` does, except when
+    rounding it to the scale precision, which is coarse for subnormal
+    scales, leaves the group's largest code below ``maximum_code`` and the
+    scale derived from that code different. Such a group instead takes the
+    largest representable scale below ``maximum / maximum_code``, whose
+    largest code is ``maximum_code``. A group of zeros has scale 1; a group
+    whose scale is below the smallest subnormal has the smallest one.
+    Scales beyond the format's range are infinite, for the caller to reject.
+    """
+    dtype = np.float32 if scale_precision == "float32" else np.float16
+    smallest = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
+    maxima = np.asarray(maxima, dtype=np.float64)
+    nonzero = maxima != 0
+    ideal = np.where(nonzero, maxima / maximum_code, 1.0)
+    with np.errstate(over="ignore"):
+        scales = ideal.astype(dtype).astype(np.float64)
+    scales[nonzero & (scales == 0)] = smallest
+    finite = np.isfinite(scales)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        top = np.minimum(np.rint(maxima / scales), maximum_code)
+        recovered = (top * scales / maximum_code).astype(dtype).astype(np.float64)
+    recovered[(top > 0) & (recovered == 0)] = smallest
+    inconsistent = nonzero & finite & (top > 0) & (recovered != scales)
+    if inconsistent.any():
+        below = ideal[inconsistent].astype(dtype)
+        above = below.astype(np.float64) > ideal[inconsistent]
+        below[above] = np.nextafter(below[above], dtype(0))
+        scales[inconsistent] = np.maximum(below.astype(np.float64), smallest)
+    return scales
 
 
 def quantize_codebook_values(

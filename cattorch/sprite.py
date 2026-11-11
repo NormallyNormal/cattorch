@@ -21,6 +21,7 @@ from cattorch.storage import (
     StorageConfig,
     build_decoder_programs,
     build_shared_unpack_program,
+    group_scales,
     rounded_values,
     _float_bytes,
     _quantize_arrays,
@@ -1213,21 +1214,19 @@ def _check_integer_codec_grid(
     if values.size == 0 or values.size % group_size:
         return False
     maximum_code = {"int8": 127, "int6": 31, "int4": 7}[storage.precision]
-    scale_dtype = np.float16 if storage.scale_precision == "float16" else np.float32
-    tiny = math.ldexp(1.0, -24 if storage.scale_precision == "float16" else -149)
     # Every group is checked on its own, so whole groups at a time, in
     # logical order, give the same answer as all of them at once.
     for groups in _logical_group_chunks(values, interleave_segments, group_size):
         work = groups.astype(np.float64)
         if not np.isfinite(work).all():
             return False
-        maximum = np.abs(work).max(axis=1, keepdims=True)
-        with np.errstate(over="ignore"):
-            scale = (maximum / maximum_code).astype(scale_dtype).astype(np.float64)
+        # The encoder's own scale rule, so a tensor passes exactly when the
+        # encoder reproduces it.
+        scale = group_scales(
+            np.abs(work).max(axis=1), maximum_code, storage.scale_precision,
+        )[:, None]
         if not np.isfinite(scale).all():
             return False
-        scale[(maximum > 0) & (scale == 0)] = tiny
-        scale[maximum <= 0] = 1.0
         reconstructed = np.clip(np.round(work / scale), -maximum_code, maximum_code) * scale
         if native:
             rounded = reconstructed.astype(values.dtype)

@@ -80,8 +80,27 @@ def _reference_quantize_values(values, precision, group_size=64, scale_precision
                 f"quantization scale {scale!r} is outside the finite "
                 f"{scale_precision} range; {scale_guidance}"
             ) from error
+        smallest = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
         if maximum and scale == 0:
-            scale = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
+            scale = smallest
+        if maximum:
+            # Storage re-derives the scale from the largest reconstructed
+            # value; a scale it wouldn't get back is replaced by the largest
+            # representable one below maximum / maximum_code.
+            top = min(round(maximum / scale), maximum_code)
+            recovered = struct.unpack(
+                scale_code, struct.pack(scale_code, top * scale / maximum_code),
+            )[0] if top else scale
+            if top and recovered == 0:
+                recovered = smallest
+            if recovered != scale:
+                ideal = maximum / maximum_code
+                below = struct.unpack(scale_code, struct.pack(scale_code, ideal))[0]
+                if below > ideal:
+                    integer = ">I" if scale_precision == "float32" else ">H"
+                    bits = struct.unpack(integer, struct.pack(scale_code, below))[0]
+                    below = struct.unpack(scale_code, struct.pack(integer, bits - 1))[0]
+                scale = max(below, smallest)
         scales.append(scale)
         for number in group:
             code = round(number / scale) if maximum else 0
