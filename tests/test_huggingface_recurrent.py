@@ -156,6 +156,38 @@ def test_the_users_model_is_not_changed(exported):
     assert all(torch.equal(before[key], after[key]) for key in before)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_quantized_export_changes_only_its_own_copy(tmp_path, monkeypatch, dtype):
+    # The export copies the model once to adapt it, then adapts and
+    # quantizes that copy in place rather than copying it again.
+    import copy
+
+    model = mamba2().to(dtype)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    copies = []
+    deepcopy = copy.deepcopy
+    depth = [0]
+
+    def counting(value, *args, **kwargs):
+        # copy.deepcopy recurses through the module-level name too.
+        if isinstance(value, torch.nn.Module) and not depth[0]:
+            copies.append(type(value).__name__)
+        depth[0] += 1
+        try:
+            return deepcopy(value, *args, **kwargs)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(copy, "deepcopy", counting)
+    transpile(
+        model, RecurrentGenerationProgram(), tmp_path / "q",
+        quantization=QuantizationConfig(bits=8, min_quantized_values=64),
+    )
+    assert copies == ["Mamba2ForCausalLM"]
+    assert model.backbone.embeddings.weight.dtype == dtype
+    assert all(torch.equal(before[key], value) for key, value in model.state_dict().items())
+
+
 @pytest.mark.parametrize("name", sorted(BUILDERS))
 def test_hidden_prefill_gives_the_same_logits(tmp_path, name):
     model = BUILDERS[name]()

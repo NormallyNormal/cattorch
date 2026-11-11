@@ -280,6 +280,9 @@ def transpile_recurrent_generation(
 ) -> TranspileResult:
     """Export ``program.step`` with the init, reset, prefill and decode blocks."""
     hint = ""
+    # Whether ``model`` is a copy this export made, which the export can then
+    # adapt and quantize in place instead of copying again.
+    owned = False
     if program.states is None:
         adapted = adapt_recurrent_model(model)
         if adapted is None:
@@ -297,6 +300,7 @@ def transpile_recurrent_generation(
                 "supported Hugging Face recurrent model (Mamba, Mamba-2, RWKV)"
             )
         model = adapted.module
+        owned = True
         program = replace(
             program, states=adapted.states, step=adapted.step, reference=adapted.reference,
         )
@@ -316,6 +320,7 @@ def transpile_recurrent_generation(
         # Scratch computes in doubles either way; in float32 the step can be
         # checked against the reference without bfloat16 rounding noise.
         model = copy.deepcopy(model).float()
+        owned = True
     states = tuple(
         State(state.name, state.initial.float())
         if state.initial.is_floating_point() else state
@@ -377,6 +382,7 @@ def transpile_recurrent_generation(
         _calibration_name="calibration_sequences",
         # The generation blocks guard the step and reset.
         _guard_overlaps=False,
+        _owned_model=owned,
     )
     (entry,) = result.entrypoints
     return TranspileResult(

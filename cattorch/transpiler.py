@@ -2452,6 +2452,7 @@ def _transpile_automatic_generation(
     ):
         raise ValueError("calibration_sequences can only be used with GPTQ quantization")
     max_context = program.max_context
+    owned = False
     if any(
         value.is_floating_point() and value.dtype != torch.float32
         for value in (*model.parameters(), *model.buffers())
@@ -2459,8 +2460,10 @@ def _transpile_automatic_generation(
         # Scratch computes in doubles either way. In float32 the cached step
         # can be checked against the model without bfloat16 rounding noise.
         model = copy.deepcopy(model).float()
+        owned = True
     module = model if program.method == "forward" else MethodLeaves(model, program.method)
-    prepared = registry.adapt_model(module)
+    # A copy made above is this export's own; adapt it in place.
+    prepared = registry.adapt_model(module, _copy=not owned)
     if optimization == "fast":
         prepared = prepare_fast_model(prepared, config)
     prepared = fold_eval_batch_norms(prepared)
@@ -2511,9 +2514,10 @@ def _transpile_automatic_generation(
     )
     example = torch.zeros(1, 1, dtype=torch.long)
     try:
-        # Tracing runs the step, so every attempt gets its own copy.
+        # Tracing runs the step, so every attempt gets its own copy. Without
+        # layer sharing there is no second attempt.
         return _transpile(
-            copy.deepcopy(step),
+            copy.deepcopy(step) if codegen.layer_sharing == "auto" else step,
             (example,),
             output_path,
             sig_figs,

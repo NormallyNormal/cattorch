@@ -531,6 +531,7 @@ def transpile_program(
     _calibration_resets: frozenset[int] = frozenset(),
     _calibration_name: str = "calibration_calls",
     _guard_overlaps: bool = True,
+    _owned_model: bool = False,
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -565,6 +566,10 @@ def transpile_program(
     - ``_guard_overlaps=False`` leaves out the busy flag and epoch that keep
       stopped and overlapping calls from changing the states unnoticed, for
       a caller that guards the entry points and ``cattorch reset`` itself.
+    - ``_owned_model=True`` says ``model`` is a copy the caller made and no
+      longer needs, so it is adapted and quantized in place instead of
+      copied again. Variable-length entry points still copy it: their
+      check runs the original model afterwards.
 
     The renaming and hidden-output hooks can't be combined with
     variable-length inputs, whose export check runs the entry points through
@@ -619,8 +624,12 @@ def transpile_program(
 
     # Model ownership, transforms, and calibration belong to the whole
     # program. Every entrypoint below captures the same prepared module.
+    dynamic_entries = any(
+        isinstance(binding, Input) and binding.dynamic is not None
+        for entry in program.entrypoints for binding in entry.arguments
+    )
     prepared_model = registry.adapt_model(
-        model, state_names=frozenset(states),
+        model, state_names=frozenset(states), _copy=not _owned_model or dynamic_entries,
     )
     config = fast_config or FastConfig()
     if optimization == "fast":

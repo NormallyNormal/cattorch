@@ -614,3 +614,35 @@ def test_non_causal_model_is_rejected_at_export(tmp_path):
     )).eval()
     with pytest.raises(UnsupportedModelError, match="isn't causal"):
         transpile(bert, GenerationProgram(max_context=8), tmp_path / "bert")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_generation_export_copies_the_model_once(tmp_path, monkeypatch, dtype):
+    # One copy to adapt and quantize; without layer sharing there is no
+    # second attempt, so tracing gets the step itself.
+    import copy
+
+    torch.manual_seed(0)
+    model = NanoGPT(layers=2, width=16, heads=2, context=8).eval().to(dtype)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    copies = []
+    deepcopy = copy.deepcopy
+    depth = [0]
+
+    def counting(value, *args, **kwargs):
+        # copy.deepcopy recurses through the module-level name too.
+        if isinstance(value, nn.Module) and not depth[0]:
+            copies.append(type(value).__name__)
+        depth[0] += 1
+        try:
+            return deepcopy(value, *args, **kwargs)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(copy, "deepcopy", counting)
+    transpile(
+        model, GenerationProgram(max_context=8), tmp_path / "g",
+        quantization=QuantizationConfig(bits=8, min_quantized_values=64),
+    )
+    assert copies == ["NanoGPT"]
+    assert all(torch.equal(before[key], value) for key, value in model.state_dict().items())

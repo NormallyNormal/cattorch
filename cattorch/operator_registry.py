@@ -227,9 +227,15 @@ class OperatorRegistry:
         model: torch.nn.Module,
         *,
         state_names: frozenset[str] = frozenset(),
+        _copy: bool = True,
     ) -> torch.nn.Module:
-        """Apply registered adapters to an export-owned model copy."""
-        model = copy.deepcopy(model)
+        """Apply registered adapters to an export-owned model copy.
+
+        ``_copy=False`` adapts ``model`` in place, for a caller that already
+        made the copy and doesn't use it otherwise.
+        """
+        if _copy:
+            model = copy.deepcopy(model)
         if any(module.training for module in model.modules()):
             model.eval()
             eval_mode_copy_warning()
