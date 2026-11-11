@@ -65,7 +65,7 @@ start with the sprite's name:
 | Model | Broadcast | Reads | Writes |
 |---|---|---|---|
 | Plain model | `NAME run` | `NAME input`, `NAME input_1`, ... | `NAME output`, ... |
-| Classifier (with `labels`) | `NAME predict`, after `NAME run` | `NAME output` | `NAME prediction` |
+| Classifier (with `labels`) | `NAME predict`, after `NAME run` | `NAME output`, `NAME labels` | `NAME prediction` |
 | Entry point | `NAME ENTRY` | `NAME ` + each input list | `NAME ` + each output list |
 | Text generator | `NAME prefill`, `NAME decode` | `NAME tokens`, `NAME temperature` | `NAME next token`, `NAME status` |
 | Tokenizer | `NAME tokenize` | `NAME text` | `NAME token ids` |
@@ -108,8 +108,8 @@ status 1 if the check fails. `MODEL` is one of:
 
 The inputs come from the model's [`@cattorch.example`](markers.md) marker or
 `@entrypoint` methods, or from `--shape 1,28,28` for random float inputs and
-`--tokens 1,8` (with `--vocab`) for token IDs. Repeat them for several
-inputs, floats first. `--dynamic 0=1:32` lets input 0's first dimension vary
+`--tokens 1,8` for random token IDs below `--vocab` (default 2). Repeat them
+for several inputs, floats first. `--dynamic 0=1:32` lets input 0's first dimension vary
 from 1 to 32 at run time, and `--dynamic 0.1=1:64` its second; see
 [variable-length inputs](supported-models.md#variable-length-inputs).
 
@@ -128,10 +128,10 @@ Both commands take:
 
 | Option | Effect |
 |---|---|
-| `-o PATH` | Output path, with or without `.sprite3` or `.sb3`. The sprite is `PATH.sprite3` and `generate`'s tokenizer `PATH_tokenizer.sprite3`. Defaults to the model's name. |
+| `-o PATH` | Output path, with or without `.sprite3` or `.sb3`. The sprite is `PATH.sprite3` and `generate`'s tokenizer `PATH_tokenizer.sprite3`. Defaults to the model's name, lowercased: `name` in `file.py:name` or `module:name`, the `.pt` file's stem, or the last part of the `--hf` repo. |
 | `--project` | Also write `PATH.sb3` with `build_project`. |
 | `--fast` | Use [approximate kernels](optimization.md). |
-| `--precision` | `float16` stores weights at half precision, and `int8` or `int4` [quantize](storage.md) matrices. Lossy exports are verified to within 0.05. |
+| `--precision` | `float32` (the default) stores weights exactly, `float16` at half precision, and `int8` or `int4` [quantize](storage.md) matrices. `export` verifies a lossy or `--fast` export with `atol=0.05, rtol=0.05`, and any other with `atol=1e-4, rtol=1e-5`. |
 
 `export` also takes `--labels` for its project and `--no-verify`, and
 `generate` takes `--max-new-tokens`, `--temperature`, and `--eos` (defaulting
@@ -149,4 +149,4 @@ project: an MLP that names a point's quadrant, a CNN that tells horizontal
 lines from vertical ones, and a character-level transformer and GRU that
 continue a nursery rhyme.
 
-Related: [getting started](getting-started.md), [API reference](api-reference.md#buildproject).
+Related: [getting started](getting-started.md), [API reference](api-reference.md#build_project).

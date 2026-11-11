@@ -21,7 +21,7 @@ def _heading_anchors(text: str) -> set[str]:
     anchors: set[str] = set()
     counts: dict[str, int] = {}
     for heading in re.findall(r"^#{1,6}\s+(.+?)\s*$", text, re.MULTILINE):
-        plain = re.sub(r"[`*_~]", "", heading).lower()
+        plain = re.sub(r"[`*~]", "", heading).lower()
         anchor = re.sub(r"[^a-z0-9 _-]", "", plain)
         anchor = re.sub(r"[ ]+", "-", anchor).strip("-")
         count = counts.get(anchor, 0)

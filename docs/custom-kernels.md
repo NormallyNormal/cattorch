@@ -183,4 +183,4 @@ build_kernel_benchmark(mish, [("mish", model, (example,))], "mish.sb3")
 
 Run it on [scratch.mit.edu](https://scratch.mit.edu) or in the desktop editor,
 save it, and read the timings with
-[`analyze_benchmark`](api-reference.md#analyzebenchmark).
+[`analyze_benchmark`](api-reference.md#analyze_benchmark).

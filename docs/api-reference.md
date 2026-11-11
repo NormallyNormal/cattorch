@@ -160,8 +160,11 @@ BPETokenizer(tokenizer).save(output_path, *, name=None, codegen=None)
 ```
 
 Export a Hugging Face tokenizer as a character or BPE tokenizer, without
-auto-detection. The tokenizer must have `get_vocab()`. `BPETokenizer` also
-needs a fast (Rust-backed) BPE tokenizer so cattorch can read its merges.
+auto-detection. The tokenizer must have `get_vocab()`; anything else raises
+`TypeError`. `BPETokenizer` also needs a fast (Rust-backed) BPE tokenizer so
+cattorch can read its merges. `CharTokenizer` checks that the tokenizer's
+tokens are single characters and that it encodes text one character at a
+time, and raises `ValueError` otherwise.
 
 ### `SentencePieceBPETokenizer`
 
@@ -174,8 +177,10 @@ SentencePieceBPETokenizer(
 ```
 
 `tokenizer` can be a `SentencePieceProcessor` or an object with one in its
-`.processor` attribute. See [tokenizers](tokenizers.md) for normalization,
-Unicode, and byte fallback limits.
+`.processor` attribute. The model must be trained with `model_type="bpe"`;
+Unigram, word and char models raise `ValueError`. See
+[tokenizers](tokenizers.md) for normalization, case, Unicode, and byte
+fallback limits.
 
 ## Verification
 
