@@ -20,6 +20,92 @@ Example
     sprite = ta.apply(sprite, ["p_w1", "p_w2"], weights={"p_w1": w1, "p_w2": w2})
 """
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import numpy as np
+
+# Values per step when a StaticValues is iterated, to bound the temporary list.
+_ITERATION_CHUNK = 1 << 16
+
+
+class StaticValues:
+    """A floating static tensor's flat values, kept as an array.
+
+    A Python list holds every value as its own float object, about 32 bytes
+    each; the tensor's own array holds them in 4. Storage encodes a weight
+    from its values without ever needing them as Python objects, so a weight
+    list holds one of these from the moment it is attached until storage
+    replaces it with its encoded payload (or, uncompressed, with the list).
+
+    It stands in for the list wherever static contents pass: ``len``,
+    slicing (which returns a view), comparison with another StaticValues or
+    a list, iteration, and ``numpy.asarray``. Anything else a list does is
+    deliberately missing, so a new use fails instead of silently doing
+    something else (``+`` on an array would add elementwise).
+    """
+
+    __slots__ = ("array",)
+
+    def __init__(self, array: np.ndarray):
+        if array.ndim != 1:
+            raise ValueError("static values must be one-dimensional")
+        self.array = array
+
+    @classmethod
+    def from_tensor(cls, tensor) -> StaticValues:
+        """Wrap a floating tensor's values, sharing its memory when possible."""
+        import torch
+
+        values = tensor.detach().reshape(-1)
+        if values.dtype not in (torch.float16, torch.float32, torch.float64):
+            # bfloat16 and other formats numpy lacks widen exactly to float32.
+            values = values.to(torch.float32)
+        return cls(values.numpy(force=True))
+
+    def __len__(self) -> int:
+        return len(self.array)
+
+    def __bool__(self) -> bool:
+        return len(self.array) > 0
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return StaticValues(self.array[index])
+        return self.array[index].item()
+
+    def __iter__(self) -> Iterator[float]:
+        for start in range(0, len(self.array), _ITERATION_CHUNK):
+            yield from self.array[start:start + _ITERATION_CHUNK].tolist()
+
+    def __eq__(self, other) -> bool:
+        # As lists of floats compare: elementwise, so NaN never equals NaN
+        # (each ``tolist`` makes new NaN objects) and -0.0 equals 0.0.
+        if isinstance(other, StaticValues):
+            return bool(np.array_equal(self.array, other.array))
+        if isinstance(other, list):
+            return self.tolist() == other
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __array__(self, dtype=None, copy=None):
+        if copy:
+            return np.array(self.array, dtype=dtype)
+        return np.asarray(self.array, dtype=dtype)
+
+    def tolist(self) -> list[float]:
+        return self.array.tolist()
+
+    def __repr__(self) -> str:
+        return f"StaticValues({len(self.array)} x {self.array.dtype})"
+
+
+def static_list_contents(values):
+    """``values`` as a plain list, for the JSON a static list is written as."""
+    return values.tolist() if isinstance(values, StaticValues) else values
+
 
 def _make_id(name: str) -> str:
     """Derive a stable scratch ID from a tensor display name."""
@@ -51,6 +137,19 @@ def _flatten(tensor, sig_figs: int | None = None) -> list:
     if sig_figs is not None and not integral:
         values = [float(f"%.{sig_figs}g" % v) for v in values]
     return values
+
+
+def _contents(tensor, sig_figs: int | None):
+    """A floating tensor's values as StaticValues; anything else as a list."""
+    is_floating = getattr(tensor, "is_floating_point", None)
+    if (
+        sig_figs is None
+        and callable(is_floating)
+        and is_floating()
+        and hasattr(tensor, "detach")
+    ):
+        return StaticValues.from_tensor(tensor)
+    return _flatten(tensor, sig_figs)
 
 
 class TensorAdder:
@@ -94,12 +193,12 @@ class TensorAdder:
 
         for name in tensor_names:
             if name not in existing:
-                data = _flatten(weights[name], sig_figs) if name in weights else []
+                data = _contents(weights[name], sig_figs) if name in weights else []
                 lists[_make_id(name)] = [name, data]
                 existing.add(name)
             elif name in weights:
                 # Slot already exists — update its data
                 sid = next(sid for sid, entry in lists.items() if entry[0] == name)
-                lists[sid][1] = _flatten(weights[name], sig_figs)
+                lists[sid][1] = _contents(weights[name], sig_figs)
 
         return sprite

@@ -6,6 +6,7 @@ import copy
 import itertools
 from dataclasses import dataclass
 from cattorch.util.scratch.interface import shard_name as physical_shard_name
+from cattorch.util.scratch.tensor_adder import StaticValues
 
 
 SCRATCH_LIST_LIMIT = 200_000
@@ -356,6 +357,13 @@ class _BlockSharder:
                 )
 
 
+def _piece(contents, start: int, stop: int):
+    """A shard's own copy of ``contents[start:stop]``; static values stay arrays."""
+    if isinstance(contents, StaticValues):
+        return contents[start:stop]
+    return list(contents[start:stop])
+
+
 def shard_sprite_lists(
     sprite: dict,
     logical_sizes: dict[str, int],
@@ -402,10 +410,10 @@ def shard_sprite_lists(
             if position:
                 lists[shard_id] = [
                     shard_name,
-                    list(contents[start:start + shard_limit]),
+                    _piece(contents, start, start + shard_limit),
                 ]
             else:
-                entry[1] = list(contents[:shard_limit])
+                entry[1] = _piece(contents, 0, shard_limit)
             shards.append(ListShard(shard_name, shard_id, capacity))
         layouts[name] = ListLayout(name, logical_size, tuple(shards))
 

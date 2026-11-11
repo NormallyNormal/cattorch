@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from cattorch.graph import _GenerationSpec, _GraphInfo, _get_shape
@@ -26,6 +27,7 @@ from cattorch.storage import (
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, ListLayout
+from cattorch.util.scratch.tensor_adder import StaticValues, static_list_contents
 from cattorch.interface import STATUS_VARIABLE
 
 if TYPE_CHECKING:
@@ -527,11 +529,11 @@ def _share_repeated_transformer_layers(
     for role, names, size in bank_roles:
         winner_id = list_ids[names[0]]
         winner = sprite["lists"][winner_id]
-        winner[1] = [
-            value
-            for name in names
-            for value in sprite["lists"][list_ids[name]][1]
-        ]
+        parts = [sprite["lists"][list_ids[name]][1] for name in names]
+        if all(isinstance(part, StaticValues) for part in parts):
+            winner[1] = StaticValues(np.concatenate([part.array for part in parts]))
+        else:
+            winner[1] = [value for part in parts for value in part]
         for name in names[1:]:
             sprite["lists"].pop(list_ids[name], None)
 
@@ -546,7 +548,11 @@ def _share_repeated_transformer_layers(
                 combined_layouts.append((layout_offset + start, rows, inner))
             layout_offset += tensor.numel()
         all_matrix = all(isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 for tensor in tensors)
-        bank_tensor = torch.tensor(winner[1], dtype=torch.float32)
+        bank_tensor = (
+            torch.tensor(np.asarray(winner[1], dtype=np.float64), dtype=torch.float32)
+            if isinstance(winner[1], StaticValues)
+            else torch.tensor(winner[1], dtype=torch.float32)
+        )
         if all_matrix and size >= storage.min_quantized_values:
             matrix_shapes = {tuple(tensor.shape) for tensor in tensors}
             if len(matrix_shapes) == 1:
@@ -1290,6 +1296,16 @@ def _deinterleave_static_values(
     segments: tuple[tuple[int, int, int], ...],
 ) -> list:
     """Convert four-row physical groups back to logical output-major rows."""
+    if isinstance(values, StaticValues):
+        array = values.array.copy()
+        for start, rows, inner in segments:
+            if rows % 4 or start < 0 or start + rows * inner > len(values):
+                raise ValueError("malformed grouped static-weight layout")
+            end = start + rows * inner
+            array[start:end] = (
+                values.array[start:end].reshape(rows // 4, inner, 4).transpose(0, 2, 1).reshape(-1)
+            )
+        return StaticValues(array)
     result = list(values)
     for start, rows, inner in segments:
         if rows % 4 or start < 0 or start + rows * inner > len(values):
@@ -1479,6 +1495,7 @@ def _apply_static_storage(
                         _interleave_static_values(rounded, segments)
                         if segments else rounded
                     )
+        _materialize_static_values(sprite)
         return static_names
 
     specs = []
@@ -1609,7 +1626,14 @@ def _apply_static_storage(
             # unpack second to execute them in unpack -> interleave order.
             _insert_init_call(sprite, "cattorch interleave grouped weights")
         _insert_init_call(sprite, "cattorch unpack weights")
+    _materialize_static_values(sprite)
     return static_names
+
+
+def _materialize_static_values(sprite: dict) -> None:
+    """Turn the static values storage left in place into the lists JSON needs."""
+    for entry in sprite.get("lists", {}).values():
+        entry[1] = static_list_contents(entry[1])
 
 
 def _add_prepare_for_save(

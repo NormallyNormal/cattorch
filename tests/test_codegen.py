@@ -556,6 +556,41 @@ def test_tensor_adder_copies_only_the_lists():
     assert result["blocks"] is sprite["blocks"]
 
 
+def test_static_values_stand_in_for_the_list_tolist_makes():
+    import numpy as np
+    from cattorch.sprite import _deinterleave_static_values
+    from cattorch.util.scratch.tensor_adder import StaticValues, TensorAdder
+
+    tensor = torch.tensor([1.5, -0.0, float("nan"), 3.25, 1e-30, 7.0, 2.0, -4.0])
+    values = TensorAdder().apply({"lists": {}}, ["W_a"], weights={"W_a": tensor})["lists"][
+        "cattorch_tensor_W_a"
+    ][1]
+    assert isinstance(values, StaticValues)
+    expected = tensor.tolist()
+    assert len(values) == 8 and values[3] == 3.25
+    assert values.tolist()[:2] == expected[:2] and list(values)[3:] == expected[3:]
+    assert values[4:] == expected[4:] and values[4:].array.base is not None
+    # As lists of floats compare, NaN never equals NaN.
+    assert values != StaticValues(tensor.numpy().copy())
+    assert values[3:] == StaticValues(tensor.numpy()[3:].copy())
+    assert np.asarray(values, dtype=np.float64).tolist()[3:] == expected[3:]
+    with pytest.raises(TypeError):
+        values + values  # noqa: B018
+    # Integer tensors keep their exact list; bfloat16 widens exactly.
+    integral = TensorAdder().apply({"lists": {}}, ["W_i"], weights={"W_i": torch.arange(3)})
+    assert integral["lists"]["cattorch_tensor_W_i"][1] == [0, 1, 2]
+    half = StaticValues.from_tensor(torch.tensor([0.1, 3.0], dtype=torch.bfloat16))
+    assert half.tolist() == torch.tensor([0.1, 3.0], dtype=torch.bfloat16).tolist()
+
+    # The array path reorders four-row groups exactly as the list path does.
+    grouped = torch.arange(2 * 4 * 3 + 5, dtype=torch.float32)
+    segments = ((1, 8, 3),)
+    assert (
+        _deinterleave_static_values(StaticValues.from_tensor(grouped), segments).tolist()
+        == _deinterleave_static_values(grouped.tolist(), segments)
+    )
+
+
 def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monkeypatch):
     # A merge that only remaps the blocks just added is equivalent to
     # remapping every block only if the others are already what remap_ids
