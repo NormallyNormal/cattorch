@@ -1655,16 +1655,15 @@ def _static_values(nodes, state_inputs, generation) -> dict:
         if target in _TENSOR_GENERATORS:
             generated_weights[node.name] = _TENSOR_GENERATORS[target](node.args)
             log.info("Generated %s as static weight %s", target, node.name)
-        elif target == "aten.ones_like.default":
+        elif target in ("aten.ones_like.default", "aten.zeros_like.default"):
+            # Only the shape of the reference matters, so this folds even
+            # when the reference is computed at run time. ``val`` is on
+            # every node, including a buffer's ``get_attr``.
             ref = node.args[0]
             shape = (generated_weights[ref.name].shape if ref.name in generated_weights
-                     else tuple(ref.meta['tensor_meta'].shape))
-            generated_weights[node.name] = torch.ones(shape, dtype=torch.float32)
-        elif target == "aten.zeros_like.default":
-            ref = node.args[0]
-            shape = (generated_weights[ref.name].shape if ref.name in generated_weights
-                     else tuple(ref.meta['tensor_meta'].shape))
-            generated_weights[node.name] = torch.zeros(shape, dtype=torch.float32)
+                     else tuple(ref.meta["val"].shape))
+            fill = torch.ones if target == "aten.ones_like.default" else torch.zeros
+            generated_weights[node.name] = fill(shape, dtype=node.meta["val"].dtype)
 
     # Evaluate every deterministic, non-mutating operation whose tensor inputs
     # are all static during export. Registered-buffer masks (`bias == 0`),

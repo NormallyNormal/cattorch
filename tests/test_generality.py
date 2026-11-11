@@ -172,6 +172,36 @@ def test_torch_multihead_attention_with_weights(tmp_path):
     _export_and_verify(tmp_path, model, (value, value, value))
 
 
+class BooleanMasks(nn.Module):
+    """Boolean masks registered as buffers, as attention code usually keeps them."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.attention = nn.MultiheadAttention(8, 2, batch_first=True)
+        self.decoder = nn.TransformerDecoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+        self.register_buffer("future", torch.triu(torch.ones(4, 4, dtype=torch.bool), 1))
+        self.register_buffer("padding", torch.tensor([[False, False, False, True]]))
+
+    def forward(self, x):
+        if self.kind == "multihead":
+            return self.attention(
+                x, x, x, attn_mask=self.future, key_padding_mask=self.padding,
+            )[0]
+        if self.kind == "decoder":
+            return self.decoder(
+                x, x, tgt_mask=self.future, tgt_key_padding_mask=self.padding,
+                memory_key_padding_mask=self.padding,
+            )
+        return F.scaled_dot_product_attention(x, x, x, attn_mask=~self.future)
+
+
+@pytest.mark.parametrize("kind", ["multihead", "decoder", "sdpa"])
+def test_boolean_attention_mask_buffers(tmp_path, kind):
+    torch.manual_seed(8)
+    _export_and_verify(tmp_path, BooleanMasks(kind), (torch.randn(1, 4, 8),))
+
+
 def test_torch_transformer_encoder_classifier(tmp_path):
     torch.manual_seed(8)
 

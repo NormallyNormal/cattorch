@@ -831,6 +831,11 @@
   verified with `quantization=`. Calibration runs the entry points under
   inference mode, and the buffers they assigned stayed inference tensors;
   each calibration call now leaves the model's buffers as it found them.
+- `nn.MultiheadAttention`, `nn.TransformerEncoderLayer` and
+  `nn.TransformerDecoderLayer` with a boolean `attn_mask` or
+  `key_padding_mask` held in a buffer failed with an internal
+  `KeyError: 'tensor_meta'`. `zeros_like` and `ones_like` of a buffer now
+  fold to a constant of the right shape and dtype.
 
 ## Deprecations
 
