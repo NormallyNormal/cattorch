@@ -267,6 +267,18 @@
   in int8 took 32 s instead of 258 s for 2 layers and 35 s instead of 300 s
   for 4; a 2-layer GPT-2 `GenerationProgram` in float32 took 46 s instead of
   243 s. cattorch now depends on numpy.
+- Large exports use a fraction of the memory, and write the same sprite as
+  before. Weight lists stay as arrays until storage encodes them instead of
+  holding every value as a Python float; the checks and quantization that
+  run over a whole weight work a few rows at a time; and a model copy the
+  export made itself is adapted in place instead of copied again. Measured
+  on a 4-core machine with random weights in Mamba2-130m's shape, the
+  50,288-token tied embedding and int8: 2 layers peaked at 1.3 GB instead of
+  6.2 GB (10 s instead of 25 s) and 8 layers at 1.7 GB instead of 7.4 GB
+  (16 s instead of 38 s). All 24 layers peaked at 2.7 GB in 35 s; that
+  export wasn't repeated before the change, where the smaller ones
+  extrapolate to about 11 GB. A 2-layer, 768-wide GPT-2
+  `GenerationProgram` in int8 peaked at 0.7 GB instead of 1.3 GB.
 
 ## Fixes
 

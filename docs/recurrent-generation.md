@@ -275,19 +275,20 @@ so no state list is sharded. Mamba-2 models with more heads or larger states,
 such as the 2.7B model's 655,360-value `ssm` states, shard them. Mamba-130m
 has 29,184 state values per layer and RWKV-4 169M 3,840.
 
-Measured with random weights in Mamba2-130m's shape, on a 4-core machine:
+Measured with random weights in Mamba2-130m's shape, on a 4-core machine; the
+first three rows use a 256-token vocabulary:
 
 | Export | Time | `.sprite3` | `sprite.json` | Blocks |
 |---|---|---|---|---|
-| One layer, float32 | 17 s | 16 MB | 23 MB | 3,386 |
-| Two layers, float32 | 35 s | 31 MB | 42 MB | 6,068 |
-| Two layers, int8 | 27 s | 8 MB | 13 MB | 4,788 |
-| All 24 layers and the 50,288-token tied embedding, int8 | 16 min | 215 MB | 276 MB | 71,125 |
+| One layer, float32 | 3 s | 16 MB | 23 MB | 3,447 |
+| Two layers, float32 | 4 s | 31 MB | 42 MB | 6,129 |
+| Two layers, int8 | 3 s | 8 MB | 13 MB | 4,849 |
+| All 24 layers and the 50,288-token tied embedding, int8 | 35 s | 136 MB | 180 MB | 66,659 |
 
-The full int8 export peaked at 11.5 GB of memory; only the embedding's list
-was sharded. Each layer adds about 3.8 million weights, 17 seconds and 15 MB
-in float32. The whole float32 model, about 129 million weights, would be
-roughly 500 MB and was not exported. Either is far beyond what Scratch's
+The full int8 export peaked at 2.7 GB of memory, the model itself included.
+Each layer adds about 3.8 million weights, 2 seconds and 15 MB in float32. The
+whole float32 model, about 129 million weights, would be roughly 500 MB and
+was not exported. Either is far beyond what Scratch's
 website accepts; see [project size](storage.md#project-size). Each generated
 token is about 129 million multiply-adds, so expect a full-size model to be
 very slow; it wasn't timed in Scratch.
