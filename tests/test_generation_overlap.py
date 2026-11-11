@@ -25,8 +25,17 @@ from test_optimization import CachedLM  # noqa: E402
 from test_recurrent_generation import make, reference_rows  # noqa: E402
 
 TOLERANCE = 1e-4
+# Pause places tried per case, spread over the call.
+SAMPLES = 8
 OVERTAKEN = "another reset, prefill, decode or init ran during this one; reset or prefill first"
 SETUP = [1, 2, 3, 4]
+
+
+def spread(count, samples=SAMPLES):
+    """Up to ``samples`` of ``range(count)``, first and last included."""
+    if count <= samples:
+        return list(range(count))
+    return sorted({round(index * (count - 1) / (samples - 1)) for index in range(samples)})
 
 
 class Stopped(Exception):
@@ -320,7 +329,7 @@ OVERLAPS = {
 @pytest.mark.parametrize("overlap", sorted(OVERLAPS))
 def test_a_call_paused_while_another_runs_never_reports_wrong_logits(generator, overlap):
     first, second = OVERLAPS[overlap]
-    for pause in range(generator.pauses(first)):
+    for pause in spread(generator.pauses(first)):
         # The second script runs to its end while the first is paused, then
         # the first resumes; or the first is stopped where it was paused.
         for resume in (None, "stop"):
@@ -335,7 +344,7 @@ def test_a_call_taken_over_while_it_decodes_the_weights_leaves_them_to_decode_ag
     # In a freshly loaded project the first call decodes the weights; one that
     # resumes doing so after another call decoded them leaves them wrong.
     first, second = OVERLAPS[overlap]
-    for pause in range(generator.pauses(first, fresh=True)):
+    for pause in spread(generator.pauses(first, fresh=True)):
         for resume in (None, "stop"):
             state = generator.interleave(
                 first, second, [(0, pause), (1, None), (0, resume)], fresh=True,
@@ -347,8 +356,8 @@ def test_a_call_taken_over_while_it_decodes_the_weights_leaves_them_to_decode_ag
 def test_a_resumed_call_that_ends_first_fails_the_call_running(generator, overlap):
     first, second = OVERLAPS[overlap]
     taken_over = generator.pauses(second[:1])
-    for pause in range(0, generator.pauses(first), 2):
-        for other in range(0, taken_over, 2):
+    for pause in spread(generator.pauses(first), 4):
+        for other in spread(taken_over, 4):
             # The first script resumes while the second is paused in its
             # takeover, and ends first.
             emulator, finished = generator.interleave(

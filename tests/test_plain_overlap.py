@@ -19,7 +19,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_generation_automatic import load_sprite  # noqa: E402
-from test_generation_overlap import Script, Scripts  # noqa: E402
+from test_generation_overlap import Script, Scripts, spread  # noqa: E402
 from test_program_overlap import LOOPS, OVERTAKEN  # noqa: E402
 
 TOLERANCE = 1e-5
@@ -43,13 +43,6 @@ def pause_points(emulator):
         if block["opcode"] in LOOPS and block["inputs"].get("SUBSTACK") is not None
     )
     return points
-
-
-def spread(count, samples=SAMPLES):
-    """Up to ``samples`` of ``range(count)``, first and last included."""
-    if count <= samples:
-        return list(range(count))
-    return sorted({round(index * (count - 1) / (samples - 1)) for index in range(samples)})
 
 
 class Plain:
@@ -254,12 +247,28 @@ class _Cell(nn.Module):
         return h, h.sum(-1)
 
 
+_EXPORTED: dict = {}
+
+
+def _exported(name, tmp_path_factory):
+    if name not in _EXPORTED:
+        model, inputs, options = EXPORTS[name]()
+        sprite, _ = export(tmp_path_factory, name.replace(" ", "_"), model, inputs, **options)
+        sprite.name = name
+        _EXPORTED[name] = sprite
+    return _EXPORTED[name]
+
+
 @pytest.fixture(scope="module", params=sorted(EXPORTS))
 def plain(request, tmp_path_factory):
-    model, inputs, options = EXPORTS[request.param]()
-    sprite, _ = export(tmp_path_factory, request.param.replace(" ", "_"), model, inputs, **options)
-    sprite.name = request.param
-    return sprite
+    return _exported(request.param, tmp_path_factory)
+
+
+# Init and prepare for save decode or keep the weights, which depends on the
+# storage, and wrap the forward procedure, which a variable length changes.
+@pytest.fixture(scope="module", params=["int8", "static", "uncompressed", "variable length"])
+def stored(request, tmp_path_factory):
+    return _exported(request.param, tmp_path_factory)
 
 
 def calls(plain, seeds):
@@ -278,7 +287,7 @@ def setup_calls(plain, setup):
 def test_a_forward_paused_while_another_runs_never_reports_wrong_outputs(plain, setup):
     before = setup_calls(plain, setup)
     first, second = calls(plain, [10]), calls(plain, [20, 21])
-    for pause in spread(plain.pauses(before, first)):
+    for pause in spread(plain.pauses(before, first), SAMPLES):
         for resume in (None, "stop"):
             emulator, finished = plain.interleave(
                 before, first, second, [(0, pause), (1, None), (0, resume)],
@@ -291,7 +300,7 @@ def test_a_forward_paused_while_another_runs_never_reports_wrong_outputs(plain, 
 def test_a_stopped_forward_leaves_the_next_one_to_run_as_usual(plain, setup):
     before = setup_calls(plain, setup)
     first = calls(plain, [10])
-    for pause in spread(plain.pauses(before, first)):
+    for pause in spread(plain.pauses(before, first), SAMPLES):
         emulator, finished = plain.interleave(before, first, [], [(0, pause), (0, "stop")])
         assert finished == []
         plain.check_afterwards(emulator)
@@ -303,8 +312,9 @@ def test_a_stopped_forward_leaves_the_next_one_to_run_as_usual(plain, setup):
 ])
 @pytest.mark.parametrize("setup", SETUPS)
 def test_init_and_prepare_for_save_never_leave_wrong_outputs_reported_ok(
-    plain, setup, first, second,
+    stored, setup, first, second,
 ):
+    plain = stored
     if PREPARE not in ScratchEmulator(plain.sprite)._procedures and "prepare for save" in (
         first, second,
     ):
@@ -312,7 +322,7 @@ def test_init_and_prepare_for_save_never_leave_wrong_outputs_reported_ok(
     before = setup_calls(plain, setup)
     named = {"init": [(INIT, {})], "prepare for save": [(PREPARE, {})], "forward": calls(plain, [10])}
     first_calls, second_calls = named[first], [*named[second], *calls(plain, [20])]
-    for pause in spread(plain.pauses(before, first_calls)):
+    for pause in spread(plain.pauses(before, first_calls), SAMPLES):
         for resume in (None, "stop"):
             emulator, _ = plain.interleave(
                 before, first_calls, second_calls, [(0, pause), (1, None), (0, resume)],
@@ -348,7 +358,7 @@ def test_sharded_outputs_are_cleared_by_a_forward_another_ran_during(
     assert "output shard 3" in {entry[0] for entry in plain.sprite["lists"].values()}
     first, second = calls(plain, [10]), calls(plain, [20])
     overtaken = 0
-    for pause in spread(plain.pauses([], first)):
+    for pause in spread(plain.pauses([], first), 12):
         emulator, finished = plain.interleave([], first, second, [(0, pause), (1, None), (0, None)])
         overtaken += finished[-1][3] == OVERTAKEN
         plain.check_afterwards(emulator)
