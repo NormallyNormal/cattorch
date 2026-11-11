@@ -21,9 +21,9 @@ from cattorch.storage import (
     StorageConfig,
     build_decoder_programs,
     build_shared_unpack_program,
-    quantize_values,
     rounded_values,
     _float_bytes,
+    _quantize_arrays,
     _quantized_bytes,
 )
 from cattorch.util.scratch.remap import remap_ids
@@ -1618,7 +1618,7 @@ def _apply_static_storage(
                 if segments else contents
             )
             if shard_precision in {"int8", "int6", "int4"}:
-                codes, scales = quantize_values(
+                codes, scales = _quantize_arrays(
                     encoded_contents,
                     shard_precision,
                     group_size,
@@ -1639,7 +1639,7 @@ def _apply_static_storage(
                     scale_payload_name=f"cattorch scale payload {scale_number}",
                     scale_precision=storage.scale_precision,
                     payload_bytes=raw_payload,
-                    scale_values=tuple(scales),
+                    scale_values=tuple(scales.tolist()),
                 ))
             else:
                 raw_payload = _float_bytes(encoded_contents, shard_precision)
@@ -1653,6 +1653,8 @@ def _apply_static_storage(
             if segments:
                 runtime_interleaves.append((shard.name, segments))
             sprite["lists"][shard.identifier][1] = []
+        # Its shards hold the payload now; let a derived tensor go.
+        static_tensors[logical_name.removeprefix("W_")] = None
 
     if specs:
         for index, (decoder_name, program) in enumerate(
