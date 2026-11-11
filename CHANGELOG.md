@@ -253,6 +253,11 @@
   batched weight, such as `[n, 1, 3, 4] @ [3, 4, 5]`, runs once per item
   instead of failing the length check, and rows inside a batch against a
   batched weight are rejected with a message saying so.
+- `torch.lgamma` (also `Tensor.lgamma` and `torch.special.gammaln`), and
+  through it `torch.mvlgamma` and `torch.special.multigammaln`. It agrees
+  with float64 PyTorch to about 1e-14 over the whole domain, including
+  negative arguments, and is exactly zero at 1 and 2 with full
+  relative accuracy around them; poles and both infinities give Infinity.
 
 ## Performance
 

@@ -1754,21 +1754,21 @@ def test_verify_reports_exact_and_lossy_export_error(tmp_path):
 
 
 def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
-    class LogGammaBlock(nn.Module):
+    class DigammaBlock(nn.Module):
         def forward(self, value):
-            return torch.lgamma(value)
+            return torch.digamma(value)
 
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.features = LogGammaBlock()
+            self.features = DigammaBlock()
 
         def forward(self, value):
             return self.features(value)
 
     with pytest.raises(UnsupportedOperationError) as caught:
-        transpile(Model().eval(), torch.ones(2), tmp_path / "lgamma")
+        transpile(Model().eval(), torch.ones(2), tmp_path / "digamma")
     message = str(caught.value)
-    assert "aten.lgamma.default" in message
+    assert "aten.digamma.default" in message
     assert "module: features" in message
-    assert "exported node: lgamma" in message
+    assert "exported node: digamma" in message

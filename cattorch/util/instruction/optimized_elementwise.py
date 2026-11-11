@@ -22,6 +22,7 @@ from cattorch.util.scratch.dsl import (
     mul,
     for_each,
     repeat,
+    round_,
     set_var,
     sub,
     var,
@@ -58,6 +59,87 @@ def _erfc_statements(value, target: str):
         set_var(target, mul(t, mathop(
             "e ^", sub(polynomial, mul(magnitude, magnitude)),
         ))),
+    )
+
+
+# Lanczos approximation, g = 7 and n = 9 (Godfrey's coefficients): for z > 0,
+# Gamma(z) = sqrt(2 pi) t^(z - 1/2) e^-t A(z), with t = z + 6.5 and
+# A(z) = c0 + sum c_i / (z + i - 1). Dividing by the same formula at z = 1
+# gives lgamma(z) = (z - 1)(ln t - 1) + ln(A(z) / A(1) sqrt(t / 7.5)), whose
+# terms all vanish at z = 1. ``A(z) / A(1) - 1`` is ``(z - 1)`` times the
+# series below, so lgamma keeps its relative accuracy near its zero at 1.
+_LANCZOS = (
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+)
+_LANCZOS_AT_ONE = _LANCZOS[0] + sum(c / i for i, c in enumerate(_LANCZOS[1:], 1))
+_LGAMMA_SERIES = tuple(-c / (i * _LANCZOS_AT_ONE) for i, c in enumerate(_LANCZOS[1:], 1))
+# sin(pi r) / (pi r) as a polynomial in r^2 for |r| <= 1/2, within 4e-16.
+_SINE_RATIO = (
+    1.0, -1.6449340668481678, 0.8117424252784269, -0.19075182396433998,
+    0.026147845336487233, -0.002346059829910968, 0.00014832827396380304,
+    -6.7270425170826265e-06,
+)
+
+
+_LGAMMA_VARIABLES = (
+    "lgamma z", "lgamma shift", "lgamma delta", "lgamma series", "lgamma log", "lgamma sine",
+)
+
+
+def _lgamma_statements(value, out):
+    """Statements appending ``lgamma(value)`` to ``out``, the last one a branch.
+
+    ``value`` is a variable; the statements use ``inner`` and the variables
+    in ``_LGAMMA_VARIABLES``. Arguments below 1/2 use the reflection formula
+    ``lgamma(x) = ln(pi / |sin(pi x)|) - lgamma(1 - x)``, with the sine as a
+    polynomial (Scratch rounds its own to ten decimal places). Arguments
+    within 1/2 of 2 step down to ``lgamma(z - 1) + ln(z - 1)`` so the zero at
+    2 is exact as well. Poles, and -Infinity, give Infinity.
+    """
+    z, shift, delta, series, log, reflected = (var(name) for name in _LGAMMA_VARIABLES)
+    terms = div(_LGAMMA_SERIES[-1], add(z, len(_LGAMMA_SERIES) - 1))
+    for offset in reversed(range(len(_LGAMMA_SERIES) - 1)):
+        terms = add(terms, div(_LGAMMA_SERIES[offset], add(z, offset) if offset else z))
+    # sqrt(t / 7.5) - 1, without cancellation for z near 1.
+    scaled = div(delta, 7.5)
+    root = div(scaled, add(mathop("sqrt", add(1, scaled)), 1))
+    sine = _SINE_RATIO[-1]
+    for coefficient in reversed(_SINE_RATIO[:-1]):
+        sine = add(coefficient, mul(log, sine))
+    return (
+        set_var("lgamma z", value),
+        if_(lt(value, 0.5), (set_var("lgamma z", sub(1, value)),)),
+        if_else(
+            lt(mathop("abs", sub(z, 2)), 0.5),
+            (set_var("lgamma shift", mathop("ln", sub(z, 1))), change_var("lgamma z", -1)),
+            (set_var("lgamma shift", 0),),
+        ),
+        set_var("lgamma delta", sub(z, 1)),
+        # A(z) / A(1) - 1, then A(z) / A(1) sqrt(t / 7.5) - 1.
+        set_var("lgamma series", mul(delta, terms)),
+        set_var("lgamma series", add(series, mul(root, add(1, series)))),
+        # ln(1 + series), corrected for the rounding of 1 + series.
+        set_var("lgamma log", add(1, series)),
+        set_var("inner", add(add(
+            mul(delta, sub(mathop("ln", add(z, 6.5)), 1)),
+            add(mathop("ln", log), div(sub(series, sub(log, 1)), log)),
+        ), shift)),
+        if_else(
+            lt(value, 0.5),
+            (
+                set_var("lgamma sine", sub(value, round_(value))),
+                set_var("lgamma log", mul(reflected, reflected)),
+                set_var("lgamma sine", mathop("abs", mul(reflected, sine))),
+                if_else(
+                    eq(reflected, 0),
+                    (append(out, math.inf),),
+                    (append(out, mul(-1, add(mathop("ln", reflected), var("inner")))),),
+                ),
+            ),
+            (append(out, var("inner")),),
+        ),
     )
 
 
@@ -174,7 +256,7 @@ class _Elementwise:
 
         if not isinstance(self.size, int):
             traversal = (set_var("index", 1), repeat(self.size, iteration))
-        elif op in {"aten.gelu.default", "aten.erf.default"}:
+        elif op in {"aten.gelu.default", "aten.erf.default", "aten.lgamma.default"}:
             # GELU's large reporter tree regressed when unrolled, but the
             # palette-hidden official loop still removes one index mutation.
             traversal = (for_each("index", self.size, iteration[:-1]),)
@@ -289,6 +371,11 @@ class _Elementwise:
             result = mathop("e ^", mul(direct, 0.6931471805599453))
         elif op == "aten.log2.default":
             result = mul(mathop("ln", direct), 1.4426950408889634)
+        elif op == "aten.lgamma.default":
+            for name in _LGAMMA_VARIABLES:
+                self.ctx.temp_var(name)
+            *statements, output = _lgamma_statements(cached, out)
+            setup = (set_var("value", direct), *statements)
         elif op == "aten.erfc.default":
             setup = (set_var("value", direct), *_erfc_statements(cached, "inner"))
             output = choose(lt(cached, 0), sub(2, var("inner")), var("inner"))

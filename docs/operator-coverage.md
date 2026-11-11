@@ -12,10 +12,10 @@ an argument a model rarely uses, so a partial or failing operator may
 still work in your model; see [supported models](supported-models.md)
 for what cattorch is designed to handle.
 
-Of 1555 samples tried with PyTorch 2.14, 1396 pass.
+Of 1555 samples tried with PyTorch 2.14, 1410 pass.
 Samples were skipped when their output is random, complex, or not a tensor.
 
-## Every sample passes (402)
+## Every sample passes (406)
 
 `H`, `T`, `__getitem__`, `__radd__`, `__rdiv__`, `__rmatmul__`, `__rmod__`,
 `__rmul__`, `__rpow__`, `__rsub__`, `_chunk_cat`, `_softmax_backward_data`,
@@ -40,7 +40,7 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `index_put`, `index_reduce.amax`, `index_reduce.amin`, `index_reduce.mean`,
 `index_reduce.prod`, `index_select`, `inner`, `isfinite`, `isin`, `isinf`,
 `isnan`, `isneginf`, `isposinf`, `isreal`, `kron`, `kthvalue`, `ldexp`, `le`,
-`lerp`, `log`, `log10`, `log1p`, `log2`, `log_softmax`,
+`lerp`, `lgamma`, `log`, `log10`, `log1p`, `log2`, `log_softmax`,
 `log_softmax.with_dtype`, `logaddexp`, `logaddexp2`, `logcumsumexp`,
 `logical_and`, `logical_not`, `logical_or`, `logical_xor`, `logit`,
 `logspace.tensor_overload`, `logsumexp`, `lt`, `mH`, `mT`, `masked_fill`,
@@ -48,7 +48,8 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `max_pool2d_with_indices_backward`, `maximum`, `mean`, `median`,
 `meshgrid.list_of_tensors`, `meshgrid.variadic_tensors`, `min.binary`,
 `min.reduction_no_dim`, `min.reduction_with_dim`, `minimum`, `mm`, `movedim`,
-`msort`, `mul`, `mv`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
+`msort`, `mul`, `mv`, `mvlgamma.mvlgamma_p_1`, `mvlgamma.mvlgamma_p_3`,
+`mvlgamma.mvlgamma_p_5`, `nan_to_num`, `nanmean`, `nansum`, `narrow_copy`,
 `native_dropout_backward`, `native_group_norm`, `native_layer_norm`, `ne`,
 `neg`, `new_full`, `new_ones`, `new_zeros`,
 `nn.functional.adaptive_avg_pool1d`, `nn.functional.adaptive_avg_pool2d`,
@@ -121,12 +122,11 @@ Samples were skipped when their output is random, complex, or not a tensor.
 `var_mean`, `var_mean.unbiased`, `vdot`, `view`, `view_as`, `view_copy`,
 `vsplit`, `vstack`, `where`, `xlogy`, `zero_`, `zeros_like`
 
-## Some samples pass (10)
+## Some samples pass (9)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
 | `digamma` | 1/3 | no kernel for `aten.digamma.default` |
-| `lgamma` | 1/3 | no kernel for `aten.lgamma.default` |
 | `linspace.tensor_overload` | 2/3 | no kernel for `aten.copy.default` |
 | `narrow` | 2/4 | passes only with constant integer arguments |
 | `native_batch_norm` | 1/4 | no kernel for `aten.copy_.default` |
@@ -136,7 +136,7 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `nn.functional.scaled_dot_product_attention` | 2/4 | tracing failed (RuntimeError: cattorch SDPA decomposition requires dropout_p=0) |
 | `repeat_interleave` | 3/4 | passes only with constant integer arguments |
 
-## No sample passes (39)
+## No sample passes (36)
 
 | Operator | Passing | Most common failure |
 |---|---|---|
@@ -160,9 +160,6 @@ Samples were skipped when their output is random, complex, or not a tensor.
 | `log_normal` | 0/3 | no kernel for `aten.randn_like.default` |
 | `masked_scatter` | 0/4 | no kernel for `aten.masked_scatter.default` |
 | `mode` | 0/4 | no kernel for `aten.mode.default` |
-| `mvlgamma.mvlgamma_p_1` | 0/4 | no kernel for `aten.lgamma.default` |
-| `mvlgamma.mvlgamma_p_3` | 0/4 | no kernel for `aten.lgamma.default` |
-| `mvlgamma.mvlgamma_p_5` | 0/4 | no kernel for `aten.lgamma.default` |
 | `nanmedian` | 0/4 | no kernel for `aten.nanmedian.default` |
 | `nanquantile` | 0/4 | needs an input's value at export (`aten.equal.default`) |
 | `nextafter` | 0/4 | no kernel for `aten.nextafter.default` |

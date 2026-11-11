@@ -337,7 +337,7 @@ ELEMENTWISE_OPS = frozenset({
     "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
     "aten.where.Scalar", "aten.sin.default", "aten.cos.default",
     "aten.tan.default", "aten.asin.default", "aten.acos.default", "aten.atan.default",
-    "aten.exp2.default", "aten.log2.default", "aten.erfc.default",
+    "aten.exp2.default", "aten.log2.default", "aten.erfc.default", "aten.lgamma.default",
 })
 
 # Pure data-movement operations. The transpiler describes each call as a

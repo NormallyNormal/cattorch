@@ -54,6 +54,8 @@ POINTWISE = {
     "reciprocal": (torch.reciprocal, POSITIVE),
     "erf": (torch.erf, VECTOR),
     "exact gelu": (F.gelu, VECTOR),
+    "log gamma": (torch.lgamma, POSITIVE),
+    "log gamma of negative values": (torch.lgamma, VECTOR + 0.1),
     "clamp": (lambda x: x.clamp(-1.0, 0.5), VECTOR),
     "clamp min": (lambda x: x.clamp(min=-1.0), VECTOR),
     "clamp max": (lambda x: x.clamp(max=0.5), VECTOR),
@@ -81,6 +83,19 @@ POINTWISE = {
 def test_pointwise_operation(tmp_path, name):
     function, value = POINTWISE[name]
     _export_and_verify(tmp_path, Lambda(function), (value,), atol=1e-6)
+
+
+def test_log_gamma_across_its_domain(tmp_path):
+    """Large and tiny arguments, the zeros at 1 and 2, reflection below 1/2,
+    poles and infinities, against float64 PyTorch."""
+    near_one = [1 - 2.0 ** -24, 1 + 2.0 ** -23, 1 + 1e-12, 2 - 2.0 ** -23, 2 + 2.0 ** -22]
+    value = torch.tensor([
+        1e30, 3.5e36, 171.5, 1e6 + 0.25, 25.0, 10.5, 3.7, 2.75, 1.5, 0.75, 0.3,
+        1e-3, 1e-8, 1e-30, 1.0, 2.0, *near_one, -1e-7, -0.5, -1.5, -3.9, -6.999999999,
+        -10.3, -123456.5, 0.0, -0.0, -1.0, -5.0, -1e30, math.inf, -math.inf,
+    ], dtype=torch.float64)
+    # No absolute tolerance: lgamma(1) and lgamma(2) must be exactly zero.
+    _export_and_verify(tmp_path, Lambda(torch.lgamma), (value,), atol=0, rtol=1e-13)
 
 
 def test_integer_input_can_be_cast_to_float(tmp_path):
@@ -576,13 +591,14 @@ def test_decomposed_operation(tmp_path, name):
     _export_and_verify(tmp_path, model, inputs, atol=1e-5)
 
 
-KNOWN_UNSUPPORTED = {
-    "log gamma": (Lambda(torch.lgamma), (POSITIVE,)),
-}
+# Cases that still fail, as ``name: (model, inputs)``. Every typical case is
+# supported now; the test is only defined while there is something to xfail.
+KNOWN_UNSUPPORTED: dict[str, tuple[nn.Module, tuple[torch.Tensor, ...]]] = {}
 
 
-@pytest.mark.parametrize("name", sorted(KNOWN_UNSUPPORTED))
-@pytest.mark.xfail(raises=CattorchError, strict=True)
-def test_known_unsupported(name):
-    model, inputs = KNOWN_UNSUPPORTED[name]
-    _prepare_graph(model.eval(), inputs)
+if KNOWN_UNSUPPORTED:
+    @pytest.mark.parametrize("name", sorted(KNOWN_UNSUPPORTED))
+    @pytest.mark.xfail(raises=CattorchError, strict=True)
+    def test_known_unsupported(name):
+        model, inputs = KNOWN_UNSUPPORTED[name]
+        _prepare_graph(model.eval(), inputs)
