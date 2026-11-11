@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from cattorch.graph import _GenerationSpec, _GraphInfo, _get_shape
+from cattorch.quantization import effective_group_size
 from cattorch.storage import (
     EncodedList,
     StorageConfig,
@@ -1148,10 +1149,8 @@ def _static_storage_precision(
     ndim = tensor.ndim if effective_ndim is None else effective_ndim
     if storage.precision in {"int8", "int6", "int4"} and ndim < 2:
         return "float16"
-    if (
-        storage.precision in {"int8", "int6", "int4"}
-        and storage.grouping == "row"
-        and not _on_integer_codec_grid(tensor, storage, interleave_segments)
+    if storage.precision in {"int8", "int6", "int4"} and not _on_integer_codec_grid(
+        tensor, storage, interleave_segments,
     ):
         # QuantizationConfig decides which weights are lossy. Storage must not
         # quantize anything it did not reconstruct, such as buffers (RoPE
@@ -1292,19 +1291,11 @@ def _static_storage_group_size(
     tensor: torch.Tensor | None,
     storage: StorageConfig,
 ) -> int:
-    """Resolve the physical group width for one logical matrix."""
-    if (
-        storage.grouping != "row"
-        or not isinstance(tensor, torch.Tensor)
-        or tensor.ndim < 2
-        or tensor.shape[-1] < 1
-    ):
+    """The quantization group width of one logical matrix, as quantization
+    chose it: groups never cross a row."""
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2 or tensor.shape[-1] < 1:
         return storage.group_size
-    width = int(tensor.shape[-1])
-    for candidate in range(min(width, storage.group_size), 0, -1):
-        if width % candidate == 0:
-            return candidate
-    return 1
+    return effective_group_size(int(tensor.shape[-1]), storage.group_size)
 
 
 def _static_storage_shard_limits(

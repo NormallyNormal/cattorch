@@ -441,7 +441,8 @@ class _Compiler:
         # A tied table that ends up stored a second time, with the reason.
         self.tied_storage_copies: dict[str, str] = {}
         self.storage = storage
-        self.row_aligned_weights = storage.grouping == "row"
+        # Quantization groups each matrix along its rows, over its inputs.
+        self.row_aligned_weights = storage.precision in {"int8", "int6", "int4"}
         # id(weight) -> (weak reference to it, its storage list cap).
         self._storage_shard_limits: dict[int, tuple[weakref.ref, int]] = {}
         self.interleaved_static_layouts: dict[str, tuple[tuple[int, int, int], ...]] = {}

@@ -72,7 +72,6 @@ class StorageConfig:
     scale_precision: Literal["float32", "float16"] = field(
         default="float32", init=False, repr=False,
     )
-    grouping: Literal["flat", "row"] = field(default="flat", init=False, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.compression, bool):
@@ -96,7 +95,6 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
         ("group_size", quantization.group_size),
         ("min_quantized_values", quantization.min_quantized_values),
         ("scale_precision", quantization.scale_precision),
-        ("grouping", "row"),
     ):
         object.__setattr__(result, name, value)
     return result
