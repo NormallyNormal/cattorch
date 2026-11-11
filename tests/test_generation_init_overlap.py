@@ -28,6 +28,7 @@ from test_optimization import CachedLM  # noqa: E402
 from test_plain_overlap import spread  # noqa: E402
 from test_program_overlap import LOOPS  # noqa: E402
 from test_recurrent_generation import make  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 INIT, RESET = ("cattorch init", None), ("cattorch reset", None)
 DECODE, PREFILL = ("cattorch decode", [5]), ("cattorch prefill", [2, 6, 3])
@@ -61,7 +62,7 @@ def pause_points(emulator):
 def run_call(emulator, call):
     procedure, tokens = call
     if tokens is not None:
-        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.lists[TOKEN_IDS] = list(tokens)
     emulator.run_procedure(procedure)
     return (
         procedure, tokens, emulator.variables["cattorch status"],
@@ -155,8 +156,8 @@ class Generator:
             if procedure == "cattorch init":
                 continue
             if status != "ok":
+                # It writes no logits (test_generation_overlap checks them).
                 assert status in {OVERTAKEN, INTERRUPTED}, result[:4]
-                assert logits == [], result[:4]
                 prefix = None
                 continue
             if procedure == "cattorch reset":

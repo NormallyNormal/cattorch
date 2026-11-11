@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import itertools
 from dataclasses import dataclass
-from cattorch.util.scratch.interface import shard_name as physical_shard_name
+from cattorch.interface import shard_name as physical_shard_name, shard_variables
 from cattorch.util.scratch.tensor_adder import StaticValues
 
 
@@ -424,11 +424,7 @@ def shard_sprite_lists(
         if len(layout.shards) < 2 or name.startswith("_"):
             continue
         safe = "".join(char if char.isalnum() else "_" for char in name)
-        label = name.removeprefix("cattorch ")
-        variables[f"cattorch_{safe}_shard_count"] = [
-            f"cattorch {label} shard count", len(layout.shards),
-        ]
-        variables[f"cattorch_{safe}_logical_length"] = [
-            f"cattorch {label} logical length", layout.logical_size,
-        ]
+        count, logical_length = shard_variables(name)
+        variables[f"cattorch_{safe}_shard_count"] = [count, len(layout.shards)]
+        variables[f"cattorch_{safe}_logical_length"] = [logical_length, layout.logical_size]
     return layouts

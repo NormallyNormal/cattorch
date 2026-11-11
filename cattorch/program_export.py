@@ -27,20 +27,21 @@ from cattorch.program_runtime import (
     validate_entry_outputs,
 )
 from cattorch.results import (
-    EntryPointResult, ProgramResult, StateResult, TensorSpec, fallback_warning,
+    BoundedDimension, EntryPointResult, ProgramResult, StateResult, TensorSpec, fallback_warning,
 )
 from cattorch.quantization import quantize_model
+from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
-    _BUSY, _CALL_OVERTAKEN, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
+    _BUSY, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
     _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
     _stop_overtaken_decoding,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
     Program, Statement, add, append, argument, broadcast_and_wait, call, change_var, clear, eq,
-    for_each, gt, if_, if_else, item, length, lt, mod, not_, repeat, set_var, var,
+    for_each, gt, if_, if_else, item, length, mod, mul, not_, repeat, set_var, var,
 )
 from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
 from cattorch.util.scratch.interface import (
@@ -193,12 +194,8 @@ def _deduplicate_program_payloads(sprite: dict, payload_names: set[str]) -> None
             slots.pop(identifier, None)
 
 
-def _state_list(name: str) -> str:
-    return f"cattorch state {name}"
-
-
-def _input_list(entrypoint: str, name: str) -> str:
-    return f"cattorch {entrypoint} {name}"
+_state_list = interface.state_list
+_input_list = interface.entry_list
 
 
 def _temporary_return(entrypoint: str, index: int) -> str:
@@ -216,11 +213,6 @@ _ENSURE_STATES = "_cattorch ensure states"
 # With the calling block's epoch.
 _ENSURE_STATES_IN_EPOCH = "_cattorch ensure states %s"
 _STATES_FILLED = "_cattorch states filled"
-_INTERRUPTED = (
-    "an earlier call or reset was stopped while changing the states, or is still "
-    "changing them; reset first"
-)
-_OVERTAKEN = _CALL_OVERTAKEN
 
 
 def _overtaken() -> tuple[Statement, ...]:
@@ -229,7 +221,19 @@ def _overtaken() -> tuple[Statement, ...]:
     It changes the epoch too: a call it resumed during, still running, may
     have read what it wrote meanwhile, and fails as well.
     """
-    return (change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, _OVERTAKEN))
+    return (change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, interface.OVERTAKEN))
+
+
+def _all_initialized(flags) -> tuple[Statement, ...]:
+    """Set ``cattorch initialized`` to 1 when every entry point's weights are decoded.
+
+    Each entry point decodes its own weights on its first call; the flags
+    are each one's ``_cattorch ENTRY initialized``, 0 or 1.
+    """
+    product = var(flags[0])
+    for flag in flags[1:]:
+        product = mul(product, var(flag))
+    return (set_var(interface.INITIALIZED_VARIABLE, product),)
 
 
 def _fill_procedure(index: int) -> str:
@@ -324,27 +328,38 @@ def _build_entry_wrapper(
     hidden: frozenset[int] = frozenset(),
     gate: str = "",
     guarded: bool = False,
+    display: Callable[[str], str] = lambda name: name,
+    finish: tuple[Statement, ...] = (),
+    finish_variables: tuple[str, ...] = (),
+    item_kinds: Mapping[int, tuple] = {},
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
     """The procedure body that checks, computes and commits one entry point.
 
     The ``hidden`` return positions are checked and copied only while the
     ``gate`` variable is 1. A ``guarded`` body is run by
     ``_add_epoch_procedure`` and commits nothing once another call started.
+    A call that fails writes no output and changes no state. ``display``
+    gives a list's final name, for the status; ``finish`` ends the body,
+    whatever happened, with the ``finish_variables``. An unguarded body then
+    sends its completion broadcast, which a guarded one's public block sends. ``item_kinds`` say
+    what each input's items must be (``interface.item_checks``), by position;
+    a guarded body computes nothing once another call started.
     """
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
     internal = f"_cattorch {entrypoint.name} compute"
-    completion = f"cattorch {entrypoint.name} complete"
+    completion = interface.completion(f"cattorch {entrypoint.name}")
     public_outputs = []
     lists = set()
-    variables = {status, gate} if hidden else {status}
-    body: list[Statement] = [set_var(status, "ok")]
+    variables = {status, gate, *finish_variables} if hidden else {status, *finish_variables}
+    body: list[Statement] = [set_var(status, interface.OK)]
     if ensure_states:
         body.append(
             call(_ENSURE_STATES_IN_EPOCH, epoch=argument("epoch")) if guarded
             else call(_ENSURE_STATES)
         )
 
+    ok = eq(var(status), interface.OK)
     for index, (binding, spec) in enumerate(zip(entrypoint.arguments, result.inputs)):
         name = (
             _input_list(entrypoint.name, binding.name)
@@ -355,29 +370,33 @@ def _build_entry_wrapper(
             trailing = math.prod(
                 extent for extent in spec.shape[1:] if isinstance(extent, int)
             )
-            body.extend((
-                if_(gt(mod(length(name), trailing), 0), (
-                    set_var(status, f"invalid dynamic length: {name}"),
-                )),
-                if_(gt(length(name), spec.max_numel), (
-                    set_var(status, f"dynamic capacity exceeded: {name}"),
-                )),
-            ))
+            rows = spec.shape[0]
+            minimum = rows.minimum if isinstance(rows, BoundedDimension) else 1
+            # An append state can be empty.
+            minimum = max(minimum, 1) if isinstance(binding, Input) else 0
+            checks = interface.length_checks(
+                display(name), width=trailing, min_items=trailing * minimum,
+                max_items=spec.max_numel, lists=(name,),
+            )
         else:
-            expected = spec.numel
-            body.extend((
-                if_(gt(length(name), expected), (set_var(status, f"invalid length: {name}"),)),
-                if_(lt(length(name), expected), (set_var(status, f"invalid length: {name}"),)),
-            ))
+            checks = interface.length_checks(display(name), numel=spec.numel, lists=(name,))
+        body.append(if_(ok, checks))
+        if isinstance(binding, Input) and index in item_kinds:
+            items = interface.item_checks(display(name), *item_kinds[index], lists=(name,))
+            if items:
+                variables.add("_cattorch check index")
+                body.append(if_(ok, items))
 
     temporary_specs = result.outputs
     validate_entry_outputs(program, entrypoint, temporary_specs)
+    output_lists = []
     for index, (binding, spec) in enumerate(zip(entrypoint.returns, temporary_specs)):
         temporary = _temporary_return(entrypoint.name, index)
         lists.add(temporary)
         if isinstance(binding, Output):
             destination = _input_list(entrypoint.name, binding.name)
             lists.add(destination)
+            output_lists.append(destination)
             public_outputs.append(TensorSpec(
                 list_name=destination,
                 shape=spec.shape,
@@ -386,60 +405,46 @@ def _build_entry_wrapper(
                 max_numel=spec.max_numel,
             ))
 
-    computation = [call(internal)]
+    # What the model returned, checked against what the lists can hold.
+    computation: list[Statement] = [call(internal)]
     for index, (binding, spec) in enumerate(zip(entrypoint.returns, temporary_specs)):
         temporary = _temporary_return(entrypoint.name, index)
         if isinstance(binding, Output):
+            shown = display(_input_list(entrypoint.name, binding.name))
             if spec.numel is None:
                 trailing = math.prod(
                     extent for extent in spec.shape[1:] if isinstance(extent, int)
                 )
-                computation.extend((
-                    if_(gt(mod(length(temporary), trailing), 0), (
-                        set_var(status, f"invalid dynamic return: {binding.name}"),
-                    )),
-                    if_(gt(length(temporary), spec.max_numel), (
-                        set_var(status, f"dynamic return capacity exceeded: {binding.name}"),
-                    )),
-                ))
-            else:
-                expected = spec.numel
-                checks: tuple[Statement, ...] = (
-                    if_(gt(length(temporary), expected), (
-                        set_var(status, f"invalid return length: {binding.name}"),
-                    )),
-                    if_(lt(length(temporary), expected), (
-                        set_var(status, f"invalid return length: {binding.name}"),
-                    )),
+                checks = interface.length_checks(
+                    shown, width=trailing, min_items=0, max_items=spec.max_numel,
+                    lists=(temporary,),
                 )
-                computation.extend(
-                    (if_(eq(var(gate), 1), checks),) if index in hidden else checks,
+                computation.append(if_(ok, checks))
+            else:
+                checks = interface.length_checks(shown, numel=spec.numel, lists=(temporary,))
+                computation.append(
+                    if_(eq(var(gate), 1), checks) if index in hidden else if_(ok, checks),
                 )
             continue
         state = states[binding.name]
         destination = _state_list(state.name)
+        shown = display(destination)
         lists.add(destination)
         if state.mode == "replace":
-            expected = state.initial.numel()
-            computation.extend((
-                if_(gt(length(temporary), expected), (
-                    set_var(status, f"invalid state update: {state.name}"),
-                )),
-                if_(lt(length(temporary), expected), (
-                    set_var(status, f"invalid state update: {state.name}"),
-                )),
-            ))
+            computation.append(if_(ok, interface.length_checks(
+                shown, numel=state.initial.numel(), lists=(temporary,),
+            )))
         else:
             item_size = math.prod(state.initial.shape[1:])
             maximum = state.capacity * item_size
-            computation.extend((
+            computation.append(if_(ok, (
                 if_(gt(mod(length(temporary), item_size), 0), (
-                    set_var(status, f"invalid append update: {state.name}"),
+                    set_var(status, interface.wrong_number_of_items(shown)),
                 )),
                 if_(gt(add(length(destination), length(temporary)), maximum), (
-                    set_var(status, f"state capacity exceeded: {state.name}"),
+                    set_var(status, interface.state_full(shown)),
                 )),
-            ))
+            )))
 
     commits = []
     for index, binding in enumerate(entrypoint.returns):
@@ -451,22 +456,27 @@ def _build_entry_wrapper(
             destination = _state_list(state.name)
         if isinstance(binding, StateUpdate) and states[binding.name].mode == "append":
             commits.append(for_each(
-                f"{entrypoint.name} append {index}", length(temporary),
-                (append(destination, item(temporary, var(f"{entrypoint.name} append {index}"))),),
+                f"_cattorch {entrypoint.name} append {index}", length(temporary),
+                (append(destination, item(
+                    temporary, var(f"_cattorch {entrypoint.name} append {index}"),
+                )),),
             ))
         else:
-            copy = _copy_list(temporary, destination, f"{entrypoint.name} copy {index}")
+            copy = _copy_list(temporary, destination, f"_cattorch {entrypoint.name} copy {index}")
             commits.extend((if_(eq(var(gate), 1), copy),) if index in hidden else copy)
     if not guarded:
-        commits.append(broadcast_and_wait(completion))
-        computation.append(if_(eq(var(status), "ok"), tuple(commits)))
-        body.append(if_(eq(var(status), "ok"), tuple(computation)))
+        computation.append(if_(ok, tuple(commits)))
+        body.append(if_(ok, tuple(computation)))
+        body.extend(finish)
+        body.append(broadcast_and_wait(completion))
     else:
         # The commit is the call's last step, so a call that another one ran
         # during skips it. One paused part way, or stopped, leaves the states
-        # marked busy until a reset.
+        # marked busy until a reset; one another call started during leaves
+        # its outputs mixed, and clears them.
         current = _epoch_current()
         variables.add(_EPOCH)
+        mixed = tuple(clear(name) for name in output_lists)
         if any(isinstance(binding, StateUpdate) for binding in entrypoint.returns):
             variables.add(_BUSY)
             commits = [
@@ -474,35 +484,35 @@ def _build_entry_wrapper(
                 if_else(
                     current,
                     # A call refused meanwhile set the status.
-                    (set_var(_BUSY, 0), set_var(status, "ok"), broadcast_and_wait(completion)),
-                    (set_var(_BUSY, 1), *_overtaken()),
+                    (set_var(_BUSY, 0), set_var(status, interface.OK)),
+                    (set_var(_BUSY, 1), *mixed, *_overtaken()),
                 ),
             ]
         else:
-            commits.append(if_else(
-                current, (broadcast_and_wait(completion),), _overtaken(),
-            ))
-        body.append(if_(eq(var(status), "ok"), tuple(computation)))
+            commits.append(if_(not_(current), (*mixed, *_overtaken())))
+        # A call taken over while it checked its inputs computes nothing.
+        body.append(if_(ok, (if_(current, tuple(computation)),)))
         # Another call may have finished decoding the weights while this one
         # was, and this one then left them half overwritten.
         initialized = f"_cattorch {entrypoint.name} initialized"
         variables.add(initialized)
         body.append(if_else(
             current,
-            (if_(eq(var(status), "ok"), tuple(commits)),),
+            (if_(ok, tuple(commits)),),
             (set_var(initialized, 0), *_overtaken()),
         ))
+        body.extend(finish)
     return Program(
         f"entrypoint_{entrypoint.name}",
         variables=variables | {
-            f"{entrypoint.name} copy {index}"
+            f"_cattorch {entrypoint.name} copy {index}"
             for index, binding in enumerate(entrypoint.returns)
             if not (
                 isinstance(binding, StateUpdate)
                 and states[binding.name].mode == "append"
             )
         } | {
-            f"{entrypoint.name} append {index}"
+            f"_cattorch {entrypoint.name} append {index}"
             for index, binding in enumerate(entrypoint.returns)
             if isinstance(binding, StateUpdate) and states[binding.name].mode == "append"
         },
@@ -543,6 +553,8 @@ def transpile_program(
     _calibration_name: str = "calibration_calls",
     _guard_overlaps: bool = True,
     _owned_model: bool = False,
+    _initialized_flag: bool = True,
+    _check_items: bool = True,
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -577,6 +589,9 @@ def transpile_program(
     - ``_guard_overlaps=False`` leaves out the busy flag and epoch that keep
       stopped and overlapping calls from changing the states unnoticed, for
       a caller that guards the entry points and ``cattorch reset`` itself.
+    - ``_initialized_flag=False`` leaves out ``cattorch initialized``, and
+      ``_check_items=False`` the check of each input item, for a caller that
+      keeps the one and checks the inputs itself.
     - ``_owned_model=True`` says ``model`` is a copy the caller made and no
       longer needs, so it is adapted and quantized in place instead of
       copied again. Variable-length entry points still copy it: their
@@ -679,6 +694,8 @@ def transpile_program(
 
     combined = None
     entry_results = []
+    flags = [f"_cattorch {entry.name} initialized" for entry in program.entrypoints]
+    all_initialized = _all_initialized(flags) if _initialized_flag else ()
     sub_warnings: list[str] = []
     fallbacks: Counter[str] = Counter()
     approximations: Counter[str] = Counter()
@@ -718,6 +735,8 @@ def transpile_program(
         )
 
         deferred_sizes: dict[str, int] = {}
+        # What the items of each input list must be.
+        item_kinds: dict = {}
 
         def capture(arguments, dynamic, edit=None):
             deferred_sizes.clear()
@@ -743,6 +762,7 @@ def transpile_program(
                 _finalize=keep_entry,
                 _hidden_outputs=hidden,
                 _deferred_sizes=deferred_sizes,
+                _item_kinds=item_kinds,
             )
 
         try:
@@ -816,7 +836,10 @@ def transpile_program(
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
             entrypoint, sub_result, program, ensure_states=any_filled,
-            hidden=hidden, gate=_PROJECT_OUTPUT, guarded=_guard_overlaps,
+            hidden=hidden, gate=_PROJECT_OUTPUT, guarded=_guard_overlaps, display=name_of,
+            finish=all_initialized,
+            finish_variables=(interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else (),
+            item_kinds=item_kinds if _check_items else {},
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(
@@ -826,8 +849,11 @@ def transpile_program(
             combined = _add_epoch_procedure(
                 combined, f"cattorch {entrypoint.name}", wrapper_program,
                 x=640, y=160 + 160 * position,
-                refusal=(set_var(STATUS_VARIABLE, _INTERRUPTED),) if program.states else None,
+                refusal=(
+                    (set_var(STATUS_VARIABLE, interface.INTERRUPTED),) if program.states else None
+                ),
                 variables=(STATUS_VARIABLE,),
+                completion=interface.completion(f"cattorch {entrypoint.name}"),
             )
         else:
             combined = _add_warp_procedure(
@@ -895,10 +921,10 @@ def transpile_program(
         for state in program.states if fills[state.name] is None
     }
     lifecycle_variables = {
-        f"cattorch reset {index}" for index, state in enumerate(program.states)
+        f"_cattorch reset {index}" for index, state in enumerate(program.states)
         if fills[state.name] is None
     }
-    reset_body: list[Statement] = [set_var(STATUS_VARIABLE, "ok")]
+    reset_body: list[Statement] = [set_var(STATUS_VARIABLE, interface.OK)]
     lifecycle_variables.add(STATUS_VARIABLE)
     for index, state in enumerate(program.states):
         if fills[state.name] is not None:
@@ -907,7 +933,7 @@ def transpile_program(
         reset_body.extend(_copy_list(
             f"_cattorch initial state {state.name}",
             _state_list(state.name),
-            f"cattorch reset {index}",
+            f"_cattorch reset {index}",
         ))
     ensure_call = (
         call(_ENSURE_STATES_IN_EPOCH, epoch=argument("epoch")) if _guard_overlaps
@@ -945,22 +971,29 @@ def transpile_program(
                 )),),
             )
             combined = _add_warp_procedure(combined, _ENSURE_STATES, ensure, x=1920, y=0)
-    initialized = [f"_cattorch {entry.name} initialized" for entry in program.entrypoints]
     init_body: list[Statement] = [*((ensure_call,) if any_filled else ())]
-    for entry, flag in zip(program.entrypoints, initialized):
+    for entry, flag in zip(program.entrypoints, flags):
         if _guard_overlaps:
             # A call running meanwhile decodes the weights itself.
             init_body.append(set_var(flag, 0))
         init_body.append(call(f"_cattorch {entry.name} init"))
     if _guard_overlaps:
         # A call that ran meanwhile may have left the weights half decoded.
-        init_body.append(if_(not_(_epoch_current()), (
-            *(set_var(flag, 0) for flag in initialized), change_var(_EPOCH, 1),
+        init_body.append(if_else(_epoch_current(), (set_var(STATUS_VARIABLE, interface.OK),), (
+            *(set_var(flag, 0) for flag in flags), change_var(_EPOCH, 1),
+            set_var(STATUS_VARIABLE, interface.OVERTAKEN),
         )))
-    init_body.append(broadcast_and_wait("cattorch init complete"))
+        init_body.extend(all_initialized)
+    else:
+        init_body.extend((*all_initialized, set_var(STATUS_VARIABLE, interface.OK)))
+    init_body.append(broadcast_and_wait(interface.completion(interface.INIT)))
     prepare_body: list[Statement] = [
         call(f"_cattorch {entry.name} prepare for save") for entry in program.entrypoints
     ]
+    prepare_body.extend((
+        *all_initialized, set_var(STATUS_VARIABLE, interface.OK),
+        broadcast_and_wait(interface.completion(interface.PREPARE_FOR_SAVE)),
+    ))
     if _guard_overlaps:
         lifecycle_variables.add(_EPOCH)
         if program.states:
@@ -968,40 +1001,57 @@ def transpile_program(
             # the states busy. A call refused meanwhile set the status.
             lifecycle_variables.add(_BUSY)
             reset_body.append(if_else(
-                _epoch_current(), (set_var(_BUSY, 0), set_var(STATUS_VARIABLE, "ok")),
+                _epoch_current(), (set_var(_BUSY, 0), set_var(STATUS_VARIABLE, interface.OK)),
                 (set_var(_BUSY, 1), *_overtaken()),
             ))
         else:
             reset_body.append(if_(not_(_epoch_current()), _overtaken()))
-        # Re-encoding the weights takes them from a running call.
+        # Clearing the weights takes them from a running call.
         prepare_body.insert(0, change_var(_EPOCH, 1))
+    else:
+        reset_body.extend((
+            set_var(STATUS_VARIABLE, interface.OK),
+            broadcast_and_wait(interface.completion(interface.RESET)),
+        ))
     epoch = (_EPOCH,) if _guard_overlaps else ()
+    initialized_variables = (
+        (interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else tuple(flags)
+    )
     lifecycle = (
-        ("cattorch reset", Program(
+        (interface.RESET, Program(
             "program_reset", variables=lifecycle_variables, lists=lifecycle_lists,
             body=reset_body,
         )),
-        ("cattorch init", Program(
-            "program_init", variables=(*epoch, *initialized), body=init_body,
+        (interface.INIT, Program(
+            "program_init", variables=(*epoch, *initialized_variables, STATUS_VARIABLE),
+            body=init_body,
         )),
-        ("cattorch prepare for save", Program(
-            "program_prepare", variables=epoch, body=prepare_body,
+        (interface.PREPARE_FOR_SAVE, Program(
+            "program_prepare", variables=(*epoch, *initialized_variables, STATUS_VARIABLE),
+            body=prepare_body,
         )),
     )
     for position, (procedure, body_program) in enumerate(lifecycle):
         y = 160 + 160 * position
-        if _guard_overlaps and procedure != "cattorch prepare for save":
+        if _guard_overlaps and procedure != interface.PREPARE_FOR_SAVE:
             combined = _add_epoch_procedure(
                 combined, procedure, body_program, x=1280, y=y,
                 take_over=(
-                    (set_var(_BUSY, 1),) if procedure == "cattorch reset" and program.states
+                    (set_var(_BUSY, 1),) if procedure == interface.RESET and program.states
                     else ()
                 ),
+                completion=interface.completion(procedure) if procedure == interface.RESET else None,
             )
         else:
             combined = _add_warp_procedure(combined, procedure, body_program, x=1280, y=y)
     _merge_lists_by_name(combined, lifecycle_lists)
-    _merge_variables_by_name(combined, lifecycle_variables | {STATUS_VARIABLE})
+    _merge_variables_by_name(
+        combined, lifecycle_variables | {
+            STATUS_VARIABLE, *initialized_variables,
+            # Each entry point's checks of its input items use one.
+            "_cattorch check index",
+        },
+    )
     if _hidden_outputs:
         _merge_variables_by_name(combined, {_PROJECT_OUTPUT})
         for entry in combined["variables"].values():

@@ -141,7 +141,7 @@ def build(checkpoint: Path, output_dir: Path) -> dict:
             "generation_wrapper": "automatic cached step",
             "weight_precision": "int8",
             "scale_precision": "float16",
-            "compression": "costume-base92-huffman-int4",
+            "compression": "base92-huffman-int4",
             "unrolling": "compact",
             "compact_internal_names": {
                 "processor_tokenizer_and_combined_internals": True,

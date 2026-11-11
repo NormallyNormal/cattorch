@@ -173,7 +173,7 @@ def test_procedure_arguments_are_local_to_each_call():
     _compact_internal_display_names(
         sprite, public_data_names=frozenset({"seen"}), public_procedures=frozenset({"run"}),
     )
-    assert "p0 %s" in {
+    assert "_p0 %s" in {
         block["mutation"]["proccode"] for block in sprite["blocks"].values() if "mutation" in block
     }
     emulator = ScratchEmulator(sprite)

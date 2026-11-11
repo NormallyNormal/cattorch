@@ -23,11 +23,8 @@ from cattorch.quantization import QuantizationConfig
 from cattorch.huggingface_recurrent import contains_recurrent_model
 from cattorch.program import GenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.transpiler import (
-    _add_warp_procedure,
-    _merge_lists_by_name,
-    transpile,
-)
+from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.transpiler import transpile
 from cattorch.util.scratch.dsl import (
     Program, append, broadcast_and_wait, change_var, clear, join, repeat, reset_timer, set_var,
     timer, var,
@@ -41,6 +38,7 @@ from cattorch.util.scratch.interface import (
     logical_list_chunks, read_logical_list, write_sprite_list,
 )
 from cattorch.interface import input_name
+from cattorch.interface import TOKEN_IDS
 
 
 LEGACY_TIMINGS = "cattorch legacy timings"
@@ -115,17 +113,17 @@ def _add_cached_decode_procedure(sprite: dict, token: int) -> None:
         "cattorch benchmark decode",
         Program(
             "cached_benchmark_decode",
-            lists=("cattorch tokens",),
+            lists=(TOKEN_IDS,),
             body=(
-                clear("cattorch tokens"),
-                append("cattorch tokens", int(token)),
+                clear(TOKEN_IDS),
+                append(TOKEN_IDS, int(token)),
                 call("cattorch decode"),
             ),
         ),
         x=640,
         y=960,
     )
-    _merge_lists_by_name(sprite, {"cattorch tokens"})
+    _merge_lists_by_name(sprite, {TOKEN_IDS})
 
 
 def _add_broadcast_entry(
@@ -575,7 +573,7 @@ def build_generation_benchmark_suite(
             )
             cached, cached_assets = _load_sprite(cached_base.with_suffix(".sprite3"))
             for entry in cached.get("lists", {}).values():
-                if entry[0] == "cattorch tokens":
+                if entry[0] == TOKEN_IDS:
                     entry[1] = prompt_inputs[0].detach().flatten().tolist()
             prompt_length = prompt_inputs[0].shape[1]
             full_tokens = stateless_inputs[0]

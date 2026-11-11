@@ -8,13 +8,15 @@ procedure, and at each repeat of a loop.
 from __future__ import annotations
 
 import sys
+import threading
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
-from cattorch import QuantizationConfig, StorageConfig, transpile
+from cattorch import QuantizationConfig, StorageConfig, interface, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -69,7 +71,7 @@ class Plain:
         key = tuple((name, tuple(values)) for name, values in inputs.items())
         if key not in self._expected:
             emulator = ScratchEmulator(self.sprite)
-            procedure, _, status, outputs = self.run_call(emulator, (FORWARD, inputs))
+            procedure, _, status, outputs, _ = self.run_call(emulator, (FORWARD, inputs))
             assert status == "ok"
             values = [
                 torch.tensor(inputs[name], dtype=example.dtype).reshape(-1, *example.shape[1:])
@@ -91,19 +93,33 @@ class Plain:
         return [_logical(emulator, name) for name in self.output_names()]
 
     def run_call(self, emulator, call):
+        """Run a call; what it left, with the broadcasts its own script sent."""
         procedure, inputs = call
         for name, values in inputs.items():
             emulator.lists[name] = list(values)
+        sent = _sent(emulator)[threading.get_ident()]
+        before = len(sent)
         emulator.run_procedure(procedure)
-        return procedure, inputs, emulator.variables["cattorch status"], self.outputs(emulator)
+        return (
+            procedure, inputs, emulator.variables["cattorch status"], self.outputs(emulator),
+            tuple(sent[before:]),
+        )
 
-    def check(self, result, ok=False):
-        procedure, inputs, status, outputs = result[-4:]
+    def check(self, result, ok=False, previous=None):
+        """Check a finished call; ``previous`` are the outputs the last ok call left.
+
+        Every call that ends sends its completion broadcast, whatever its
+        status. One that another call ran during writes no output: the
+        outputs stay as the last ok call left them, or are empty if it was
+        taken over while it copied them.
+        """
+        procedure, inputs, status, outputs, sent = result[-5:]
+        assert sent[-1:] == (interface.completion(procedure),), result
         if procedure != FORWARD:
             return
         if not ok and status != "ok":
             assert status == OVERTAKEN, result
-            assert all(values == [] for values in outputs), result
+            assert all(values == [] for values in outputs) or outputs == previous, result
             return
         assert status == "ok", result
         for actual, expected in zip(outputs, self.expected(inputs)):
@@ -117,8 +133,12 @@ class Plain:
     def start(self, setup, prepare):
         emulator = ScratchEmulator(self.sprite)
         prepared = prepare(emulator)
+        emulator.previous = None
         for call in setup:
-            self.check(self.run_call(emulator, call), ok=True)
+            result = self.run_call(emulator, call)
+            self.check(result, ok=True)
+            if call[0] == FORWARD:
+                emulator.previous = result[3]
         return emulator, prepared
 
     def pauses(self, setup, calls):
@@ -164,8 +184,11 @@ class Plain:
                 scripts.run(pair[index], pauses)
         for script in pair:
             scripts.run(script)
+        previous = emulator.previous
         for result in finished:
-            self.check(result)
+            self.check(result, previous=previous)
+            if result[1] == FORWARD and result[3] == "ok":
+                previous = result[4]
         return emulator, finished
 
     def check_afterwards(self, emulator):
@@ -184,6 +207,14 @@ class Plain:
                 values = torch.randint(0, 4, shape, generator=generator)
             inputs[name] = values.flatten().tolist()
         return (FORWARD, inputs)
+
+
+def _sent(emulator):
+    """The broadcasts each script (thread) of ``emulator`` sent."""
+    if not hasattr(emulator, "sent"):
+        emulator.sent = defaultdict(list)
+        emulator.on_broadcast = lambda message: emulator.sent[threading.get_ident()].append(message)
+    return emulator.sent
 
 
 def _logical(emulator, name):

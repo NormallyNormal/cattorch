@@ -16,6 +16,7 @@ moe = pytest.importorskip("transformers.integrations.moe")
 if not hasattr(moe, "use_experts_implementation"):
     pytest.skip("transformers has no experts interface", allow_module_level=True)
 from transformers.activations import ACT2FN  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 EXPERTS, WIDTH, HIDDEN = 4, 6, 5
 
@@ -280,13 +281,13 @@ def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
 
     emulator.run_procedure("cattorch init")
     prefix = [3, 17, 5]
-    emulator.lists["cattorch tokens"] = list(prefix)
+    emulator.lists[TOKEN_IDS] = list(prefix)
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     assert_logits(prefix)
     for token in (40, 9):
         prefix.append(token)
-        emulator.lists["cattorch tokens"] = [token]
+        emulator.lists[TOKEN_IDS] = [token]
         emulator.run_procedure("cattorch decode")
         assert emulator.variables["cattorch status"] == "ok"
         assert_logits(prefix)

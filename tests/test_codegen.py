@@ -260,7 +260,7 @@ def test_internal_name_compaction_preserves_public_interface(tmp_path):
         for entry in sprite[section].values()
     }
     assert {"input", "output"} <= data_names
-    assert any(name.startswith("l") for name in data_names)
+    assert any(name.startswith("_l") for name in data_names)
     assert all(
         block.get("shadow") is True or "shadow" not in block
         for block in sprite["blocks"].values()
@@ -393,7 +393,7 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
         sprites[mode].run_procedure("cattorch forward")
 
     assert "_cattorch shared transformer layer" in sprites["auto"]._procedures
-    assert "W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
+    assert "_W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
     torch.testing.assert_close(
         torch.tensor(sprites["auto"].lists["output"]),
         torch.tensor(sprites["off"].lists["output"]),
@@ -416,7 +416,7 @@ def test_tied_grouped_embedding_head_uses_one_physical_weight(tmp_path):
     )
     sprite = _load(path.with_suffix(".sprite3"))
     weight_lists = [
-        entry for entry in sprite["lists"].values() if entry[0].startswith("W_")
+        entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
     assert len(weight_lists) == 1
     assert len(weight_lists[0][1]) == model.embedding.weight.numel()
@@ -454,7 +454,7 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
     )
     sprite = _load(path.with_suffix(".sprite3"))
     weight_lists = [
-        entry for entry in sprite["lists"].values() if entry[0].startswith("W_")
+        entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
     assert [len(entry[1]) for entry in weight_lists] == [199_680, 62_464]
     assert sum(len(entry[1]) for entry in weight_lists) == model.embedding.weight.numel()

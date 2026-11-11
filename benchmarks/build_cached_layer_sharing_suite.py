@@ -43,8 +43,9 @@ from cattorch.benchmark import (  # noqa: E402
 )
 from cattorch import adapter  # noqa: E402
 from cattorch.experimental import StackedSwiGLUMoE  # noqa: E402
-from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
+from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
 from cattorch.util.scratch.dsl import Program, append, call, clear  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 
 @adapter(Top1SwiGLUMoE)
@@ -79,24 +80,24 @@ def _compile_variant(model, directory: Path, label: str, sharing: str, namespace
     )
     sprite, assets = _load_sprite(result.path)
     for entry in sprite.get("lists", {}).values():
-        if entry[0] == "cattorch tokens":
+        if entry[0] == TOKEN_IDS:
             entry[1] = [1]
     _add_warp_procedure(
         sprite,
         "cattorch sharing benchmark decode",
         Program(
             "cached_layer_sharing_decode",
-            lists=("cattorch tokens",),
+            lists=(TOKEN_IDS,),
             body=(
-                clear("cattorch tokens"),
-                append("cattorch tokens", 1),
+                clear(TOKEN_IDS),
+                append(TOKEN_IDS, 1),
                 call("cattorch decode"),
             ),
         ),
         x=900,
         y=0,
     )
-    _merge_lists_by_name(sprite, {"cattorch tokens"})
+    _merge_lists_by_name(sprite, {TOKEN_IDS})
     sprite["name"] = label
     sprite["visible"] = False
     return sprite, assets, result

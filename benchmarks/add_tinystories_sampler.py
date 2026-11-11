@@ -41,6 +41,7 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
+from cattorch.interface import TOKEN_IDS
 
 
 PROCEDURE = "tinystories sample streaming"
@@ -55,7 +56,7 @@ EOS_ID = 2
 TEMPERATURE = 0.6
 FREQUENCY_PENALTY = 0.3
 
-MODEL_INPUT = "cattorch tokens"
+MODEL_INPUT = TOKEN_IDS
 MODEL_OUTPUT = "cattorch logits"
 TOKEN_IDS = "cattorch token ids"
 # The tokenizer sprite reads and writes its text here.

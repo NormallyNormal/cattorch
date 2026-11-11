@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import contextlib
 import json
 import sys
@@ -19,6 +20,7 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list
+from cattorch.interface import TOKEN_IDS
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -201,7 +203,9 @@ def logits(emulator):
 
 def run(emulator, procedure, tokens=None):
     if tokens is not None:
-        emulator.lists["cattorch tokens"] = list(tokens)
+        # The internal step reads its own one-token list.
+        name = "_cattorch step token" if procedure.startswith("_") else TOKEN_IDS
+        emulator.lists[name] = list(tokens)
     emulator.run_procedure(procedure)
     return emulator.variables["cattorch status"]
 
@@ -237,8 +241,11 @@ def test_prefill_then_decode_matches_the_stateless_forward(exported):
         torch.tensor(emulator.lists["cattorch top k values"], dtype=torch.float64),
         expected[-1].topk(3).values, atol=TOLERANCE, rtol=0,
     )
-    assert result.procedures == ("cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode")
-    assert result.inputs[0].list_name == "cattorch tokens"
+    assert result.procedures == (
+        "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
+        "cattorch prepare for save",
+    )
+    assert result.inputs[0].list_name == TOKEN_IDS
     assert result.output.list_name == "cattorch logits"
     assert result.output.numel == expected.shape[1]
 
@@ -277,25 +284,24 @@ def test_invalid_tokens_leave_every_state_untouched(exported):
     run(emulator, "cattorch prefill", [1, 2])
     before = states(emulator, model)
     for tokens, status in (
-        ([], "decode requires exactly one token"),
-        ([1, 2], "decode requires exactly one token"),
-        ([vocabulary], "token ids must be whole numbers"),
-        ([-1], "token ids must be whole numbers"),
-        ([2.5], "token ids must be whole numbers"),
-        (["abc"], "token ids must be whole numbers"),
+        ([], interface.wrong_number_of_items(interface.TOKEN_IDS)),
+        ([1, 2], interface.wrong_number_of_items(interface.TOKEN_IDS)),
+        ([vocabulary], interface.invalid_item(interface.TOKEN_IDS)),
+        ([-1], interface.invalid_item(interface.TOKEN_IDS)),
+        ([2.5], interface.invalid_item(interface.TOKEN_IDS)),
+        (["abc"], interface.invalid_item(interface.TOKEN_IDS)),
     ):
-        assert run(emulator, "cattorch decode", tokens).startswith(status), tokens
+        outputs = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
+        assert run(emulator, "cattorch decode", tokens) == status, tokens
         assert states(emulator, model) == before
         assert emulator.variables["cattorch cache length"] == 2
-        assert emulator.lists["cattorch logits"] == []
-        assert emulator.lists["cattorch top k ids"] == []
-    # As for a K/V cache, prefill resets before it checks its tokens.
-    initial = {state.name: state.initial.flatten().tolist() for state in model.states()}
+        # A call that fails writes nothing.
+        assert (emulator.lists["cattorch logits"], emulator.lists["cattorch top k ids"]) == outputs
+    # As for a K/V cache, prefill checks its tokens before it resets.
     for tokens in ([], [1, vocabulary], [3, -2]):
         assert run(emulator, "cattorch prefill", tokens) != "ok"
-        assert states(emulator, model) == pytest.approx(initial)
-        assert emulator.variables["cattorch cache length"] == 0
-        assert emulator.lists["cattorch logits"] == []
+        assert states(emulator, model) == before
+        assert emulator.variables["cattorch cache length"] == 2
     assert run(emulator, "cattorch decode", [vocabulary - 1]) == "ok"
 
 
@@ -313,10 +319,15 @@ def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
     emulator, _ = export(model, tmp_path / "lstm", top_k=2)
     assert run(emulator, "cattorch prefill", [2, 7]) == "ok"
     stop_during(emulator, public, procedure, call, tokens)
-    before = (states(emulator, model), emulator.variables["cattorch cache length"])
+    before = (
+        states(emulator, model), emulator.variables["cattorch cache length"],
+        list(emulator.lists["cattorch logits"]),
+    )
     assert run(emulator, "cattorch decode", [3]) == INTERRUPTED
-    assert emulator.lists["cattorch logits"] == emulator.lists["cattorch top k ids"] == []
-    assert (states(emulator, model), emulator.variables["cattorch cache length"]) == before
+    assert (
+        states(emulator, model), emulator.variables["cattorch cache length"],
+        emulator.lists["cattorch logits"],
+    ) == before
     assert run(emulator, "cattorch reset") == "ok"
     assert run(emulator, "cattorch decode", [3]) == "ok"
     torch.testing.assert_close(
@@ -349,12 +360,14 @@ def test_max_tokens_limits_decode_and_prefill(tmp_path):
     assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
     assert run(emulator, "cattorch decode", [3]) == "ok"
     before = states(emulator, model)
-    assert run(emulator, "cattorch decode", [4]) == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == [] and emulator.lists["cattorch top k ids"] == []
+    kept = list(emulator.lists["cattorch logits"])
+    assert run(emulator, "cattorch decode", [4]) == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 3
     assert states(emulator, model) == before
-    assert run(emulator, "cattorch prefill", [1, 2, 3, 4]) == "prefill exceeds maximum context"
-    assert emulator.lists["cattorch logits"] == []
+    assert run(emulator, "cattorch prefill", [1, 2, 3, 4]) == interface.too_many_items(interface.TOKEN_IDS)
+    assert emulator.lists["cattorch logits"] == kept
+    assert emulator.variables["cattorch cache length"] == 3
     assert run(emulator, "cattorch prefill", [5, 6, 7]) == "ok"
     torch.testing.assert_close(
         logits(emulator), reference_rows(model, [5, 6, 7])[-1].double(), atol=TOLERANCE, rtol=0,
@@ -362,7 +375,7 @@ def test_max_tokens_limits_decode_and_prefill(tmp_path):
 
 
 def test_a_max_tokens_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_list_limit):
-    # A prompt arrives in the one `cattorch tokens` list, so the buffer that
+    # A prompt arrives in the one `cattorch token ids` list, so the buffer that
     # copies it never needs more than a list holds.
     limit = small_list_limit(400)
     model = make("gru")
@@ -421,9 +434,9 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
     emulator, _ = export(model, tmp_path / "ssm")
     run(emulator, "cattorch prefill", [1])
     emulator.variables["_cattorch project output"] = 0
-    kept = list(emulator.lists["cattorch logits"])
+    kept = list(emulator.lists["_cattorch step logits"])
     assert run(emulator, "_cattorch token step for epoch %s", [2]) == "ok"
-    assert emulator.lists["cattorch logits"] == kept
+    assert emulator.lists["_cattorch step logits"] == kept
     # Decode computes its logits whatever a stopped prefill left behind.
     emulator.variables["_cattorch project output"] = 0
     assert run(emulator, "cattorch decode", [3]) == "ok"
@@ -448,14 +461,20 @@ def test_lifecycle_broadcasts(tmp_path):
     messages = set(load_sprite(result.path)["broadcasts"].values())
     assert messages == {
         "cattorch init complete", "cattorch reset complete", "cattorch prefill complete",
-        "cattorch decode complete",
+        "cattorch decode complete", "cattorch prepare for save complete",
     }
+    # Decode decodes the weights itself, as cattorch init does.
+    emulator.lists[TOKEN_IDS] = [4]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.broadcasts == ["cattorch init complete", "cattorch decode complete"]
     for procedure, tokens in (
         ("init", None), ("reset", None), ("prefill", [1, 2, 3]), ("decode", [4]),
+        ("prepare for save", None),
     ):
         emulator.broadcasts.clear()
         run(emulator, f"cattorch {procedure}", tokens)
         assert emulator.broadcasts == [f"cattorch {procedure} complete"]
+    assert emulator.variables["cattorch initialized"] == 0
 
 
 def test_no_loose_canvas_block_runs_a_private_procedure(tmp_path):
@@ -621,7 +640,7 @@ def test_the_token_may_be_rearranged_before_its_lookup(tmp_path, form):
             rows.append(row.reshape(-1).double())
     assert run(emulator, "cattorch prefill", [8]) == "ok"
     torch.testing.assert_close(logits(emulator), rows[0], atol=TOLERANCE, rtol=0)
-    assert run(emulator, "cattorch decode", [9]).startswith("token ids must be whole numbers from 0 to 8")
+    assert run(emulator, "cattorch decode", [9]) == interface.invalid_item(interface.TOKEN_IDS)
     assert run(emulator, "cattorch decode", [3]) == "ok"
     torch.testing.assert_close(logits(emulator), rows[1], atol=TOLERANCE, rtol=0)
 

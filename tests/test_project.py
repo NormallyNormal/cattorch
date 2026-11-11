@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import collections
 import math
 
@@ -34,8 +35,13 @@ def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
     )
     emulator = ProjectEmulator(project.path)
     emulator.green_flag()
+    # NaN isn't a number the sprite takes; the bridge copies no output.
+    assert emulator.stage.variables["same status"] == interface.invalid_item("input")
+    assert emulator.stage.lists["same output"] == []
+    emulator.stage.lists["same input"] = [1.5, math.inf, -math.inf, 0]
+    emulator.green_flag()
     output = [float(value) for value in emulator.stage.lists["same output"]]
-    assert output[:3] == [1.5, math.inf, -math.inf]
+    assert output == [1.5, math.inf, -math.inf, 0]
 
 
 def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
@@ -94,13 +100,15 @@ def test_entry_points_are_bridged(tmp_path):
     emulator = ProjectEmulator(project.path)
     value = torch.tensor([[0.5, -1.0]])
     name = result.entrypoints[0].inputs[0].list_name
-    emulator.stage.lists[f"counter {name}"] = value.flatten().tolist()
+    emulator.stage.lists[interface.project_name("counter", name)] = value.flatten().tolist()
     output = result.entrypoints[0].outputs[0].list_name
     for _ in range(2):
         emulator.broadcast("counter add")
     with torch.no_grad():
         expected = 2 * model.linear(value)
-    assert emulator.stage.lists[f"counter {output}"] == pytest.approx(
+    assert emulator.stage.variables["counter status"] == interface.OK
+    assert emulator.sprites["counter"].broadcasts[-1] == "counter add complete"
+    assert emulator.stage.lists[interface.project_name("counter", output)] == pytest.approx(
         expected.flatten().tolist(), abs=1e-5,
     )
 
@@ -183,7 +191,7 @@ def test_generation_stops_at_the_end_token_and_the_context(generator):
     project = build_project(directory / "full", result, tokenizer=tokenizer, temperature=0)
     emulator = ProjectEmulator(project.path, answers=["abc", ""])
     emulator.green_flag()
-    assert emulator.stage.variables["lm status"] == "maximum context exceeded"
+    assert emulator.stage.variables["lm status"] == interface.CONTEXT_FULL
     # 16 cached tokens, plus the one their logits predict.
     assert len(emulator.sprites["Demo"].said[-1]) == 17
 

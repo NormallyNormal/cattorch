@@ -228,7 +228,7 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
     transpile(model, value, str(path))
     sprite = _load(path.with_suffix(".sprite3"))
 
-    weight_lists = [entry for entry in sprite["lists"].values() if entry[0].startswith("W_")]
+    weight_lists = [entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")]
     assert weight_lists and all(not entry[1] for entry in weight_lists)
     weight_banks = [
         entry for entry in sprite["variables"].values()
@@ -342,7 +342,7 @@ def test_split_scale_banks_decode_every_tensor_value(tmp_path):
     decoded = [
         emulator._lists[identifiers[0]]
         for name, identifiers in sorted(emulator._list_name_to_ids.items())
-        if name.startswith("W_")
+        if name.startswith("_W_")
     ]
     assert [len(values) for values in decoded] == [30_000, 30_000]
     assert all(all(value != 0 for value in values) for values in decoded)
@@ -395,7 +395,7 @@ def test_default_float32_export_shards_for_temporary_decode_limit(tmp_path):
     weight_lengths = [
         len(emulator.lists[name])
         for name in emulator._list_name_to_ids
-        if name.startswith("W_")
+        if name.startswith("_W_")
     ]
     assert weight_lengths == [50_000, 15_536]
     assert sum(weight_lengths) == model.weight.numel()
@@ -538,7 +538,7 @@ def test_uncompressed_prepare_save_keeps_static_weights(tmp_path):
     before = {
         name: list(emulator.lists[name])
         for name in emulator._list_name_to_ids
-        if name.startswith("W_")
+        if name.startswith("_W_")
     }
     emulator._exec_chain(emulator._procedures["cattorch prepare for save"])
     assert before
@@ -732,7 +732,7 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
         assert next(
             entry[1] for entry in sprite["variables"].values()
             if entry[0] == "cattorch storage compression"
-        ) == "costume-base92-huffman-int4"
+        ) == "base92-huffman-int4"
 
 
 def test_storage_benchmark_bundles_all_variants(tmp_path):
@@ -825,7 +825,8 @@ def test_prepare_for_save_leaves_the_data_of_a_fresh_export(tmp_path, options):
     emulator.run_procedure("cattorch prepare for save")
 
     for identifier, (name, values) in sprite["lists"].items():
-        if name != "input":
+        # Public lists keep their values.
+        if name not in ("input", "output"):
             assert len(emulator._lists[identifier]) == len(values), name
     for identifier, (name, value) in sprite["variables"].items():
         # Counters and other numbers change; nothing grows past one.

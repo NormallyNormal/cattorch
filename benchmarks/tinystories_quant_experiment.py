@@ -32,7 +32,7 @@ from cattorch.benchmark import (
 )
 from cattorch.quantization import quantize_model
 from cattorch.storage import rounded_codebook_values, rounded_values
-from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name
+from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.scratch.dsl import (
     Program,
     append,

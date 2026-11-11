@@ -8,6 +8,7 @@ blocks, which commit and restore the states.
 
 from __future__ import annotations
 
+from cattorch import interface
 import sys
 from pathlib import Path
 
@@ -27,11 +28,8 @@ from test_generation_automatic import load_sprite  # noqa: E402
 from test_generation_overlap import Script, Scripts  # noqa: E402
 
 TOLERANCE = 1e-5
-INTERRUPTED = (
-    "an earlier call or reset was stopped while changing the states, or is still "
-    "changing them; reset first"
-)
-OVERTAKEN = "another call ran during this one"
+INTERRUPTED = interface.INTERRUPTED
+OVERTAKEN = interface.OVERTAKEN
 LIFECYCLE = ("cattorch init", "cattorch reset", "cattorch prepare for save")
 LOOPS = ("control_repeat", "control_for_each", "control_repeat_until")
 
@@ -268,6 +266,11 @@ class Sprite:
         return kinds
 
 
+def commit_start(kinds):
+    """Where a call's commit starts: its last loops, after its inputs' checks and computation."""
+    return len(kinds) - next(index for index, loop in enumerate(reversed(kinds)) if not loop)
+
+
 @pytest.fixture(scope="module")
 def stateful(tmp_path_factory):
     model = Machine().eval()
@@ -339,7 +342,7 @@ def test_a_resumed_call_that_ends_first_fails_the_call_running(stateful, overlap
     kinds = stateful.pauses(setup, first)
     if second[0] != RESET:
         # A step is refused, rather than paused, during the first one's commit.
-        kinds = kinds[:kinds.index(True)]
+        kinds = kinds[:commit_start(kinds)]
     for pause in range(0, len(kinds), 2):
         for other_pause in range(0, taken_over, 2):
             # The first script resumes while the second is paused, and ends first.
@@ -348,6 +351,11 @@ def test_a_resumed_call_that_ends_first_fails_the_call_running(stateful, overlap
             )
             assert [result[0] for result in finished[:2]] == ["first", "second"]
             assert [result[3] for result in finished[:2]] == [OVERTAKEN, OVERTAKEN]
+            # Each call sent its completion broadcast, though it failed.
+            for procedure in {result[1] for result in finished}:
+                assert emulator.broadcasts.count(interface.completion(procedure)) == sum(
+                    call[0] == procedure for call in (*setup, *(result[1:] for result in finished))
+                )
             stateful.check_afterwards(emulator, replay)
 
 
@@ -375,7 +383,7 @@ def test_a_stopped_call_changes_nothing_or_leaves_calls_failing_until_reset(
 def test_a_call_refused_during_a_commit_leaves_it_to_finish(stateful):
     setup = SETUPS["initialized"]
     first, second = [step(10.0, 0.0, -1.0)], [step(100.0, 2.0, 0.5), peek(1.0, 1.0, 1.0)]
-    commit = stateful.pauses(setup, first).index(True)
+    commit = commit_start(stateful.pauses(setup, first))
     emulator, replay, finished = stateful.interleave(
         setup, first, second, [(0, commit + 1), (1, None), (0, None)],
     )
@@ -388,7 +396,7 @@ def test_a_call_refused_during_a_commit_leaves_it_to_finish(stateful):
 def test_a_reset_during_a_commit_leaves_calls_failing_until_the_next_reset(stateful):
     setup = SETUPS["initialized"]
     first = [step(10.0, 0.0, -1.0)]
-    commit = stateful.pauses(setup, first).index(True)
+    commit = commit_start(stateful.pauses(setup, first))
     emulator, replay, finished = stateful.interleave(
         setup, first, [RESET], [(0, commit + 1), (1, None), (0, None)],
     )

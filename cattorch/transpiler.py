@@ -55,13 +55,16 @@ from cattorch.quantization import (
 from cattorch.sprite import (
     _TOP_K_IDS,
     _TOP_K_VALUES,
+    _GENERATION_RESET,
+    _STEP_LOGITS,
+    _STEP_TOKEN,
+    _add_input_checks,
     _add_prepare_for_save,
-    _add_procedure_completion_broadcast,
-    _add_warp_procedure,
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
     _find_procedure_definition,
+    _finish_generation_prepare,
     _gate_chain,
     _guard_generation_init,
     _guard_plain_calls,
@@ -78,7 +81,11 @@ from cattorch.sprite import (
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
-from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
+from cattorch import interface
+from cattorch.interface import (
+    NUMBERS, OK, STATUS_VARIABLE, WHOLE_NUMBERS, final_data_name, input_name, item_checks,
+    length_checks, output_name,
+)
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
 from cattorch.operator_registry import (
@@ -126,14 +133,8 @@ from cattorch.util.scratch.interface import (
     rename_procedure as _rename_procedure,
 )
 from cattorch.util.scratch.dsl import (
-    Program,
-    call,
-    clear,
     eq,
-    gt,
     if_,
-    length,
-    set_var,
     unroll_factor_limit,
     var,
 )
@@ -199,92 +200,93 @@ def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
     return query_only
 
 
-def _check_input_lengths(sprite, graph: _GraphInfo, layouts, output_names) -> None:
-    """Reject a variable-length input of the wrong length before running.
+def _kinds_of_items(graph: _GraphInfo, flat_inputs) -> dict[int, tuple[str | None, int | None]]:
+    """What each input's items must be, by position, and the rows of the table it indexes.
 
-    ``cattorch forward`` becomes a wrapper that checks each variable-length
-    input holds whole items within its bounds, as program entry points do;
-    otherwise it clears the outputs and reports why in ``cattorch status``.
+    Numbers in a floating-point list, whole numbers in an integer one, and,
+    for an index into an embedding table, whole numbers within its rows.
+    Bool lists take any values.
     """
-    from cattorch.util.scratch.dsl import broadcast_and_wait, if_else, lt, mod
+    kinds: dict[int, tuple[str | None, int | None]] = {}
+    for index, example in enumerate(flat_inputs):
+        if example.is_floating_point():
+            kinds[index] = (NUMBERS, None)
+        elif example.dtype == torch.bool or example.is_complex():
+            kinds[index] = (None, None)
+        else:
+            kinds[index] = (WHOLE_NUMBERS, _index_rows(graph, input_name(index)))
+    return kinds
 
-    checks: list = []
-    for node in graph.nodes:
-        name = graph.input_names.get(node.name)
-        if name is None or node.name not in graph.dynamic_bounds:
-            continue
-        if name in layouts and len(layouts[name].shards) > 1:
-            continue  # a split list's length isn't one list's length
-        shape = _get_shape(node)
-        axis = graph.dynamic_axes[node.name]
-        width = max(math.prod(shape) // max(shape[axis], 1), 1)
-        _, minimum, _ = graph.dynamic_bounds[node.name]
-        checks.extend(
-            (
-                if_(
-                    gt(mod(length(name), width), 0),
-                    (set_var(STATUS_VARIABLE, f"invalid dynamic length: {name}"),),
-                ),
-                if_(
-                    lt(length(name), width * max(minimum, 1)),
-                    (set_var(STATUS_VARIABLE, f"too few items: {name}"),),
-                ),
-                if_(
-                    gt(length(name), graph.runtime_capacity(node.name, shape)),
-                    (set_var(STATUS_VARIABLE, f"dynamic capacity exceeded: {name}"),),
-                ),
+
+def _input_checks(graph: _GraphInfo, layouts, flat_inputs, *, unit_spec=None) -> list[tuple]:
+    """What ``cattorch forward`` checks in each input list before it runs.
+
+    The number of items: a fixed list's, or a variable-length list's whole
+    rows within its bounds (``unit_spec`` gives them for an export run once
+    per item); then the items, as ``_kinds_of_items`` says. Returns one group of
+    statements per input.
+    """
+    groups: list[tuple] = []
+    nodes = {graph.input_names[node.name]: node for node in graph.nodes if node.name in graph.input_names}
+    kinds = _kinds_of_items(graph, flat_inputs)
+    for index, example in enumerate(flat_inputs):
+        name = input_name(index)
+        node = nodes.get(name)
+        shards = [shard.name for shard in layouts[name].shards] if name in layouts else [name]
+        statements: list = []
+        if unit_spec is not None and index in unit_spec:
+            _, minimum, maximum, _ = unit_spec[index]
+            width = example.numel()
+            statements += length_checks(
+                name, width=width, min_items=width * max(minimum, 1),
+                max_items=width * maximum, lists=shards,
             )
-        )
-    if not checks:
-        return
-    internal = "_cattorch checked forward"
-    _rename_procedure(sprite, "cattorch forward", internal)
-    wrapper = Program(
-        "checked_forward",
-        variables=(STATUS_VARIABLE,),
-        lists=tuple(dict.fromkeys((*graph.input_names.values(), *output_names))),
-        body=(
-            set_var(STATUS_VARIABLE, "ok"),
-            *checks,
-            if_else(
-                eq(var(STATUS_VARIABLE), "ok"),
-                (call(internal),),
-                (
-                    *(clear(name) for name in output_names),
-                    broadcast_and_wait("cattorch forward complete"),
-                ),
-            ),
-        ),
-    )
-    _add_warp_procedure(sprite, "cattorch forward", wrapper, x=640, y=960)
+        elif node is not None and node.name in graph.dynamic_bounds:
+            shape = _get_shape(node)
+            width = max(math.prod(shape) // max(shape[graph.dynamic_axes[node.name]], 1), 1)
+            _, minimum, _ = graph.dynamic_bounds[node.name]
+            statements += length_checks(
+                name, width=width, min_items=width * max(minimum, 1),
+                max_items=graph.runtime_capacity(node.name, shape), lists=shards,
+            )
+        else:
+            statements += length_checks(name, numel=example.numel(), lists=shards)
+        items = item_checks(name, *kinds[index], lists=shards)
+        if items:
+            statements.append(if_(eq(var(STATUS_VARIABLE), OK), items))
+        groups.append(tuple(statements))
+    return groups
 
 
-def _token_vocabulary(graph: _GraphInfo) -> int | None:
-    """Rows of the embedding table the token input is looked up in."""
-    tokens = {name for name, list_name in graph.input_names.items() if list_name == "input"}
+def _input_lists(layouts, flat_inputs) -> list[str]:
+    """Every physical list of the inputs, shards included."""
+    names = []
+    for index in range(len(flat_inputs)):
+        name = input_name(index)
+        names += [shard.name for shard in layouts[name].shards] if name in layouts else [name]
+    return names
+
+
+def _index_rows(graph: _GraphInfo, list_name: str = "input") -> int | None:
+    """Rows of the smallest embedding table an input list indexes, if it indexes one."""
+    tokens = {name for name, value in graph.input_names.items() if value == list_name}
+    rows: int | None = None
     for node in graph.nodes:
         if node.op != "call_function":
             continue
         if (
             str(node.target) == "aten.embedding.default"
-            and getattr(
-                node.args[1],
-                "name",
-                None,
-            )
-            in tokens
+            and getattr(node.args[1], "name", None) in tokens
         ):
-            return int(_get_shape(node.args[0])[0])
+            table = int(_get_shape(node.args[0])[0])
+            rows = table if rows is None else min(rows, table)
         if (
             node.all_input_nodes
             and node.all_input_nodes[0].name in tokens
-            and str(
-                node.target,
-            )
-            in _NOOP_OPS | {"aten.to.dtype", "aten._to_copy.default"}
+            and str(node.target) in _NOOP_OPS | {"aten.to.dtype", "aten._to_copy.default"}
         ):
             tokens.add(node.name)
-    return None
+    return rows
 
 
 def _shared_layer_attention(graph: _GraphInfo) -> str:
@@ -2245,6 +2247,7 @@ def _transpile_dynamic(
             sig_figs,
             **arguments,
             _edit_sprite=lambda sprite: run_per_unit(sprite, spec, input_shapes, len(axes)),
+            _unit_inputs=spec,
         )
         result = per_unit_result(
             result,
@@ -2618,7 +2621,17 @@ def _transpile(
     _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
     _hidden_outputs: frozenset[int] = frozenset(),
     _deferred_sizes: dict[str, int] | None = None,
+    _unit_inputs: dict | None = None,
+    _item_kinds: dict | None = None,
 ) -> TranspileResult:
+    """Export one graph as a sprite. Private hooks, for the other export paths:
+
+    ``_unit_inputs`` gives the bounds of the input an ``_edit_sprite`` runs
+    once per item, which ``cattorch forward`` checks. With
+    ``_defer_interface_sharding`` (a program's entry point), the inputs
+    aren't checked; ``_item_kinds`` is filled with what their items must
+    be, for the program to check them.
+    """
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
     for index, value in enumerate(example_inputs):
@@ -2864,15 +2877,17 @@ def _transpile(
             hidden_prefill=generation.hidden_prefill,
             top_k=generation.top_k,
             compact_top_k=codegen.unrolling != "speed",
-            vocabulary=_token_vocabulary(graph),
+            vocabulary=_index_rows(graph),
         )
         # Kernels declare `cattorch cache length` themselves; unify them with
         # the lifecycle's variable.
-        _merge_variables_by_name(sprite, {"cattorch cache length"})
+        _merge_variables_by_name(sprite, {interface.CACHE_LENGTH})
         generation_lists = {
             "input",
             "output",
             "cattorch prefill buffer",
+            interface.TOKEN_IDS,
+            interface.LOGITS,
         }
         if generation.top_k is not None:
             generation_lists.update({_TOP_K_VALUES, _TOP_K_IDS})
@@ -2884,20 +2899,17 @@ def _transpile(
         # The step is private; only reset, prefill and decode run it.
         _remove_canvas_calls(sprite, "cattorch forward")
         _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
-        _rename_procedure(
-            sprite,
-            "cattorch reset cache",
-            "_cattorch reset state",
-        )
-        public_lists = {
-            "input": "cattorch tokens",
-            "output": "cattorch logits",
+        private_lists = {
+            "input": _STEP_TOKEN,
+            "output": _STEP_LOGITS,
             "cattorch prefill buffer": "_cattorch prefill buffer",
         }
-        _rename_lists(sprite, public_lists)
-        for old, new in public_lists.items():
+        _rename_lists(sprite, private_lists)
+        for old, new in private_lists.items():
             if old in logical_sizes:
                 logical_sizes[new] = logical_sizes.pop(old)
+        # The public logits are a copy of the step's.
+        logical_sizes[interface.LOGITS] = logical_sizes.get(_STEP_LOGITS, 0)
 
     deferred_names = (
         frozenset((*graph.input_names.values(), *output_names))
@@ -2960,63 +2972,28 @@ def _transpile(
         effective_ndims=compiler.static_effective_ndims,
         source_numels=compiler.static_source_numels,
     )
-    # GenerationProgram deliberately exposes only its four lifecycle methods.
-    # Its processor sprite is intended to remain initialized while a project
-    # runs, and emitting one clear block for every decoded weight shard is a
-    # material JSON cost for the large language models this interface serves.
-    if generation is None:
-        _add_prepare_for_save(
-            sprite,
-            layouts,
-            static_names=static_names,
-            compressed=storage.compression,
-            inputs=set(graph.input_names.values()),
-        )
+    # Public lists keep their values; a generation sprite's prepare for save
+    # also resets it, since its cache is internal data it can't keep.
+    _add_prepare_for_save(
+        sprite,
+        layouts,
+        static_names=static_names,
+        compressed=storage.compression,
+        inputs=(
+            {interface.TOKEN_IDS, interface.LOGITS, _TOP_K_VALUES, _TOP_K_IDS}
+            if generation is not None else set(graph.input_names.values())
+        ),
+    )
     if generation is not None:
-        _add_procedure_completion_broadcast(
-            sprite,
-            "cattorch init",
-            "cattorch init complete",
-            status="ok",
-        )
-        _add_procedure_completion_broadcast(
-            sprite,
-            "cattorch prefill",
-            "cattorch prefill complete",
-        )
-        _add_procedure_completion_broadcast(
-            sprite,
-            "cattorch reset",
-            "cattorch reset complete",
-        )
-        _add_procedure_completion_broadcast(
-            sprite,
-            "cattorch decode",
-            "cattorch decode complete",
-        )
-    if generation is None and not _defer_interface_sharding:
-        # Like generation and programs: a status and a notification when each
-        # public block finishes. Program entry points get theirs from the
-        # program.
-        variables = sprite.setdefault("variables", {})
-        if not any(entry[0] == STATUS_VARIABLE for entry in variables.values()):
-            variables["cattorch_status"] = [STATUS_VARIABLE, ""]
-        for procedure in ("cattorch init", "cattorch forward"):
-            _add_procedure_completion_broadcast(
-                sprite,
-                procedure,
-                f"{procedure} complete",
-                status="ok",
-            )
-        _check_input_lengths(sprite, graph, layouts, output_names)
+        _finish_generation_prepare(sprite, _GENERATION_RESET)
     sprite.setdefault("variables", {}).update(
         {
             "cattorch_storage_compression": [
                 "cattorch storage compression",
                 (
-                    "costume-base92-huffman-int4"
+                    "base92-huffman-int4"
                     if storage.compression and storage.precision == "int4"
-                    else "costume-base92"
+                    else "base92"
                     if storage.compression
                     else "none"
                 ),
@@ -3049,9 +3026,13 @@ def _transpile(
     # come before finalization, so it sees the sprite whole.
     if _edit_sprite is not None:
         sprite = _edit_sprite(sprite)
+    flat_inputs = flat_example_inputs(example_inputs, example_kwargs)
     if generation is not None:
         sprite = _guard_generation_init(sprite)
     elif not _defer_interface_sharding:
+        _add_input_checks(sprite, _input_checks(
+            graph, layouts, flat_inputs, unit_spec=_unit_inputs,
+        ), _input_lists(layouts, flat_inputs))
         sprite = _guard_plain_calls(sprite, [
             shard
             for name in dict.fromkeys(output_names)
@@ -3059,6 +3040,8 @@ def _transpile(
                 [shard.name for shard in layouts[name].shards] if name in layouts else [name]
             )
         ])
+    elif _item_kinds is not None:
+        _item_kinds.update(_kinds_of_items(graph, flat_inputs))
     finalized = _finalize(
         sprite,
         output_path,
@@ -3070,11 +3053,7 @@ def _transpile(
 
     input_specs = tuple(
         boundary_spec(
-            (
-                "cattorch tokens"
-                if generation is not None
-                else (input_name(index))
-            ),
+            interface.TOKEN_IDS if generation is not None else input_name(index),
             tuple(value.shape),
             value.dtype,
             _public_dynamic_bound((_dynamic_inputs or {}).get(index)),
@@ -3083,7 +3062,10 @@ def _transpile(
     )
     procedures = ["cattorch init", "cattorch forward", "cattorch prepare for save"]
     if generation is not None:
-        procedures = ["cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode"]
+        procedures = [
+            "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
+            "cattorch prepare for save",
+        ]
     return TranspileResult(
         path=finalized.path,
         sprite_name=sprite_name,
@@ -3098,11 +3080,7 @@ def _transpile(
         ),
         inputs=input_specs,
         output=boundary_spec(
-            (
-                "cattorch logits"
-                if generation is not None
-                else "output"
-            ),
+            interface.LOGITS if generation is not None else "output",
             tuple(graph.output_shape),
             graph.output_dtype,
             (

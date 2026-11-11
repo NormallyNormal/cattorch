@@ -5,6 +5,7 @@ Each test transpiles a tokenizer, runs encode/decode through the emulator,
 and compares against the HuggingFace tokenizer output.
 """
 
+from cattorch import interface
 import json
 import os
 import tempfile
@@ -658,10 +659,9 @@ class TestSentencePieceBPE:
             sprite = json.loads(archive.read("sprite.json"))
 
         emulator = ScratchEmulator(sprite)
-        assert set(emulator._procedures) == {
-            "cattorch tokenize",
-            "cattorch detokenize",
-        }
+        assert {
+            name for name in emulator._procedures if not name.startswith("_")
+        } == {interface.TOKENIZE, interface.DETOKENIZE}
         assert len(emulator._find_roots()) == 2
         assert any("non-ASCII byte tokens" in warning for warning in result.warnings)
         prototypes = [

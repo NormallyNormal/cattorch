@@ -27,9 +27,10 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name
+from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.instruction import optimized_linear
 from cattorch.util.scratch.dsl import Program, append, call, clear
+from cattorch.interface import TOKEN_IDS
 
 
 OUTPUT = Path(__file__).parent / "artifacts" / "grouped_linear_network_suite.sb3"
@@ -64,24 +65,24 @@ def _compile_variant(source, name: str, threshold: float):
         optimized_linear.GROUPED_MIN_MACS = previous_threshold
 
     for entry in sprite.get("lists", {}).values():
-        if entry[0] == "cattorch tokens":
+        if entry[0] == TOKEN_IDS:
             entry[1] = prompt.detach().flatten().tolist()
     _add_warp_procedure(
         sprite,
         "cattorch grouped benchmark decode",
         Program(
             "grouped_network_benchmark_decode",
-            lists=("cattorch tokens",),
+            lists=(TOKEN_IDS,),
             body=(
-                clear("cattorch tokens"),
-                append("cattorch tokens", 0),
+                clear(TOKEN_IDS),
+                append(TOKEN_IDS, 0),
                 call("cattorch decode"),
             ),
         ),
         x=900,
         y=0,
     )
-    _merge_lists_by_name(sprite, {"cattorch tokens"})
+    _merge_lists_by_name(sprite, {TOKEN_IDS})
     sprite["name"] = name
     sprite["visible"] = False
     return sprite, assets, standalone_size

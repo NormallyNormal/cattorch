@@ -9,6 +9,7 @@ logits and that a later reset or prefill always recovers.
 
 from __future__ import annotations
 
+from cattorch import interface
 import sys
 import threading
 from pathlib import Path
@@ -23,11 +24,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_generation_automatic import INTERRUPTED, load_sprite, logits_of  # noqa: E402
 from test_optimization import CachedLM  # noqa: E402
 from test_recurrent_generation import make, reference_rows  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 TOLERANCE = 1e-4
 # Pause places tried per case, spread over the call.
 SAMPLES = 8
-OVERTAKEN = "another reset, prefill, decode or init ran during this one; reset or prefill first"
+OVERTAKEN = interface.OVERTAKEN
 SETUP = [1, 2, 3, 4]
 
 
@@ -59,12 +61,13 @@ def run_generation_call(emulator, call):
     """Run one ``(procedure, tokens)`` call and return what it left."""
     procedure, tokens = call
     if tokens is not None:
-        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.lists[TOKEN_IDS] = list(tokens)
+    before = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
     emulator.run_procedure(procedure)
     return (
         procedure, tokens, emulator.variables["cattorch status"],
         list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"]),
-        emulator.variables["cattorch cache length"],
+        emulator.variables["cattorch cache length"], before,
     )
 
 
@@ -177,7 +180,7 @@ class Generator:
         self.expected = expected
 
     def check(self, result, prefix):
-        name, procedure, _, status, logits, top_k, length = result
+        name, procedure, _, status, logits, top_k, length = result[:7]
         assert status == "ok", result[:4]
         if procedure == "cattorch reset":
             assert logits == top_k == [] and length == 0
@@ -215,9 +218,13 @@ class Generator:
         for script in pair:
             scripts.run(script)
         self.prefix: list | None = [] if fresh else list(SETUP)
+        # A call that fails writes no output: the logits stay as the last ok
+        # call left them, or are empty if one was taken over while it copied.
+        outputs = ([], []) if fresh else self.setup_outputs
         for result in finished:
             procedure, tokens, status = result[1:4]
             if status == "ok":
+                outputs = (result[4], result[5])
                 if procedure == "cattorch decode":
                     assert self.prefix is not None, ("ok while stopped", finished)
                     self.prefix = [*self.prefix, *tokens]
@@ -226,23 +233,30 @@ class Generator:
                 self.check(result, self.prefix)
             else:
                 assert status in {INTERRUPTED, OVERTAKEN}, result[:4]
-                assert result[4] == result[5] == [], result[:4]
                 self.prefix = None
+        # Once every call has ended, the outputs are the last ok call's, or
+        # empty if a call was taken over while it copied them; a call that
+        # fails writes none. (While a call copies them, one that ends meanwhile
+        # can find them part copied, and one stopped meanwhile leaves them so.)
+        if not any(pauses == "stop" for _, pauses in schedule):
+            assert (
+                list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"]),
+            ) in (outputs, ([], [])), finished
         return emulator, finished
 
     def check_afterwards(self, emulator, finished):
         """Check the next decode, then that prefill recovers."""
-        emulator.lists["cattorch tokens"] = [6]
+        emulator.lists[TOKEN_IDS] = [6]
         emulator.run_procedure("cattorch decode")
         status = emulator.variables["cattorch status"]
         if self.prefix is None:
             assert status == INTERRUPTED, finished
         else:
             self.check(self._result(emulator, "after"), [*self.prefix, 6])
-        emulator.lists["cattorch tokens"] = [5, 3]
+        emulator.lists[TOKEN_IDS] = [5, 3]
         emulator.run_procedure("cattorch prefill")
         assert emulator.variables["cattorch status"] == "ok"
-        emulator.lists["cattorch tokens"] = [7]
+        emulator.lists[TOKEN_IDS] = [7]
         emulator.run_procedure("cattorch decode")
         self.check(self._result(emulator, "recovered"), [5, 3, 7])
 
@@ -259,9 +273,12 @@ class Generator:
         emulator = ScratchEmulator(self.sprite)
         if not fresh:
             emulator.run_procedure("cattorch init")
-            emulator.lists["cattorch tokens"] = list(SETUP)
+            emulator.lists[TOKEN_IDS] = list(SETUP)
             emulator.run_procedure("cattorch prefill")
             assert emulator.variables["cattorch status"] == "ok"
+            self.setup_outputs = (
+                list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"]),
+            )
         return emulator
 
     def pauses(self, calls, fresh=False):
@@ -277,7 +294,7 @@ class Generator:
             emulator._chains[start] = counted
         for procedure, tokens in calls:
             if tokens is not None:
-                emulator.lists["cattorch tokens"] = list(tokens)
+                emulator.lists[TOKEN_IDS] = list(tokens)
             emulator.run_procedure(procedure)
         return counter["calls"]
 
@@ -374,10 +391,11 @@ def test_overlapping_calls_report_why(tmp_path):
         [DECODE], [PREFILL, ("cattorch decode", [6])], [(0, 3), (1, None), (0, None)],
     )
     assert [result[3] for result in finished] == ["ok", "ok", OVERTAKEN]
-    emulator.lists["cattorch tokens"] = [6]
+    emulator.lists[TOKEN_IDS] = [6]
     emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == INTERRUPTED
-    assert emulator.lists["cattorch logits"] == []
+    # The overtaken decode and the refused one wrote nothing.
+    assert emulator.lists["cattorch logits"] == finished[1][4]
     emulator, finished = generator.interleave(
         [DECODE], [("cattorch decode", [6])], [(0, 3), (1, None), (0, None)],
     )

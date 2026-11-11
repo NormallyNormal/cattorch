@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import json
 import zipfile
 
@@ -19,6 +20,7 @@ from cattorch import (
 )
 from cattorch.experimental import ExpertFamily, SparseMoE, analyze
 from cattorch.util.scratch.emulator import ScratchEmulator
+from cattorch.interface import TOKEN_IDS
 
 
 def _emulator(result: ProgramResult) -> ScratchEmulator:
@@ -98,7 +100,7 @@ def test_program_replace_state_is_transactional_and_resettable(tmp_path):
     emulator.run_procedure("cattorch step")
     assert emulator.lists["cattorch step value"] == [4.0, 6.0]
     assert emulator.lists["cattorch state counter"] == [4.0, 6.0]
-    assert str(emulator.variables["cattorch status"]).startswith("invalid length")
+    assert str(emulator.variables["cattorch status"]).startswith(interface.wrong_number_of_items(""))
     emulator.run_procedure("cattorch reset")
     assert emulator.lists["cattorch state counter"] == [1.0, 2.0]
     comparison = verify(
@@ -245,7 +247,7 @@ def test_append_state_capacity_failure_does_not_partially_commit(tmp_path):
     emulator.lists["cattorch write value"] = [5.0, 6.0]
     emulator.run_procedure("cattorch write")
     assert emulator.lists["cattorch state rows"] == [1.0, 2.0, 3.0, 4.0]
-    assert str(emulator.variables["cattorch status"]).startswith("state capacity")
+    assert emulator.variables["cattorch status"] == interface.state_full("cattorch state rows")
 
 
 def test_append_state_is_a_bounded_runtime_extent_through_linear(tmp_path):
@@ -691,7 +693,7 @@ def test_private_states_and_renamed_interface(tmp_path, compact):
         codegen=CodegenConfig(compact_internal_names=compact),
         _private_states=True,
         _public_names={
-            "cattorch step delta": "cattorch tokens",
+            "cattorch step delta": TOKEN_IDS,
             "cattorch step value": "cattorch logits",
             "cattorch step": "cattorch run step",
             "cattorch step complete": "cattorch step done",
@@ -701,7 +703,7 @@ def test_private_states_and_renamed_interface(tmp_path, compact):
     (entry,) = result.entrypoints
     assert entry.procedure == "cattorch run step"
     assert entry.completion_broadcast == "cattorch step done"
-    assert [value.list_name for value in entry.inputs] == ["cattorch tokens"]
+    assert [value.list_name for value in entry.inputs] == [TOKEN_IDS]
     assert [value.list_name for value in entry.outputs] == ["cattorch logits"]
     assert entry.state_inputs == entry.state_updates == ()
     assert result.procedures == (
@@ -718,7 +720,7 @@ def test_private_states_and_renamed_interface(tmp_path, compact):
     assert "cattorch step done" in sprite["broadcasts"].values()
 
     emulator = _emulator(result)
-    emulator.lists["cattorch tokens"] = [1.0, 2.0]
+    emulator.lists[TOKEN_IDS] = [1.0, 2.0]
     emulator.run_procedure("cattorch run step")
     assert emulator.variables["cattorch status"] == "ok"
     assert _floats(emulator.lists["cattorch logits"]) == [2.0, 4.0]
@@ -736,7 +738,7 @@ def test_public_names_reject_unknown_and_colliding_names(tmp_path):
     with pytest.raises(ValueError, match="no entry point name"):
         transpile_program(
             _Accumulator().eval(), program, tmp_path / "unknown",
-            _public_names={"cattorch step missing": "cattorch tokens"},
+            _public_names={"cattorch step missing": TOKEN_IDS},
         )
     with pytest.raises(ValueError, match="distinct, unused"):
         transpile_program(

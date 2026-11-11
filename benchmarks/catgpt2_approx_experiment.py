@@ -44,8 +44,9 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.transpiler import _add_warp_procedure, _merge_lists_by_name
+from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.scratch.dsl import Program, append, call, clear
+from cattorch.interface import TOKEN_IDS
 
 
 def policies() -> dict[str, FastConfig]:
@@ -525,7 +526,7 @@ def _build_cached_project(
         standalone_size = sprite_path.stat().st_size
         sprite, assets = _load_sprite(sprite_path)
     for entry in sprite.get("lists", {}).values():
-        if entry[0] == "cattorch tokens":
+        if entry[0] == TOKEN_IDS:
             entry[1] = prompt.detach().flatten().tolist()
     decode_token = int(prompt[0, -1])
     _add_warp_procedure(
@@ -533,10 +534,10 @@ def _build_cached_project(
         "cattorch benchmark decode",
         Program(
             "catgpt2_benchmark_decode",
-            lists=("cattorch tokens",),
+            lists=(TOKEN_IDS,),
             body=(
-                clear("cattorch tokens"),
-                append("cattorch tokens", decode_token),
+                clear(TOKEN_IDS),
+                append(TOKEN_IDS, decode_token),
                 call("cattorch decode"),
             ),
         ),

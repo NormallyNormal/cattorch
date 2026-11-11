@@ -141,28 +141,37 @@ def _procedure_codes(sprite: dict) -> set[str]:
 def _mark_internal_names(
     sprite: dict, *, public_data_names: frozenset[str], public_procedures: frozenset[str],
 ) -> None:
-    """Prefix internal ``cattorch ...`` names with ``_`` and record the interface version.
+    """Prefix every internal name with ``_`` and record the interface version.
 
-    Names starting with ``cattorch `` are the public, versioned interface
-    (see ``cattorch.interface``), so helpers that share the prefix are marked
-    internal where Scratch users can see it.
+    A name is public by ``cattorch.interface.is_public_data`` (or, for a
+    block, ``is_public_procedure``); every other list, variable and block is
+    internal, and gets the ``_`` prefix so that nothing internal looks public
+    in Scratch.
     """
     data_names = {
         identifier: interface.internal_name(entry[0])
         for section in ("variables", "lists")
         for identifier, entry in sprite.get(section, {}).items()
-        if entry[0].startswith(interface.PUBLIC_PREFIX)
-        and not interface.is_public_data(entry[0], public_data_names)
+        if not entry[0].startswith(interface.INTERNAL_PREFIX)
+        and not interface.is_public_data(
+            entry[0], public_data_names, is_list=section == "lists",
+        )
     }
     procedures = {
         proccode: interface.internal_name(proccode)
         for proccode in _procedure_codes(sprite)
-        if proccode.startswith(interface.PUBLIC_PREFIX)
-        and proccode not in interface.PUBLIC_PROCEDURES
-        and proccode not in public_procedures
+        if not proccode.startswith(interface.INTERNAL_PREFIX)
+        and not interface.is_public_procedure(proccode, public_procedures)
     }
+    _check_distinct_names(sprite, data_names)
     _rename_display_names(sprite, data_names, procedures)
     variables = sprite.setdefault("variables", {})
+    # What a sprite holds before any block has run.
+    for entry in variables.values():
+        if entry[0] == interface.STATUS_VARIABLE:
+            entry[1] = interface.INITIAL_STATUS
+        elif entry[0] == interface.INITIALIZED_VARIABLE:
+            entry[1] = 0
     for entry in variables.values():
         if entry[0] == interface.VERSION_VARIABLE:
             entry[1] = interface.INTERFACE_VERSION
@@ -173,29 +182,41 @@ def _mark_internal_names(
         ]
 
 
+def _check_distinct_names(sprite: dict, renames: dict[str, str]) -> None:
+    """Fail if renaming would give two lists, or two variables, the same name."""
+    for section in ("variables", "lists"):
+        names = [
+            renames.get(identifier, entry[0])
+            for identifier, entry in sprite.get(section, {}).items()
+        ]
+        renamed = {renames[identifier] for identifier in sprite.get(section, {}) if identifier in renames}
+        clashes = {name for name in renamed if names.count(name) > 1}
+        if clashes:
+            raise ValueError(f"internal {section} would share a name: {sorted(clashes)}")
+
+
 def _compact_internal_display_names(
     sprite: dict,
     *,
     public_data_names: frozenset[str] = frozenset(),
     public_procedures: frozenset[str] = frozenset(),
 ) -> None:
-    """Shorten private UI names while preserving documented interfaces."""
+    """Shorten internal names (to ``_v0``, ``_l0``, ``_p0``) and keep public ones."""
     data_names: dict[str, str] = {}
     counters = {"variables": 0, "lists": 0}
-    prefixes = {"variables": "v", "lists": "l"}
+    prefixes = {"variables": "_v", "lists": "_l"}
     for section in ("variables", "lists"):
         for identifier, entry in sprite.get(section, {}).items():
-            if interface.is_public_data(entry[0], public_data_names):
+            if interface.is_public_data(entry[0], public_data_names, is_list=section == "lists"):
                 continue
             data_names[identifier] = f"{prefixes[section]}{counters[section]}"
             counters[section] += 1
     procedure_names = {
         # Keep each argument's slot, which calls and the editor read.
-        proccode: f"p{position}" + "".join(f" {slot}" for slot in re.findall(r"%[snb]", proccode))
+        proccode: f"_p{position}" + "".join(f" {slot}" for slot in re.findall(r"%[snb]", proccode))
         for position, proccode in enumerate(sorted(
             proccode for proccode in _procedure_codes(sprite)
-            if proccode not in interface.PUBLIC_PROCEDURES
-            and proccode not in public_procedures
+            if not interface.is_public_procedure(proccode, public_procedures)
         ))
     }
     _rename_display_names(sprite, data_names, procedure_names)

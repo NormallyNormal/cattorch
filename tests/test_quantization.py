@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
 from cattorch.quantization import _symmetric_matrix, effective_group_size, quantize_model
 from cattorch.util.scratch.emulator import ScratchEmulator
+from cattorch.interface import TOKEN_IDS
 
 
 def _load(path):
@@ -576,7 +577,7 @@ def test_gpt2_conv1d_weights_are_stored_as_integers_in_generation(
     tokens = [3, 1, 95]
     emulator = ScratchEmulator(_load(result.path))
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = tokens
+    emulator.lists[TOKEN_IDS] = tokens
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     logits = torch.tensor([float(value) for value in emulator.lists["cattorch logits"]])

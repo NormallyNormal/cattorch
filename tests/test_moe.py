@@ -455,7 +455,7 @@ def test_generic_exact_gelu_expert_matches_eager_including_the_tail(tmp_path):
     assert comparison.passed, comparison
     with zipfile.ZipFile(result.path) as archive:
         variables = json.loads(archive.read("sprite.json"))["variables"].values()
-    assert "expert gelu erfc" in {name for name, _ in variables}
+    assert "_expert gelu erfc" in {name for name, _ in variables}
 
 
 @torch.no_grad()
@@ -588,7 +588,7 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
         if mode == "auto":
             assert "_cattorch shared transformer layer" in emulator._procedures
             assert {
-                f"W__param_constant{index} shard 2" for index in (1, 2, 3)
+                f"_W__param_constant{index} shard 2" for index in (1, 2, 3)
             } <= set(emulator._list_name_to_ids)
 
     torch.testing.assert_close(outputs["auto"], outputs["off"], atol=1e-6, rtol=0)

@@ -21,10 +21,14 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Sequence
 
+from cattorch import interface
 from cattorch.codegen import CodegenConfig
 from cattorch.results import TokenizerResult
 from cattorch.sprite import (
+    _EPOCH,
+    _add_epoch_procedure,
     _add_warp_procedure,
+    _epoch_current,
     _merge_variables_by_name,
     _procedure_mutation,
 )
@@ -34,6 +38,7 @@ from cattorch.util.scratch.dsl import (
     Statement,
     add,
     append,
+    call,
     change_var,
     clear,
     costume_number,
@@ -45,10 +50,12 @@ from cattorch.util.scratch.dsl import (
     index_of,
     item,
     join,
+    for_each,
     length,
     letter,
     lt,
     mul,
+    not_,
     repeat,
     repeat_until,
     replace,
@@ -59,12 +66,15 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
-from cattorch.util.scratch.interface import rename_lists, rename_variables
+from cattorch.util.scratch.interface import rename_lists, rename_procedure, rename_variables
 from cattorch.util.scratch.ids import uniquify_data_ids
 
 # The Scratch interface; see ``docs/scratch-interface.md``.
-TEXT_VARIABLE = "cattorch text"
-TOKEN_IDS_LIST = "cattorch token ids"
+TEXT_VARIABLE = interface.TEXT
+TOKEN_IDS_LIST = interface.TOKEN_IDS
+# What tokenize and detokenize write, before they copy it to the public names.
+_TOKENIZED = "_cattorch tokenized"
+_DETOKENIZED = "_cattorch detokenized"
 
 _SENTENCEPIECE_METHODS = (
     "get_piece_size",
@@ -351,9 +361,9 @@ class _TokenizerBase(ABC):
 
         sprite = self._build_sprite(tokens)
         # The public interface: one text variable for both directions.
-        rename_variables(sprite, {"input": TEXT_VARIABLE, "output": TEXT_VARIABLE})
-        _merge_variables_by_name(sprite, {TEXT_VARIABLE})
+        rename_variables(sprite, {"input": TEXT_VARIABLE, "output": _DETOKENIZED})
         rename_lists(sprite, {"token_ids": TOKEN_IDS_LIST, "tokens": "_cattorch tokens"})
+        sprite = _add_tokenizer_interface(sprite, len(tokens))
 
         uniquify_data_ids(sprite)
         output_path = Path(output_path)
@@ -378,6 +388,73 @@ class _TokenizerBase(ABC):
             tokenizer_type=self.__class__.__name__,
             token_count=len(tokens),
         )
+
+
+def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
+    """Give the tokenize and detokenize blocks the interface every sprite's blocks have.
+
+    Each sets ``cattorch status`` and sends its completion broadcast when it
+    ends. Detokenize first checks that every token ID is a whole number in
+    the vocabulary. Each writes into an internal list or variable, and
+    copies it to the public one at its end only if it succeeded and no
+    other call started meanwhile, so a call that fails writes nothing.
+    """
+    status, ok = interface.STATUS_VARIABLE, interface.OK
+    current = _epoch_current()
+    copy = "_cattorch commit index"
+    for public, inner in (
+        (interface.TOKENIZE, "_cattorch tokenize text"),
+        (interface.DETOKENIZE, "_cattorch detokenize ids"),
+    ):
+        rename_procedure(sprite, public, inner)
+        for block in sprite["blocks"].values():
+            if block.get("topLevel") and block.get("opcode") == "procedures_call" and (
+                block["mutation"].get("proccode") == inner
+            ):
+                block["mutation"] = _procedure_mutation(public)
+    # A call it resumed during may have read what it wrote meanwhile, and
+    # fails too.
+    overtaken = (if_(not_(current), (
+        change_var(_EPOCH, 1), set_var(status, interface.OVERTAKEN),
+    )),)
+    tokenize = Program(
+        "tokenize_in_epoch",
+        variables=(status, _EPOCH, copy),
+        lists=(_TOKENIZED, TOKEN_IDS_LIST),
+        body=(
+            set_var(status, ok),
+            call("_cattorch tokenize text"),
+            if_(current, (
+                clear(TOKEN_IDS_LIST),
+                for_each(copy, length(_TOKENIZED), (
+                    append(TOKEN_IDS_LIST, item(_TOKENIZED, var(copy))),
+                )),
+            )),
+            *overtaken,
+        ),
+    )
+    detokenize = Program(
+        "detokenize_in_epoch",
+        variables=(status, _EPOCH, _DETOKENIZED, TEXT_VARIABLE, "_cattorch check index"),
+        lists=(TOKEN_IDS_LIST,),
+        body=(
+            set_var(status, ok),
+            *interface.item_checks(TOKEN_IDS_LIST, interface.WHOLE_NUMBERS, vocabulary),
+            if_(eq(var(status), ok), (
+                call("_cattorch detokenize ids"),
+                if_(current, (set_var(TEXT_VARIABLE, var(_DETOKENIZED)),)),
+            )),
+            *overtaken,
+        ),
+    )
+    blocks = ((interface.TOKENIZE, tokenize), (interface.DETOKENIZE, detokenize))
+    for y, (public, body) in enumerate(blocks):
+        sprite = _add_epoch_procedure(
+            sprite, public, body, x=640, y=360 * y, variables=(status,),
+            completion=interface.completion(public),
+        )
+    _merge_variables_by_name(sprite, {TEXT_VARIABLE, status})
+    return sprite
 
 
 def _reject_non_bmp(tokens: Sequence[str]) -> None:
@@ -594,11 +671,11 @@ def _build_character_tokenizer_sprite(
             character_ids.append(token_id)
     lookup = _CharacterLookup(characters)
     lists = (
-        ("tokens", "token_ids", *lookup.lists("_characters"), "_character ids")
+        ("tokens", "token_ids", _TOKENIZED, *lookup.lists("_characters"), "_character ids")
         + (("splitlist", "merge_keys", "merge_ids") if bpe else ())
     )
     values: dict[str, Sequence[int | float | str]] = {
-        "tokens": tokens, "token_ids": [],
+        "tokens": tokens, "token_ids": [], _TOKENIZED: [],
         "_characters": characters, "_character ids": character_ids,
     }
     if lookup.exact:
@@ -690,7 +767,7 @@ def _build_character_tokenizer_sprite(
                 length("splitlist"),
                 (
                     change_var("idx", 1),
-                    append("token_ids", item("splitlist", var("idx"))),
+                    append(_TOKENIZED, item("splitlist", var("idx"))),
                 ),
             ),
             *lookup.finish(),
@@ -702,7 +779,7 @@ def _build_character_tokenizer_sprite(
                 string_length(var("input")),
                 (
                     change_var("idx", 1),
-                    *append_lookup("token_ids"),
+                    *append_lookup(_TOKENIZED),
                 ),
             ),
             *lookup.finish(),
@@ -713,7 +790,7 @@ def _build_character_tokenizer_sprite(
         lists=lists,
         list_values=values,
         body=(
-            clear("token_ids"),
+            clear(_TOKENIZED),
             *encode_body,
         ),
     )
@@ -1035,6 +1112,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         lists = (
             "tokens",
             "token_ids",
+            _TOKENIZED,
             "_sp split",
             *lookup.lists("_sp characters"),
             "_sp character ids",
@@ -1045,6 +1123,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         list_values = {
             "tokens": pieces,
             "token_ids": [],
+            _TOKENIZED: [],
             "_sp split": [],
             "_sp characters": characters,
             "_sp character ids": character_ids,
@@ -1113,7 +1192,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             lists=lists,
             list_values=list_values,
             body=(
-                clear("token_ids"),
+                clear(_TOKENIZED),
                 clear("_sp split"),
                 set_var("_sp i", 0),
                 repeat(
@@ -1157,7 +1236,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                     (
                         change_var("_sp i", 1),
                         append(
-                            "token_ids",
+                            _TOKENIZED,
                             item("_sp split", var("_sp i")),
                         ),
                     ),

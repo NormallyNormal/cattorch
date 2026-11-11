@@ -18,6 +18,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_generation_automatic import load_sprite, nano, prefill_and_decode  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 CONTEXT, VOCAB, WIDTH, HEADS = 16, 24, 16, 2
 
@@ -136,7 +137,7 @@ def test_hidden_prefill_skips_the_final_query_projection(tmp_path, monkeypatch):
         emulator = ScratchEmulator(sprite)
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
-        emulator.lists["cattorch tokens"] = [3, 1, 4, 1, 5]
+        emulator.lists[TOKEN_IDS] = [3, 1, 4, 1, 5]
         emulator.run_procedure("cattorch prefill")
         return sum(emulator.opcode_counts.values()) - before
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import json
 import zipfile
 
@@ -13,6 +14,7 @@ from cattorch import (
     UnsupportedModelError, transpile,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
+from cattorch.interface import TOKEN_IDS
 
 transformers = pytest.importorskip("transformers")
 
@@ -68,7 +70,7 @@ def load(result):
 
 def run(emulator, procedure, tokens=None):
     if tokens is not None:
-        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.lists[TOKEN_IDS] = list(tokens)
     emulator.run_procedure(procedure)
     return emulator.variables["cattorch status"]
 
@@ -131,6 +133,7 @@ def test_prefill_and_decode_match_the_stateless_forward(exported):
     assert result.output.numel == VOCAB
     assert result.procedures == (
         "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
+        "cattorch prepare for save",
     )
 
 
@@ -207,8 +210,8 @@ def test_max_tokens_limits_the_tokens_between_resets(tmp_path):
     emulator = load(transpile(model, RecurrentGenerationProgram(max_tokens=3), tmp_path / "m"))
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", TOKENS[:3]) == "ok"
-    assert run(emulator, "cattorch decode", [TOKENS[3]]) == "maximum context exceeded"
-    assert run(emulator, "cattorch prefill", TOKENS[:4]) == "prefill exceeds maximum context"
+    assert run(emulator, "cattorch decode", [TOKENS[3]]) == interface.CONTEXT_FULL
+    assert run(emulator, "cattorch prefill", TOKENS[:4]) == interface.too_many_items(interface.TOKEN_IDS)
 
 
 def test_rescaled_rwkv_layers_follow_transformers_without_changing_the_model(tmp_path):

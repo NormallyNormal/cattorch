@@ -21,6 +21,7 @@ from cattorch import (
 )
 from cattorch.quantization import _symmetric_matrix
 from cattorch.util.scratch.emulator import ScratchEmulator
+from cattorch.interface import TOKEN_IDS
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -149,7 +150,7 @@ def _gpt2(vocabulary, width):
 
 
 def _generate(emulator, tokens):
-    emulator.lists["cattorch tokens"] = list(tokens)
+    emulator.lists[TOKEN_IDS] = list(tokens)
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     return list(emulator.lists["cattorch logits"])

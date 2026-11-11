@@ -1,5 +1,6 @@
 """Regression coverage for program boundaries and shared export infrastructure."""
 
+from cattorch import interface
 import json
 import zipfile
 
@@ -214,7 +215,7 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
         assert em.lists["cattorch state destination"] == expected
     em.lists["cattorch state source"] = [9.0]
     em.run_procedure("cattorch copy")
-    assert em.variables["cattorch status"] == "state capacity exceeded: destination"
+    assert em.variables["cattorch status"] == interface.state_full("cattorch state destination")
     assert em.lists["cattorch state destination"] == [0.0, 1.0, 2.0, 3.0]
     assert em.lists["cattorch copy value"] == [12.0, 13.0]
     em.run_procedure("cattorch reset")
@@ -258,7 +259,7 @@ def test_verification_fails_rejected_call_and_resumes_from_unmodified_state(tmp_
     )
     assert not result.passed
     assert not result.calls[0].passed
-    assert result.calls[0].status == "invalid length: cattorch step x"
+    assert result.calls[0].status == interface.wrong_number_of_items("cattorch step x")
     assert result.calls[1].passed
     assert result.calls[1].status == "ok"
 

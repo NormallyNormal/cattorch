@@ -27,6 +27,8 @@ from cattorch import (
 )
 from cattorch.util.scratch.archive import dumps
 from cattorch.util.scratch.emulator import ProjectEmulator
+from cattorch import interface
+from cattorch.interface import TOKEN_IDS
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "benchmarks" / "run_project_vm.cjs"
@@ -181,13 +183,13 @@ def test_program_state_carries_between_calls(tmp_path):
     project = build_project(tmp_path / "tally", result)
     rows = torch.randn(3, 3)
     stage = run_vm(project, tmp_path, flag=False, calls=[
-        ("tally add", {"tally cattorch add row": row.tolist()}) for row in rows
+        ("tally add", {"tally add row": row.tolist()}) for row in rows
     ])["stage"]
     expected = None
     for row in rows:
         expected = model.add(row)
     torch.testing.assert_close(
-        values(stage, "tally cattorch add output"), expected.detach(), atol=1e-4, rtol=1e-4,
+        values(stage, "tally add output"), expected.detach(), atol=1e-4, rtol=1e-4,
     )
 
 
@@ -218,7 +220,7 @@ def test_an_output_list_holding_a_longer_intermediate_is_sharded(tmp_path):
     project = build_project(tmp_path / "readout", result)
     stage = run_vm(project, tmp_path, flag=False, calls=[("readout read", {})])["stage"]
     expected = model.read(torch.ones(200_005)).detach()
-    torch.testing.assert_close(values(stage, "readout cattorch read value"), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(values(stage, "readout read value"), expected, atol=1e-6, rtol=1e-6)
 
 
 def _layered_language():
@@ -283,8 +285,10 @@ def test_non_finite_example_values_load_and_round_trip(tmp_path):
         entry[1] for entry in stored["targets"][0]["lists"].values()
     ]
     stage = run_vm(project, tmp_path)["stage"]
-    # Scratch reads "NaN" as 0 wherever it wants a number.
-    assert stage["scale output"] == [3, "Infinity", "-Infinity", 0]
+    # Scratch would read "NaN" as 0 wherever it wants a number, so the
+    # forward refuses it, and writes no output.
+    assert stage["scale status"] == interface.invalid_item("input")
+    assert stage["scale output"] == []
     stage = run_vm(project, tmp_path, lists={"scale input": [math.inf, 2.0, 0.0, -1.0]})["stage"]
     assert values(stage, "scale output").tolist() == [math.inf, 4.0, 0.0, -2.0]
 
@@ -374,7 +378,7 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     done = builder.global_variable("first done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
     status, busy = "cattorch status", "_cattorch busy"
-    tokens = "cattorch tokens"
+    tokens = TOKEN_IDS
 
     def run(procedure, values, results):
         return (
@@ -491,7 +495,8 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
 def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
     # Scratch pauses the long forward once it has run for 500 ms, and runs the
     # second script, whose short forward uses the same temporary lists: the
-    # long one must then neither report ok nor leave its outputs.
+    # long one must then neither report ok nor write its outputs over the
+    # short one's, and still send its completion broadcast.
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
         append, call, change_var, clear, div, eq, for_each, item, length, mod, mul,
@@ -518,7 +523,12 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
         builder.global_list(name) for name in ("first results", "second results", "outputs")
     )
     started, done = (builder.global_variable(name, 0) for name in ("started", "first done"))
+    received = builder.global_variable("completions", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    builder.script(builder.stage, {
+        "opcode": "event_whenbroadcastreceived",
+        "fields": {"BROADCAST_OPTION": ["cattorch forward complete", "forward_complete"]},
+    }, (change_var(received, 1),), variables=(received,), y=800)
     status = "cattorch status"
 
     def fill(rows, step):
@@ -552,8 +562,10 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
     path = tmp_path / "overlap.sb3"
     builder.write(path)
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
-    assert stage["first results"] == [OVERTAKEN, 0]
+    # The short forward's 64 outputs stay.
+    assert stage["first results"] == [OVERTAKEN, 64]
     assert stage["second results"] == [0, "ok", "ok"]
+    assert stage["completions"] == 3
 
     def row(step):
         return torch.tensor([((index * step) % 101) / 101 - 0.5 for index in range(1, 65)])
@@ -587,7 +599,7 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     done = builder.global_variable("first done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
     status, busy, initialized = "cattorch status", "_cattorch busy", "cattorch initialized"
-    tokens = "cattorch tokens"
+    tokens = TOKEN_IDS
 
     def run(procedure, values, results):
         return (
@@ -656,7 +668,7 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     )
     started, done = builder.global_variable("started", 0), builder.global_variable("done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, initialized, tokens = "cattorch status", "cattorch initialized", "cattorch tokens"
+    status, initialized, tokens = "cattorch status", "cattorch initialized", TOKEN_IDS
 
     def run(procedure, values):
         return (
@@ -691,3 +703,67 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     torch.testing.assert_close(
         values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
     )
+
+
+def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
+    # A forward given the wrong number of items, or an index outside its
+    # table, reports why, writes no output, and still sends its completion
+    # broadcast, as a bridge does; so does prepare for save.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import append, call, clear, length, var
+
+    class Lookup(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(7)
+            self.table = nn.Embedding(5, 2)
+
+        def forward(self, index):
+            return self.table(index)
+
+    model = Lookup().eval()
+    result = transpile(model, torch.tensor([[1, 3]]), tmp_path / "lookup")
+    project = build_project(tmp_path / "lookup", result)
+    calls = [
+        ("lookup run", {"lookup input": [1, 3]}),
+        ("lookup run", {"lookup input": [1]}),
+        ("lookup run", {"lookup input": [1, 5]}),
+        ("lookup run", {"lookup input": [1, "a"]}),
+    ]
+    stage = run_vm(project, tmp_path, flag=False, calls=calls[:1])["stage"]
+    expected = model(torch.tensor([[1, 3]])).detach().flatten()
+    torch.testing.assert_close(values(stage, "lookup output"), expected, atol=1e-6, rtol=0)
+    assert stage["lookup status"] == interface.OK
+    for call_, status in zip(calls[1:], (
+        interface.wrong_number_of_items("input"), interface.invalid_item("input"),
+        interface.invalid_item("input"),
+    )):
+        stage = run_vm(project, tmp_path, flag=False, calls=[calls[0], call_])["stage"]
+        assert stage["lookup status"] == status
+        # The bridge copies no output: the first call's stay.
+        torch.testing.assert_close(values(stage, "lookup output"), expected, atol=1e-6, rtol=0)
+
+    # In the sprite itself: each block's broadcast, the status it set then.
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    heard = builder.global_list("heard")
+    status = interface.STATUS_VARIABLE
+    for position, message in enumerate((
+        "cattorch forward complete", "cattorch init complete", "cattorch prepare for save complete",
+    )):
+        builder.script(sprite, {
+            "opcode": "event_whenbroadcastreceived",
+            "fields": {"BROADCAST_OPTION": [message, message.replace(" ", "_")]},
+        }, (append(heard, message), append(heard, var(status))),
+            lists=(heard,), variables=(status,), y=200 * (position + 1))
+    builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
+        clear("input"), append("input", 9), call(interface.FORWARD),
+        append(heard, length("output")), call(interface.PREPARE_FOR_SAVE),
+    ), lists=("input", "output", heard))
+    path = tmp_path / "heard.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["heard"][:3] == [
+        "cattorch forward complete", interface.wrong_number_of_items("input"), 0,
+    ]
+    assert stage["heard"][3:] == ["cattorch prepare for save complete", interface.OK]

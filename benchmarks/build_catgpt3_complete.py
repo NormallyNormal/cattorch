@@ -195,7 +195,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
             "quantization": "symmetric q4",
             "group_size": 256,
             "scale_precision": "float16",
-            "compression": "costume-base92 with canonical Huffman q4",
+            "compression": "base92 with canonical Huffman q4",
             "unrolling": "compact",
             "compact_schema": True,
             "compact_internal_names": True,

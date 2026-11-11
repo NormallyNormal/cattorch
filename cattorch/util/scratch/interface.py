@@ -6,10 +6,7 @@ import re
 from collections.abc import Mapping
 
 from cattorch.errors import UnsupportedModelError
-
-
-def shard_name(name: str, position: int) -> str:
-    return name if position == 0 else f"{name} shard {position + 1}"
+from cattorch.interface import shard_name, shard_variables
 
 
 def logical_list_names(lists, name: str) -> tuple[str, ...]:
@@ -82,13 +79,8 @@ def _rename_list_entries(sprite: dict, old: str, new: str, names: dict[str, str]
         match = pattern.fullmatch(entry[0])
         if match:
             entry[0] = names[identifier] = new + (match.group(1) or "")
-    for suffix in ("shard count", "logical length"):
-        _rename_variable_entry(
-            sprite,
-            f"cattorch {old.removeprefix('cattorch ')} {suffix}",
-            f"cattorch {new.removeprefix('cattorch ')} {suffix}",
-            names,
-        )
+    for old_variable, new_variable in zip(shard_variables(old), shard_variables(new)):
+        _rename_variable_entry(sprite, old_variable, new_variable, names)
 
 
 def rename_variables(sprite: dict, renames: Mapping[str, str]) -> None:

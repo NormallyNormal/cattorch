@@ -28,9 +28,12 @@ from cattorch.storage import (
     _quantize_arrays,
     _quantized_bytes,
 )
+from cattorch.util.scratch.interface import refresh_data_display_names
+from cattorch.util.scratch.interface import rename_procedure as _rename_procedure
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, ListLayout
 from cattorch.util.scratch.tensor_adder import StaticValues, static_list_contents
+from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE
 
 if TYPE_CHECKING:
@@ -763,7 +766,8 @@ def _remove_unused(sprite):
         unused = [
             sid for sid, entry in slots.items()
             if sid not in referenced
-            and not entry[0].startswith("cattorch ") and not is_public_data(entry[0])
+            and not entry[0].startswith("cattorch ")
+            and not is_public_data(entry[0], is_list=section == "lists")
         ]
         for sid in unused:
             log.info("Removing unused %s: %s", section.rstrip("s"), slots[sid][0])
@@ -1734,12 +1738,14 @@ def _add_prepare_for_save(
     compressed: bool,
     inputs: AbstractSet[str] = frozenset(),
 ) -> None:
-    """Add a public procedure that drops rebuildable runtime list contents.
+    """Add the public procedure that drops rebuildable runtime list contents.
 
-    Input lists are kept: they hold the caller's values, and a program's
-    persistent state is passed to its entry points as inputs.
+    It marks the weights undecoded and clears the decoded weights and the
+    working lists. The ``inputs`` lists are kept: they hold the caller's
+    values, or are public lists, and a program's persistent state is passed
+    to its entry points as inputs.
     """
-    from cattorch.util.scratch.dsl import Program, clear
+    from cattorch.util.scratch.dsl import Program, clear, set_var
 
     names = [
         shard.name
@@ -1748,33 +1754,15 @@ def _add_prepare_for_save(
         and (compressed or layout.name not in static_names)
         for shard in layout.shards
     ]
-    if not names:
-        return
+    initialized = interface.INITIALIZED_VARIABLE
     program = Program(
         "prepare_for_save",
+        variables=(initialized,),
         lists=names,
-        body=tuple(clear(name) for name in names),
+        body=(set_var(initialized, 0), *(clear(name) for name in names)),
     )
-    _add_warp_procedure(
-        sprite, "cattorch prepare for save", program, x=640, y=640,
-    )
-
-    blocks = sprite["blocks"]
-    definition = _find_procedure_definition(sprite, "cattorch prepare for save")
-    old_root = blocks[definition]["next"]
-    initialized_id = next(
-        sid for sid, entry in sprite["variables"].items()
-        if entry[0] == "cattorch initialized"
-    )
-    reset = f"cattorch_prepare_save_{uuid.uuid4().hex[:8]}"
-    blocks[reset] = {
-        "opcode": "data_setvariableto", "next": old_root, "parent": definition,
-        "inputs": {"VALUE": [1, [4, 0]]},
-        "fields": {"VARIABLE": ["cattorch initialized", initialized_id]},
-        "shadow": False, "topLevel": False,
-    }
-    blocks[definition]["next"] = reset
-    blocks[old_root]["parent"] = reset
+    _add_warp_procedure(sprite, interface.PREPARE_FOR_SAVE, program, x=640, y=640)
+    _merge_variables_by_name(sprite, {initialized})
 
 
 def _gate_chain(
@@ -1830,9 +1818,9 @@ def _gate_chain(
         blocks[stop]["parent"] = guard
 
 
-_TOP_K_VALUES = "cattorch top k values"
-_TOP_K_IDS = "cattorch top k ids"
-_TOP_K_PROCEDURE = "cattorch select top k"
+_TOP_K_VALUES = interface.TOP_K_VALUES
+_TOP_K_IDS = interface.TOP_K_IDS
+_TOP_K_PROCEDURE = "_cattorch select top k"
 # 1 while a call is changing the states: while reset, prefill or decode runs in
 # a generation sprite, or while a program's reset or entry point writes them.
 # Still 1 when another call starts if that one was stopped part way or is
@@ -1843,13 +1831,6 @@ _BUSY = "_cattorch busy"
 # took over the states while it was paused, and wrote to them, or will write
 # to them, when it resumes.
 _EPOCH = "_cattorch epoch"
-_INTERRUPTED = (
-    "an earlier reset, prefill or decode was stopped or is still running; "
-    "reset or prefill first"
-)
-_OVERTAKEN = (
-    "another reset, prefill, decode or init ran during this one; reset or prefill first"
-)
 
 
 def _epoch_current():
@@ -1861,7 +1842,7 @@ def _epoch_current():
 
 def _add_epoch_procedure(
     sprite: dict, name: str, body, *, x: int, y: int, take_over=(), refusal=None,
-    variables: Sequence[str] = (), lists: Sequence[str] = (),
+    variables: Sequence[str] = (), lists: Sequence[str] = (), completion: str | None = None,
 ) -> dict:
     """Add the public ``name``, which changes the epoch and runs ``body`` with it.
 
@@ -1869,14 +1850,15 @@ def _add_epoch_procedure(
     body, an internal procedure with an ``epoch`` argument, tells by
     ``_epoch_current()`` whether another call started since. ``take_over``
     runs first; with a ``refusal``, that runs instead while ``_BUSY`` is 1.
-    ``variables`` and ``lists`` are what those two use.
+    ``variables`` and ``lists`` are what those two use. The block ends,
+    whatever happened, with a ``broadcast and wait`` of ``completion``.
     """
     sprite = _add_warp_procedure(
         sprite, _epoch_procedure(name), body, x=x + 320, y=y, arguments=("epoch",),
     )
     return _add_epoch_entry(
         sprite, name, f"{body.name}_public", x=x, y=y, take_over=take_over, refusal=refusal,
-        variables=(_BUSY, _EPOCH, *variables), lists=lists,
+        variables=(_BUSY, _EPOCH, *variables), lists=lists, completion=completion,
     )
 
 
@@ -1887,26 +1869,25 @@ def _epoch_procedure(name: str) -> str:
 
 def _add_epoch_entry(
     sprite: dict, name: str, program_name: str, *, x: int, y: int, take_over=(), refusal=None,
-    variables: Sequence[str] = (), lists: Sequence[str] = (),
+    variables: Sequence[str] = (), lists: Sequence[str] = (), completion: str | None = None,
 ) -> dict:
     """Add the public ``name``, which changes the epoch and runs its epoch procedure.
 
     As ``_add_epoch_procedure``, for an epoch procedure the sprite already has;
     ``variables`` are all the ones the public block uses.
     """
-    from cattorch.util.scratch.dsl import Program, call, change_var, eq, if_else, var
+    from cattorch.util.scratch.dsl import (
+        Program, broadcast_and_wait, call, change_var, eq, if_else, var,
+    )
 
     start = (*take_over, change_var(_EPOCH, 1), call(_epoch_procedure(name), epoch=var(_EPOCH)))
+    body = start if refusal is None else (if_else(eq(var(_BUSY), 1), refusal, start),)
+    if completion is not None:
+        body = (*body, broadcast_and_wait(completion))
     public = Program(
-        program_name, variables=dict.fromkeys(variables), lists=lists,
-        body=start if refusal is None else (if_else(eq(var(_BUSY), 1), refusal, start),),
+        program_name, variables=dict.fromkeys(variables), lists=lists, body=body,
     )
     return _add_warp_procedure(sprite, name, public, x=x, y=y)
-
-
-# What a program entry point or a plain forward reports when another call
-# started while it ran.
-_CALL_OVERTAKEN = "another call ran during this one"
 
 
 def _unlink_broadcasts(sprite: dict, message: str) -> None:
@@ -1984,12 +1965,17 @@ def _mark_init_decoding(sprite: dict, prefix: str) -> None:
 
     Init marks them so as it starts, and again at its end if another call
     started meanwhile; it then also changes the epoch, so that a call it
-    resumed during fails. ``cattorch init`` must later run in an epoch
-    procedure, with ``_add_init_epoch_entry``.
+    resumed during fails, and reports that it was overtaken. Either way it
+    ends by setting the status and broadcasting ``cattorch init complete``,
+    also when another block runs it to decode the weights first: an init a
+    block starts itself is like one called. ``cattorch init`` must later run
+    in an epoch procedure, with ``_add_init_epoch_entry``.
     """
-    from cattorch.util.scratch.dsl import Program, change_var, if_, not_, set_var
+    from cattorch.util.scratch.dsl import (
+        Program, broadcast_and_wait, change_var, if_else, set_var,
+    )
 
-    init, initialized = "cattorch init", "cattorch initialized"
+    init, initialized = interface.INIT, interface.INITIALIZED_VARIABLE
     # A call that starts meanwhile decodes the weights itself.
     _add_to_procedure(sprite, init, Program(
         f"{prefix}_init_start", variables=(initialized,), body=(set_var(initialized, 0),),
@@ -1997,8 +1983,14 @@ def _mark_init_decoding(sprite: dict, prefix: str) -> None:
     # That call may have finished decoding them while this init was, and
     # this one then left them half overwritten.
     _add_to_procedure(sprite, init, Program(
-        f"{prefix}_init_end", variables=(initialized, _EPOCH),
-        body=(if_(not_(_epoch_current()), (set_var(initialized, 0), change_var(_EPOCH, 1))),),
+        f"{prefix}_init_end", variables=(initialized, _EPOCH, STATUS_VARIABLE),
+        body=(
+            if_else(_epoch_current(), (set_var(STATUS_VARIABLE, interface.OK),), (
+                set_var(initialized, 0), change_var(_EPOCH, 1),
+                set_var(STATUS_VARIABLE, interface.OVERTAKEN),
+            )),
+            broadcast_and_wait(interface.completion(init)),
+        ),
     ))
 
 
@@ -2329,54 +2321,115 @@ def _guard_plain_calls(sprite: dict, outputs: Sequence[str]) -> dict:
     share temporary lists and the decoded weights. As program entry points
     do, ``cattorch forward`` and ``cattorch init`` change the epoch and run in
     an epoch procedure, and ``cattorch prepare for save`` changes the epoch.
-    A forward that another call started during clears ``outputs``, every
-    output list and shard, reports so in ``cattorch status``, sends no
-    completion broadcast, and changes the epoch, so that a call it resumed
-    during fails too. An init that another call started during, the forward's
-    own included, leaves the weights for the next call to decode again.
+
+    The forward computes into private copies of ``outputs``, every output
+    list and shard, and copies them to the public lists at its end only if
+    no other call started meanwhile and ``cattorch status`` is ok, so that a
+    call another one ran during never writes the outputs: it reports so,
+    and changes the epoch, so that a call it resumed during fails too. Only
+    a call overtaken while it copies, which leaves them mixed, clears them.
+    An init that another call started during, the forward's own included,
+    leaves the weights for the next call to decode again. Every block sets
+    the status and sends its completion broadcast as it ends.
     """
     from cattorch.util.scratch.dsl import (
-        Program, broadcast_and_wait, change_var, clear, if_else, set_var,
+        Program, append, broadcast_and_wait, change_var, clear, eq, for_each, if_, item,
+        length, not_, set_var, var,
     )
 
-    forward = "cattorch forward"
-    complete = f"{forward} complete"
+    forward = interface.FORWARD
     current = _epoch_current()
-    # Sent at the end instead, only by a call that ran alone.
-    _unlink_broadcasts(sprite, complete)
+    staged = {name: f"_cattorch staged {name}" for name in outputs}
+    renamed = {}
+    for identifier, entry in sprite.get("lists", {}).items():
+        if entry[0] in staged:
+            entry[0] = renamed[identifier] = staged[entry[0]]
+    refresh_data_display_names(sprite["blocks"], renamed)
+    copy = "_cattorch commit index"
+    commit = tuple(
+        statement
+        for public, private in staged.items()
+        for statement in (
+            clear(public),
+            for_each(copy, length(private), (append(public, item(private, var(copy))),)),
+        )
+    )
+    mixed = tuple(clear(public) for public in staged)
     _add_to_procedure(sprite, forward, Program(
-        "plain_forward_end", variables=(_EPOCH, STATUS_VARIABLE), lists=outputs,
-        body=(if_else(current, (broadcast_and_wait(complete),), (
-            change_var(_EPOCH, 1), *(clear(name) for name in outputs),
-            set_var(STATUS_VARIABLE, _CALL_OVERTAKEN),
-        )),),
+        "plain_forward_end", variables=(_EPOCH, STATUS_VARIABLE, copy),
+        lists=(*staged, *staged.values()),
+        body=(
+            if_(current, (if_(eq(var(STATUS_VARIABLE), interface.OK), (
+                *commit, if_(not_(current), mixed),
+            )),)),
+            if_(not_(current), (
+                change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, interface.OVERTAKEN),
+            )),
+        ),
     ))
     _mark_init_decoding(sprite, "plain")
     _take_epoch_argument(sprite, forward)
-    inner_init = _take_epoch_argument(sprite, "cattorch init")
+    inner_init = _take_epoch_argument(sprite, interface.INIT)
     sprite = _add_epoch_entry(
         sprite, forward, "plain_forward_public", x=0, y=320, variables=(_EPOCH,),
+        completion=interface.completion(forward),
     )
     sprite = _add_init_epoch_entry(sprite, inner_init, "plain", x=0, y=480)
-    # A variable-length export renamed the loose forward block on the canvas
-    # with the procedure it wraps, so it ran that unchecked.
-    wrapped = ("_cattorch checked forward", "_cattorch forward unit")
+    _stop_overtaken_decoding(sprite)
+    try:
+        _find_procedure_definition(sprite, interface.PREPARE_FOR_SAVE)
+    except ValueError:
+        return sprite
+    # Clearing the weights takes them from a running call.
+    _add_to_procedure(sprite, interface.PREPARE_FOR_SAVE, Program(
+        "plain_prepare_start", variables=(_EPOCH,), body=(change_var(_EPOCH, 1),),
+    ), first=True)
+    _add_to_procedure(sprite, interface.PREPARE_FOR_SAVE, Program(
+        "plain_prepare_end", variables=(STATUS_VARIABLE,), body=(
+            set_var(STATUS_VARIABLE, interface.OK),
+            broadcast_and_wait(interface.completion(interface.PREPARE_FOR_SAVE)),
+        ),
+    ))
+    return sprite
+
+
+# What ``cattorch forward`` becomes once a wrapper checks its inputs first.
+_CHECKED_FORWARD = "_cattorch checked forward"
+
+
+def _add_input_checks(sprite: dict, checks: Sequence[Sequence], lists: Sequence[str]) -> None:
+    """Make ``cattorch forward`` set the status, and run only if ``checks`` leave it ok.
+
+    ``checks`` are groups of statements, each run only while the status is
+    still ok, so that it reports the first problem. The forward becomes the
+    internal ``_cattorch checked forward``. ``lists`` are the lists the
+    checks read.
+    """
+    from cattorch.util.scratch.dsl import Program, call, eq, if_, set_var, var
+
+    ok = eq(var(STATUS_VARIABLE), interface.OK)
+    _rename_procedure(sprite, interface.FORWARD, _CHECKED_FORWARD)
+    wrapper = Program(
+        "checked_forward",
+        variables=(STATUS_VARIABLE, "_cattorch check index", _EPOCH),
+        lists=tuple(dict.fromkeys(lists)),
+        body=(
+            set_var(STATUS_VARIABLE, interface.OK),
+            *(if_(ok, tuple(group)) for group in checks),
+            # A forward taken over while it checked computes nothing; the
+            # forward later runs in an epoch procedure (_guard_plain_calls).
+            if_(ok, (if_(_epoch_current(), (call(_CHECKED_FORWARD),)),)),
+        ),
+    )
+    _add_warp_procedure(sprite, interface.FORWARD, wrapper, x=640, y=960)
+    # The loose forward block on the canvas runs the public block, not the
+    # procedure it wraps.
     for block in sprite["blocks"].values():
         if (
             block.get("opcode") == "procedures_call" and block.get("topLevel")
-            and block["mutation"].get("proccode") in wrapped
+            and block["mutation"].get("proccode") == _CHECKED_FORWARD
         ):
-            block["mutation"] = _procedure_mutation(forward)
-    _stop_overtaken_decoding(sprite)
-    try:
-        _find_procedure_definition(sprite, "cattorch prepare for save")
-    except ValueError:
-        return sprite
-    # Re-encoding the weights takes them from a running call.
-    _add_to_procedure(sprite, "cattorch prepare for save", Program(
-        "plain_prepare_start", variables=(_EPOCH,), body=(change_var(_EPOCH, 1),),
-    ), first=True)
-    return sprite
+            block["mutation"] = _procedure_mutation(interface.FORWARD)
 
 
 # An empty slot of the top-k lists. Scratch compares a number with an empty
@@ -2553,14 +2606,24 @@ def _guard_cache_capacity(first_cache: tuple[str, int]) -> _TokenCount:
     return report
 
 
+# The internal reset of a generation sprite's states, which the public
+# ``cattorch reset``, prefill and prepare for save run.
+_GENERATION_RESET = "_cattorch reset state"
+# The one-token list a generation step reads, and the logits it writes.
+_STEP_TOKEN = "_cattorch step token"
+_STEP_LOGITS = "_cattorch step logits"
+
+
 def _add_generation_blocks(
     sprite: dict,
     *,
     step: str = "cattorch forward",
     reset: str = "cattorch reset cache",
     restore: str | None = None,
-    tokens: str = "input",
-    logits: str = "output",
+    tokens: str = interface.TOKEN_IDS,
+    step_tokens: str = "input",
+    logits: str = interface.LOGITS,
+    step_logits: str = "output",
     state_lists: Sequence[str] = (),
     capacity: int | None,
     hidden_prefill: bool,
@@ -2572,15 +2635,19 @@ def _add_generation_blocks(
     """Add the public reset/prefill/decode blocks around a one-token step.
 
     ``step`` must already be a procedure whose first block is the automatic
-    init check; it consumes the one token in ``tokens`` and writes ``logits``.
-    A ``reset`` procedure is created that calls the ``restore`` procedure, if
-    given, and clears ``state_lists``; the public ``cattorch reset`` runs it.
-    Without a ``token_count``, ``cattorch cache length`` counts steps that
-    finish with an ok status. A ``capacity`` of None sets no token limit.
+    init check; it reads the one token in ``step_tokens`` and writes
+    ``step_logits``. Prefill and decode check the public ``tokens`` first,
+    and copy the step's logits to the public ``logits``, and the top-k lists,
+    only at their end, when they succeeded and no other call started
+    meanwhile, so a call that fails writes no output. A ``reset`` procedure
+    is created that calls the ``restore`` procedure, if given, and clears
+    ``state_lists``; the public ``cattorch reset`` runs it. Without a
+    ``token_count``, ``cattorch cache length`` counts steps that finish with
+    an ok status. A ``capacity`` of None sets no token limit.
     """
     from cattorch.util.scratch.dsl import (
-        Program, append, call, change_var, clear, eq, for_each, gt, if_, if_else,
-        item, length, lt, not_, round_, set_var, sub, var,
+        Program, append, call, change_var, clear, eq, for_each, if_, if_else,
+        item, length, not_, set_var, sub, var,
     )
 
     buffer = "cattorch prefill buffer"
@@ -2598,7 +2665,9 @@ def _add_generation_blocks(
             y=480,
         )
 
-    reset_lists = (*state_lists, logits, *top_k_lists)
+    # Prefill runs the internal reset too, and writes the public outputs only
+    # if it succeeds; the public reset clears them.
+    reset_lists = (*state_lists, step_logits)
     reset_program = Program(
         "generation_reset",
         lists=reset_lists,
@@ -2610,18 +2679,32 @@ def _add_generation_blocks(
     sprite = _add_warp_procedure(sprite, reset, reset_program, x=640, y=0)
 
     current = _epoch_current()
+    ok = eq(var(STATUS_VARIABLE), interface.OK)
     overtaken = (
         set_var(_BUSY, 1),
         change_var(_EPOCH, 1),
         # Another call may have finished decoding the weights while this one
         # was, and this one then left them half overwritten.
-        set_var("cattorch initialized", 0),
-        clear(logits), *(clear(name) for name in top_k_lists),
-        set_var(STATUS_VARIABLE, _OVERTAKEN),
+        set_var(interface.INITIALIZED_VARIABLE, 0),
+        set_var(STATUS_VARIABLE, interface.OVERTAKEN),
     )
-    finish = if_else(current, (set_var(_BUSY, 0),), overtaken)
-    lifecycle_variables = (_BUSY, _EPOCH, "cattorch initialized", STATUS_VARIABLE)
-    lifecycle_lists = (logits, *top_k_lists)
+    copy = "_cattorch commit index"
+    commit = (
+        clear(logits),
+        for_each(copy, length(step_logits), (append(logits, item(step_logits, var(copy))),)),
+        *((call(_TOP_K_PROCEDURE),) if top_k is not None else ()),
+    )
+    # A call overtaken while it copies leaves the outputs mixed.
+    mixed = (clear(logits), *(clear(name) for name in top_k_lists))
+    # The states stay busy until the outputs are copied, so a decode that
+    # starts meanwhile is refused rather than build on a call that may yet
+    # fail.
+    finish = (
+        if_(current, (if_(ok, (*commit, if_(not_(current), mixed))),)),
+        if_else(current, (set_var(_BUSY, 0),), overtaken),
+    )
+    lifecycle_variables = (_BUSY, _EPOCH, interface.INITIALIZED_VARIABLE, STATUS_VARIABLE, copy)
+    lifecycle_lists = (logits, step_logits, *top_k_lists)
 
     def add_public(name: str, body: Program, *, y: int, refusal=None) -> None:
         """Add ``name``, which takes the states over and runs ``body`` with its epoch."""
@@ -2629,138 +2712,89 @@ def _add_generation_blocks(
         sprite = _add_epoch_procedure(
             sprite, name, body, x=640, y=y, take_over=(set_var(_BUSY, 1),), refusal=refusal,
             variables=lifecycle_variables, lists=lifecycle_lists,
+            completion=interface.completion(name),
         )
 
-    add_public("cattorch reset", Program(
+    add_public(interface.RESET, Program(
         "generation_reset_in_epoch", variables=lifecycle_variables, lists=lifecycle_lists,
-        body=(call(reset), finish),
+        body=(
+            call(reset), clear(logits), *(clear(name) for name in top_k_lists),
+            if_else(current, (set_var(_BUSY, 0),), overtaken),
+        ),
     ), y=640)
 
     # A token that isn't a whole number in the vocabulary would read past the
     # embedding table and still report ok.
-    valid_tokens = "_cattorch tokens valid"
-    token = "_cattorch token"
-
-    def check_tokens(source):
-        if vocabulary is None:
-            return (set_var(valid_tokens, 1),)
-        return (
-            set_var(valid_tokens, 1),
-            for_each("_cattorch token index", length(source), (
-                set_var(token, item(source, var("_cattorch token index"))),
-                if_(not_(eq(var(token), round_(var(token)))), (set_var(valid_tokens, 0),)),
-                if_(lt(var(token), 0), (set_var(valid_tokens, 0),)),
-                if_(gt(var(token), vocabulary - 1), (set_var(valid_tokens, 0),)),
-            )),
+    def check_tokens(source: str) -> tuple:
+        return interface.item_checks(
+            tokens, interface.WHOLE_NUMBERS, vocabulary, lists=(source,),
         )
 
-    invalid_token = f"token ids must be whole numbers from 0 to {(vocabulary or 0) - 1}"
-    invalid_decode = (
-        clear(logits),
-        *(clear(name) for name in top_k_lists),
-        set_var(STATUS_VARIABLE, "decode requires exactly one token"),
-    )
-    token_variables = (valid_tokens, token, "_cattorch token index")
+    def one_step(source: str, position) -> tuple:
+        return (clear(step_tokens), append(step_tokens, item(source, position)), call(step))
+
     decode = Program(
         "generation_decode",
         variables=(
-            *lifecycle_variables, *token_variables,
+            *lifecycle_variables, "_cattorch check index",
             *(("cattorch project output",) if hidden_prefill else ()),
         ),
-        lists=(tokens, *lifecycle_lists),
+        lists=(tokens, step_tokens, *lifecycle_lists),
         body=(
             # A stopped hidden prefill can leave it 0.
             *((set_var("cattorch project output", 1),) if hidden_prefill else ()),
-            if_else(
-                eq(length(tokens), 1),
-                (
-                    *check_tokens(tokens),
-                    if_else(
-                        eq(var(valid_tokens), 1),
-                        (call(step),),
-                        (
-                            clear(logits), *(clear(name) for name in top_k_lists),
-                            set_var(STATUS_VARIABLE, invalid_token),
-                        ),
-                    ),
-                ),
-                invalid_decode,
-            ),
-            finish,
+            set_var(STATUS_VARIABLE, interface.OK),
+            *interface.length_checks(tokens, numel=1),
+            if_(ok, check_tokens(tokens)),
+            if_(ok, one_step(tokens, 1)),
+            *finish,
         ),
     )
     # A refusal sets the status, so a call still running couldn't report its
     # own; it is stopped too.
-    add_public("cattorch decode", decode, y=160, refusal=(
-        change_var(_EPOCH, 1),
-        clear(logits), *(clear(name) for name in top_k_lists),
-        set_var(STATUS_VARIABLE, _INTERRUPTED),
+    add_public(interface.DECODE, decode, y=160, refusal=(
+        change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, interface.INTERRUPTED),
     ))
 
-    # A prefill that another call took over skips the rest of its work.
-    copy_and_reset = (
+    # The prompt is checked, from a copy, before the prefill resets anything,
+    # so a prefill that fails changes nothing. One that another call took
+    # over skips the rest of its work.
+    if hidden_prefill:
+        steps: tuple = (
+            if_(current, (set_var("cattorch project output", 0),)),
+            for_each("prefill index", sub(length(buffer), 1), (
+                if_(current, one_step(buffer, var("prefill index"))),
+            )),
+            if_(current, (
+                set_var("cattorch project output", 1), *one_step(buffer, length(buffer)),
+            )),
+        )
+    else:
+        steps = (
+            for_each("prefill index", length(buffer), (
+                if_(current, one_step(buffer, var("prefill index"))),
+            )),
+        )
+    prefill = Program(
+        "generation_prefill",
+        variables=(
+            "prefill index", "_cattorch check index", *lifecycle_variables,
+            *(("cattorch project output",) if hidden_prefill else ()),
+        ),
+        lists=(tokens, buffer, step_tokens, *lifecycle_lists),
+        body=(
+            set_var(STATUS_VARIABLE, interface.OK),
             clear(buffer),
             for_each("prefill index", length(tokens), (
                 append(buffer, item(tokens, var("prefill index"))),
             )),
-            if_(current, (call(reset),)),
-            clear(tokens),
-    )
-    if hidden_prefill:
-        valid_prefill: tuple = (
-                if_(current, (set_var("cattorch project output", 0),)),
-                for_each("prefill index", sub(length(buffer), 1), (if_(current, (
-                    append(tokens, item(buffer, var("prefill index"))),
-                    call(step),
-                    clear(tokens),
-                )),)),
-                if_(current, (
-                    set_var("cattorch project output", 1),
-                    append(tokens, item(buffer, length(buffer))),
-                    call(step),
-                    clear(tokens),
-                )),
-        )
-        prefill_variables: tuple[str, ...] = (
-            "prefill index", "cattorch project output", STATUS_VARIABLE, *token_variables,
-        )
-    else:
-        valid_prefill = (
-            for_each("prefill index", length(buffer), (if_(current, (
-                append(tokens, item(buffer, var("prefill index"))),
-                call(step),
-                clear(tokens),
-            )),)),
-        )
-        prefill_variables = ("prefill index", STATUS_VARIABLE, *token_variables)
-    checked_prefill = if_else(
-        eq(var(valid_tokens), 1),
-        valid_prefill,
-        (set_var(STATUS_VARIABLE, invalid_token),),
-    )
-    if capacity is not None:
-        checked_prefill = if_else(
-            gt(length(buffer), capacity),
-            (set_var(STATUS_VARIABLE, "prefill exceeds maximum context"),),
-            (checked_prefill,),
-        )
-    prefill_body = (
-        *copy_and_reset,
-        *check_tokens(buffer),
-        if_else(
-            eq(length(buffer), 0),
-            (set_var(STATUS_VARIABLE, "prefill requires at least one token"),),
-            (checked_prefill,),
+            *interface.length_checks(tokens, max_items=capacity, lists=(buffer,)),
+            if_(ok, check_tokens(buffer)),
+            if_(ok, (if_(current, (call(reset),)), *steps)),
+            *finish,
         ),
-        finish,
     )
-    prefill = Program(
-        "generation_prefill",
-        variables=(*prefill_variables, *lifecycle_variables),
-        lists=(tokens, buffer, *lifecycle_lists),
-        body=prefill_body,
-    )
-    add_public("cattorch prefill", prefill, y=320)
+    add_public(interface.PREFILL, prefill, y=320)
     if hidden_prefill:
         # Only prefill clears it, so a decode before any prefill must find 1.
         for entry in sprite["variables"].values():
@@ -2774,21 +2808,18 @@ def _add_generation_blocks(
     step_def = _find_procedure_definition(sprite, step)
     init_check = blocks[step_def]["next"]
     old_root = blocks[init_check]["next"]
-    logits_id = next(
-        sid for sid, entry in sprite["lists"].items() if entry[0] == logits
-    )
     suffix = uuid.uuid4().hex[:8]
     prefix = f"cattorch_generation_guard_{suffix}"
     status_id = f"{prefix}_status"
     cache_length_id = f"{prefix}_cache_length"
-    sprite.setdefault("variables", {})[status_id] = [STATUS_VARIABLE, "ok"]
-    sprite["variables"][cache_length_id] = ["cattorch cache length", 0]
+    sprite.setdefault("variables", {})[status_id] = [STATUS_VARIABLE, interface.INITIAL_STATUS]
+    sprite["variables"][cache_length_id] = [interface.CACHE_LENGTH, 0]
     if capacity is not None:
-        sprite["variables"][f"{prefix}_max_context"] = ["cattorch max context", capacity]
+        sprite["variables"][f"{prefix}_max_context"] = [interface.MAX_CONTEXT, capacity]
 
     def count_input(identifier: str, parent: str, shadow: list) -> list:
         if token_count is None:
-            return [3, [12, "cattorch cache length", cache_length_id], shadow]
+            return [3, [12, interface.CACHE_LENGTH, cache_length_id], shadow]
         token_count(sprite, identifier, parent)
         return [3, identifier, shadow]
 
@@ -2800,7 +2831,6 @@ def _add_generation_blocks(
         guard = f"{prefix}_guard"
         condition = f"{prefix}_condition"
         failure = f"{prefix}_failure"
-        clear_output = f"{prefix}_clear_output"
         blocks[init_check]["next"] = guard
         blocks[guard] = {
             "opcode": "control_if_else", "next": None, "parent": init_check,
@@ -2822,37 +2852,19 @@ def _add_generation_blocks(
         success_parent = guard
     blocks[success] = {
         "opcode": "data_setvariableto", "next": old_root, "parent": success_parent,
-        "inputs": {"VALUE": [1, [10, "ok"]]},
+        "inputs": {"VALUE": [1, [10, interface.OK]]},
         "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[old_root]["parent"] = success
     if capacity is not None:
+        # A full context: the step writes nothing.
         blocks[failure] = {
-            "opcode": "data_setvariableto", "next": clear_output, "parent": guard,
-            "inputs": {"VALUE": [1, [10, "maximum context exceeded"]]},
+            "opcode": "data_setvariableto", "next": None, "parent": guard,
+            "inputs": {"VALUE": [1, [10, interface.CONTEXT_FULL]]},
             "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
             "shadow": False, "topLevel": False,
         }
-        blocks[clear_output] = {
-            "opcode": "data_deletealloflist", "next": None, "parent": failure,
-            "inputs": {}, "fields": {"LIST": [logits, logits_id]},
-            "shadow": False, "topLevel": False,
-        }
-        clear_failure_tail = clear_output
-        for index, name in enumerate(top_k_lists):
-            list_id = next(
-                sid for sid, entry in sprite["lists"].items() if entry[0] == name
-            )
-            clear_top_k = f"{prefix}_clear_top_k_{index}"
-            blocks[clear_failure_tail]["next"] = clear_top_k
-            blocks[clear_top_k] = {
-                "opcode": "data_deletealloflist", "next": None,
-                "parent": clear_failure_tail,
-                "inputs": {}, "fields": {"LIST": [name, list_id]},
-                "shadow": False, "topLevel": False,
-            }
-            clear_failure_tail = clear_top_k
 
     # Update the public cache-length variable after a successful step.
     terminal = old_root
@@ -2871,14 +2883,14 @@ def _add_generation_blocks(
             "opcode": "operator_equals", "next": None, "parent": tail,
             "inputs": {
                 "OPERAND1": [3, [12, STATUS_VARIABLE, status_id], [10, ""]],
-                "OPERAND2": [1, [10, "ok"]],
+                "OPERAND2": [1, [10, interface.OK]],
             },
             "fields": {}, "shadow": False, "topLevel": False,
         }
         blocks[increment] = {
             "opcode": "data_changevariableby", "next": None, "parent": tail,
             "inputs": {"VALUE": [1, [4, 1]]},
-            "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
+            "fields": {"VARIABLE": [interface.CACHE_LENGTH, cache_length_id]},
             "shadow": False, "topLevel": False,
         }
     else:
@@ -2886,47 +2898,13 @@ def _add_generation_blocks(
         blocks[tail] = {
             "opcode": "data_setvariableto", "next": None, "parent": terminal,
             "inputs": {"VALUE": None},
-            "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
+            "fields": {"VARIABLE": [interface.CACHE_LENGTH, cache_length_id]},
             "shadow": False, "topLevel": False,
         }
         blocks[tail]["inputs"]["VALUE"] = count_input(
             f"{prefix}_final_normalized_length", tail, [4, 0],
         )
     blocks[terminal]["next"] = tail
-    if top_k is not None:
-        top_k_guard = f"{prefix}_top_k_guard"
-        top_k_condition = f"{prefix}_top_k_condition"
-        top_k_output_length = f"{prefix}_top_k_output_length"
-        top_k_call = f"{prefix}_top_k_call"
-        blocks[tail]["next"] = top_k_guard
-        blocks[top_k_guard] = {
-            "opcode": "control_if", "next": None, "parent": tail,
-            "inputs": {
-                "CONDITION": [2, top_k_condition],
-                "SUBSTACK": [2, top_k_call],
-            },
-            "fields": {}, "shadow": False, "topLevel": False,
-        }
-        blocks[top_k_condition] = {
-            "opcode": "operator_gt", "next": None, "parent": top_k_guard,
-            "inputs": {
-                "OPERAND1": [3, top_k_output_length, [4, 0]],
-                "OPERAND2": [1, [4, 0]],
-            },
-            "fields": {}, "shadow": False, "topLevel": False,
-        }
-        blocks[top_k_output_length] = {
-            "opcode": "data_lengthoflist", "next": None,
-            "parent": top_k_condition,
-            "inputs": {}, "fields": {"LIST": [logits, logits_id]},
-            "shadow": False, "topLevel": False,
-        }
-        blocks[top_k_call] = {
-            "opcode": "procedures_call", "next": None, "parent": top_k_guard,
-            "inputs": {}, "fields": {}, "shadow": False, "topLevel": False,
-            "mutation": _procedure_mutation(_TOP_K_PROCEDURE),
-        }
-
     # Reset also resets public state variables.
     reset_def = _find_procedure_definition(sprite, reset)
     reset_root = blocks[reset_def]["next"]
@@ -2935,14 +2913,14 @@ def _add_generation_blocks(
     blocks[reset_def]["next"] = reset_status
     blocks[reset_status] = {
         "opcode": "data_setvariableto", "next": reset_length, "parent": reset_def,
-        "inputs": {"VALUE": [1, [10, "ok"]]},
+        "inputs": {"VALUE": [1, [10, interface.OK]]},
         "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[reset_length] = {
         "opcode": "data_setvariableto", "next": reset_root, "parent": reset_status,
         "inputs": {"VALUE": [1, [4, 0]]},
-        "fields": {"VARIABLE": ["cattorch cache length", cache_length_id]},
+        "fields": {"VARIABLE": [interface.CACHE_LENGTH, cache_length_id]},
         "shadow": False, "topLevel": False,
     }
     blocks[reset_root]["parent"] = reset_length
@@ -2971,4 +2949,33 @@ def _wrap_generation_lifecycle(
         compact_top_k=compact_top_k,
         vocabulary=vocabulary,
         token_count=_guard_cache_capacity(first_cache),
+        reset=_GENERATION_RESET,
     )
+
+
+def _finish_generation_prepare(sprite: dict, reset: str) -> None:
+    """Make a generation sprite's ``cattorch prepare for save`` reset it too.
+
+    It clears the decoded weights, and with them its cache, an internal list
+    too large to save, so it resets as ``cattorch reset`` does (by the
+    internal ``reset`` procedure) and takes over from any running call.
+    """
+    from cattorch.util.scratch.dsl import (
+        Program, broadcast_and_wait, call, change_var, clear, set_var,
+    )
+
+    prepare = interface.PREPARE_FOR_SAVE
+    outputs = [
+        name for name in (interface.LOGITS, _TOP_K_VALUES, _TOP_K_IDS)
+        if any(entry[0] == name for entry in sprite.get("lists", {}).values())
+    ]
+    _add_to_procedure(sprite, prepare, Program(
+        "generation_prepare_start", variables=(_EPOCH,), body=(change_var(_EPOCH, 1),),
+    ), first=True)
+    _add_to_procedure(sprite, prepare, Program(
+        "generation_prepare_end", variables=(_BUSY, STATUS_VARIABLE), lists=outputs, body=(
+            call(reset), *(clear(name) for name in outputs), set_var(_BUSY, 0),
+            set_var(STATUS_VARIABLE, interface.OK),
+            broadcast_and_wait(interface.completion(prepare)),
+        ),
+    ))

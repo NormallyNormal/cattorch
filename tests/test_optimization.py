@@ -1,3 +1,4 @@
+from cattorch import interface
 import json
 import zipfile
 
@@ -49,6 +50,7 @@ from cattorch.util.scratch.dsl import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.instruction import optimized_linear
+from cattorch.interface import TOKEN_IDS
 
 
 def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
@@ -509,8 +511,8 @@ def test_exact_linear_uses_direct_weight_layout_and_fuses_epilogue(tmp_path):
     transpile(model, x, str(base), optimization="exact")
     sprite = _load_sprite(base.with_suffix(".sprite3"))
     exact_variables = {entry[0] for entry in sprite["variables"].values()}
-    assert "weight_offset" in exact_variables
-    assert "weight_index" not in exact_variables
+    assert "_weight_offset" in exact_variables
+    assert "_weight_index" not in exact_variables
 
 
 def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu(
@@ -544,21 +546,21 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
     )
     previous_variables = {entry[0] for entry in sprites["previous"]["variables"].values()}
     grouped_variables = {entry[0] for entry in sprites["grouped"]["variables"].values()}
-    assert "sum a" not in previous_variables
-    assert {"sum a", "sum b", "sum c", "sum d", "input value"} <= grouped_variables
+    assert "_sum a" not in previous_variables
+    assert {"_sum a", "_sum b", "_sum c", "_sum d", "_input value"} <= grouped_variables
     grouped_mutations = {
         block.get("fields", {}).get("VARIABLE", [None])[0]
         for block in sprites["grouped"]["blocks"].values()
     }
-    assert "weight" in grouped_mutations
-    assert not {"weight a", "weight b", "weight c", "weight d"} & grouped_mutations
+    assert "_weight" in grouped_mutations
+    assert not {"_weight a", "_weight b", "_weight c", "_weight d"} & grouped_mutations
 
     weight = model.linear.weight.detach()
     expected_prefix = weight[:4, :2].T.flatten().tolist()
     stored = next(
         entry[1]
         for entry in sprites["grouped"]["lists"].values()
-        if entry[0].startswith("W_linear_")
+        if entry[0].startswith("_W_linear_")
     )
     assert stored[:8] == expected_prefix
 
@@ -579,10 +581,10 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
     physical = [
         entry
         for entry in sprite["lists"].values()
-        if entry[0].startswith("W_linear_")
+        if entry[0].startswith("_W_linear_")
     ]
     assert [len(entry[1]) for entry in physical] == [199_680, 512]
-    assert not any(name.startswith("W_linear_") for name in result.sharded_lists)
+    assert not any(name.startswith("_W_linear_") for name in result.sharded_lists)
 
     emulator = ScratchEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
@@ -608,8 +610,8 @@ def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
     )
     sprite = _load_sprite(base.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
-    assert "sum a" not in variables
-    assert "weight_offset" in variables
+    assert "_sum a" not in variables
+    assert "_weight_offset" in variables
 
 
 def test_linear_epilogue_keeps_two_residuals_apart(tmp_path):
@@ -899,7 +901,7 @@ def test_swiglu_fusion_is_exact_in_both_modes(tmp_path, mode):
     assert len(graph.paired_swiglu_fusions) == 1
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
-    assert {"gate sum", "value sum", "input value"} <= variables
+    assert {"_gate sum", "_value sum", "_input value"} <= variables
 
 
 def test_fast_layernorm_matches_one_pass_formula(tmp_path):
@@ -965,10 +967,10 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
     weights = [
         entry
         for entry in sprite["lists"].values()
-        if entry[0].startswith("W_matmul_")
+        if entry[0].startswith("_W_matmul_")
     ]
     assert [len(entry[1]) for entry in weights] == [199_680, 512]
-    assert not any(name.startswith("W_matmul_") for name in result.sharded_lists)
+    assert not any(name.startswith("_W_matmul_") for name in result.sharded_lists)
 
     emulator = ScratchEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
@@ -1126,7 +1128,7 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
     actual = torch.tensor(emulator.lists["output"]).reshape(2, 3, 5)
     torch.testing.assert_close(actual, model(left, right), atol=1e-4, rtol=0)
     assert not any(
-        entry[0].startswith("W_fast_") for entry in sprite["lists"].values()
+        entry[0].startswith("_W_fast_") for entry in sprite["lists"].values()
     )
 
 
@@ -1186,10 +1188,10 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         "_cattorch token step for epoch %s", "cattorch init", "cattorch reset",
         "cattorch prefill", "cattorch decode",
     } <= set(emulator._procedures)
-    assert "cattorch prepare for save" not in emulator._procedures
     assert set(sprite["broadcasts"].values()) == {
         "cattorch init complete", "cattorch reset complete",
         "cattorch prefill complete", "cattorch decode complete",
+        "cattorch prepare for save complete",
     }
     assert emulator.variables["cattorch max context"] == 5
     assert emulator.variables["cattorch cache length"] == 0
@@ -1198,7 +1200,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     assert emulator.variables["cattorch status"] == "ok"
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
+    emulator.lists[TOKEN_IDS] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     assert emulator.broadcasts == [
         "cattorch init complete", "cattorch prefill complete",
@@ -1213,7 +1215,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
 
     for token in (2, 4):
         prompt.append(token)
-        emulator.lists["cattorch tokens"] = [token]
+        emulator.lists[TOKEN_IDS] = [token]
         emulator._exec_chain(emulator._procedures["cattorch decode"])
         expected = model(torch.tensor([prompt]))[0, -1]
         torch.testing.assert_close(
@@ -1221,10 +1223,11 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         )
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator.lists["cattorch tokens"] = [6]
+    kept = list(emulator.lists["cattorch logits"])
+    emulator.lists[TOKEN_IDS] = [6]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 5
 
     emulator._exec_chain(emulator._procedures["cattorch reset"])
@@ -1245,21 +1248,21 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
 
     for invalid in ([], [1, 2]):
-        emulator.lists["cattorch tokens"] = invalid
+        emulator.lists[TOKEN_IDS] = invalid
         emulator.run_procedure("cattorch decode")
-        assert emulator.variables["cattorch status"] == "decode requires exactly one token"
+        assert emulator.variables["cattorch status"] == interface.wrong_number_of_items(interface.TOKEN_IDS)
         assert emulator.variables["cattorch cache length"] == 0
         assert emulator.lists["cattorch logits"] == []
         assert emulator.lists["cattorch top k ids"] == []
 
-    emulator.lists["cattorch tokens"] = []
+    emulator.lists[TOKEN_IDS] = []
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill requires at least one token"
+    assert emulator.variables["cattorch status"] == interface.too_few_items(interface.TOKEN_IDS)
     assert emulator.variables["cattorch cache length"] == 0
 
-    emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill exceeds maximum context"
+    assert emulator.variables["cattorch status"] == interface.too_many_items(interface.TOKEN_IDS)
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["cattorch logits"] == []
 
@@ -1276,7 +1279,7 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
+    emulator.lists[TOKEN_IDS] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
@@ -1285,7 +1288,7 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     assert len(emulator.lists["_cattorch K cache 1"]) == 3 * 4
     assert len(emulator.lists["_cattorch V cache 2"]) == 3 * 4
 
-    emulator.lists["cattorch tokens"] = [2]
+    emulator.lists[TOKEN_IDS] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     expected = model(torch.tensor([[*prompt, 2]]))[0, -1]
     torch.testing.assert_close(
@@ -1318,7 +1321,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     assert "_cattorch K cache 1" not in emulator.lists
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
+    emulator.lists[TOKEN_IDS] = prompt
     emulator.run_procedure("cattorch prefill")
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]),
@@ -1329,7 +1332,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     assert len(emulator.lists["_cattorch K cache"]) == len(prompt) * 2 * 8
     assert emulator.variables["cattorch cache length"] == len(prompt)
 
-    emulator.lists["cattorch tokens"] = [2]
+    emulator.lists[TOKEN_IDS] = [2]
     emulator.run_procedure("cattorch decode")
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]),
@@ -1353,7 +1356,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     assert "_cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
+    emulator.lists[TOKEN_IDS] = prompt
     emulator._exec_chain(emulator._procedures["cattorch prefill"])
     expected_logits = model(torch.tensor([prompt]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
@@ -1368,7 +1371,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["cattorch tokens"] = [2]
+    emulator.lists[TOKEN_IDS] = [2]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     expected_logits = model(torch.tensor([[*prompt, 2]]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
@@ -1383,15 +1386,18 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["cattorch tokens"] = [4]
+    emulator.lists[TOKEN_IDS] = [4]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
     assert len(emulator.lists["cattorch top k values"]) == 5
-    emulator.lists["cattorch tokens"] = [6]
+    kept = [list(emulator.lists[name]) for name in (
+        "cattorch logits", "cattorch top k values", "cattorch top k ids",
+    )]
+    emulator.lists[TOKEN_IDS] = [6]
     emulator._exec_chain(emulator._procedures["cattorch decode"])
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
-    assert emulator.lists["cattorch top k values"] == []
-    assert emulator.lists["cattorch top k ids"] == []
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert [emulator.lists[name] for name in (
+        "cattorch logits", "cattorch top k values", "cattorch top k ids",
+    )] == kept
 
     emulator._exec_chain(emulator._procedures["cattorch reset"])
     assert emulator.lists["cattorch top k values"] == []
@@ -1411,7 +1417,7 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
             str(path),
         )
         emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-        emulator.lists["cattorch tokens"] = prompt
+        emulator.lists[TOKEN_IDS] = prompt
         emulator._exec_chain(emulator._procedures["cattorch prefill"])
         emulators[hidden_prefill] = emulator
 

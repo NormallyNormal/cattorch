@@ -8,7 +8,7 @@ import math
 import torch
 
 from cattorch.errors import UnsupportedModelError
-from cattorch.interface import STATUS_VARIABLE, input_name, output_name
+from cattorch.interface import input_name, output_name
 
 
 def normalize_dynamic(dynamic, flat_inputs, kwarg_names) -> dict[int, tuple[str, int, int, int]]:
@@ -366,20 +366,22 @@ def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> l
 def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     """Make ``cattorch forward`` run the one-unit forward once per unit.
 
-    ``sprite`` is a fixed export for one unit, before it is finalized. Its
-    forward becomes the internal ``_cattorch forward unit``, reading the
-    dynamic input and writing the outputs through internal lists, and a new
-    ``cattorch forward`` copies each unit in, calls it, and appends each
-    unit's outputs. The sprite is changed in place and returned.
+    ``sprite`` is a fixed export for one unit, before its interface is
+    finished. Its forward becomes the internal ``_cattorch forward unit``,
+    reading the dynamic input and writing the outputs through internal
+    lists, and a new ``cattorch forward`` copies each unit in, calls it, and
+    appends each unit's outputs. The export checks the input's length, as
+    ``_unit_inputs`` gives it, around the new forward. The sprite is changed
+    in place and returned.
     """
-    from cattorch.sprite import _add_warp_procedure, _remove_completion_broadcast
+    from cattorch.sprite import _add_warp_procedure, _procedure_mutation
     from cattorch.util.scratch.dsl import (
-        Program, add, append, broadcast_and_wait, call, change_var, clear, div, eq, for_each,
-        gt, if_, item, length, lt, mod, mul, set_var, var,
+        Program, add, append, call, change_var, clear, div, for_each, item, length, mul,
+        set_var, var,
     )
     from cattorch.util.scratch.interface import rename_lists, rename_procedure
 
-    ((index, (_, minimum, maximum, _)),) = spec.items()
+    ((index, _),) = spec.items()
     names = {entry[0] for entry in sprite.get("lists", {}).values()}
     if any(" shard " in value for value in names if value.startswith(("input", "output"))):
         raise UnsupportedModelError("a dynamic export's inputs and outputs must fit in one list each")
@@ -388,15 +390,14 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     public_input = input_name(index)
     private_input = f"_cattorch unit {public_input}"
     rename_procedure(sprite, "cattorch forward", "_cattorch forward unit")
-    # The new forward reports completion once, after every unit.
-    _remove_completion_broadcast(sprite, "cattorch forward complete")
     input_size = math.prod(input_shapes[index])
     outputs = []
     for position_index in range(output_count):
         public = output_name(position_index)
         outputs.append((public, f"_cattorch unit {public}"))
     rename_lists(sprite, {public_input: private_input, **dict(outputs)})
-    run_units = (
+    body = (
+        *(clear(public) for public, _ in outputs),
         set_var(unit, 0),
         for_each("_cattorch units", div(length(public_input), input_size), (
             clear(private_input),
@@ -411,30 +412,21 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
             change_var(unit, 1),
         )),
     )
-    # Whole items within the bounds, as an exported forward checks them.
-    status = STATUS_VARIABLE
-    body = [
-        *(clear(public) for public, _ in outputs),
-        set_var(status, "ok"),
-        if_(gt(mod(length(public_input), input_size), 0), (
-            set_var(status, f"invalid dynamic length: {public_input}"),
-        )),
-        if_(lt(length(public_input), input_size * max(minimum, 1)), (
-            set_var(status, f"too few items: {public_input}"),
-        )),
-        if_(gt(length(public_input), input_size * maximum), (
-            set_var(status, f"dynamic capacity exceeded: {public_input}"),
-        )),
-        if_(eq(var(status), "ok"), run_units),
-        broadcast_and_wait("cattorch forward complete"),
-    ]
     program = Program(
         "forward_by_unit",
-        variables=(unit, position, "_cattorch units", STATUS_VARIABLE),
+        variables=(unit, position, "_cattorch units"),
         lists=(public_input, private_input, *(entry for pair in outputs for entry in pair)),
-        body=tuple(body),
+        body=body,
     )
-    return _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
+    sprite = _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
+    # The loose forward block on the canvas runs the public block.
+    for block in sprite["blocks"].values():
+        if (
+            block.get("opcode") == "procedures_call" and block.get("topLevel")
+            and block["mutation"].get("proccode") == "_cattorch forward unit"
+        ):
+            block["mutation"] = _procedure_mutation("cattorch forward")
+    return sprite
 
 
 def per_unit_result(result, spec, output_axes, input_shapes, output_shapes):

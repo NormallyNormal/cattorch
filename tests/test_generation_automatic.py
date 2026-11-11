@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import json
 import math
 import sys
@@ -22,6 +23,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 sys.path.insert(0, str(Path(__file__).parent))
 from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
 from test_optimization import CachedLM  # noqa: E402
+from cattorch.interface import TOKEN_IDS
 
 TOLERANCE = 1e-4
 
@@ -56,14 +58,14 @@ def assert_logits(emulator, model, prefix):
 
 def prefill_and_decode(emulator, model, prompt, more):
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = list(prompt)
+    emulator.lists[TOKEN_IDS] = list(prompt)
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     prefix = list(prompt)
     assert_logits(emulator, model, prefix)
     for token in more:
         prefix.append(token)
-        emulator.lists["cattorch tokens"] = [token]
+        emulator.lists[TOKEN_IDS] = [token]
         emulator.run_procedure("cattorch decode")
         assert emulator.variables["cattorch status"] == "ok"
         assert_logits(emulator, model, prefix)
@@ -124,16 +126,17 @@ def test_overflow_rolls_back_and_reset_recovers(tmp_path):
         name: list(emulator.lists[name])
         for name in ("_cattorch K cache 1", "_cattorch V cache 2")
     }
-    emulator.lists["cattorch tokens"] = [6]
+    kept = list(emulator.lists["cattorch logits"])
+    emulator.lists[TOKEN_IDS] = [6]
     emulator.run_procedure("cattorch decode")
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 5
     for name, values in caches.items():
         assert emulator.lists[name] == values
-    emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill exceeds maximum context"
+    assert emulator.variables["cattorch status"] == interface.too_many_items(interface.TOKEN_IDS)
     emulator.run_procedure("cattorch reset")
     prefill_and_decode(emulator, model, [4], [2])
 
@@ -142,7 +145,7 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     model = nano()
     emulator, _ = emulator_for(model, tmp_path, max_context=8, top_k=3)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [2, 9, 4]
+    emulator.lists[TOKEN_IDS] = [2, 9, 4]
     emulator.run_procedure("cattorch prefill")
     expected = logits_of(model, [2, 9, 4]).topk(3)
     assert emulator.lists["cattorch top k ids"] == expected.indices.tolist()
@@ -166,12 +169,12 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, shari
         assert shared == (sharing == "auto")
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
-        emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6, 7, 8]
+        emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6, 7, 8]
         emulator.run_procedure("cattorch prefill")
         counts[hidden] = sum(emulator.opcode_counts.values()) - before
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8])
         # The skipped tokens still filled the final layer's cache.
-        emulator.lists["cattorch tokens"] = [9]
+        emulator.lists[TOKEN_IDS] = [9]
         emulator.run_procedure("cattorch decode")
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8, 9])
     assert counts[True] < counts[False] * 0.8
@@ -184,7 +187,7 @@ def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
     emulator, _ = emulator_for(
         model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing),
     )
-    emulator.lists["cattorch tokens"] = [3]
+    emulator.lists[TOKEN_IDS] = [3]
     emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == "ok"
     assert_logits(emulator, model, [3])
@@ -262,15 +265,13 @@ def stop_on_call(emulator, procedure, call):
     return lambda: emulator._chains.__setitem__(start, chain)
 
 
-INTERRUPTED = (
-    "an earlier reset, prefill or decode was stopped or is still running; reset or prefill first"
-)
+INTERRUPTED = interface.INTERRUPTED
 
 
 def stop_during(emulator, public, procedure, call, tokens=None):
     restore = stop_on_call(emulator, procedure, call)
     if tokens is not None:
-        emulator.lists["cattorch tokens"] = tokens
+        emulator.lists[TOKEN_IDS] = tokens
     with pytest.raises(Stopped):
         emulator.run_procedure(public)
     restore()
@@ -289,14 +290,16 @@ def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
     prefill_and_decode(emulator, model, [2, 7], [])
     stop_during(emulator, public, procedure, call, tokens)
     length = emulator.variables["cattorch cache length"]
-    emulator.lists["cattorch tokens"] = [3]
+    outputs = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
+    emulator.lists[TOKEN_IDS] = [3]
     emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == INTERRUPTED
-    assert emulator.lists["cattorch logits"] == emulator.lists["cattorch top k ids"] == []
+    # A refused decode writes nothing.
+    assert (emulator.lists["cattorch logits"], emulator.lists["cattorch top k ids"]) == outputs
     assert emulator.variables["cattorch cache length"] == length
     emulator.run_procedure("cattorch reset")
     assert emulator.variables["cattorch status"] == "ok"
-    emulator.lists["cattorch tokens"] = [3]
+    emulator.lists[TOKEN_IDS] = [3]
     emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == "ok"
     assert_logits(emulator, model, [3])
@@ -368,7 +371,7 @@ def test_reduced_precision_models_export(tmp_path, dtype):
     model = tiny_decoder("llama", layers=1).to(dtype).eval()
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3]
     emulator.run_procedure("cattorch prefill")
     expected = logits_of(model.float(), [1, 2, 3])
     actual = torch.tensor(emulator.lists["cattorch logits"])
@@ -390,7 +393,7 @@ def test_banned_tokens_with_negative_infinity_export(tmp_path):
     model = Banned().eval()
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3]
     emulator.run_procedure("cattorch prefill")
     logits = emulator.lists["cattorch logits"]
     assert logits[0] == logits[5] == -math.inf
@@ -402,16 +405,16 @@ def test_token_ids_outside_the_vocabulary_are_rejected(tmp_path):
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
     for tokens in ([1, VOCAB], [1, -1], [1, 2.5], [1, "abc"]):
-        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.lists[TOKEN_IDS] = list(tokens)
         emulator.run_procedure("cattorch prefill")
-        assert emulator.variables["cattorch status"].startswith("token ids must be"), tokens
+        assert emulator.variables["cattorch status"] == interface.invalid_item(TOKEN_IDS), tokens
         assert emulator.lists["cattorch logits"] == []
-    emulator.lists["cattorch tokens"] = [VOCAB - 1]
+    emulator.lists[TOKEN_IDS] = [VOCAB - 1]
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
-    emulator.lists["cattorch tokens"] = [VOCAB]
+    emulator.lists[TOKEN_IDS] = [VOCAB]
     emulator.run_procedure("cattorch decode")
-    assert emulator.variables["cattorch status"].startswith("token ids must be")
+    assert emulator.variables["cattorch status"] == interface.invalid_item(TOKEN_IDS)
 
 
 def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
@@ -439,8 +442,8 @@ def test_caches_and_position_are_not_static_weights(exported):
     sprite = load_sprite(result.path)
     names = [entry[0] for entry in sprite["lists"].values()]
     assert "_cattorch K cache 1" in names
-    assert not any(name.startswith("W_") and "cache" in name for name in names)
-    assert not any("position" in name for name in names if name.startswith("W_"))
+    assert not any(name.startswith("_W_") and "cache" in name for name in names)
+    assert not any("position" in name for name in names if name.startswith("_W_"))
 
 
 def test_fast_softmax_kernel_skips_the_maximum_pass(tmp_path):
@@ -452,7 +455,7 @@ def test_fast_softmax_kernel_skips_the_maximum_pass(tmp_path):
     )
     exact = transpile(model, GenerationProgram(max_context=8), tmp_path / "exact")
     names = lambda result: {e[0] for e in load_sprite(result.path)["variables"].values()}
-    assert "maximum" in names(exact) and "maximum" not in names(fast)
+    assert "_maximum" in names(exact) and "_maximum" not in names(fast)
     assert fast.block_count < exact.block_count
     emulator = ScratchEmulator(load_sprite(fast.path))
     prefill_and_decode(emulator, model, [1, 2, 3], [4, 5])

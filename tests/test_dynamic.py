@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import pytest
 import torch
 import torch.nn as nn
@@ -401,14 +402,16 @@ def test_a_wrong_input_length_is_reported(tmp_path, by_item):
     with zipfile.ZipFile(result.path) as archive:
         sprite = json.loads(archive.read("sprite.json"))
     for count, status in (
-        (0, "too few items"), (5 * width, "dynamic capacity exceeded"),
-        (width + 1, "invalid dynamic length"), (2 * width, "ok"),
+        (0, interface.too_few_items("input")), (5 * width, interface.too_many_items("input")),
+        (width + 1, interface.wrong_number_of_items("input")), (2 * width, interface.OK),
     ):
         emulator = ScratchEmulator(sprite)
         emulator.lists["input"] = [0.5] * count
         emulator.run_procedure("cattorch forward")
-        assert emulator.variables["cattorch status"].startswith(status), count
-        assert bool(emulator.lists["output"]) == (status == "ok")
+        assert emulator.variables["cattorch status"] == status, count
+        # A forward that fails writes no output.
+        assert bool(emulator.lists["output"]) == (status == interface.OK)
+        assert emulator.broadcasts[-1] == interface.completion(interface.FORWARD)
 
 
 def test_each_item_can_give_several_output_rows(tmp_path):
