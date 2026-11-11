@@ -898,6 +898,16 @@
   (`self.count += 1`) still fails, now with an error that points to
   `@entrypoint` and `State`, and other in-place updates cattorch can't
   follow say what to write instead.
+- `atan2`, `signbit` and `copysign` read -0 as 0, so `atan2(-0., -1.)` gave
+  pi instead of -pi; they now tell -0 from 0, at about 1.3 times the work of
+  `atan2` and twice that of `signbit`. `F.one_hot` was rejected because of
+  its run-time index check, which Scratch can't raise; such checks are now
+  left out. `x.norm(dim=0)` over a variable number of items failed with a
+  misleading "extent folded" error, because PyTorch's decomposition of a
+  norm over one item, as traced, is just `abs`; the sum is now kept. The
+  numeric differences that remain (NaN results, integer overflow, rounding at
+  float32 boundaries, signed zeros) are listed in
+  [supported models](docs/supported-models.md).
 
 ## Deprecations
 

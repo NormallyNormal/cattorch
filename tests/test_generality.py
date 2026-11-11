@@ -172,6 +172,27 @@ def test_torch_multihead_attention_with_weights(tmp_path):
     _export_and_verify(tmp_path, model, (value, value, value))
 
 
+def test_signed_zeros_in_atan2_signbit_and_copysign(tmp_path):
+    # 1 / -0 is -infinity, which tells -0 from 0: atan2(-0, -1) is -pi.
+    values = torch.tensor([0.0, -0.0, 1.0, -1.0, math.inf, -math.inf, -0.3])
+    y, x = values.repeat_interleave(len(values)), values.repeat(len(values))
+    finite = ~(y.isinf() & x.isinf())  # two infinities are a documented difference
+    model = Lambda(lambda y, x: (
+        torch.atan2(y, x), torch.signbit(y), torch.copysign(x, y),
+    ))
+    _export_and_verify(tmp_path, model, (y[finite], x[finite]))
+
+
+def test_one_hot_and_a_norm_over_variable_items(tmp_path):
+    one_hot = Lambda(lambda ids: F.one_hot(ids, 5))
+    _export_and_verify(tmp_path, one_hot, (torch.tensor([0, 4, 2]),))
+    # Traced with one item, PyTorch's norm over it is just abs; it must
+    # still sum over the items at other lengths.
+    norm = Lambda(lambda x: x.norm(dim=0)).eval()
+    result = transpile(norm, torch.randn(3, 4), tmp_path / "norm", dynamic={0: (1, 6)})
+    assert verify(norm, torch.randn(5, 4), result).passed
+
+
 class BooleanMasks(nn.Module):
     """Boolean masks registered as buffers, as attention code usually keeps them."""
 

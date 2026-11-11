@@ -672,11 +672,16 @@ def _input_conversions_rejected():
 
 # Mode switches that make_fx records but that have no effect on a traced
 # inference graph. Enter-autocast results are consumed by the matching exit.
+# Run-time checks of input values, such as F.one_hot's check that its
+# indices are in range, can't stop a Scratch script: like an out-of-range
+# index elsewhere, a value that fails one is the caller's error.
 _IGNORED_CALLS = tuple(
     target for target in (
         getattr(torch._C, "_set_grad_enabled", None),
         getattr(getattr(torch.amp, "autocast_mode", None), "_enter_autocast", None),
         getattr(getattr(torch.amp, "autocast_mode", None), "_exit_autocast", None),
+        torch.ops.aten._assert_async.default,
+        torch.ops.aten._assert_async.msg,
     ) if target is not None
 )
 

@@ -148,7 +148,21 @@ broadcasting pattern, or option. The error names the operation that failed.
   give different results downstream, and `torch.isnan` is always 0.
   `torch.nan_to_num` works with its default `nan=0`; another replacement value
   is rejected, since Scratch can't tell NaN from 0. `verify` runs the sprite
-  with Scratch's rules and reports such differences.
+  with Scratch's rules and reports such differences. Known cases where
+  PyTorch gives NaN: a softmax over a row that is all `-inf` gives equal
+  probabilities, `std` or `var` with a correction over one item gives 0, and
+  `atan2` of two infinities gives NaN where PyTorch gives an odd multiple of
+  pi/4.
+- Integer arithmetic doesn't wrap around at the dtype's range: `uint8` 250 + 10
+  is 260, not 4. Values are exact up to 2^53.
+- Arithmetic runs in double precision, so a float32 result that lands exactly
+  on a rounding boundary in PyTorch can round the other way, as
+  `torch.round(x, decimals=1)` does for -0.05 (-0.0 in PyTorch, -0.1 in the
+  sprite). A zero can also come out as 0 where PyTorch gives -0; `atan2`,
+  `signbit` and `copysign` read the sign of -0 as PyTorch does.
+- Run-time checks of input values, such as `F.one_hot`'s check that its
+  indices are in range, are left out: an out-of-range index gives a wrong
+  result instead of an error.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a

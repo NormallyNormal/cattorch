@@ -212,14 +212,56 @@ def _atanh(value):
     return _aten.mul.Tensor(_aten.log.default(ratio), 0.5)
 
 
+def _negative(value):
+    """``signbit``: true for negative numbers, -0 and -infinity included.
+
+    ``value + 1 / value`` has ``value``'s sign: ``1 / -0`` is -infinity, so
+    it tells -0 from 0, and ``1 / -infinity`` is -0.
+    """
+    return _aten.lt.Scalar(_aten.add.Tensor(value, _aten.reciprocal.default(value)), 0)
+
+
 def _atan2(y, x):
     y, x = _float(y), _float(x)
-    # x = 0 gives ±infinity, whose arctangent is ±pi/2.
+    # x = ±0 gives ±infinity, whose arctangent is ±pi/2. Two infinities give
+    # NaN (PyTorch: an odd multiple of pi/4); handling them would double the
+    # cost of every atan2, so that difference is documented instead.
     base = _aten.atan.default(_aten.div.Tensor(y, x))
-    shift = _aten.where.ScalarSelf(_aten.lt.Scalar(y, 0), -math.pi, _aten.full_like.default(base, math.pi))
-    result = _aten.where.self(_aten.lt.Scalar(x, 0), _aten.add.Tensor(base, shift), base)
+    # Left of the axis, turn by pi towards y's sign, -0 included: atan2(-0, -1)
+    # is -pi.
+    shift = _aten.where.ScalarSelf(_negative(y), -math.pi, _aten.full_like.default(base, math.pi))
+    left = _negative(x)
+    result = _aten.where.self(left, _aten.add.Tensor(base, shift), base)
+    # At the origin y / x is NaN: y itself (±0) right of the axis, and ±pi left
+    # of it (x = -0).
     origin = _aten.logical_and.default(_aten.eq.Scalar(x, 0), _aten.eq.Scalar(y, 0))
-    return _aten.where.ScalarSelf(origin, 0.0, result)
+    return _aten.where.self(origin, _aten.where.self(left, shift, y), result)
+
+
+def _vector_norm(value, ord=2, dim=None, keepdim=False, *, dtype=None):
+    """``linalg.vector_norm``, keeping the reduction over dimensions of size 1.
+
+    PyTorch's decomposition gives ``abs(value)`` when every reduced dimension
+    has size 1. A variable-length export traces one item, so a norm over the
+    items would lose its sum; the sum is kept instead, with the same result.
+    """
+    from cattorch.frontend import _available_decompositions
+
+    general = _available_decompositions()[_aten.linalg_vector_norm.default]
+    dims = (
+        list(range(value.ndim)) if dim is None or (not isinstance(dim, int) and not dim)
+        else [dim] if isinstance(dim, int) else list(dim)
+    )
+    single = value.ndim > 0 and all(value.shape[d] == 1 for d in dims)
+    if (
+        not single or dtype is not None or not value.is_floating_point()
+        or ord in (0, math.inf, -math.inf)
+    ):
+        return general(value, ord, dim, keepdim, dtype=dtype)
+    if ord % 2 != 0:
+        value = _aten.abs.default(value)
+    total = _aten.sum.dim_IntList(_aten.pow.Tensor_Scalar(value, ord), dims, keepdim)
+    return _aten.pow.Tensor_Scalar(total, 1.0 / ord)
 
 
 def _hypot(left, right):
@@ -250,7 +292,7 @@ def _copysign(left, right):
     magnitude = _aten.abs.default(_float(left))
     if not isinstance(right, torch.Tensor):
         return magnitude if math.copysign(1, right) > 0 else _aten.neg.default(magnitude)
-    return _aten.where.self(_aten.lt.Scalar(right, 0), _aten.neg.default(magnitude), magnitude)
+    return _aten.where.self(_negative(right), _aten.neg.default(magnitude), magnitude)
 
 
 def _logaddexp(left, right):
@@ -1256,7 +1298,8 @@ POINTWISE_DECOMPOSITIONS = {
     **_recurrent_decompositions(),
     _aten.sign.default: _sign,
     _aten.sgn.default: _sign,
-    _aten.signbit.default: lambda value: _aten.lt.Scalar(value, 0),
+    _aten.signbit.default: lambda value: _negative(_float(value)),
+    _aten.linalg_vector_norm.default: _vector_norm,
     _aten.trunc.default: _trunc,
     _aten.fix.default: _trunc,
     _aten.round.default: _round,
