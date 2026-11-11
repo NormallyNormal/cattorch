@@ -372,3 +372,41 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
         torch.tensor([float(value) for value in emulator.lists["output"]]),
         expected, atol=1e-4, rtol=1e-5,
     )
+
+
+class _QuantizedAndPlainMatMuls(torch.nn.Module):
+    """Two same-shaped right-hand weights, only one of them quantized."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(384, 400) * 0.05)
+        self.register_buffer("table", torch.randn(384, 400) * 0.05)
+
+    def forward(self, value):
+        return value @ self.weight + value @ self.table
+
+
+@torch.no_grad()
+def test_same_shaped_matmul_weights_are_each_sharded_at_their_own_storage_cap(tmp_path):
+    # Each weight is laid out as a transposed copy. The quantized one fits
+    # one list in int8; the buffer is stored in float16, capped at half a
+    # list, and so must be cut into whole four-row groups. Its copy can reuse
+    # the first copy's freed memory, which must not make it reuse that
+    # copy's shard size.
+    torch.manual_seed(0)
+    model = _QuantizedAndPlainMatMuls().eval()
+    example = torch.randn(1, 384)
+    config = QuantizationConfig(bits=8)
+    result = transpile(model, example, tmp_path / "matmuls", quantization=config)
+
+    expected_model = copy.deepcopy(model)
+    quantize_model(expected_model, config, None, orientation_inputs=[(example,)])
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    torch.testing.assert_close(
+        torch.tensor([float(value) for value in emulator.lists["output"]]),
+        expected_model(example).flatten(),
+        atol=1e-3,
+        rtol=1e-4,
+    )

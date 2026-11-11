@@ -434,6 +434,7 @@ class _Compiler:
         *,
         grouped: bool,
         tied: bool = False,
+        source: torch.Tensor | None = None,
     ) -> int:
         """The most values in each row shard of an output-major ``weight``.
 
@@ -443,13 +444,21 @@ class _Compiler:
         physical list ends inside a four-row group the codec must undo, and
         so is a tied weight larger than a list, so the table, sharded at the
         same row boundaries, can share the head's lists.
+
+        A ``weight`` derived from a stored tensor, such as a transposed copy,
+        names that tensor as ``source``: the limit is cached by the tensor's
+        identity, and a temporary's address can be reused by the next one.
         """
         if weight.numel() <= SCRATCH_LIST_LIMIT // 4 or not (
             # No storage caps a list below a quarter of the limit.
             (grouped and self.row_aligned_weights) or (tied and weight.numel() > SCRATCH_LIST_LIMIT)
         ):
             return SCRATCH_LIST_LIMIT
-        identity = self._weight_identity(weight)
+        identity = (
+            self._weight_identity(weight)
+            if source is None
+            else ("derived", self._weight_identity(source))
+        )
         if identity not in self._storage_shard_limits:
             self._storage_shard_limits[identity] = _static_storage_shard_limits(
                 {"weight": weight},
@@ -1701,6 +1710,7 @@ class _Compiler:
             self._row_shard_limit(
                 weight,
                 grouped=grouped_linear(columns, inner),
+                source=rhs,
             )
             // inner
         )

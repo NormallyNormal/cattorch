@@ -22,8 +22,10 @@ Usage
 import json
 import math
 import re
+import sys
 import time
 from collections import Counter
+from contextlib import contextmanager
 
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
@@ -80,6 +82,21 @@ def _constant(value):
         return value
     constant.constant = value
     return constant
+
+
+# A read of a list sharded hundreds of ways is a sum that many reporters deep,
+# and the emulator compiles and runs each reporter as a nested call.
+_RECURSION_LIMIT = 100_000
+
+
+@contextmanager
+def _deep_reporters():
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, _RECURSION_LIMIT))
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
 
 
 class _NameView:
@@ -182,14 +199,16 @@ class ScratchEmulator:
         roots = self._find_roots()
         if root_index >= len(roots):
             raise ValueError(f"root_index {root_index} out of range, found {len(roots)} roots")
-        self._exec_chain(roots[root_index])
+        with _deep_reporters():
+            self._exec_chain(roots[root_index])
 
     def run_procedure(self, name: str) -> None:
         """Run a named custom block without relying on top-level stack order."""
         if name not in self._procedures:
             available = ", ".join(sorted(self._procedures)) or "none"
             raise ValueError(f"procedure {name!r} not found; available: {available}")
-        self._exec_chain(self._procedures[name])
+        with _deep_reporters():
+            self._exec_chain(self._procedures[name])
 
     def _find_roots(self) -> list[str]:
         roots = [
@@ -976,7 +995,8 @@ class ProjectEmulator:
                 if block.get("opcode") == opcode and block.get("topLevel") and matches(block)
             ]
             for hat in hats:
-                emulator._exec_chain(hat.get("next"))
+                with _deep_reporters():
+                    emulator._exec_chain(hat.get("next"))
 
     def green_flag(self) -> None:
         self._run_hats("event_whenflagclicked")

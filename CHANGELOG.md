@@ -270,6 +270,17 @@
 
 ## Fixes
 
+- A quantized export could fail with `grouped weight sharding must preserve
+  complete four-row groups` when compressed storage keeps a weight that runs
+  four output rows at a time in float16 or float32, whose lists hold fewer
+  values than Scratch's limit, such as a GPT-2-shaped `GenerationProgram`
+  in int8 or a model with a quantized and an unquantized matrix product
+  weight of the same shape. Such weights are now cut into lists at the
+  size storage gives each one.
+- An export failed with `RecursionError` when it read a stored tensor split
+  into several hundred lists into a list larger than Scratch's limit,
+  for example an embedding of 31 million values in float32 storage looked up
+  for 300 tokens. `verify` and the emulator also handle such sprites.
 - A token embedding tied to the output head and larger than one Scratch list
   was stored twice, as the head's weights and again as the embedding's own
   table, in float16 beside an int8 head when quantized. Now the embedding

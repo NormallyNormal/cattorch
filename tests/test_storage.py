@@ -601,6 +601,24 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
     assert sprite["variables"]["cattorch_input_logical_length"][1] == SCRATCH_LIST_LIMIT + 3
 
 
+def test_table_sharded_hundreds_of_ways_is_read_into_a_sharded_output(
+    tmp_path,
+    small_list_limit,
+):
+    # Float32 storage caps each table list at a quarter of the limit, so the
+    # table is 601 lists and each lookup a sum of 601 reads. Copying that sum
+    # into each shard of the output must not recurse once per read: at the
+    # real limit, a 31M-value embedding and a 300-token input did.
+    limit = small_list_limit(300)
+    torch.manual_seed(0)
+    model = torch.nn.Embedding(704, 64).eval()
+    tokens = torch.tensor([[3, 703, 0, 350, 9]])
+    assert model.weight.numel() > 600 * (limit // 4)
+    assert tokens.numel() * 64 > limit
+    result = transpile(model, tokens, tmp_path / "embedding")
+    assert verify(model, tokens, result, atol=0, rtol=0).passed
+
+
 def test_storage_config_validation():
     with pytest.raises(ValueError, match="precision"):
         StorageConfig(precision="int7")
