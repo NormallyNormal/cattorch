@@ -102,8 +102,10 @@ def _emit_reduction(ctx: KernelContext):
     dims = _normalize_dims(dims, len(shape))
     outputs, reduced, bases, offsets = _reduction_layout(shape, dims)
     trailing = dims == tuple(range(len(shape) - len(dims), len(shape)))
+    # Not "output": a variable of that name would sit beside the public list.
     index, output_index, base, position, acc, best = (
-        ctx.temp_var(name) for name in ("index", "output", "base", "position", "acc", "best")
+        ctx.temp_var(name)
+        for name in ("index", "output_index", "base", "position", "acc", "best")
     )
     if trailing:
         value = item(source.list, var(index))

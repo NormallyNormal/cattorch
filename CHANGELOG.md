@@ -806,6 +806,10 @@
   203,840-value int8 Linear, for example, while the quantization report said
   int8. A quantized weight's storage is now decided once, for the whole
   weight.
+- A sprite whose model sums or otherwise reduces a tensor, such as
+  `x.sum()`, had a variable named `output` beside the public `output` list,
+  which the interface helpers counted as public. The reduction kernel's
+  working variable has a private name now.
 
 ## Deprecations
 

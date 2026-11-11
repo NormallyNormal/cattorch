@@ -107,6 +107,32 @@ def test_a_model_sprite(tmp_path):
     check(result.path, MODEL)
 
 
+def test_a_reduced_output_adds_no_variable_named_like_a_list(tmp_path):
+    # The reduction kernel named a working variable "output", which sat
+    # beside the public list and counted as public itself.
+    from cattorch.util.scratch.emulator import ScratchEmulator
+
+    class Sums(nn.Module):
+        def forward(self, value):
+            return value.sum(), value.sum(0)
+
+    example = torch.randn(2, 3)
+    result = transpile(Sums().eval(), example, tmp_path / "sums")
+    check(result.path, {**MODEL, "data": MODEL["data"] | {"output_1"}})
+    with zipfile.ZipFile(result.path) as archive:
+        sprite = json.loads(archive.read("sprite.json"))
+    lists = {entry[0] for entry in sprite["lists"].values()}
+    assert not lists & {entry[0] for entry in sprite["variables"].values()}
+    emulator = ScratchEmulator(sprite)
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    for name, expected in (("output", example.sum()), ("output_1", example.sum(0))):
+        torch.testing.assert_close(
+            torch.tensor([float(value) for value in emulator.lists[name]]),
+            expected.flatten(),
+        )
+
+
 def test_a_model_run_once_per_item(tmp_path):
     layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True).eval()
     result = transpile(layer, torch.randn(2, 3, 8), tmp_path / "items", dynamic={0: (1, 4)})
