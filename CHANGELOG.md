@@ -800,6 +800,12 @@
 - Initialization left the last compressed weight bank in a variable, so a
   project saved after `cattorch prepare for save` still stored the
   compressed weights twice. Initialization now clears it when done.
+- A quantized weight split across several lists could have its smaller
+  lists stored in float16, because `min_quantized_values` was applied to
+  each list as well as to the matrix: the last 4,160 values of a
+  203,840-value int8 Linear, for example, while the quantization report said
+  int8. A quantized weight's storage is now decided once, for the whole
+  weight.
 
 ## Deprecations
 

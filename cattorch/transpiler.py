@@ -446,6 +446,9 @@ class _Compiler:
         # id(weight) -> (weak reference to it, its storage list cap).
         self._storage_shard_limits: dict[int, tuple[weakref.ref, int]] = {}
         self.interleaved_static_layouts: dict[str, tuple[tuple[int, int, int], ...]] = {}
+        # A row shard's source weight size, for storage to decide the shard's
+        # precision as the whole weight's.
+        self.static_source_numels: dict[str, int] = {}
         self._tied_weights, self._grouped_tied_weights = self._find_tied_weights()
         self._compiled_output_lists: tuple[str, ...] = ()
 
@@ -521,6 +524,7 @@ class _Compiler:
                 )
             name = key(index)
             self.static_lists[name] = shard
+            self.static_source_numels[name] = weight.numel()
             if interleaved and self.row_aligned_weights:
                 self.interleaved_static_layouts[name] = ((0, shard.shape[0], inner),)
             shards.append((f"W_{name}", shard))
@@ -1764,6 +1768,8 @@ class _Compiler:
             value_key = f"swiglu_{node.name}_value_weight_{index}"
             self.static_lists[gate_key] = gate_weight[start:end].detach().clone()
             self.static_lists[value_key] = value_weight[start:end].detach().clone()
+            self.static_source_numels[gate_key] = gate_weight.numel()
+            self.static_source_numels[value_key] = value_weight.numel()
             names.extend((f"W_{gate_key}", f"W_{value_key}"))
             row_counts.append(end - start)
         return [input_lists[0], *names, input_lists[2], input_lists[4]], tuple(row_counts)
@@ -2894,6 +2900,7 @@ def _transpile(
             storage,
             effective_ndims=compiler.static_effective_ndims,
             interleaved_layouts=compiler.interleaved_static_layouts,
+            source_numels=compiler.static_source_numels,
         ),
     )
     if _deferred_sizes is not None:
@@ -2937,6 +2944,7 @@ def _transpile(
         storage,
         interleaved_layouts=compiler.interleaved_static_layouts,
         effective_ndims=compiler.static_effective_ndims,
+        source_numels=compiler.static_source_numels,
     )
     # GenerationProgram deliberately exposes only its four lifecycle methods.
     # Its processor sprite is intended to remain initialized while a project

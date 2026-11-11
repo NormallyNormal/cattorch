@@ -564,6 +564,12 @@ def _share_repeated_transformer_layers(
             else:
                 bank_tensor = bank_tensor.reshape(len(names), -1)
         compiler.static_lists[names[0].removeprefix("W_")] = bank_tensor
+        sources = [compiler.static_source_numels.pop(name.removeprefix("W_"), 0) for name in names]
+        if any(sources):
+            # Row shards of weights: kept like those weights.
+            compiler.static_source_numels[names[0].removeprefix("W_")] = max(
+                bank_tensor.numel(), *sources,
+            )
         bank_alignment = math.lcm(
             *shard_alignments,
             *(4 * inner for _, _, inner in combined_layouts),
@@ -1143,14 +1149,22 @@ def _static_storage_precision(
     storage: StorageConfig,
     effective_ndim: int | None = None,
     interleave_segments: tuple[tuple[int, int, int], ...] = (),
+    source_numel: int | None = None,
 ) -> str:
+    """How storage keeps ``tensor``: decided once for the whole tensor.
+
+    A row shard the compiler cut from a weight gives that weight's size as
+    ``source_numel``, so it is kept like the rest of the weight.
+    """
     if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
         return "float32"
     ndim = tensor.ndim if effective_ndim is None else effective_ndim
     if storage.precision in {"int8", "int6", "int4"} and ndim < 2:
         return "float16"
-    if storage.precision in {"int8", "int6", "int4"} and not _on_integer_codec_grid(
-        tensor, storage, interleave_segments,
+    if storage.precision in {"int8", "int6", "int4"} and (
+        # Quantization leaves matrices below the threshold unquantized.
+        (source_numel or tensor.numel()) < storage.min_quantized_values
+        or not _on_integer_codec_grid(tensor, storage, interleave_segments)
     ):
         # QuantizationConfig decides which weights are lossy. Storage must not
         # quantize anything it did not reconstruct, such as buffers (RoPE
@@ -1304,6 +1318,7 @@ def _static_storage_shard_limits(
     *,
     effective_ndims: dict[str, int] | None = None,
     interleaved_layouts: dict[str, tuple[tuple[int, int, int], ...]] | None = None,
+    source_numels: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Cap static shards so every temporary decode stream fits in Scratch."""
     if not storage.compression:
@@ -1313,6 +1328,7 @@ def _static_storage_shard_limits(
         precision = _static_storage_precision(
             tensor, storage, (effective_ndims or {}).get(key),
             (interleaved_layouts or {}).get(key, ()),
+            (source_numels or {}).get(key),
         )
         group_size = _static_storage_group_size(tensor, storage)
         if precision == "float32":
@@ -1323,10 +1339,6 @@ def _static_storage_shard_limits(
             scale_bytes = 4 if storage.scale_precision == "float32" else 2
             scale_groups = SCRATCH_LIST_LIMIT // scale_bytes
             limit = min(SCRATCH_LIST_LIMIT, scale_groups * group_size)
-            # A shard below the quantization threshold falls back to float16.
-            # Keep every possible fallback shard within its byte budget too.
-            if storage.min_quantized_values > SCRATCH_LIST_LIMIT // 2:
-                limit = min(limit, SCRATCH_LIST_LIMIT // 2)
             # Each physical payload is quantized independently.  Ending a
             # shard mid-group would restart scale selection in the next shard
             # and change weights compared with the logical matrix (notably
@@ -1523,8 +1535,10 @@ def _apply_static_storage(
         str, tuple[tuple[int, int, int], ...]
     ] | None = None,
     effective_ndims: dict[str, int] | None = None,
+    source_numels: dict[str, int] | None = None,
 ) -> set[str]:
     """Encode static physical shards and install the one-time unpacker."""
+    source_numels = source_numels or {}
     static_names = {f"W_{key}" for key in static_tensors}
     interleaved_layouts = interleaved_layouts or {}
     physical_interleaves = {}
@@ -1549,6 +1563,7 @@ def _apply_static_storage(
                         logical_name.removeprefix("W_"),
                     ),
                     interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+                    source_numels.get(logical_name.removeprefix("W_")),
                 )
                 group_size = _static_storage_group_size(tensor, storage)
                 for shard in layouts.get(logical_name, ListLayout(logical_name, 0, ())).shards:
@@ -1558,15 +1573,9 @@ def _apply_static_storage(
                         _deinterleave_static_values(contents, segments)
                         if segments else contents
                     )
-                    shard_precision = precision
-                    if (
-                        precision in {"int8", "int6", "int4"}
-                        and len(contents) < storage.min_quantized_values
-                    ):
-                        shard_precision = "float16"
                     rounded = rounded_values(
                         logical_contents,
-                        shard_precision,
+                        precision,
                         group_size,
                         storage.scale_precision,
                     )
@@ -1589,32 +1598,27 @@ def _apply_static_storage(
                 logical_name.removeprefix("W_"),
             ),
             interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+            source_numels.get(logical_name.removeprefix("W_")),
         )
         group_size = _static_storage_group_size(tensor, storage)
         for position, shard in enumerate(layout.shards, 1):
             contents = sprite["lists"][shard.identifier][1]
             if not contents:
                 continue
-            shard_precision = precision
-            if (
-                precision in {"int8", "int6", "int4"}
-                and len(contents) < storage.min_quantized_values
-            ):
-                shard_precision = "float16"
             payload_name = f"cattorch payload {len(specs) + 1}"
             segments = physical_interleaves.get(shard.name, ())
             encoded_contents = (
                 _deinterleave_static_values(contents, segments)
                 if segments else contents
             )
-            if shard_precision in {"int8", "int6", "int4"}:
+            if precision in {"int8", "int6", "int4"}:
                 codes, scales = _quantize_arrays(
                     encoded_contents,
-                    shard_precision,
+                    precision,
                     group_size,
                     storage.scale_precision,
                 )
-                raw_payload = _quantized_bytes(codes, shard_precision)
+                raw_payload = _quantized_bytes(codes, precision)
                 scale_number = len(specs) + 1
                 # With payload_bytes on every spec the unpacker encodes whole
                 # banks itself, so the per-list Base92 payloads stay empty.
@@ -1622,7 +1626,7 @@ def _apply_static_storage(
                     shard.name,
                     payload_name,
                     "",
-                    shard_precision,
+                    precision,
                     value_count=len(contents),
                     group_size=group_size,
                     scale_list_name=f"cattorch quant scales {scale_number}",
@@ -1632,12 +1636,12 @@ def _apply_static_storage(
                     scale_values=tuple(scales.tolist()),
                 ))
             else:
-                raw_payload = _float_bytes(encoded_contents, shard_precision)
+                raw_payload = _float_bytes(encoded_contents, precision)
                 specs.append(EncodedList(
                     shard.name,
                     payload_name,
                     "",
-                    shard_precision,
+                    precision,
                     payload_bytes=raw_payload,
                 ))
             if segments:

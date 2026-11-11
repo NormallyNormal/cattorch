@@ -1138,6 +1138,31 @@ def test_right_hand_matmul_weight_whose_four_rows_never_fit_a_list(
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("compression", [True, False], ids=["compressed", "uncompressed"])
+def test_every_row_shard_of_a_quantized_weight_keeps_its_integers(
+    tmp_path, small_list_limit, compression,
+):
+    # 11 rows of 416 values are cut into shards of nine rows and two. The
+    # weight is above min_quantized_values, so it is quantized; its last
+    # shard, below the threshold on its own, was stored in float16.
+    small_list_limit(4000)
+    torch.manual_seed(0)
+    model = torch.nn.Linear(416, 11).eval()
+    example = torch.randn(1, 416)
+    config = QuantizationConfig(bits=8, min_quantized_values=1024)
+    result = transpile(
+        model, example, tmp_path / "linear", quantization=config,
+        storage=StorageConfig(compression=compression),
+    )
+    expected_model = copy.deepcopy(model)
+    quantize_model(expected_model, config, None, orientation_inputs=[(example,)])
+    # The float16 shard put the last two outputs 2e-4 off.
+    torch.testing.assert_close(
+        _forward(result, example), expected_model(example).flatten(), atol=5e-5, rtol=0,
+    )
+
+
+@torch.no_grad()
 def test_grouped_weight_stored_in_float16_beside_integers_is_cut_at_its_cap(
     tmp_path, small_list_limit,
 ):
