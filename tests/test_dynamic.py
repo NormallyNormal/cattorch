@@ -92,6 +92,33 @@ def test_a_model_using_the_length_itself_is_rejected(tmp_path):
         transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
 
 
+def test_the_length_check_compares_with_the_stored_weights(tmp_path):
+    # Quantization changes the weights, so the sprite and the model differ
+    # by more at some lengths than at one row; the check compares with a
+    # model holding the quantized weights, so only a real difference trips it.
+    from cattorch import QuantizationConfig
+
+    quantization = QuantizationConfig(bits=4, min_quantized_values=1, group_size=4)
+    torch.manual_seed(4)
+    model = nn.Sequential(nn.Linear(4, 5), nn.ReLU()).eval()
+    transpile(model, torch.randn(3, 4), tmp_path / "m", dynamic={0: (1, 8)}, quantization=quantization)
+
+    class Positions(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4)
+            self.positions = nn.Parameter(torch.randn(16, 4))
+
+        def forward(self, x):
+            return self.linear(x) + self.positions[:x.shape[0]]
+
+    with pytest.raises(UnsupportedModelError, match="uses the length itself"):
+        transpile(
+            Positions().eval(), torch.randn(3, 4), tmp_path / "p", dynamic={0: (1, 8)},
+            quantization=quantization,
+        )
+
+
 def test_a_model_with_two_runtime_dimensions_is_rejected(tmp_path):
     with pytest.raises(UnsupportedModelError, match="two runtime dimensions"):
         transpile(

@@ -2183,7 +2183,6 @@ def _transpile_dynamic(
     from cattorch.dynamic import (
         at_length,
         check_lengths,
-        exact_export,
         normalize_dynamic,
         per_unit_result,
         run_per_unit,
@@ -2254,13 +2253,12 @@ def _transpile_dynamic(
             input_shapes,
             [tuple(item for item in spec_value.shape) for spec_value in result.outputs],
         )
-    exact = exact_export(
-        optimization=options.get("optimization", "exact"),
-        storage=options.get("storage"),
-        quantization=options.get("quantization"),
-        sig_figs=sig_figs,
+    check_lengths(
+        model, flat, kwarg_names, spec, result, verify, example_kwargs,
+        optimization=options.get("optimization", "exact"), storage=options.get("storage"),
+        quantization=options.get("quantization"), sig_figs=sig_figs, adapters=adapters,
+        kernels=kernels,
     )
-    check_lengths(model, flat, kwarg_names, spec, result, verify, example_kwargs, exact=exact)
     return result
 
 

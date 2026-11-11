@@ -99,6 +99,62 @@ def _compare_values(
     )
 
 
+def round_as_stored(
+    model: torch.nn.Module,
+    storage: StorageConfig,
+    *,
+    quantization: QuantizationConfig | None = None,
+    sig_figs: int | None = None,
+) -> None:
+    """Round ``model``'s floating parameters and buffers as a sprite stores them.
+
+    ``storage``, ``quantization`` and ``sig_figs`` are the export's options;
+    a quantized model has already had its weights quantized. Values are cut
+    to ``sig_figs`` first, then kept or rounded to float16 as storage
+    decides: integer storage keeps biases, small tensors and anything it
+    would not reproduce exactly in float16. A comparison with the result
+    then isolates Scratch lowering from the independently lossy storage.
+    Values computed in ``forward`` rather than held by the model, such as a
+    table built there, aren't rounded.
+    """
+    from cattorch.sprite import _static_storage_group_size, _static_storage_precision
+    from cattorch.storage import rounded_values
+
+    if quantization is not None:
+        storage = quantized_storage(storage, quantization)
+    effective_ndims = expert_bank_effective_ndims(model)
+    with torch.no_grad():
+        for value in (*model.parameters(), *model.buffers()):
+            if not value.is_floating_point():
+                continue
+            ndim = effective_ndims.get(value.untyped_storage().data_ptr())
+            # Storage decides on the tensor as the model holds it; weights
+            # used on the right of a matmul, and bilinear weights, are
+            # stored transposed, so check that layout too.
+            layout = value
+            precision = _static_storage_precision(layout, storage, ndim)
+            if precision == "float16" and value.ndim >= 2:
+                layout = value.transpose(-1, -2).contiguous()
+                precision = _static_storage_precision(layout, storage, ndim)
+                if precision == "float16":
+                    layout = value
+            if quantization is not None and value.numel() < quantization.min_quantized_values:
+                precision = "float16"
+            if sig_figs is None and precision not in {"float16"}:
+                continue
+            flat = layout.detach().flatten().tolist()
+            if sig_figs is not None:
+                flat = [float(f"%.{sig_figs}g" % item) for item in flat]
+            if precision != "float32":
+                # Integer storage quantizes the cut values again.
+                flat = rounded_values(
+                    flat, precision, _static_storage_group_size(layout, storage),
+                    storage.scale_precision,
+                )
+            stored = torch.tensor(flat, dtype=value.dtype).reshape(layout.shape)
+            value.copy_(stored if layout is value else stored.transpose(-1, -2))
+
+
 def _verify_program(
     model: torch.nn.Module,
     program: ExportProgram,
@@ -109,6 +165,8 @@ def _verify_program(
     quantization: QuantizationConfig | None,
     atol: float,
     rtol: float,
+    _storage: StorageConfig | None = None,
+    _sig_figs: int | None = None,
 ) -> ProgramVerifyResult:
     path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
     project = read_json(path)
@@ -117,15 +175,18 @@ def _verify_program(
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )
-    if quantization is not None:
-        if quantization.method != "symmetric":
-            raise ValueError(
-                "program verification currently reconstructs symmetric quantization; "
-                "GPTQ requires the exact export calibration sequence"
-            )
+    if quantization is not None and quantization.method != "symmetric":
+        raise ValueError(
+            "program verification currently reconstructs symmetric quantization; "
+            "GPTQ requires the exact export calibration sequence"
+        )
+    lossy = quantization is not None or _storage is not None or _sig_figs is not None
+    if lossy:
+        # Stored values are those of the folded model.
         owned = fold_eval_batch_norms(
             owned, methods=tuple(entry.method for entry in program.entrypoints),
         )
+    if quantization is not None:
         from cattorch.program_export import _ProgramCalibrationModule
         from cattorch.program_runtime import default_program_calls
         observed_calls = default_program_calls(program)
@@ -136,32 +197,10 @@ def _verify_program(
             orientation_inputs=[torch.zeros(1) for _ in observed_calls],
             _registry=registry,
         )
-        # Integer storage keeps biases, small tensors, and anything it would
-        # not reproduce exactly in float16. Mirror that one-time decoder result
-        # so this comparison isolates Scratch lowering from the independently
-        # lossy storage decision.
-        from cattorch.sprite import _static_storage_precision
-        storage = quantized_storage(StorageConfig(), quantization)
-        effective_ndims = expert_bank_effective_ndims(owned)
-        with torch.no_grad():
-            for value in (*owned.parameters(), *owned.buffers()):
-                if not value.is_floating_point():
-                    continue
-                precision = _static_storage_precision(
-                    value, storage,
-                    effective_ndims.get(value.untyped_storage().data_ptr()),
-                )
-                if precision == "float16" and value.ndim >= 2:
-                    # Weights used on the right of a matmul, and bilinear
-                    # weights, are stored transposed, so check that layout too.
-                    precision = _static_storage_precision(
-                        value.transpose(-1, -2).contiguous(), storage,
-                        effective_ndims.get(value.untyped_storage().data_ptr()),
-                    )
-                if value.numel() < quantization.min_quantized_values:
-                    precision = "float16"
-                if precision == "float16":
-                    value.copy_(value.to(torch.float16).to(value.dtype))
+    if lossy:
+        round_as_stored(
+            owned, _storage or StorageConfig(), quantization=quantization, sig_figs=_sig_figs,
+        )
     replay = ProgramReplay(owned, program)
     if calls is None:
         from cattorch.program_runtime import default_program_calls
@@ -231,6 +270,8 @@ def verify(
     adapters: tuple[ModuleAdapter, ...] = (),
     quantization: QuantizationConfig | None = None,
     example_kwargs: dict[str, Any] | None = None,
+    _storage: StorageConfig | None = None,
+    _sig_figs: int | None = None,
 ):
     """Run one generated forward in the emulator and compare it with PyTorch.
 
@@ -274,7 +315,7 @@ def verify(
         return _verify_program(
             model, example_inputs, sprite,
             calls=calls, adapters=adapters, quantization=quantization,
-            atol=atol, rtol=rtol,
+            atol=atol, rtol=rtol, _storage=_storage, _sig_figs=_sig_figs,
         )
     if calls is not None or adapters or quantization is not None:
         raise ValueError("calls, adapters, and quantization require an ExportProgram")

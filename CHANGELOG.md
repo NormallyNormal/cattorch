@@ -850,6 +850,15 @@
   test checks that every kind of export leaves the caller's parameters,
   buffers, dtypes and training flags as they were, whether it succeeds or
   fails.
+- Valid variable-length (`dynamic=`) exports with `quantization=`, float16
+  storage or `sig_figs` were rejected at random, depending on the weights,
+  with a false "probably uses torch.arange" message: the length check
+  allowed ten times the storage error it saw at the shortest length, which
+  can be tiny. The check now compares the sprite with a copy of the model
+  holding the values the sprite stores, with the same tolerance as an exact
+  export, for plain models and entry points alike. Only fast kernels and
+  GPTQ, whose effect it can't reproduce, still use the shortest length's
+  difference.
 
 ## Deprecations
 

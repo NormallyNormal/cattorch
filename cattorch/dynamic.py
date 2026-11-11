@@ -99,35 +99,94 @@ def varied_at_length(value: torch.Tensor, axis: int, length: int, seed: int = 0)
 _LONGEST_CHECKED = 1024
 
 
-def exact_export(*, optimization, storage, quantization, sig_figs) -> bool:
-    """Whether an export's numbers should match PyTorch to float32 rounding."""
-    precision = getattr(storage, "precision", "float32")
-    return (
-        optimization == "exact" and quantization is None and precision == "float32"
-        and sig_figs is None
+def reproducible_export(*, optimization, quantization) -> bool:
+    """Whether a length check can reproduce the export's numbers exactly.
+
+    Storage precision, ``sig_figs`` and symmetric quantization change only
+    the stored values, which the reference model can hold too. Fast kernels'
+    approximations and GPTQ's calibration over inputs it has consumed can't
+    be reproduced.
+    """
+    return optimization == "exact" and (
+        quantization is None or quantization.method == "symmetric"
     )
 
 
-# Tolerances for an export that should match PyTorch exactly, a little looser
-# than ``verify``'s because a long sum accumulates float32 rounding.
+# Tolerances for a sprite compared with a model holding its stored values, a
+# little looser than ``verify``'s because a long sum accumulates float32
+# rounding.
 _EXACT_TOLERANCE = {"atol": 1e-3, "rtol": 1e-4}
 
 
+def _stored_values_model(
+    model, positional, example_kwargs, *, storage, quantization, sig_figs, registry,
+):
+    """A copy of ``model`` holding the values the sprite stores.
+
+    It is prepared as the export prepares its copy (adapters, folded batch
+    norms, quantized weights), then rounded as storage rounds it, so its
+    output differs from the sprite's only by float32 arithmetic.
+    """
+    from cattorch.graph_transforms import fold_eval_batch_norms
+    from cattorch.quantization import quantize_model
+    from cattorch.storage import StorageConfig
+    from cattorch.verify import round_as_stored
+
+    owned = copy.deepcopy(model).eval()
+    lossy = (
+        quantization is not None or sig_figs is not None
+        or getattr(storage, "precision", "float32") != "float32"
+    )
+    if not lossy:
+        return owned
+    owned = fold_eval_batch_norms(registry.adapt_model(owned, _copy=False))
+    if quantization is not None:
+        quantize_model(
+            owned, quantization, None, orientation_inputs=[tuple(positional)],
+            call_kwargs=example_kwargs, _registry=registry,
+        )
+    round_as_stored(
+        owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs,
+    )
+    return owned
+
+
+_USES_LENGTH = (
+    "The model probably uses the length itself, for example torch.arange or a "
+    "position table sliced to it, which dynamic= can't follow; a "
+    "GenerationProgram handles variable-length token sequences"
+)
+
+
 def check_lengths(
-    model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs, *, exact=False,
+    model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs, *,
+    optimization="exact", storage=None, quantization=None, sig_figs=None,
+    adapters=(), kernels=(),
 ) -> None:
     """Compare the sprite with PyTorch at lengths other than the traced one.
 
     The trace saw one row, so a model that builds something from the length
     itself (``torch.arange(n)``, a position table, a reshape over it) is
-    exported for one row only. Comparing at other lengths finds that. An
-    ``exact`` export must match at every length. Otherwise the error at the
-    shortest length is the baseline, so approximate kernels and quantization
-    don't trip the check.
+    exported for one row only. Comparing at other lengths finds that. The
+    sprite is compared with a copy of the model holding the values the
+    sprite stores (see ``reproducible_export``), and must match it at every
+    length. An export the check can't reproduce is compared with the model,
+    taking the error at the shortest length as the baseline, so approximate
+    kernels and GPTQ don't trip the check.
     """
+    from cattorch.operator_registry import default_registry
+
     ((index, (_, minimum, maximum, axis)),) = spec.items()
     lengths = _lengths(minimum, flat_inputs[index].shape[axis], maximum)
     positional = len(flat_inputs) - len(kwarg_names)
+    exact = reproducible_export(optimization=optimization, quantization=quantization)
+    reference = model
+    if exact:
+        reference = _stored_values_model(
+            model, flat_inputs[:positional], example_kwargs, storage=storage,
+            quantization=quantization, sig_figs=sig_figs,
+            registry=default_registry().for_export(adapters=adapters, kernels=kernels),
+        )
 
     def report(length):
         values = list(flat_inputs)
@@ -136,14 +195,14 @@ def check_lengths(
         keywords.update(zip(kwarg_names, values[positional:]))
         tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
         # verify runs the model; a fresh copy each time keeps a forward that
-        # changes module state away from the caller's model.
+        # changes module state away from the caller's model and later runs.
         return verify(
-            copy.deepcopy(model), tuple(values[:positional]), result,
+            copy.deepcopy(reference), tuple(values[:positional]), result,
             example_kwargs=keywords or None, **tolerance,
         )
 
     def error(outcome):
-        """The largest difference, and whether an exact export is within tolerance."""
+        """The largest difference, and whether it is within tolerance."""
         reports = getattr(outcome, "outputs", None) or (outcome,)
         if any(item.values_compared != item.actual_values for item in reports):
             return math.inf, False
@@ -157,13 +216,11 @@ def check_lengths(
         )
     for length in lengths[1:]:
         found, matches = error(report(length))
-        if not matches or found > 10 * baseline + 1e-4:
+        if not matches or (not exact and found > 10 * baseline + 1e-4):
             raise UnsupportedModelError(
                 f"with {length} items along the dynamic dimension the sprite doesn't "
                 f"match the model (largest difference {found:.3g}), though it does with "
-                f"{lengths[0]}. The model probably uses the length itself, for example "
-                "torch.arange or a position table sliced to it, which dynamic= can't "
-                "follow; a GenerationProgram handles variable-length token sequences"
+                f"{lengths[0]}. {_USES_LENGTH}"
             )
 
 
@@ -183,17 +240,20 @@ def _lengths(minimum, original, maximum) -> list[int]:
 
 
 def check_entry_lengths(
-    model, program, result, verify, *, adapters=(), quantization=None, exact=False,
+    model, program, result, verify, *, adapters=(), optimization="exact", storage=None,
+    quantization=None, sig_figs=None,
 ) -> None:
     """``check_lengths`` for each variable-length input of a program's entry points.
 
     Each check calls the entry point once, from the initial state, with that
-    input at another length and the other inputs at their examples.
+    input at another length and the other inputs at their examples. verify
+    gives the model the values the sprite stores.
     """
     from cattorch.program import Input, ProgramCall
 
     if quantization is not None and quantization.method != "symmetric":
         return  # verify can't reproduce other quantization methods
+    exact = reproducible_export(optimization=optimization, quantization=quantization)
     for entry in program.entrypoints:
         inputs = [binding for binding in entry.arguments if isinstance(binding, Input)]
         for position, binding in enumerate(inputs):
@@ -207,7 +267,8 @@ def check_entry_lengths(
                 tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
                 outcome = verify(
                     model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
-                    adapters=adapters, quantization=quantization, **tolerance,
+                    adapters=adapters, quantization=quantization, _storage=storage,
+                    _sig_figs=sig_figs, **tolerance,
                 )
                 (call,) = outcome.calls
                 reports = [*call.outputs, *(report for _, report in call.states)]
@@ -228,7 +289,7 @@ def check_entry_lengths(
                 )
             for length in lengths[1:]:
                 found, matches = error(length)
-                if not matches or found > 10 * baseline + 1e-4:
+                if not matches or (not exact and found > 10 * baseline + 1e-4):
                     raise UnsupportedModelError(
                         f"with {length} items in {where} the sprite doesn't match the model "
                         f"(largest difference {found:.3g}), though it does with {lengths[0]}. "

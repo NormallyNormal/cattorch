@@ -211,7 +211,11 @@ cattorch traces the model with one item, and again with two to tell bounds
 like `x[-1]` and `x[0]` apart. It then checks the sprite against the model at
 several lengths during export. A model that builds something from the length,
 such as `torch.arange(tokens.shape[1])` for positions or a `cumsum`, fails
-that check. Language models should use a [`GenerationProgram`](generation.md)
+that check. With lossy storage (`quantization=`, float16 storage, `sig_figs`),
+the sprite is checked against a copy of the model holding the values it
+stores, so the check is as strict as for an exact export; with
+`optimization="fast"` or GPTQ, whose effect it can't reproduce, it allows the
+difference it finds at the shortest length. Language models should use a [`GenerationProgram`](generation.md)
 instead, which handles prompts of any length up to `max_context`.
 
 Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
