@@ -25,7 +25,7 @@ from cattorch.autoregressive import (
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.fast import FastConfig
-from cattorch.frontend import tensor_output_leaves
+from cattorch.frontend import capture_model, tensor_output_leaves
 from cattorch.huggingface_recurrent import (
     adapt_recurrent_model, find_recurrent_model, version_hint,
 )
@@ -35,6 +35,7 @@ from cattorch.program import (
     StateInput, StateUpdate,
 )
 from cattorch.program_export import ProgramAssembly, transpile_program
+from cattorch.program_runtime import MethodModule
 from cattorch.quantization import QuantizationConfig
 from cattorch.results import TranspileResult
 from cattorch.sprite import (
@@ -96,16 +97,23 @@ def _check_step(model: nn.Module, program: RecurrentGenerationProgram) -> tuple[
 def _check_reference(
     model: nn.Module, program: RecurrentGenerationProgram, vocabulary: int, hint: str,
 ) -> None:
-    """Run the step over random tokens and compare each logits row with the reference.
+    """Run the traced step over random tokens and compare each logits row with the reference.
 
+    The step is traced as the export traces it, one tensor argument per
+    declared input, and the traced graph (what cattorch lowers to blocks)
+    runs token by token from the initial states, so a step that disagrees
+    with the reference and a trace that binds its inputs wrongly are both
+    caught. Lowering the graph to blocks is not part of this check.
     ``hint`` ends a mismatch's message.
     """
     assert program.reference is not None and program.states is not None
     length = min(program.max_tokens or 32, 32)
     generator = torch.Generator().manual_seed(0)
     tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
-    step = getattr(model, program.step)
     states = [state.initial for state in program.states]
+    step = capture_model(
+        MethodModule(model, program.step), (tokens[:, :1], *states),
+    ).graph_module
     rows = []
     with torch.no_grad():
         expected = tensor_output_leaves(getattr(model, program.reference)(tokens), warn=False)[0]

@@ -353,3 +353,30 @@ def test_python_conversions_of_constants_still_fold():
 
     captured = capture_model(Constant(), (torch.ones(2),))
     assert torch.equal(captured.graph_module(torch.ones(2))[0], torch.full((2,), 3.0))
+
+
+class TwoInputsAndBuffer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("offset", torch.tensor([1.0, -2.0, 3.0]))
+
+    def forward(self, value, residual, *, scale):
+        return 2 * value + residual * scale + self.offset
+
+
+@pytest.mark.parametrize("frontend", ["fx", "export"])
+def test_one_tensor_passed_as_several_arguments_traces_one_input_each(tmp_path, frontend):
+    # The tracer knows tensors by identity: the same object as two inputs,
+    # or a buffer of the model as an input, must still give each argument
+    # its own input list.
+    model = TwoInputsAndBuffer().eval()
+    shared = model.offset
+    result = transpile(
+        model, (shared, shared), tmp_path / frontend, frontend=frontend,
+        example_kwargs={"scale": shared},
+    )
+    distinct = (torch.tensor([0.5, 1.0, 2.0]), torch.tensor([-1.0, 4.0, 0.0]))
+    check = verify(
+        model, distinct, result, example_kwargs={"scale": torch.tensor([3.0, 0.0, 1.0])},
+    )
+    assert check.passed, check

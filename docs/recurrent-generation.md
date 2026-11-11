@@ -110,8 +110,8 @@ value replaces it. `RecurrentGenerationProgram` rejects append states.
 
 ## The reference check
 
-With `reference="forward"`, or another method name, export runs the step from
-the initial states over up to 32 random tokens (fewer if `max_tokens` is
+With `reference="forward"`, or another method name, export traces the step as
+it is exported and runs the traced graph from the initial states over up to 32 random tokens (fewer if `max_tokens` is
 smaller) and compares each logits row with
 `reference(tokens)`, which must return `[1, n, V]` or `[n, V]` logits. Every
 row must agree within `1e-4` of its largest value, or export stops with an

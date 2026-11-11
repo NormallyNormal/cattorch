@@ -810,6 +810,14 @@
   `x.sum()`, had a variable named `output` beside the public `output` list,
   which the interface helpers counted as public. The reduction kernel's
   working variable has a private name now.
+- Two states sharing one initial tensor, as in `zeros = torch.zeros(...)`;
+  `State("hidden", zeros), State("cell", zeros)`, exported a step that read
+  one state's list for both and gave wrong logits from the second token on.
+  The same happened for any tensor passed as two traced arguments, or an
+  argument that is also a parameter or buffer of the model: every argument
+  is now traced from its own copy. The reference check of a
+  `RecurrentGenerationProgram` now runs the traced step graph rather than the
+  model's `step` method, so it checks what is exported.
 
 ## Deprecations
 

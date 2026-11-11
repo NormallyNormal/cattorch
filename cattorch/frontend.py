@@ -160,7 +160,7 @@ def _capture_export(model, example_inputs, example_kwargs=None) -> CapturedGraph
         if getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
         == "USER_OUTPUT"
     )
-    return CapturedGraph(
+    captured = CapturedGraph(
         graph=exported.graph,
         graph_module=exported.graph_module,
         state_inputs=state_inputs,
@@ -168,6 +168,8 @@ def _capture_export(model, example_inputs, example_kwargs=None) -> CapturedGraph
         user_output_names=user_outputs,
         frontend="export",
     )
+    _check_input_count(captured, example_inputs, example_kwargs)
+    return captured
 
 
 def _resolve_attr(module: GraphModule, target: str):
@@ -963,7 +965,7 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
         leaves, _ = tree_flatten(value)
         output_names = tuple(leaf.name if isinstance(leaf, Node) else None for leaf in leaves)
 
-    return CapturedGraph(
+    captured = CapturedGraph(
         graph=graph_module.graph,
         graph_module=graph_module,
         state_inputs=state_inputs,
@@ -973,12 +975,51 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
         user_output_names=output_names,
         frontend="fx",
     )
+    _check_input_count(captured, example_inputs, example_kwargs)
+    return captured
+
+
+def _own_tensor(value):
+    """A copy of ``value`` with storage no other traced value shares."""
+    if not isinstance(value, torch.Tensor):
+        return value
+    return value.detach().clone().requires_grad_(value.requires_grad)
+
+
+def distinct_example_inputs(example_inputs, example_kwargs=None):
+    """Give every traced tensor argument its own storage.
+
+    The tracer identifies a tensor by the object: the same tensor passed as
+    two arguments (two states sharing one initial value), or an argument
+    that is also a parameter or buffer of the model, would trace as one
+    input, so the graph would read one argument's list for both. A copy per
+    argument keeps each its own input. Tracing also runs the model on these
+    tensors, so an in-place update in ``forward`` can't reach the caller's.
+    """
+    inputs = tuple(_own_tensor(value) for value in example_inputs)
+    kwargs = None if example_kwargs is None else {
+        key: _own_tensor(value) for key, value in example_kwargs.items()
+    }
+    return inputs, kwargs
+
+
+def _check_input_count(captured: CapturedGraph, example_inputs, example_kwargs) -> None:
+    expected = len(flat_example_inputs(example_inputs, example_kwargs))
+    found = len(captured.user_input_names)
+    if found != expected:
+        # Every later stage binds argument lists to placeholders by position;
+        # a merged or dropped input would silently read the wrong list.
+        raise RuntimeError(
+            f"cattorch internal error: the traced graph has {found} inputs for "
+            f"{expected} tensor arguments; please report this model"
+        )
 
 
 def capture_model(
     model, example_inputs, *, frontend: Frontend = "fx", example_kwargs=None,
 ) -> CapturedGraph:
     """Capture ``model`` and normalize frontend-specific state and outputs."""
+    example_inputs, example_kwargs = distinct_example_inputs(example_inputs, example_kwargs)
     # ProxyTensor and TorchDynamo both manipulate process-global tracing state.
     # Concurrent captures can therefore corrupt one another even for unrelated
     # models. Serializing this short export-only phase makes the public API safe

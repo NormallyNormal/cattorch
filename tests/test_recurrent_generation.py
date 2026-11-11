@@ -476,6 +476,44 @@ def test_the_reference_check_catches_a_wrong_step(tmp_path):
     export(model, tmp_path / "unchecked")
 
 
+class SharedZerosLSTM(LSTMLM):
+    """The usual LSTM pattern: both states start from one zeros tensor."""
+
+    def states(self):
+        zeros = torch.zeros(1, 1, self.width)
+        return (State("hidden", zeros), State("cell", zeros))
+
+    def forward(self, tokens):
+        output, _ = self.lstm(self.embed(tokens))
+        return self.head(output)
+
+
+def test_states_sharing_one_initial_tensor_each_keep_their_own_list(tmp_path):
+    model = make("lstm")
+    shared = SharedZerosLSTM()
+    shared.load_state_dict(model.state_dict())
+    shared.eval()
+    emulator, _ = export(shared, tmp_path / "shared", reference="forward")
+    tokens = [1, 3, 5, 2, 7]
+    expected = reference_rows(shared, tokens).double()
+    rows = []
+    for token in tokens:
+        assert run(emulator, "cattorch decode", [token]) == "ok"
+        rows.append(logits(emulator))
+    torch.testing.assert_close(torch.stack(rows), expected, atol=TOLERANCE, rtol=0)
+
+
+def test_the_reference_check_runs_the_traced_step(monkeypatch, tmp_path):
+    # A trace that binds both states to one input must fail the check, not
+    # export a wrong sprite: the check runs the traced graph, not the method.
+    import cattorch.frontend
+
+    monkeypatch.setattr(cattorch.frontend, "distinct_example_inputs", lambda *args: args)
+    torch.manual_seed(0)
+    with pytest.raises(UnsupportedModelError, match="the recurrent step disagrees with forward"):
+        export(SharedZerosLSTM().eval(), tmp_path / "merged", reference="forward")
+
+
 def test_reference_must_return_one_row_per_token(tmp_path):
     class LastOnly(GRULM):
         def last(self, tokens):
