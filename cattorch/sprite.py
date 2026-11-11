@@ -107,7 +107,7 @@ def _deduplicate_static_tensors(
     shape-specific index arithmetic. Hash matches are confirmed byte-for-byte
     so this transform remains exact even for NaNs and signed zeroes.
     """
-    winners: dict[tuple[str, int, bytes], tuple[str, bytes]] = {}
+    winners: dict[tuple[str, int, int, bytes], tuple[str, torch.Tensor]] = {}
     aliases: dict[str, str] = {}
     kept: dict[str, torch.Tensor | None] = {}
     # A tensor that no block reads, such as one a fast-mode kernel replaced,
@@ -118,14 +118,15 @@ def _deduplicate_static_tensors(
             kept[key] = tensor
             continue
         contiguous = tensor.detach().cpu().contiguous()
-        raw = contiguous.reshape(-1).view(torch.uint8).numpy().tobytes()
+        # The bytes in place, not a copy of every weight held until the end.
+        raw = contiguous.reshape(-1).view(torch.uint8)
         identity = (
             str(contiguous.dtype), contiguous.numel(),
             (effective_ndims or {}).get(key, tensor.ndim),
-            hashlib.sha256(raw).digest(),
+            hashlib.sha256(raw.numpy()).digest(),
         )
         previous = winners.get(identity)
-        if previous is not None and previous[1] == raw:
+        if previous is not None and torch.equal(previous[1], raw):
             aliases[f"W_{key}"] = f"W_{previous[0]}"
             log.info("Sharing identical static tensor W_%s -> W_%s", key, previous[0])
         else:
