@@ -262,6 +262,27 @@
   version. `cattorch generate --help` now explains `--top-k`,
   `--max-new-tokens`, and `--temperature`, `analyze-benchmark --help` its
   `PROJECT`, and the help shows each option's default.
+- One Scratch interface for every kind of sprite, frozen as interface
+  version 1 in [the Scratch interface](docs/scratch-interface.md): every
+  public block of a model, program, generation or tokenizer sprite, and every
+  `build_project` bridge, sets `cattorch status` and does a
+  `broadcast and wait` of its `... complete` broadcast whenever it ends,
+  whether it succeeded, got invalid input or was taken over by another call;
+  only a block that is stopped sends none. A block that fails writes no
+  output and changes no state. The page lists every public name, every value
+  of the storage variables, and the one table of status values.
+- Tokenizer sprites have `cattorch status`, `cattorch tokenize complete` and
+  `cattorch detokenize complete`, and detokenize checks its token IDs.
+  Program sprites have `cattorch initialized` (1 once every entry point's
+  weights are decoded), `cattorch reset complete` and
+  `cattorch prepare for save complete`; model and generation sprites have
+  `cattorch prepare for save complete`. Generation and recurrent generation
+  sprites have `cattorch prepare for save`, which clears the decoded weights
+  and resets.
+- `build_project` bridges set `NAME status` for every kind of sprite, copy the
+  outputs back only when it is `ok`, and end with a `NAME OPERATION complete`
+  broadcast, such as `points run complete`; the bridge blocks
+  (`cattorch bridge NAME OPERATION`) are part of the documented interface.
 
 ## Performance
 
@@ -917,6 +938,34 @@
   that error now says something depends on the prompt's length, names the
   usual causes (a Python branch on `tokens.shape[1]`, positions scaled by
   the length) and what to do.
+- A plain sprite's `cattorch forward` ran on input of the wrong length, or
+  with an embedding index outside the table, and reported `ok` with a
+  meaningless output. Every block now checks its input lists before it runs:
+  the number of items (fixed or variable-length), that a floating-point list
+  holds numbers and an integer list whole numbers, and that an index into an
+  embedding table is within it, in model, program and generation sprites
+  alike. Measured in the emulator, the checks add about one command per input
+  item to a forward.
+- A forward of a plain sprite that another call took over wrote its outputs
+  as it computed, over the newer call's, and then cleared them; one the
+  newer call took over while it decoded the weights could stop without
+  reporting anything. A plain forward and a generation prefill or decode now
+  compute into internal lists and copy their results to the public ones only
+  if they succeed and no other call started meanwhile, so a call taken over
+  leaves the newer call's outputs, and every call reaches its end and reports
+  its status. A program entry point taken over while it checked its inputs
+  no longer computes.
+- A recurrent generation sprite that decoded its weights on the first
+  prefill or decode didn't send `cattorch init complete`, as a KV generation
+  sprite did; an implicit init now behaves like `cattorch init` on both. An
+  overtaken `cattorch init` reported `ok`; it now reports that another call
+  ran during it.
+- `cattorch prefill` reset the cache, or the recurrent states, before it
+  checked the prompt, so a prefill that failed lost the conversation; it now
+  checks first and changes nothing when it fails. Prefill no longer empties
+  the token list either: no block changes its input lists.
+- A variable-length program input with fewer rows than its minimum ran;
+  it now reports `too few items`, as a plain sprite does.
 
 ## Deprecations
 
@@ -959,6 +1008,43 @@
   TinyStories-sized model, the automatic path matched or beat the legacy one.
 - `max_context` is now the first field of `GenerationProgram` and the only
   positional one; `method`, `hidden_prefill`, and `top_k` are keyword-only.
+- The Scratch interface was made consistent before it is frozen at 1.0. The
+  generation sprites' token list `cattorch tokens` is now
+  `cattorch token ids`, the name the tokenizer sprites use, and a text
+  generator project's global list `NAME tokens` is `NAME token ids`. A
+  project's global names drop a `cattorch ` prefix: an entry point's
+  bridged list `NAME cattorch add row` is `NAME add row`.
+- `cattorch status` values follow one table, in one style, with the list at
+  fault named: `invalid length: LIST` and `invalid dynamic length: LIST` are
+  `wrong number of items: LIST`; `dynamic capacity exceeded: LIST` is
+  `too many items: LIST`; `state capacity exceeded: STATE` is
+  `state full: cattorch state STATE`; `maximum context exceeded` is
+  `context full`; `decode requires exactly one token`,
+  `prefill requires at least one token` and `prefill exceeds maximum context`
+  are `wrong number of items`, `too few items` and `too many items` of
+  `cattorch token ids`; `token ids must be whole numbers from 0 to N` is
+  `invalid item: cattorch token ids`; the two kinds of
+  "another ... ran during this one" are `another call ran during this one`,
+  and the two "earlier call was stopped" messages are
+  `an earlier call was stopped or is still running; reset first`. Statuses
+  are part of the interface, not wording. `cattorch status` starts empty on
+  every sprite.
+- Every block sends its completion broadcast whenever it ends, also when it
+  fails or another call took it over, so a script reacting to
+  `... complete` must check `cattorch status`; a failed program call and an
+  overtaken plain forward used to send none. A block that fails leaves its
+  output lists as they were instead of emptying them, and `cattorch prepare
+  for save` keeps a plain sprite's output lists.
+- Input lists are checked: a plain sprite's forward with the wrong number
+  of items, or text in an input, now fails instead of reporting `ok`, and NaN
+  isn't accepted as a number.
+- `cattorch storage compression` holds `base92` and `base92-huffman-int4`
+  instead of `costume-base92` and `costume-base92-huffman-int4`.
+- Every internal list, variable and block now starts with `_`, including
+  working names that had no prefix (`index`, `sum`, `T1`, `W_...`,
+  `decode bits`, `add copy 0`), and `CodegenConfig(compact_internal_names=True)`
+  names them `_v0`, `_l0` and `_p0`. The `build_project` demo's blocks are
+  `_cattorch demo ...`.
 
 # 0.5.0 - 2026-09-14
 
