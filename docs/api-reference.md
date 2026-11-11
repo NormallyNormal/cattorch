@@ -342,7 +342,7 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `damp_percent` | `0.01` | GPTQ damping added to the Hessian diagonal, as a fraction of its mean. GPTQ only. |
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
 | `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses `fallback`. |
-| `fallback` | `"symmetric"` | Method for matrices without enough calibration data. Only `"symmetric"` is supported. |
+| `fallback` | `"symmetric"` | Method for matrices without enough calibration data. Only `"symmetric"` is supported, so the field has no effect yet. |
 
 GPTQ needs a model in evaluation mode and at least one calibration example,
 passed as `calibration_inputs`, `calibration_calls`, or `calibration_sequences`
@@ -456,21 +456,26 @@ error fields are infinite; no exception is raised.
 ### `QuantizationReport`
 
 Summary of a quantized export: the requested `method` and `bits`, the
-`calibration_batches` and `calibration_rows` used, `quantized_values` in total,
-how many of those used GPTQ (`gptq_values`) or symmetric quantization
-(`symmetric_values`), and a `TensorQuantizationReport` per tensor in
-`tensors`.
+`calibration_batches` and `calibration_rows` used, `quantized_values` stored
+in integers in total, how many of those used GPTQ (`gptq_values`) or
+symmetric quantization (`symmetric_values`), and a `TensorQuantizationReport`
+per tensor in `tensors`. The report says what storage stores, so a value
+quantized and then kept in float16 doesn't count as quantized.
 
 ### `TensorQuantizationReport`
 
 One weight tensor, or one part of a tensor the model uses as a separate
-matrix: `name`, the
-`method` used, `bits`, number of `values`, `calibration_rows` seen,
-`effective_group_size`, and `fallback_reason` if GPTQ wasn't used. A `method`
-of `"float16"` means the tensor is stored in float16, and `fallback_reason`
-says why: it was smaller than `min_quantized_values`, or storage reads it
-grouped along a different axis than it was quantized in, so it couldn't keep
-it in integers.
+matrix (`name[offset=...,shape=...]`): `name`, the `method` used, `bits`,
+number of `values`, `calibration_rows` seen, `effective_group_size`, and
+`fallback_reason` if GPTQ wasn't used. A `method` of `"float16"` means the
+values are stored in float16, and `fallback_reason` says why: the tensor was
+smaller than `min_quantized_values`, storage reads it grouped along a
+different axis than it was quantized in, or it is a weight computed from
+parameters during export (named `weight computed from <parameters>`).
+Values of a quantized entry that are also, or only, stored in float16, such
+as the copy a second use reads in another layout, are reported in a
+`name[float16]` entry. `name[remaining]` holds a parameter's values that no
+use reads as a matrix when the rest is quantized for its uses.
 
 ## Benchmark API
 

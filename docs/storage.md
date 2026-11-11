@@ -67,31 +67,55 @@ GPT-2's `Conv1D` layers), `torch.baddbmm` or `torch.addmv`, by a two-operand
 `torch.einsum` or `torch.tensordot` that contracts it over one dimension, or
 by `F.bilinear` and `nn.Bilinear` is grouped over its inputs, and GPTQ
 calibrates it. So are `nn.MultiheadAttention`'s input projection, its output
-projection when the call passes no mask, and the input
-weights of `nn.RNN`, `nn.LSTM` and `nn.GRU`, plus their hidden weights when
-there is one layer in one direction. Convolution kernels are grouped along
-their last dimension, the kernel width, which is how storage reads them, so a
-3x3 kernel has a scale for every 3 values. GPTQ calibrates each group of
-kernels over the input windows it reads, for 1D, 2D and 3D, grouped,
-depthwise and transposed convolutions. Other matrices, such as embeddings,
-are grouped along their last dimension and use symmetric quantization; with
-GPTQ, `result.warnings` names each of them.
+projection when the call passes no mask, and the input and hidden weights of
+every layer and direction of `nn.RNN`, `nn.LSTM` and `nn.GRU`. A projected
+LSTM's projection (`weight_hr_l*`) reads a value no output shows, so it uses
+symmetric quantization, and so does every layer but the first when the
+module runs with dropout in training mode. Convolution kernels are grouped
+along their last dimension, the kernel width, which is how storage reads
+them, so a 3x3 kernel has a scale for every 3 values. GPTQ calibrates each
+group of kernels over the input windows it reads, for 1D, 2D and 3D,
+grouped, depthwise and transposed convolutions. Other matrices, such as
+embeddings, are grouped along their last dimension and use symmetric
+quantization; with GPTQ, `result.warnings` names each of them.
+
+Each part of a parameter that a use reads, such as the slices of a fused
+QKV weight, even and odd rows, or one half read by `F.linear` and the other
+on the right of a matrix product, is quantized once, grouped over that use's
+inputs, and reported as its own entry (`qkv[offset=...,shape=...]`). Uses
+that read the same values the same way, such as `F.linear(h, weight)` and
+`h @ weight.T`, share one entry and GPTQ calibrates it with both. Values no
+such use reads are grouped along the parameter's last dimension, reported as
+`name[remaining]` when the rest of the parameter is quantized for its uses.
+When two uses read the same values grouped along different axes, as
+`F.linear(x, weight)` and `x @ weight` do, only one layout can be stored in
+integers: the larger use's, or the first one's.
 
 A weight the model copies before using it, such as
 `F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is quantized
-and calibrated as the copy is used, and the copy is stored in integers.
-Storage keeps a quantized matrix in integers only in the layout it was
-quantized in, so a weight rearranged by arithmetic, such as
-`F.linear(x, weight.t() * 1)`, or only part of which is used through a
-transposed view, is stored in float16 instead. `result.warnings` says so, and
-`result.quantization.tensors` reports the weight's `method` as `"float16"`,
-with the reason.
+and calibrated as the copy is used, and the copy is stored in integers. A
+weight computed from parameters, such as `weight_norm` and `spectral_norm`
+weights or `F.linear(x, w * g)`, is computed during export and stored in
+float16: its parameters are not rounded, and the report has an entry named
+`weight computed from <parameters>` with `method="float16"`.
+
+The report says what storage stores. Storage keeps a list in integers only
+when it is on the integer grid along its own last dimension, so a quantized
+value read in another layout is kept in float16. Each stored list is traced
+back to the parameter values it holds: an entry whose values are all stored
+in float16 is reported with `method` `"float16"` and the reason, and
+values also or only stored in float16 elsewhere get a `name[float16]` entry.
+`result.warnings` names the parameter each time.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set
-`min_quantized_values=1` to quantize every eligible matrix. Biases,
-normalization parameters, and buffers such as RoPE tables and masks use
-float16. Values that can't safely be stored lossily stay float32.
+`min_quantized_values=1` to quantize every eligible matrix. A matrix is a
+parameter read as one by the uses above, or one with at least two
+dimensions larger than one (for an expert bank, per expert). Vectors stay
+float16: biases, normalization parameters, `nn.MultiheadAttention`'s
+`(1, 1, E)` `bias_k` and `bias_v`, and `(N, 1)` gains such as
+`weight_norm`'s. Buffers such as RoPE tables and masks use float16 too.
+Values that can't safely be stored lossily stay float32.
 
 Inspect `result.warnings` and `result.quantization.tensors`, then verify
 model-level output or generation quality.

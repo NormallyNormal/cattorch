@@ -122,27 +122,43 @@ def test_unobserved_stacked_experts_fall_back_independently():
     ]
 
 
-def test_overlapping_transposed_weight_views_use_symmetric_fallback():
+@torch.no_grad()
+def test_a_weight_read_in_two_layouts_is_quantized_once_and_its_float16_copy_reported(
+    tmp_path,
+):
+    # ``weight`` and ``weight.T`` group the same values along different axes.
+    # One layout is quantized once; storage keeps the other use's copy in
+    # float16, and the report and warnings say so.
     class Bidirectional(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.randn(6, 6))
+            self.weight = torch.nn.Parameter(torch.randn(8, 8))
 
         def forward(self, value):
             return F.linear(F.linear(value, self.weight), self.weight.T)
 
+    torch.manual_seed(3)
     model = Bidirectional().eval()
-    report = quantize_model(
-        model,
-        QuantizationConfig(
-            bits=4, method="gptq", min_quantized_values=1,
-            min_calibration_rows=1,
-        ),
-        [torch.randn(4, 6)],
+    config = QuantizationConfig(
+        bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1,
     )
-    assert len(report.tensors) == 1
-    assert report.tensors[0].method == "symmetric"
-    assert "overlapping matrix views" in report.tensors[0].fallback_reason
+    report = quantize_model(copy.deepcopy(model), config, [torch.randn(4, 8)])
+    assert [(item.name, item.method) for item in report.tensors] == [("weight", "gptq")]
+    result = transpile(
+        model, torch.randn(4, 8), tmp_path / "both", quantization=config,
+        calibration_inputs=[torch.randn(4, 8)],
+    )
+    assert [
+        (item.name, item.method, item.values) for item in result.quantization.tensors
+    ] == [("weight", "gptq", 64), ("weight[float16]", "float16", 64)]
+    assert result.quantization.gptq_values == result.quantization.quantized_values == 64
+    copy_reason = result.quantization.tensors[1].fallback_reason
+    assert copy_reason.startswith("64 of these values are also stored in integers")
+    assert [warning for warning in result.warnings if "quantized weight" in warning] == [
+        "quantized weight 'weight': 64 of its values are stored as float16, not int4 "
+        "(a second copy): storage reads the values in groups along a different axis "
+        "than they were quantized in"
+    ]
 
 
 def test_missing_gptq_statistics_use_reported_symmetric_fallback():
@@ -719,13 +735,32 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
         (torch.nn.LSTM(16, 8, batch_first=True), ("r.weight_ih_l0", "r.weight_hh_l0")),
         (torch.nn.GRU(16, 8), ("r.weight_ih_l0", "r.weight_hh_l0")),
         (torch.nn.RNN(16, 8, batch_first=True), ("r.weight_ih_l0", "r.weight_hh_l0")),
-        (torch.nn.LSTM(16, 8, num_layers=2, batch_first=True), ("r.weight_ih_l0",)),
+        (
+            torch.nn.LSTM(16, 8, num_layers=2, batch_first=True),
+            ("r.weight_ih_l0", "r.weight_hh_l0", "r.weight_ih_l1", "r.weight_hh_l1"),
+        ),
+        (
+            torch.nn.GRU(16, 8, num_layers=2, bidirectional=True),
+            tuple(
+                f"r.weight_{kind}_l{layer}{suffix}"
+                for kind in ("ih", "hh") for layer in (0, 1) for suffix in ("", "_reverse")
+            ),
+        ),
+        # The projection reads the cell output before projection, which no
+        # output shows; it falls back.
+        (
+            torch.nn.LSTM(16, 8, proj_size=4, batch_first=True),
+            ("r.weight_ih_l0", "r.weight_hh_l0"),
+        ),
         (
             torch.nn.MultiheadAttention(16, 2, batch_first=True),
             ("r.in_proj_weight", "r.out_proj.weight"),
         ),
     ],
-    ids=["lstm", "gru", "rnn", "lstm-2-layers", "multihead-attention"],
+    ids=[
+        "lstm", "gru", "rnn", "lstm-2-layers", "gru-2-layers-bidirectional",
+        "lstm-projected", "multihead-attention",
+    ],
 )
 @torch.no_grad()
 def test_gptq_calibrates_recurrent_and_fused_attention_weights(module, names):
@@ -753,26 +788,34 @@ def test_gptq_calibrates_recurrent_and_fused_attention_weights(module, names):
 
 @torch.no_grad()
 def test_quantized_weights_kept_in_float16_are_reported(tmp_path):
-    # A weight transposed by arithmetic is quantized over the parameter's own
-    # rows; the result storage reads is grouped the other way, so storage
-    # keeps it in float16. That must not pass silently.
+    # Weights computed from parameters by arithmetic are stored as computed,
+    # in float16. Their parameters are not rounded first, and the report and
+    # warnings name the weight by the parameters it comes from.
     torch.manual_seed(13)
     copied = _Functional(lambda s, x: F.linear(x, s.w.t() * 1), w=(32, 24)).eval()
+    scaled = _Functional(lambda s, x: F.linear(x, s.w * s.g), w=(24, 32), g=(24, 1)).eval()
     plain = _Functional(lambda s, x: F.linear(x, s.w), w=(24, 32)).eval()
     config = QuantizationConfig(bits=8, min_quantized_values=1)
+    owned = copy.deepcopy(scaled)
+    quantize_model(owned, config, None, orientation_inputs=[torch.randn(2, 32)])
+    assert torch.equal(owned.w, scaled.w) and torch.equal(owned.g, scaled.g)
     warned = transpile(copied, torch.randn(2, 32), tmp_path / "copied", quantization=config)
-    assert [warning for warning in warned.warnings if "quantized weight" in warning] == [
-        "quantized weight 'w' (24, 32) is stored as float16, not int8: it is quantized "
-        "in groups along a different axis than storage reads it in"
+    assert [warning for warning in warned.warnings if "float16" in warning] == [
+        "weight computed from w (24, 32) is stored as float16, not int8: export "
+        "computes it from parameters, and quantization only rounds parameters the "
+        "model reads directly"
     ]
-    # The report says what is stored, not the rounding applied first.
     (item,) = warned.quantization.tensors
-    assert (item.method, item.bits, item.effective_group_size) == ("float16", None, None)
-    assert item.fallback_reason == (
-        "symmetric int8 values are stored as float16: storage reads them in groups "
-        "along a different axis than they were quantized in"
+    assert (item.name, item.method, item.bits, item.values) == (
+        "weight computed from w", "float16", None, 768,
     )
     assert warned.quantization.quantized_values == warned.quantization.symmetric_values == 0
+    report = transpile(
+        scaled, torch.randn(2, 32), tmp_path / "scaled", quantization=config,
+    ).quantization
+    assert [(item.name, item.method) for item in report.tensors] == [
+        ("weight computed from g, w", "float16"),
+    ]
     quiet = transpile(plain, torch.randn(2, 32), tmp_path / "plain", quantization=config)
     assert not [warning for warning in quiet.warnings if "quantized weight" in warning]
     assert [item.method for item in quiet.quantization.tensors] == ["symmetric"]
@@ -910,3 +953,152 @@ def test_weights_copied_into_another_layout_are_stored_as_integers(tmp_path, mon
         expected_model(example).flatten(),
         atol=1e-4, rtol=1e-5,
     )
+
+
+_REGIONS = {
+    # Fused QKV slices cover the parameter between them.
+    "slices": (lambda s, x: sum(F.linear(x, s.w[i * 8:(i + 1) * 8]) for i in range(3)), (24, 16)),
+    # Disjoint interleaved rows.
+    "even-odd-rows": (lambda s, x: F.linear(x, s.w[::2]) + F.linear(x, s.w[1::2]), (16, 16)),
+    # A linear half and a right-hand half, each grouped over its own inputs.
+    "linear-and-right-halves": (
+        lambda s, x: F.linear(x, s.w[:16]) + x @ s.w[16:], (32, 16),
+    ),
+    # Two uses that read one matrix the same way share one region.
+    "linear-and-transposed-right": (
+        lambda s, x: F.linear(x, s.w) + torch.tanh(x) @ s.w.T, (16, 16),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REGIONS))
+@torch.no_grad()
+def test_each_region_of_a_parameter_is_quantized_once_in_its_uses_layout(case):
+    forward, shape = _REGIONS[case]
+    torch.manual_seed(21)
+    model = _Functional(forward, w=shape).eval()
+    original = model.w.detach().clone()
+    gptq = QuantizationConfig(
+        bits=4, method="gptq", group_size=8, min_quantized_values=1, min_calibration_rows=1,
+    )
+    report = quantize_model(copy.deepcopy(model), gptq, [torch.randn(32, 16)])
+    assert report.quantized_values == report.gptq_values == original.numel(), report
+    assert all(item.fallback_reason is None for item in report.tensors), report
+    symmetric = QuantizationConfig(bits=4, group_size=8, min_quantized_values=1)
+    report = quantize_model(model, symmetric, None, orientation_inputs=[torch.randn(2, 16)])
+    assert report.quantized_values == original.numel(), report
+    if case == "linear-and-right-halves":
+        # Each half is rounded once, over its own inputs.
+        assert torch.equal(model.w[:16], _symmetric_matrix(original[:16], symmetric)[0])
+        assert torch.equal(model.w[16:], _symmetric_matrix(original[16:].T, symmetric)[0].T)
+
+
+@torch.no_grad()
+def test_report_follows_storage_for_parameter_slices(tmp_path, monkeypatch):
+    # Column halves on the right of matrix products are stored transposed,
+    # grouped over their inputs as quantized, so storage keeps them in int4.
+    torch.manual_seed(22)
+    model = _Functional(
+        lambda s, x: torch.cat([x @ half for half in s.w.chunk(2, 1)], -1), w=(32, 64),
+    ).eval()
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(
+        model, torch.randn(2, 32), tmp_path / "halves",
+        quantization=QuantizationConfig(bits=4, min_quantized_values=1),
+    )
+    assert {precision for _, precision in precisions} == {"int4"}
+    assert [(item.method, item.values) for item in result.quantization.tensors] == [
+        ("symmetric", 1024), ("symmetric", 1024),
+    ]
+    assert not [warning for warning in result.warnings if "float16" in warning]
+
+
+@pytest.mark.parametrize("bits", [4, 6, 8])
+@pytest.mark.parametrize("scale_precision", ["float16", "float32"])
+def test_quantized_values_are_a_fixed_point_of_the_storage_codec(bits, scale_precision):
+    # Group maxima across the subnormal scale range, where rounding the scale
+    # used to leave a group's largest code one short and storage then
+    # rejected the whole tensor.
+    from cattorch.sprite import _check_integer_codec_grid
+    from cattorch.storage import StorageConfig, quantized_storage
+
+    generator = torch.Generator().manual_seed(bits)
+    low = -150 if scale_precision == "float32" else -30
+    for exponent in range(low, 2, 3):
+        for group in (1, 3, 8):
+            config = QuantizationConfig(
+                bits=bits, group_size=group, scale_precision=scale_precision,
+            )
+            values = torch.randn(16, group * 2, generator=generator) * 2.0 ** exponent
+            quantized, size = _symmetric_matrix(values, config)
+            storage = quantized_storage(StorageConfig(), config)
+            assert _check_integer_codec_grid(quantized, storage, size, ()), (exponent, group)
+
+
+@torch.no_grad()
+def test_small_weights_stay_in_integers(tmp_path, monkeypatch):
+    model = torch.nn.Linear(64, 64, bias=False).eval()
+    model.weight[0].copy_(torch.linspace(-0.000784, 0.000784, 64))
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(
+        model, torch.randn(1, 64), tmp_path / "small",
+        quantization=QuantizationConfig(bits=8, min_quantized_values=1),
+    )
+    assert {precision for _, precision in precisions} == {"int8"}
+    assert [item.method for item in result.quantization.tensors] == ["symmetric"]
+
+
+@torch.no_grad()
+def test_vectors_stay_float16_and_derived_weights_leave_parameters_unrounded():
+    from torch.nn.utils import parametrizations
+
+    torch.manual_seed(23)
+    attention = torch.nn.MultiheadAttention(16, 2, batch_first=True, add_bias_kv=True)
+    model = _Functional(
+        lambda s, x: s.a(x, x, x, need_weights=False)[0] + s.n(x.flatten(1)).view(x.shape),
+        a=attention, n=parametrizations.weight_norm(torch.nn.Linear(32, 32, bias=False)),
+    ).eval()
+    reference = copy.deepcopy(model)
+    report = quantize_model(
+        model, QuantizationConfig(bits=4, min_quantized_values=1), None,
+        orientation_inputs=[torch.randn(1, 2, 16)],
+    )
+    # ``bias_k`` and ``bias_v`` are (1, 1, 16) vectors and the weight norm's
+    # gain a (32, 1) one; the weight norm's direction is only an ingredient.
+    assert {item.name for item in report.tensors} == {"a.in_proj_weight", "a.out_proj.weight"}
+    for name in (
+        "a.bias_k", "a.bias_v", "n.parametrizations.weight.original0",
+        "n.parametrizations.weight.original1",
+    ):
+        assert torch.equal(model.get_parameter(name), reference.get_parameter(name)), name
+
+
+@torch.no_grad()
+def test_program_quantization_reports_user_names_and_forwards_storage_warnings(tmp_path):
+    from cattorch import EntryPoint, ExportProgram, Input, Output
+
+    torch.manual_seed(24)
+    model = _Functional(lambda s, x: F.linear(x, s.w) + x @ s.w, w=(16, 16)).eval()
+    program = ExportProgram(entrypoints=(EntryPoint(
+        "run", method="forward",
+        arguments=(Input("value", torch.randn(2, 16)),), returns=(Output("result"),),
+    ),))
+    result = transpile(
+        model, program, tmp_path / "program",
+        quantization=QuantizationConfig(bits=8, min_quantized_values=1),
+    )
+    assert [item.name for item in result.quantization.tensors] == ["w", "w[float16]"]
+    assert [warning for warning in result.warnings if warning.startswith("quantized weight")]
+
+
+def test_quantization_errors_name_the_calibration_item_and_the_parameter():
+    model = torch.nn.Linear(8, 4).eval()
+    config = QuantizationConfig(
+        bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1,
+    )
+    with pytest.raises(ValueError, match=r"calibration_inputs\[1\] \(inputs \(2, 5\) float32\)"):
+        quantize_model(copy.deepcopy(model), config, [torch.randn(2, 8), torch.randn(2, 5)])
+    with torch.no_grad():
+        model.weight[0, 0] = float("inf")
+    with pytest.raises(ValueError, match=r"finite values \(parameter 'weight'\)"):
+        quantize_model(model, config, [torch.randn(2, 8)])

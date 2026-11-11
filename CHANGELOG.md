@@ -736,6 +736,61 @@
 - `transpile_tokenizer`, `CharTokenizer`, and `BPETokenizer` given an object
   that isn't a tokenizer raised `AttributeError: ... 'get_vocab'`; they now
   raise a `TypeError` naming the supported tokenizer types.
+- With `quantization`, a weight used through slices, such as a fused QKV
+  weight split with `qkv[:d]`, even and odd rows, or a half read by
+  `F.linear` and a half on the right of a matrix product, was quantized for
+  its slices and then again as a whole along its rows. The report counted
+  its values twice, GPTQ reported a false "no compatible linear activation
+  statistics" fallback, and a slice rounded twice along different axes
+  ended up in float16. Each part a use reads is now quantized once, in the
+  layout that use reads it in, and the rest of the parameter once along its
+  rows. In small test models, an int4 export of two column halves on the
+  right of matrix products shrinks from 32.0 KB to 22.1 KB, with the output
+  error relative to the float model down from 0.31 to 0.25, and one of a
+  linear half and a right-hand half from 28.0 KB to 22.0 KB. GPTQ now also
+  calibrates disjoint views, which it called "overlapping matrix views", and
+  a weight read both by `F.linear(h, weight)` and `h @ weight.T`.
+- `result.quantization` now says what storage stores: each stored list is
+  traced back to the parameter values it holds. It reported int4 or int8 for
+  weights storage kept in float16, such as a weight with more than 50,000
+  rows on the right of a matrix product, and the warning named an internal
+  list such as `'_param_constant0'` instead of the parameter. Values stored
+  in float16 besides an integer copy, as when two uses read one weight along
+  different axes, get a `name[float16]` entry.
+- With `quantization`, a weight with small values, such as a row whose
+  largest value is 0.0008 in int8, or any weight quantized in groups of one
+  (`group_size=1`, or an input width that is prime, such as 97), could be
+  stored entirely in float16 without a warning while the report said int8.
+  A group's float16 scale, rounded coarsely below 6e-5, left its largest
+  code one short, and storage then derived a different scale and rejected
+  the tensor. Quantization, the encoder and storage now share one scale rule
+  that gives a quantized group's scale back from its values. GPTQ uses it
+  too, so a few GPTQ groups whose scale PyTorch's float16 conversion rounded
+  differently now keep the values GPTQ chose: GPTQ exports change in about
+  50 of every million values.
+- With `quantization`, the parameters of a weight computed from them, such
+  as `weight_norm`, `spectral_norm` or `F.linear(x, w * g)`, were rounded to
+  integers, and the weight export computed from them was stored in float16
+  without a warning, about 7% off the float model in int4. The parameters
+  are no longer rounded; the weight is stored in float16 as computed, with a
+  warning and a report entry named after its parameters.
+- With `quantization`, parameters that are vectors, such as
+  `nn.MultiheadAttention`'s `(1, 1, E)` `bias_k` and `bias_v` and `(N, 1)`
+  gains, were quantized like matrices. A matrix is now a parameter read as
+  one, or one with at least two dimensions larger than one; other parameters
+  stay float16, as for biases.
+- GPTQ now calibrates the input and hidden weights of every layer and
+  direction of `nn.RNN`, `nn.LSTM` and `nn.GRU`, including projected LSTMs,
+  instead of only the first layer's input weights (and hidden weights for
+  one layer in one direction). A projected LSTM's projection, which reads a
+  value no output shows, uses symmetric quantization.
+- `ExportProgram` quantization reports named parameters `model.l.weight`
+  instead of `l.weight`, and left out the warning for a quantized weight
+  stored in float16.
+- A GPTQ calibration item the model can't run, such as one of the wrong
+  width, raised PyTorch's error without saying which item. The error now
+  names the item's index and its input shapes. "requires finite values"
+  errors now name the parameter.
 
 ## Deprecations
 

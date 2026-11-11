@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import itertools
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Literal, cast
 
 import numpy as np
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from cattorch.storage import _quantize_arrays
+from cattorch.storage import _quantize_arrays, group_scales
 from cattorch.operator_registry import OperatorRegistry, default_registry
 
 
@@ -102,42 +104,89 @@ class QuantizationReport:
     gptq_values: int
     symmetric_values: int
     tensors: tuple[TensorQuantizationReport, ...]
+    # Where each quantized entry's values sit in its parameter, for export to
+    # say how storage stored them, and what the exports that share this
+    # report found so far. Neither is part of the public report.
+    _regions: tuple[_Region, ...] = field(default=(), repr=False, compare=False)
+    _stored: dict = field(default_factory=dict, repr=False, compare=False)
 
 
-def _report_float16_storage(
-    report: QuantizationReport, names: Iterable[str],
-) -> QuantizationReport:
-    """``report`` with the named parameters reported as stored in float16.
+@dataclass(frozen=True)
+class _StoredFloat16:
+    """How many of one entry's values an export stored in float16, and why.
 
-    Storage keeps a quantized weight in float16 when it reads it grouped
-    along another axis than quantization grouped it. The report then says
-    what is stored, and why, rather than the rounding applied to it.
+    ``only`` values are stored in float16 alone; ``copies`` are also stored
+    in integers elsewhere, as when two uses read one region in different
+    layouts.
     """
-    names = frozenset(names)
-    if not names:
-        return report
-    tensors = tuple(
-        replace(
-            item,
+
+    only: int
+    copies: int
+    reason: str
+
+
+def _stored_quantization_report(
+    report: QuantizationReport,
+    stored: dict[int, _StoredFloat16],
+    derived: Iterable[TensorQuantizationReport] = (),
+) -> QuantizationReport:
+    """``report`` saying what storage stored, not only the rounding applied.
+
+    ``stored`` holds, by entry, the values storage keeps in float16;
+    ``derived`` describes weights computed from parameters at export. They
+    add to what earlier exports sharing ``report`` found, as the entry points
+    of one program do, and the result has no storage details of its own.
+    """
+    accumulated = report._stored
+    for entry, finding in stored.items():
+        previous = accumulated.get(entry)
+        if previous is None or (finding.only, finding.copies) > (previous.only, previous.copies):
+            accumulated[entry] = finding
+    for item in derived:
+        accumulated.setdefault(("derived", item.name), item)
+    tensors: list[TensorQuantizationReport] = []
+    for entry, item in enumerate(report.tensors):
+        found: _StoredFloat16 | None = accumulated.get(entry)
+        if found is None or item.method == "float16" or not (found.only or found.copies):
+            tensors.append(item)
+            continue
+        stored_as = (
+            f"{item.method} int{item.bits} values are stored as float16: {found.reason}"
+        )
+        if found.only >= item.values:
+            tensors.append(replace(
+                item, method="float16", bits=None, effective_group_size=None,
+                fallback_reason=stored_as,
+            ))
+            continue
+        tensors.append(replace(item, values=item.values - found.only))
+        tensors.append(TensorQuantizationReport(
+            name=f"{item.name}[float16]",
             method="float16",
             bits=None,
+            values=found.only + found.copies,
+            calibration_rows=0,
             effective_group_size=None,
             fallback_reason=(
-                f"{item.method} int{item.bits} values are stored as float16: storage "
-                "reads them in groups along a different axis than they were quantized in"
+                f"{found.copies} of these values are also stored in integers; {stored_as}"
+                if found.copies else stored_as
             ),
-        )
-        if item.method != "float16" and item.name.split("[", 1)[0] in names else item
-        for item in report.tensors
+        ))
+    tensors.extend(
+        item for key, item in accumulated.items()
+        if isinstance(key, tuple) and key[0] == "derived"
     )
     gptq_values = sum(item.values for item in tensors if item.method == "gptq")
     symmetric_values = sum(item.values for item in tensors if item.method == "symmetric")
-    return replace(
-        report,
+    return QuantizationReport(
+        method=report.method,
+        bits=report.bits,
+        calibration_batches=report.calibration_batches,
+        calibration_rows=report.calibration_rows,
         quantized_values=gptq_values + symmetric_values,
         gptq_values=gptq_values,
         symmetric_values=symmetric_values,
-        tensors=tensors,
+        tensors=tuple(tensors),
     )
 
 
@@ -220,15 +269,6 @@ def _storage_key(value: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[
     )
 
 
-def _storage_interval(value: torch.Tensor) -> tuple[int, int]:
-    start = int(value.storage_offset())
-    end = start + sum(
-        (int(size) - 1) * int(stride)
-        for size, stride in zip(value.shape, value.stride())
-    )
-    return start, end + 1
-
-
 class _GPTQCaptureMode(TorchDispatchMode):
     """Collect linear input covariances without depending on module structure."""
 
@@ -239,6 +279,7 @@ class _GPTQCaptureMode(TorchDispatchMode):
         *,
         collect_hessian: bool = True,
         bases: dict[int, torch.Tensor] | None = None,
+        static_storages: Iterable[int] = (),
     ):
         super().__init__()
         self.parameters = parameters
@@ -253,6 +294,83 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # copy itself alive, only its storage. An operation that writes to a
         # copy forgets it.
         self.copies: dict[int, tuple[StorageWeakRef, tuple, torch.Tensor]] = {}
+        # A storage known before any input arrives -> (a weak reference to
+        # it, or None for the model's own tensors, the parameters whose
+        # values it holds, whether it holds them unchanged). This covers
+        # parameters, buffers, and what operations make from them alone.
+        self.static: dict[int, tuple[StorageWeakRef | None, frozenset[int], bool]] = {
+            pointer: (None, frozenset({pointer}), True) for pointer in parameters
+        }
+        for pointer in static_storages:
+            self.static.setdefault(pointer, (None, frozenset(), True))
+        # Parameters read as they are by an operation that also reads an
+        # input, and parameters combined by arithmetic into another tensor
+        # known at export, such as ``weight_norm``'s weight.
+        self.direct_reads: set[int] = set()
+        self.derivations: set[int] = set()
+
+    def _static_entry(
+        self, tensor: torch.Tensor,
+    ) -> tuple[StorageWeakRef | None, frozenset[int], bool] | None:
+        pointer = tensor.untyped_storage().data_ptr()
+        entry = self.static.get(pointer)
+        if entry is not None and entry[0] is not None and entry[0].expired():
+            del self.static[pointer]
+            return None
+        return entry
+
+    def _track_static(self, func, target: str, args, kwargs, result) -> bool:
+        """Follow which tensors are known at export, and how parameters are read.
+
+        Export folds every operation whose inputs are all known into a
+        constant, so a weight computed from parameters, as ``weight_norm``
+        and ``F.linear(x, w * g)`` compute theirs, is stored as computed.
+        Views, copies and concatenations keep the values they rearrange;
+        any other operation computes new ones. Returns whether every input
+        was known.
+        """
+        inputs = [
+            item for item in pytree.tree_leaves((args, kwargs))
+            if isinstance(item, torch.Tensor)
+        ]
+        outputs = [
+            item for item in pytree.tree_leaves(result) if isinstance(item, torch.Tensor)
+        ]
+        entries = [self._static_entry(item) for item in inputs]
+        input_storages = {item.untyped_storage().data_ptr() for item in inputs}
+        mutable = bool(func._schema.is_mutable)
+        known = [entry for entry in entries if entry is not None]
+        if len(known) == len(entries):
+            parameters = frozenset().union(*(entry[1] for entry in known))
+            aliasing = any(
+                item.untyped_storage().data_ptr() in input_storages for item in outputs
+            )
+            unchanged = (
+                bool(known) and (target in _REARRANGEMENTS or aliasing)
+                and all(entry[2] for entry in known)
+            )
+            if not unchanged:
+                for entry in known:
+                    if entry[2]:
+                        self.derivations.update(entry[1])
+            for item in outputs:
+                pointer = item.untyped_storage().data_ptr()
+                if pointer in self.parameters or (pointer in input_storages and not mutable):
+                    continue
+                self.static[pointer] = (
+                    StorageWeakRef(item.untyped_storage()), parameters, unchanged,
+                )
+            return True
+        for entry in known:
+            if entry[2]:
+                self.direct_reads.update(entry[1])
+        if mutable:
+            # A known tensor written with input values is no longer known.
+            for item in inputs:
+                pointer = item.untyped_storage().data_ptr()
+                if pointer not in self.parameters:
+                    self.static.pop(pointer, None)
+        return False
 
     def _parameter_name(self, weight: torch.Tensor) -> str | None:
         return self.parameters.get(weight.untyped_storage().data_ptr())
@@ -408,15 +526,38 @@ class _GPTQCaptureMode(TorchDispatchMode):
                 and isinstance(args[0], torch.Tensor) and isinstance(result, torch.Tensor)
             ):
                 self._track_copy(args[0], result)
+            # An operation on known tensors alone is folded at export: it
+            # computes another weight, and reads no matrix at run time.
+            folded = self._track_static(func, target, args, kwargs, result)
             views = [
                 (value, self._parameter_view(weight), orientation)
                 for value, weight, orientation in observations
                 if isinstance(value, torch.Tensor) and isinstance(weight, torch.Tensor)
+                and not folded
             ]
         for value, view, orientation in views:
             if view is not None:
                 self._record(value, view, orientation)
         return result
+
+
+# Operations, besides views, whose results only rearrange, repeat or convert
+# their inputs' values: a parameter read through them is read as it is.
+_REARRANGEMENTS = frozenset({
+    "aten.clone.default", "aten.contiguous.default", "aten._to_copy.default",
+    "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.to.other",
+    "aten.cat.default", "aten.stack.default", "aten.index_select.default",
+    "aten.index.Tensor", "aten.flip.default", "aten.roll.default",
+    "aten.repeat.default", "aten.repeat_interleave.self_Tensor",
+    "aten.repeat_interleave.self_int", "aten.constant_pad_nd.default",
+    "aten.lift_fresh_copy.default", "aten.copy.default", "aten.copy_.default",
+    "aten.permute_copy.default", "aten.t_copy.default", "aten.transpose_copy.int",
+    "aten.view_copy.default", "aten.slice_copy.Tensor", "aten.select_copy.int",
+    "aten.expand_copy.default", "aten.unsqueeze_copy.default",
+    "aten.squeeze_copy.dim", "aten.split_with_sizes_copy.default",
+    "aten.unbind_copy.int", "aten.alias_copy.default", "aten.narrow_copy.default",
+    "aten._unsafe_view.default",
+})
 
 
 # Operations whose result is a copy of their first argument's values, when it
@@ -510,36 +651,25 @@ def _gptq_matrix(
 
     result = torch.empty_like(work)
     qmax = (1 << (config.bits - 1)) - 1
-    group_scales: dict[int, torch.Tensor] = {}
+    scales_by_group: dict[int, torch.Tensor] = {}
     for block_start in range(0, width, config.block_size):
         block_end = min(width, block_start + config.block_size)
         for column in range(block_start, block_end):
             group_start = column - column % group
             group_end = min(width, group_start + group)
-            scales = group_scales.get(group_start)
+            scales = scales_by_group.get(group_start)
             if scales is None:
                 maximum = work[:, group_start:group_end].abs().amax(dim=1)
-                scales = maximum / qmax
-                scales = torch.where(maximum > 0, scales, torch.ones_like(scales))
-                # Match the exact scale values which Scratch will decode.
-                scale_dtype = (
-                    torch.float16
-                    if config.scale_precision == "float16" else torch.float32
-                )
-                scales = scales.to(scale_dtype).to(torch.float64)
-                if bool(torch.any((maximum > 0) & (scales == 0))):
-                    minimum = math.ldexp(
-                        1.0,
-                        -24 if config.scale_precision == "float16" else -149,
-                    )
-                    scales = torch.where(
-                        (maximum > 0) & (scales == 0), minimum, scales,
-                    )
+                # Storage's own scale rule: a group whose largest code stays
+                # the largest after error feedback is stored exactly as chosen.
+                scales = torch.from_numpy(group_scales(
+                    maximum.numpy(), qmax, config.scale_precision,
+                ))
                 if not bool(torch.isfinite(scales).all()):
                     raise ValueError(
                         "GPTQ scale is outside the selected scale precision"
                     )
-                group_scales[group_start] = scales
+                scales_by_group[group_start] = scales
             quantized = torch.round(work[:, column] / scales).clamp(-qmax, qmax)
             quantized = quantized * scales
             result[:, column] = quantized
@@ -581,6 +711,132 @@ def expert_bank_effective_ndims(model: torch.nn.Module) -> dict[int, int]:
     return effective_ndims
 
 
+def _is_weight_matrix(value: torch.Tensor, effective_ndim: int) -> bool:
+    """Whether a parameter is a matrix, rather than a vector such as a bias.
+
+    A parameter is a matrix when at least two of its dimensions (for an
+    expert bank, of one expert's tensor) are larger than one. Biases,
+    normalization weights, ``nn.MultiheadAttention``'s ``(1, 1, E)``
+    ``bias_k`` and ``(N, 1)`` gains are vectors.
+    """
+    shape = value.shape[value.ndim - effective_ndim:] if effective_ndim else ()
+    return sum(1 for size in shape if size > 1) >= 2
+
+
+def _canonical_spec(value: torch.Tensor) -> tuple:
+    """The storage elements ``value`` reads, as offset, shape and strides."""
+    return (
+        int(value.storage_offset()), tuple(value.shape),
+        tuple(0 if size == 1 else int(stride) for size, stride in zip(value.shape, value.stride())),
+    )
+
+
+def _storage_numel(value: torch.Tensor) -> int:
+    return value.untyped_storage().nbytes() // value.element_size()
+
+
+def _view_mask(
+    numel: int, views: Iterable[tuple[int, tuple[int, ...], tuple[int, ...]]],
+) -> torch.Tensor:
+    """A storage-sized mask of the elements the ``views`` read."""
+    mask = torch.zeros(numel, dtype=torch.bool)
+    for offset, shape, stride in views:
+        mask.as_strided(shape, stride, offset).fill_(True)
+    return mask
+
+
+@dataclass(frozen=True)
+class _Region:
+    """Where one report entry's values sit in its parameter's storage.
+
+    ``views`` are ``(offset, shape, strides)`` of the elements the entry
+    covers; with ``remaining``, it covers the elements of those views that
+    no other region of the parameter covers.
+    """
+
+    entry: int
+    pointer: int
+    numel: int
+    views: tuple[tuple[int, tuple[int, ...], tuple[int, ...]], ...]
+    remaining: bool = False
+
+
+def _region_masks(regions: Iterable[_Region]) -> dict[int, torch.Tensor]:
+    """Each region's storage mask, by report entry."""
+    masks: dict[int, torch.Tensor] = {}
+    taken: dict[int, torch.Tensor] = {}
+    ordered = sorted(regions, key=lambda region: region.remaining)
+    for region in ordered:
+        mask = _view_mask(region.numel, region.views)
+        if region.remaining:
+            mask &= ~taken.get(region.pointer, torch.zeros_like(mask))
+        else:
+            previous = taken.get(region.pointer)
+            taken[region.pointer] = mask.clone() if previous is None else previous | mask
+        masks[region.entry] = mask
+    return masks
+
+
+@dataclass
+class _Use:
+    """One matrix region of a parameter, with every use that reads it so."""
+
+    stat: _ActivationStats
+    logical: torch.Tensor
+    group_width: int | None
+    mask: torch.Tensor
+
+
+def _quantize_remaining(
+    parameter: torch.Tensor, mask: torch.Tensor, config: QuantizationConfig,
+) -> tuple[int, int | None]:
+    """Quantize the masked elements of ``parameter`` along its last dimension.
+
+    Groups run along rows as storage reads a parameter. A group only part of
+    which is masked is quantized over its masked elements alone: the rest
+    already belong to a region quantized in another layout.
+    """
+    width = int(parameter.shape[-1])
+    group = effective_group_size(width, config.group_size)
+    rows = parameter.detach().reshape(-1, width)
+    selected = mask.as_strided(
+        parameter.shape, parameter.stride(), parameter.storage_offset(),
+    ).reshape(-1, width)
+    grouped = rows.reshape(-1, group)
+    chosen = selected.reshape(-1, group)
+    full = chosen.all(dim=1)
+    partial = chosen.any(dim=1) & ~full
+    if not bool(torch.isfinite(rows[selected]).all()):
+        raise ValueError("integer weight quantization requires finite values")
+    result = grouped.clone()
+    if bool(full.any()):
+        values = grouped[full]
+        codes, scales = _quantize_arrays(
+            values.double().reshape(-1).numpy(), config.precision, group,
+            config.scale_precision,
+        )
+        result[full] = torch.from_numpy(
+            codes * np.repeat(scales, group),
+        ).to(parameter.dtype).reshape(values.shape)
+    for index in torch.nonzero(partial).flatten().tolist():
+        keep = chosen[index]
+        values = grouped[index][keep]
+        codes, scales = _quantize_arrays(
+            values.double().numpy(), config.precision, values.numel(), config.scale_precision,
+        )
+        result[index, keep] = torch.from_numpy(codes * scales[0]).to(parameter.dtype)
+    parameter.copy_(result.reshape(parameter.shape))
+    return int(selected.sum()), None if bool(partial.any()) else group
+
+
+def _named(name: str, quantize):
+    """Call ``quantize``, naming the parameter in its value errors."""
+    try:
+        return quantize()
+    except ValueError as error:
+        raise ValueError(f"{error} (parameter {name!r})") from error
+
+
 def quantize_model(
     model: torch.nn.Module,
     config: QuantizationConfig,
@@ -590,6 +846,7 @@ def quantize_model(
     call_kwargs: dict | None = None,
     _registry: OperatorRegistry | None = None,
     _calibration_name: str = "calibration_inputs",
+    _names_from: torch.nn.Module | None = None,
 ) -> QuantizationReport:
     """Quantize eligible weights in-place and return a structured report.
 
@@ -597,22 +854,31 @@ def quantize_model(
     calling it, so caller-owned parameters are never modified.
 
     Symmetric quantization runs the model once on ``orientation_inputs`` to see
-    whether each matrix is used as a linear weight or on the right of a
-    matmul. Both are then grouped over the matrix's input width, the layout
-    Scratch storage uses. Without it, matrices keep their stored orientation.
+    how each matrix is read: as a linear weight, on the right of a matmul,
+    or as convolution kernels. Each region of a parameter that a use reads
+    is quantized once, grouped over the inputs of that use, the layout
+    Scratch storage uses for it. Elements no such use reads are grouped
+    along the parameter's last dimension. Without observation, matrices
+    keep their stored orientation.
     ``call_kwargs`` are passed to every observed model call.
     ``_calibration_name`` is the caller's name for ``calibration_inputs``,
-    for its errors.
+    for its errors. ``_names_from`` is the module whose parameter names the
+    report uses, when ``model`` wraps it.
     """
     effective_ndims = expert_bank_effective_ndims(model)
 
     def effective_ndim(value: torch.Tensor) -> int:
         return effective_ndims.get(value.untyped_storage().data_ptr(), value.ndim)
 
+    display_names: dict[int, str] = {}
+    if _names_from is not None:
+        for name, parameter in _names_from.named_parameters():
+            display_names.setdefault(parameter.untyped_storage().data_ptr(), name)
     parameters_by_storage: dict[int, str] = {}
     base_parameters: dict[int, tuple[str, torch.Tensor]] = {}
     for name, parameter in model.named_parameters():
         pointer = parameter.untyped_storage().data_ptr()
+        name = display_names.get(pointer, name)
         parameters_by_storage.setdefault(pointer, name)
         base_parameters.setdefault(pointer, (name, parameter))
 
@@ -631,6 +897,9 @@ def quantize_model(
         parameters_by_storage, registry,
         collect_hessian=config.method == "gptq",
         bases={pointer: parameter for pointer, (_, parameter) in base_parameters.items()},
+        static_storages=[
+            buffer.untyped_storage().data_ptr() for buffer in model.buffers()
+        ],
     )
     batches = 0
     if config.method == "gptq":
@@ -645,7 +914,20 @@ def quantize_model(
         from cattorch.experts import _expert_family_context
         with torch.inference_mode(), _expert_family_context(registry.expert_families), capture:
             for raw_batch in observed_inputs:
-                model(*_normalize_batch(raw_batch), **(call_kwargs or {}))
+                batch = _normalize_batch(raw_batch)
+                try:
+                    model(*batch, **(call_kwargs or {}))
+                except RuntimeError as error:
+                    if config.method != "gptq":
+                        raise
+                    shapes = ", ".join(
+                        f"{tuple(item.shape)} {str(item.dtype).removeprefix('torch.')}"
+                        for item in batch
+                    )
+                    raise ValueError(
+                        f"the model failed on {_calibration_name}[{batches}] "
+                        f"(inputs {shapes}): {error}"
+                    ) from error
                 batches += 1
         if config.method == "gptq" and batches == 0:
             raise ValueError(f"GPTQ requires nonempty {_calibration_name}")
@@ -653,187 +935,190 @@ def quantize_model(
             batches = 0
 
     reports: list[TensorQuantizationReport] = []
-    handled: set[tuple] = set()
-    fully_handled_storage: set[int] = set()
-    covered: dict[int, int] = {}
+    regions: list[_Region] = []
     gptq = config.method == "gptq"
     total_rows = sum(stat.rows for stat in capture.stats.values()) if gptq else 0
-    with torch.no_grad():
-        views_by_storage: dict[int, list[_ActivationStats]] = {}
-        for stat in capture.stats.values():
-            views_by_storage.setdefault(
-                stat.weight.untyped_storage().data_ptr(), [],
-            ).append(stat)
-        incompatible_storage = set()
-        for pointer, stats in views_by_storage.items():
-            for index, left in enumerate(stats):
-                left_start, left_end = _storage_interval(left.weight)
-                for right in stats[index + 1:]:
-                    right_start, right_end = _storage_interval(right.weight)
-                    if max(left_start, right_start) < min(left_end, right_end):
-                        incompatible_storage.add(pointer)
-                        break
-                if pointer in incompatible_storage:
-                    break
 
-        for pointer in incompatible_storage:
-            name, parameter = base_parameters[pointer]
-            if parameter.numel() < config.min_quantized_values:
-                continue
-            matrices = (
-                (parameter,) if parameter.ndim == 2 else parameter.reshape(
-                    -1, parameter.shape[-2], parameter.shape[-1],
-                )
-            )
-            values = 0
-            groups = []
-            for matrix in matrices:
-                reconstructed, group = _symmetric_matrix(matrix, config)
-                matrix.copy_(reconstructed)
-                values += matrix.numel()
-                groups.append(group)
-            reports.append(TensorQuantizationReport(
-                name=name,
-                method="symmetric",
-                bits=config.bits,
-                values=values,
-                calibration_rows=sum(
-                    stat.rows for stat in views_by_storage[pointer]
-                ) if gptq else 0,
-                effective_group_size=(
-                    groups[0] if len(set(groups)) == 1 else None
-                ),
-                fallback_reason=(
-                    "parameter is used through overlapping matrix views"
-                    if gptq else None
-                ),
+    def report(item: TensorQuantizationReport, pointer: int | None = None, views=(), remaining=False):
+        if pointer is not None:
+            regions.append(_Region(
+                entry=len(reports), pointer=pointer,
+                numel=_storage_numel(base_parameters[pointer][1]),
+                views=tuple(views), remaining=remaining,
             ))
-            fully_handled_storage.add(pointer)
+        reports.append(item)
 
+    with torch.no_grad():
+        # Every region of a parameter that a use reads as a matrix. Uses that
+        # read the same elements the same way share one region; regions that
+        # share elements but group them differently can't all be stored in
+        # integers, so the largest, then the first used, is quantized.
+        uses_by_storage: dict[int, list[_Use]] = {}
         for stat in capture.stats.values():
             pointer = stat.weight.untyped_storage().data_ptr()
-            if pointer in incompatible_storage:
+            base = base_parameters.get(pointer)
+            if base is None or base[1].numel() < config.min_quantized_values:
                 continue
-            key = _storage_key(stat.weight)
-            base_parameter = base_parameters.get(pointer)
-            eligible_values = (
-                stat.weight.numel()
-                if base_parameter is None else base_parameter[1].numel()
-            )
-            if key in handled or eligible_values < config.min_quantized_values:
-                continue
-            handled.add(key)
-            if base_parameter is not None and stat.weight.numel() == base_parameter[1].numel():
-                # A full view such as a tied ``weight.T`` covers the parameter.
-                fully_handled_storage.add(pointer)
-            elif base_parameter is not None and stat.orientation in {"conv", "conv_transpose"}:
-                # So do a grouped convolution's groups together. Views of one
-                # parameter that overlap were excluded above.
-                covered[pointer] = covered.get(pointer, 0) + stat.weight.numel()
-                if covered[pointer] == base_parameter[1].numel():
-                    fully_handled_storage.add(pointer)
             logical = _logical_matrix(stat.weight, stat.orientation)
             group_width = _storage_group_width(stat.weight, stat.orientation)
-            method: Literal["gptq", "symmetric"] = "gptq"
-            fallback_reason = None
-            if not gptq:
-                method = "symmetric"
-                reconstructed, group = _symmetric_matrix(logical, config, group_width)
-            elif stat.rows < config.min_calibration_rows:
-                method = "symmetric"
-                fallback_reason = (
-                    f"only {stat.rows} calibration rows; "
-                    f"requires {config.min_calibration_rows}"
-                )
-                reconstructed, group = _symmetric_matrix(logical, config, group_width)
-            else:
-                try:
-                    reconstructed, group = _gptq_matrix(
-                        logical, stat.hessian, config, group_width,
-                    )
-                    # Canonicalize through the physical symmetric codec. This
-                    # makes the reconstructed tensor an exact fixed point of
-                    # the existing Scratch storage encoder, including its one
-                    # deliberately-unused signed code.
-                    reconstructed, group = _symmetric_matrix(
-                        reconstructed, config, group_width,
-                    )
-                except ValueError as error:
-                    method = "symmetric"
-                    fallback_reason = str(error)
-                    reconstructed, group = _symmetric_matrix(logical, config, group_width)
-            stat.weight.copy_(_physical_weight(reconstructed, stat.weight, stat.orientation))
-            reports.append(TensorQuantizationReport(
-                name=stat.name,
-                method=method,
-                bits=config.bits,
-                values=stat.weight.numel(),
-                calibration_rows=stat.rows if gptq else 0,
-                effective_group_size=group,
-                fallback_reason=fallback_reason,
+            numel = _storage_numel(base[1])
+            uses = uses_by_storage.setdefault(pointer, [])
+            same = next(
+                (
+                    use for use in uses
+                    if use.group_width == group_width
+                    and logical.untyped_storage().data_ptr() == pointer
+                    and use.logical.untyped_storage().data_ptr() == pointer
+                    and _canonical_spec(use.logical) == _canonical_spec(logical)
+                ),
+                None,
+            )
+            if same is not None:
+                if gptq:
+                    same.stat.hessian += stat.hessian
+                same.stat.rows += stat.rows
+                continue
+            uses.append(_Use(
+                stat=_ActivationStats(
+                    name=stat.name, weight=stat.weight, orientation=stat.orientation,
+                    hessian=stat.hessian.clone() if gptq else stat.hessian, rows=stat.rows,
+                ),
+                logical=logical, group_width=group_width,
+                mask=_view_mask(numel, (_canonical_spec(stat.weight),)),
             ))
 
-        # Large floating matrices not observed as linear weights use the
-        # documented symmetric fallback. This includes untied embeddings.
-        for name, parameter in model.named_parameters():
-            if effective_ndim(parameter) < 2 or parameter.numel() < config.min_quantized_values:
-                continue
-            if parameter.untyped_storage().data_ptr() in fully_handled_storage:
-                continue
-            base_key = _storage_key(parameter)
-            if parameter.ndim == 2:
-                if base_key in handled:
+        quantized_storage: set[int] = set()
+        for pointer, uses in uses_by_storage.items():
+            taken = torch.zeros_like(uses[0].mask)
+            for use in sorted(uses, key=lambda use: -int(use.mask.sum())):
+                if bool((taken & use.mask).any()):
                     continue
-                reconstructed, group = _symmetric_matrix(parameter, config)
-                parameter.copy_(reconstructed)
-                values = parameter.numel()
-                handled.add(base_key)
-                reports.append(TensorQuantizationReport(
-                    name=name,
-                    method="symmetric",
+                taken |= use.mask
+                stat = use.stat
+                name = base_parameters[pointer][0]
+                method: Literal["gptq", "symmetric"] = "gptq"
+                fallback_reason = None
+                if not gptq:
+                    method = "symmetric"
+                elif stat.rows < config.min_calibration_rows:
+                    method = "symmetric"
+                    fallback_reason = (
+                        f"only {stat.rows} calibration rows; "
+                        f"requires {config.min_calibration_rows}"
+                    )
+                if method == "gptq":
+                    try:
+                        reconstructed, group = _gptq_matrix(
+                            use.logical, stat.hessian, config, use.group_width,
+                        )
+                        # GPTQ fixes each group's scale before error feedback
+                        # changes the group's later columns, so a group can end
+                        # up without a largest code. Rounding through the
+                        # storage codec, whose scale rule is a fixed point,
+                        # puts every group on the grid storage reproduces.
+                        reconstructed, group = _symmetric_matrix(
+                            reconstructed, config, use.group_width,
+                        )
+                    except ValueError as error:
+                        method = "symmetric"
+                        fallback_reason = str(error)
+                if method == "symmetric":
+                    reconstructed, group = _named(name, lambda: _symmetric_matrix(
+                        use.logical, config, use.group_width,
+                    ))
+                stat.weight.copy_(_physical_weight(reconstructed, stat.weight, stat.orientation))
+                quantized_storage.add(pointer)
+                report(TensorQuantizationReport(
+                    name=stat.name,
+                    method=method,
                     bits=config.bits,
-                    values=values,
-                    calibration_rows=0,
+                    values=stat.weight.numel(),
+                    calibration_rows=stat.rows if gptq else 0,
                     effective_group_size=group,
-                    fallback_reason=(
-                        "no compatible linear activation statistics"
-                        if config.method == "gptq" else None
-                    ),
-                ))
-                continue
+                    fallback_reason=fallback_reason,
+                ), pointer, (_canonical_spec(stat.weight),))
 
-            for matrix in parameter.reshape(
-                -1, parameter.shape[-2], parameter.shape[-1],
+        # Elements no use reads as a matrix, such as an untied embedding, are
+        # grouped along the parameter's last dimension with the documented
+        # symmetric fallback. Parameters only combined into other weights,
+        # such as ``weight_norm``'s, are left as they are: the weight export
+        # computes from them is what storage stores.
+        fallback_reason = "no compatible linear activation statistics" if gptq else None
+        for name, parameter in model.named_parameters():
+            pointer = parameter.untyped_storage().data_ptr()
+            name = display_names.get(pointer, name)
+            if parameter.numel() < config.min_quantized_values:
+                continue
+            if pointer not in quantized_storage and (
+                not _is_weight_matrix(parameter, effective_ndim(parameter))
+                or (
+                    observing and pointer in capture.derivations
+                    and pointer not in capture.direct_reads
+                )
             ):
-                matrix_key = _storage_key(matrix)
-                if matrix_key in handled:
+                continue
+            if pointer in quantized_storage and pointer not in uses_by_storage:
+                continue
+            quantized_storage.add(pointer)
+            numel = _storage_numel(parameter)
+            taken = _view_mask(numel, (
+                view for region in regions
+                if region.pointer == pointer and not region.remaining
+                for view in region.views
+            ))
+            matrices = (
+                [((), parameter)] if parameter.ndim == 2 else [
+                    (index, parameter[index])
+                    for index in itertools.product(*map(range, parameter.shape[:-2]))
+                ]
+            )
+            for index, matrix in matrices:
+                spec = _canonical_spec(matrix)
+                rest = _view_mask(numel, (spec,)) & ~taken
+                count = int(rest.sum())
+                if not count:
                     continue
-                reconstructed, group = _symmetric_matrix(matrix, config)
-                matrix.copy_(reconstructed)
-                handled.add(matrix_key)
-                reports.append(TensorQuantizationReport(
-                    name=(
-                        f"{name}[offset={matrix.storage_offset()},"
-                        f"shape={tuple(matrix.shape)}]"
-                    ),
+                matrix_name = name if not index else (
+                    f"{name}[offset={matrix.storage_offset()},shape={tuple(matrix.shape)}]"
+                )
+                if count == matrix.numel():
+                    reconstructed, group = _named(
+                        name, lambda: _symmetric_matrix(matrix, config),
+                    )
+                    matrix.copy_(reconstructed)
+                else:
+                    # Other elements belong to regions quantized for their uses.
+                    matrix_name = f"{matrix_name}[remaining]"
+                    count, group = _named(
+                        name, lambda: _quantize_remaining(matrix, rest, config),
+                    )
+                report(TensorQuantizationReport(
+                    name=matrix_name,
                     method="symmetric",
                     bits=config.bits,
-                    values=matrix.numel(),
+                    values=count,
                     calibration_rows=0,
                     effective_group_size=group,
-                    fallback_reason=(
-                        "no compatible linear activation statistics"
-                        if config.method == "gptq" else None
-                    ),
-                ))
+                    fallback_reason=fallback_reason,
+                ), pointer, (spec,), remaining=count != matrix.numel())
+
 
         reported_names = {item.name.split("[", 1)[0] for item in reports}
+        used_storage = {
+            stat.weight.untyped_storage().data_ptr() for stat in capture.stats.values()
+        }
         for name, parameter in model.named_parameters():
+            pointer = parameter.untyped_storage().data_ptr()
+            name = display_names.get(pointer, name)
             if (
-                effective_ndim(parameter) >= 2
-                and parameter.numel() < config.min_quantized_values
+                parameter.numel() < config.min_quantized_values
                 and name not in reported_names
+                and (
+                    pointer in used_storage
+                    or _is_weight_matrix(parameter, effective_ndim(parameter))
+                )
             ):
+                reported_names.add(name)
                 reports.append(TensorQuantizationReport(
                     name=name,
                     method="float16",
@@ -857,7 +1142,402 @@ def quantize_model(
         gptq_values=gptq_values,
         symmetric_values=symmetric_values,
         tensors=tuple(reports),
+        _regions=tuple(regions),
     )
+
+
+class _SourceRecordingLists(dict):
+    """A compiler's stored lists, remembering the graph values behind each."""
+
+    def __init__(self, initial, recorder: _StaticSourceRecorder):
+        super().__init__(initial)
+        self.recorder = recorder
+
+    def __setitem__(self, key, value):
+        recorder = self.recorder
+        if key not in recorder.sources:
+            recorder.sources[key] = frozenset(
+                recorder.resolved.get(recorder.compiler.active_node, ()),
+            )
+        super().__setitem__(key, value)
+
+
+class _StaticSourceRecorder:
+    """Record which graph values each list a compiler stores is made from.
+
+    A list named after a graph value holds that value. Any other list, such
+    as a weight's row shards or a fused projection, holds values of those
+    the compiler read for the node it was compiling when it made the list.
+    """
+
+    def __init__(self, compiler):
+        self.compiler = compiler
+        self.graph = compiler.graph
+        self.resolve = compiler.graph.resolve_weight
+        self.resolved: dict[str | None, set[str]] = {}
+        self.sources: dict[str, frozenset[str]] = {}
+
+        def resolve_weight(name):
+            value = self.resolve(name)
+            if isinstance(value, torch.Tensor):
+                self.resolved.setdefault(compiler.active_node, set()).add(name)
+            return value
+
+        self.graph.resolve_weight = resolve_weight
+        compiler.static_lists = _SourceRecordingLists(compiler.static_lists, self)
+
+    def finish(self) -> None:
+        self.graph.resolve_weight = self.resolve
+
+    def graph_values(self, key: str, tensor: torch.Tensor) -> tuple[str, ...]:
+        """The graph values whose elements list ``key`` holds."""
+        if isinstance(self.resolve(key), torch.Tensor):
+            return (key,)
+        names = sorted(self.sources.get(key, ()))
+        values = {name: self.resolve(name) for name in names}
+        # A list holds no more values than the values it is made from, so a
+        # weight's shard is not made from the bias read with it. A list made
+        # from several values, as a fused projection is, is larger than each.
+        large = tuple(name for name in names if values[name].numel() >= tensor.numel())
+        return large or tuple(names)
+
+
+# Graph operations that only rearrange their inputs' values.
+_GRAPH_REARRANGEMENTS = _REARRANGEMENTS | frozenset({
+    "aten.t.default", "aten.transpose.int", "aten.permute.default", "aten.view.default",
+    "aten.reshape.default", "aten.expand.default", "aten.slice.Tensor",
+    "aten.select.int", "aten.unsqueeze.default", "aten.squeeze.default",
+    "aten.squeeze.dim", "aten.squeeze.dims", "aten.split.Tensor",
+    "aten.split_with_sizes.default", "aten.chunk.default", "aten.unbind.int",
+    "aten.narrow.default", "aten.alias.default", "aten.detach.default",
+    "aten.detach_.default", "aten.flatten.using_ints", "aten.unflatten.int",
+    "aten.movedim.int", "aten.swapaxes.default", "aten.numpy_T.default",
+    "aten.as_strided.default", "aten.tensor_split.indices",
+    "aten.tensor_split.sections", "<built-in function getitem>",
+})
+# Conversions keep a rearranged value's identity; positions don't convert.
+_CONVERSION_KEYWORDS = frozenset({"dtype", "layout", "device", "pin_memory", "memory_format"})
+_POSITION_BITS = 40
+
+
+class _GraphProvenance:
+    """Which parameter elements each graph value known at export holds.
+
+    A value rearranged from parameters holds known elements of them; one
+    computed from them by arithmetic is a weight derived from them as a
+    whole. Each parameter element is numbered, and the graph's operations
+    are replayed on the numbers.
+    """
+
+    def __init__(self, graph, parameters: dict[int, torch.Tensor], resolve):
+        self.nodes = {node.name: node for node in graph.nodes}
+        self.resolve = resolve
+        self.parameters = parameters
+        self.indices = {pointer: index for index, pointer in enumerate(parameters)}
+        self.pointers = list(parameters)
+        self.traced: dict[str, object] = {}
+
+    def parameter_of(self, value: torch.Tensor) -> int | None:
+        pointer = value.untyped_storage().data_ptr()
+        return pointer if pointer in self.parameters else None
+
+    def _positions(self, value: torch.Tensor, pointer: int) -> torch.Tensor:
+        base = torch.arange(_storage_numel(value), dtype=torch.long)
+        base += self.indices[pointer] << _POSITION_BITS
+        return base.as_strided(value.shape, value.stride(), value.storage_offset())
+
+    def _trace(self, name: str):
+        """``("ids", numbers)``, ``("derived", parameters)`` or ``None``."""
+        if name in self.traced:
+            return self.traced[name]
+        self.traced[name] = None
+        node = self.nodes.get(name)
+        value = self.resolve(name)
+        result: object = None
+        if isinstance(value, torch.Tensor) and (
+            node is None or node.op != "call_function"
+            or str(node.target) in {"aten.detach_.default"}
+        ):
+            pointer = self.parameter_of(value)
+            if pointer is not None:
+                result = ("ids", self._positions(value, pointer))
+        elif node is not None and node.op == "call_function":
+            result = self._trace_call(node)
+        self.traced[name] = result
+        return result
+
+    def _trace_call(self, node):
+        traced: dict[str, object] = {}
+        missing = object()
+
+        def argument(item):
+            if hasattr(item, "name") and hasattr(item, "op"):
+                found = self._trace(item.name)
+                traced[item.name] = found
+                if found is None:
+                    value = self.resolve(item.name)
+                    shape = (
+                        value.shape if isinstance(value, torch.Tensor)
+                        else getattr(item.meta.get("val"), "shape", None)
+                    )
+                    if shape is None:
+                        return missing
+                    return torch.full(tuple(shape), -1, dtype=torch.long)
+                if found[0] == "ids":
+                    return found[1]
+                return missing
+            if isinstance(item, (list, tuple)):
+                values = [argument(element) for element in item]
+                if any(element is missing for element in values):
+                    return missing
+                return type(item)(values)
+            return item
+
+        args = argument(node.args)
+        kwargs = {
+            key: argument(value) for key, value in node.kwargs.items()
+            if key not in _CONVERSION_KEYWORDS
+        }
+        sources: set[int] = set()
+        for found in traced.values():
+            if found is None:
+                continue
+            if found[0] == "ids":
+                ids = found[1]
+                if isinstance(ids, torch.Tensor):
+                    known = ids[ids >= 0] >> _POSITION_BITS
+                    sources.update(self.pointers[index] for index in known.unique().tolist())
+                else:
+                    for part in ids:
+                        known = part[part >= 0] >> _POSITION_BITS
+                        sources.update(
+                            self.pointers[index] for index in known.unique().tolist()
+                        )
+            else:
+                sources.update(found[1])
+        if not sources:
+            return None
+        if (
+            str(node.target) in _GRAPH_REARRANGEMENTS
+            and args is not missing and not any(value is missing for value in kwargs.values())
+        ):
+            try:
+                if str(node.target) in {"aten._to_copy.default", "aten.to.dtype"}:
+                    result = args[0]
+                else:
+                    result = node.target(*args, **kwargs)
+            except (RuntimeError, TypeError, ValueError, IndexError):
+                result = None
+            if isinstance(result, torch.Tensor) and result.dtype == torch.long:
+                return ("ids", result)
+            if isinstance(result, (list, tuple)) and all(
+                isinstance(part, torch.Tensor) and part.dtype == torch.long for part in result
+            ):
+                return ("ids", tuple(result))
+        return ("derived", frozenset(sources))
+
+    def elements(self, names: Iterable[str]):
+        """``(masks by parameter, derived from parameters)`` for graph values."""
+        masks: dict[int, torch.Tensor] = {}
+        derived: set[int] = set()
+        for name in names:
+            found = self._trace(name)
+            if found is None:
+                continue
+            if found[0] == "derived" or not isinstance(found[1], torch.Tensor):
+                derived.update(found[1] if found[0] == "derived" else ())
+                continue
+            ids = found[1].reshape(-1)
+            ids = ids[ids >= 0]
+            for index in (ids >> _POSITION_BITS).unique().tolist():
+                pointer = self.pointers[index]
+                mask = masks.get(pointer)
+                if mask is None:
+                    mask = masks[pointer] = torch.zeros(
+                        _storage_numel(self.parameters[pointer]), dtype=torch.bool,
+                    )
+                positions = ids[(ids >> _POSITION_BITS) == index] & ((1 << _POSITION_BITS) - 1)
+                mask[positions] = True
+        return masks, frozenset(derived)
+
+
+def _stored_precisions(
+    static_tensors, storage, *, sprite, layouts, effective_ndims, interleaved_layouts,
+):
+    """``(float16 values, all values, tensor-level precision)`` by stored list."""
+    from cattorch.sprite import _static_storage_precision
+
+    stored = {}
+    for key, tensor in static_tensors.items():
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            continue
+        precision = _static_storage_precision(
+            tensor, storage, effective_ndims.get(key), interleaved_layouts.get(key, ()),
+        )
+        float16 = tensor.numel() if not precision.startswith("int") else 0
+        layout = layouts.get(f"W_{key}")
+        if precision.startswith("int") and layout is not None and sprite is not None:
+            # Storage keeps a shard too small to be worth decoding in float16.
+            for shard in layout.shards:
+                size = len(sprite["lists"][shard.identifier][1])
+                if 0 < size < storage.min_quantized_values:
+                    float16 += size
+        stored[key] = (float16, tensor.numel(), precision)
+    return stored
+
+
+def _storage_quantization_report(
+    report: QuantizationReport,
+    *,
+    static_tensors: dict,
+    deduplicated: dict,
+    storage,
+    sprite: dict,
+    layouts: dict,
+    effective_ndims: dict[str, int],
+    interleaved_layouts: dict,
+    recorder: _StaticSourceRecorder,
+    model: torch.nn.Module,
+) -> tuple[tuple[str, ...], QuantizationReport]:
+    """Warnings and the report for what storage stores of quantized weights.
+
+    Storage keeps a list in integers only when it is on the integer grid
+    along its own last dimension, so quantized values it reads grouped
+    another way, or a weight computed from parameters at export, are kept in
+    float16. Each stored list is traced back through the graph to the
+    parameter elements it holds, and every report entry then says how its
+    values are stored. ``deduplicated`` are lists storage shares with an
+    identical one; they are stored as that one is.
+    """
+    if storage.precision not in {"int8", "int6", "int4"} or storage.grouping != "row":
+        return (), _stored_quantization_report(report, {})
+    stored = _stored_precisions(
+        static_tensors, storage, sprite=sprite, layouts=layouts,
+        effective_ndims=effective_ndims, interleaved_layouts=interleaved_layouts,
+    )
+    stored.update(_stored_precisions(
+        deduplicated, storage, sprite=None, layouts={},
+        effective_ndims=effective_ndims, interleaved_layouts=interleaved_layouts,
+    ))
+    tensors = {**deduplicated, **static_tensors}
+    names_module = getattr(model, "model", model) if type(model).__name__ == "MethodModule" else model
+    parameter_names: dict[int, str] = {}
+    parameters: dict[int, torch.Tensor] = {}
+    for name, parameter in names_module.named_parameters():
+        pointer = parameter.untyped_storage().data_ptr()
+        parameter_names.setdefault(pointer, name)
+        parameters.setdefault(pointer, parameter)
+    provenance = _GraphProvenance(recorder.graph, parameters, recorder.resolve)
+    regions = report._regions
+    region_pointers = {region.pointer for region in regions}
+
+    float16_masks: dict[int, torch.Tensor] = {}
+    contributions: list[tuple[str, dict[int, torch.Tensor], int]] = []
+    derived: dict[tuple, list] = {}
+    for key, (float16, total, precision) in stored.items():
+        if not float16:
+            continue
+        tensor = tensors[key]
+        sources = recorder.graph_values(key, tensor)
+        masks, from_parameters = provenance.elements(sources)
+        masks = {pointer: mask for pointer, mask in masks.items() if pointer in region_pointers}
+        for pointer, mask in masks.items():
+            previous = float16_masks.get(pointer)
+            float16_masks[pointer] = mask.clone() if previous is None else previous | mask
+        if masks:
+            contributions.append((key, masks, float16))
+        ndim = effective_ndims.get(key, tensor.ndim)
+        if (
+            from_parameters and not masks and float16 == total
+            and total >= storage.min_quantized_values
+            and _is_weight_matrix(tensor, min(ndim, tensor.ndim))
+        ):
+            names = tuple(sorted(parameter_names[pointer] for pointer in from_parameters))
+            entry = derived.setdefault((names, sources), [0, tuple(tensor.shape)])
+            entry[0] += total
+
+    integer_masks: dict[int, torch.Tensor] = {}
+    if float16_masks:
+        for key, (float16, total, precision) in stored.items():
+            if float16 == total:
+                continue
+            masks, _ = provenance.elements(recorder.graph_values(key, tensors[key]))
+            for pointer, mask in masks.items():
+                if pointer in float16_masks:
+                    previous = integer_masks.get(pointer)
+                    integer_masks[pointer] = mask.clone() if previous is None else previous | mask
+
+    warnings_found: list[str] = []
+    found: dict[int, _StoredFloat16] = {}
+    if float16_masks:
+        masks = _region_masks(region for region in regions if region.pointer in float16_masks)
+        for region in regions:
+            if region.entry not in masks:
+                continue
+            mask = masks[region.entry]
+            float16 = float16_masks[region.pointer] & mask
+            if not bool(float16.any()):
+                continue
+            integer = integer_masks.get(region.pointer)
+            copies = int((float16 & integer).sum()) if integer is not None else 0
+            only = int(float16.sum()) - copies
+            # A list holds no more values than it has: a float16 shard of a
+            # weight stores that many of the weight's values.
+            capacity = 0.0
+            whole_list = False
+            for key, held, count in contributions:
+                if region.pointer not in held:
+                    continue
+                overlap = int((held[region.pointer] & mask).sum())
+                if overlap:
+                    share = sum(int(value.sum()) for value in held.values())
+                    capacity += count * overlap / share
+                    whole_list = whole_list or stored[key][2] == "float16"
+            if only + copies > capacity:
+                scale = capacity / (only + copies)
+                only, copies = round(only * scale), round(copies * scale)
+            if not only + copies:
+                continue
+            reason = (
+                "storage reads the values in groups along a different axis than they were "
+                "quantized in" if whole_list else
+                f"a shard of fewer than min_quantized_values={storage.min_quantized_values} "
+                "values is stored as float16"
+            )
+            found[region.entry] = _StoredFloat16(only=only, copies=copies, reason=reason)
+            item = report.tensors[region.entry]
+            if only >= item.values:
+                warnings_found.append(
+                    f"quantized weight {item.name!r} is stored as float16, not "
+                    f"{storage.precision}: {reason}"
+                )
+            else:
+                warnings_found.append(
+                    f"quantized weight {item.name!r}: {only + copies} of its values are "
+                    f"stored as float16, not {storage.precision}"
+                    + (" (a second copy)" if copies else "") + f": {reason}"
+                )
+    derived_items = []
+    for (names, _), (values, shape) in derived.items():
+        description = f"weight computed from {', '.join(names)}"
+        derived_items.append(TensorQuantizationReport(
+            name=description,
+            method="float16",
+            bits=None,
+            values=values,
+            calibration_rows=0,
+            effective_group_size=None,
+            fallback_reason=(
+                "computed from parameters during export; quantization only rounds "
+                "parameters the model reads directly"
+            ),
+        ))
+        warnings_found.append(
+            f"{description} {shape} is stored as float16, not {storage.precision}: "
+            "export computes it from parameters, and quantization only rounds "
+            "parameters the model reads directly"
+        )
+    return tuple(warnings_found), _stored_quantization_report(report, found, derived_items)
 
 
 __all__ = [

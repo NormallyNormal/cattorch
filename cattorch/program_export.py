@@ -654,6 +654,7 @@ def transpile_program(
             orientation_inputs=None if gptq else sentinels,
             _registry=registry,
             _calibration_name=_calibration_name,
+            _names_from=prepared_model,
         )
         prepared_model = calibration_model.model
         resolved_storage = quantized_storage(resolved_storage, quantization)
@@ -850,7 +851,9 @@ def transpile_program(
         ))
         sub_warnings.extend(
             warning for warning in sub_result.warnings
-            if warning.startswith(("GPTQ fallback", "tied weight"))
+            if warning.startswith((
+                "GPTQ fallback", "tied weight", "quantized weight", "weight computed from",
+            ))
         )
         fallbacks.update(dict(sub_result.fallback_operations))
         approximations.update(dict(sub_result.approximate_operations))
