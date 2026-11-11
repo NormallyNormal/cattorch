@@ -2341,8 +2341,6 @@ def _transpile_any(
     if isinstance(example_inputs, GenerationProgram):
         if frontend != "fx":
             raise ValueError("GenerationProgram is supported only by the FX frontend")
-        if any(not isinstance(adapter, ModuleAdapter) for adapter in adapters):
-            raise TypeError("adapters must contain ModuleAdapter values")
         if calibration_calls is not None:
             raise ValueError("calibration_calls require an ExportProgram")
         if calibration_inputs is not None:
@@ -2380,8 +2378,6 @@ def _transpile_any(
     if isinstance(example_inputs, RecurrentGenerationProgram):
         if frontend != "fx":
             raise ValueError("RecurrentGenerationProgram is supported only by the FX frontend")
-        if any(not isinstance(adapter, ModuleAdapter) for adapter in adapters):
-            raise TypeError("adapters must contain ModuleAdapter values")
         if calibration_calls is not None:
             raise ValueError("calibration_calls require an ExportProgram")
         if calibration_inputs is not None:
@@ -2546,7 +2542,6 @@ def _transpile_automatic_generation(
         storage=storage,
         quantization=quantization,
         frontend="fx",
-        _generation_public_interface=True,
         _registry=registry,
         _prepared_model=True,
         _prepared_quantization_report=report,
@@ -2595,7 +2590,6 @@ def _transpile(
     frontend: Frontend = "fx",
     example_kwargs: dict[str, Any] | None = None,
     _registry: OperatorRegistry | None = None,
-    _generation_public_interface: bool = False,
     _prepared_model: bool = False,
     _prepared_quantization_report=None,
     _dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
@@ -2867,24 +2861,23 @@ def _transpile(
             cache_names | generation_lists,
         )
         _merge_duplicate_lists(sprite)
-        if _generation_public_interface:
-            # The step is private; only reset, prefill and decode run it.
-            _remove_canvas_calls(sprite, "cattorch forward")
-            _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
-            _rename_procedure(
-                sprite,
-                "cattorch reset cache",
-                "_cattorch reset state",
-            )
-            public_lists = {
-                "input": "cattorch tokens",
-                "output": "cattorch logits",
-                "cattorch prefill buffer": "_cattorch prefill buffer",
-            }
-            _rename_lists(sprite, public_lists)
-            for old, new in public_lists.items():
-                if old in logical_sizes:
-                    logical_sizes[new] = logical_sizes.pop(old)
+        # The step is private; only reset, prefill and decode run it.
+        _remove_canvas_calls(sprite, "cattorch forward")
+        _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
+        _rename_procedure(
+            sprite,
+            "cattorch reset cache",
+            "_cattorch reset state",
+        )
+        public_lists = {
+            "input": "cattorch tokens",
+            "output": "cattorch logits",
+            "cattorch prefill buffer": "_cattorch prefill buffer",
+        }
+        _rename_lists(sprite, public_lists)
+        for old, new in public_lists.items():
+            if old in logical_sizes:
+                logical_sizes[new] = logical_sizes.pop(old)
 
     deferred_names = (
         frozenset((*graph.input_names.values(), *output_names))
@@ -2949,7 +2942,7 @@ def _transpile(
     # Its processor sprite is intended to remain initialized while a project
     # runs, and emitting one clear block for every decoded weight shard is a
     # material JSON cost for the large language models this interface serves.
-    if not _generation_public_interface:
+    if generation is None:
         _add_prepare_for_save(
             sprite,
             layouts,
@@ -2969,17 +2962,16 @@ def _transpile(
             "cattorch prefill",
             "cattorch prefill complete",
         )
-        if _generation_public_interface:
-            _add_procedure_completion_broadcast(
-                sprite,
-                "cattorch reset",
-                "cattorch reset complete",
-            )
-            _add_procedure_completion_broadcast(
-                sprite,
-                "cattorch decode",
-                "cattorch decode complete",
-            )
+        _add_procedure_completion_broadcast(
+            sprite,
+            "cattorch reset",
+            "cattorch reset complete",
+        )
+        _add_procedure_completion_broadcast(
+            sprite,
+            "cattorch decode",
+            "cattorch decode complete",
+        )
     if generation is None and not _defer_interface_sharding:
         # Like generation and programs: a status and a notification when each
         # public block finishes. Program entry points get theirs from the
@@ -3058,7 +3050,7 @@ def _transpile(
         boundary_spec(
             (
                 "cattorch tokens"
-                if generation is not None and _generation_public_interface
+                if generation is not None
                 else (input_name(index))
             ),
             tuple(value.shape),
@@ -3076,15 +3068,7 @@ def _transpile(
     )
     procedures = ["cattorch init", "cattorch forward", "cattorch prepare for save"]
     if generation is not None:
-        if _generation_public_interface:
-            procedures = [
-                "cattorch init",
-                "cattorch reset",
-                "cattorch prefill",
-                "cattorch decode",
-            ]
-        else:
-            procedures.extend(("cattorch reset cache", "cattorch prefill", "cattorch decode"))
+        procedures = ["cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode"]
     return TranspileResult(
         path=finalized.path,
         sprite_name=sprite_name,
@@ -3101,7 +3085,7 @@ def _transpile(
         output=boundary_spec(
             (
                 "cattorch logits"
-                if generation is not None and _generation_public_interface
+                if generation is not None
                 else "output"
             ),
             tuple(graph.output_shape),

@@ -36,10 +36,6 @@ def validate_export_options(
     ):
         if value is not None and not isinstance(value, expected):
             raise TypeError(f"{label} must be a {expected.__name__}")
-    if quantization is not None and storage is not None and storage.precision.startswith("int"):
-        raise ValueError(
-            "quantization cannot be combined with legacy integer StorageConfig.precision"
-        )
     if sig_figs is not None and (
         isinstance(sig_figs, bool) or not isinstance(sig_figs, int) or sig_figs < 1
     ):

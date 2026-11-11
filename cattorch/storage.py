@@ -1004,72 +1004,11 @@ def _copy_decoded(destination: str):
 
 
 def build_shared_unpack_program(specs: list[EncodedList]) -> Program:
-    """Build compact wrappers around shared per-precision decoders."""
-    if specs and all(spec.payload_bytes is not None for spec in specs):
-        return _build_banked_unpack_program(specs)
-
-    body: list[Statement] = []
-    for spec in specs:
-        if spec.precision in {"int8", "int6", "int4"}:
-            if not spec.scale_payload_name or spec.scale_payload is None:
-                raise ValueError("quantized encoded lists require scale metadata")
-            body.extend((
-                set_var(_ACTIVE_PAYLOAD, var(spec.scale_payload_name)),
-                call(_BYTE_DECODER),
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                call(f"cattorch decode {spec.scale_precision}"),
-                clear(_DECODED_SCALES),
-                for_each(
-                    "decode copy index", length(_DECODED_VALUES),
-                    (append(
-                        _DECODED_SCALES,
-                        item(_DECODED_VALUES, var("decode copy index")),
-                    ),),
-                ),
-                set_var(_ACTIVE_PAYLOAD, var(spec.payload_name)),
-            ))
-            body.append(call(_BYTE_DECODER))
-            body.extend((
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                set_var("decode scale start", 1),
-                set_var("decode total values", spec.value_count or 0),
-                set_var("decode group size", spec.group_size or 1),
-                call(f"cattorch decode {spec.precision}"),
-            ))
-        else:
-            body.extend((
-                set_var(_ACTIVE_PAYLOAD, var(spec.payload_name)),
-                call(_BYTE_DECODER),
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                call(f"cattorch decode {spec.precision}"),
-            ))
-        body.extend(_copy_decoded(spec.name))
-    body.extend((clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES)))
-    variables = (
-        _ACTIVE_PAYLOAD, "decode copy index", "decode total values", "decode group size",
-        "decode byte start", "decode byte length", "decode scale start",
-        *(spec.payload_name for spec in specs),
-        *(spec.scale_payload_name for spec in specs if spec.scale_payload_name),
-    )
-    variable_values = {spec.payload_name: spec.payload for spec in specs}
-    variable_values.update({
-        spec.scale_payload_name: spec.scale_payload
-        for spec in specs
-        if spec.scale_payload_name and spec.scale_payload is not None
-    })
-    return Program(
-        "unpack_weights",
-        variables=variables,
-        variable_values=variable_values,
-        lists=(
-            _DECODED_BYTES, _DECODED_VALUES, _DECODED_SCALES,
-            *(spec.name for spec in specs),
-        ),
-        body=tuple(body),
-    )
+    """Build the init program that decodes ``specs`` through the shared
+    per-precision decoders, from each list's raw ``payload_bytes``."""
+    if any(spec.payload_bytes is None for spec in specs):
+        raise ValueError("shared unpacking needs every encoded list's payload_bytes")
+    return _build_banked_unpack_program(specs)
 
 
 def _huffman_bank(
@@ -1296,11 +1235,11 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
 
 
 def build_unpack_program(specs: list[EncodedList]) -> Program:
-    """Build a self-contained decoder, retained for direct DSL consumers.
+    """Build a self-contained decoder of each list's Base92 ``payload``.
 
     Production exports use :func:`build_shared_unpack_program` plus the shared
-    decoder procedures. Keeping this form makes a decoder program independently
-    executable, which is useful for unit tests and small custom sprites.
+    decoder procedures. This form runs on its own: the storage tests use it as
+    a reference decoder, and a benchmark builder times it.
     """
     if any(spec.precision == "int6" for spec in specs):
         raise ValueError("int6 requires the shared production decoder")
