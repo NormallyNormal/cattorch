@@ -140,6 +140,10 @@ def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path
         "--dynamic", "0=1:4", "--dynamic", "0.0=1:8",
     )
     assert code == 1 and "dimension 0 twice" in message
+    # The export's own explanation of a wrongly shaped input reaches the user.
+    code, message = run(capsys, "export", "models.py:Marked", "--shape", "2,5")
+    assert code == 1 and message.startswith("cattorch: error: ")
+    assert "mat1 and mat2 shapes cannot be multiplied" in message
     code, message = run(capsys, "export", "no_such_module:Net", "--shape", "1,2")
     assert code == 1 and "no module named 'no_such_module'" in message
     for path in ("missing.sb3", "models.py"):
