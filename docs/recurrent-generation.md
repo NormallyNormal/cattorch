@@ -212,12 +212,11 @@ decode that another block ran during, `cattorch init` included, reports the
 last status below, and decode then fails until reset or prefill, which always
 recover once nothing else is running. An init that another block started
 during, or one stopped part way, leaves the weights for the next block to
-decode again. The same two cases aren't caught: a block that was taken over,
-resumed while the newer block is paused, and unfinished when it ends, or
-stopped after resuming, can leave the newer block or a later decode reporting
-`ok` with logits from states it changed; and a block that runs while a
-taken-over `cattorch init` still decodes the weights, after the block that
-took it over ended, can report `ok` with weights that init half overwrote.
+decode again, and stops decoding them before it writes to them again. The
+same case isn't caught: a block that was taken over, resumed while the newer
+block is paused, and unfinished when it ends, or stopped after resuming, can
+leave the newer block or a later decode reporting `ok` with logits from
+states or working lists it changed.
 
 | Situation | Result | `cattorch status` |
 |---|---|---|

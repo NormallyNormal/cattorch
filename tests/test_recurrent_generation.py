@@ -300,8 +300,8 @@ def test_invalid_tokens_leave_every_state_untouched(exported):
 
 
 @pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
-    ("cattorch prefill", "_cattorch token step", 3, [1, 2, 3, 4, 5]),
-    ("cattorch decode", "_cattorch token step", 1, [5]),
+    ("cattorch prefill", "_cattorch token step for epoch %s", 3, [1, 2, 3, 4, 5]),
+    ("cattorch decode", "_cattorch token step for epoch %s", 1, [5]),
     ("cattorch reset", "_cattorch reset state", 1, None),
 ])
 def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
@@ -395,7 +395,7 @@ def test_hidden_prefill_skips_the_logits_of_prompt_tokens(tmp_path, name):
             for output in (1, 0):
                 emulator.variables["_cattorch project output"] = output
                 before = sum(emulator.opcode_counts.values())
-                run(emulator, "_cattorch token step", [9])
+                run(emulator, "_cattorch token step for epoch %s", [9])
                 cost[output] = sum(emulator.opcode_counts.values()) - before
             skipped = cost[1] - cost[0]
     assert torch.equal(results[True][0], results[False][0])
@@ -412,7 +412,7 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
     run(emulator, "cattorch prefill", [1])
     emulator.variables["_cattorch project output"] = 0
     kept = list(emulator.lists["cattorch logits"])
-    assert run(emulator, "_cattorch token step", [2]) == "ok"
+    assert run(emulator, "_cattorch token step for epoch %s", [2]) == "ok"
     assert emulator.lists["cattorch logits"] == kept
     # Decode computes its logits whatever a stopped prefill left behind.
     emulator.variables["_cattorch project output"] = 0

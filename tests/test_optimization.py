@@ -1183,7 +1183,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
     assert {
-        "_cattorch token step", "cattorch init", "cattorch reset",
+        "_cattorch token step for epoch %s", "cattorch init", "cattorch reset",
         "cattorch prefill", "cattorch decode",
     } <= set(emulator._procedures)
     assert "cattorch prepare for save" not in emulator._procedures

@@ -547,3 +547,72 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     torch.testing.assert_close(
         values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
     )
+
+
+def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path):
+    # Scratch pauses init once it has run for 500 ms, and runs the second
+    # script, whose reset takes over. Resumed, the init must stop decoding
+    # rather than write the weights again, where a block running meanwhile
+    # could read them, and leave them for the next block to decode.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        append, call, change_var, clear, eq, for_each, item, length, repeat_until, set_var, var,
+    )
+    from cattorch.util.scratch.emulator import ScratchEmulator
+    from test_autoregressive import NanoGPT
+    from test_generation_automatic import load_sprite, logits_of
+
+    torch.manual_seed(4)
+    model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
+    result = transpile(model, GenerationProgram(max_context=32), tmp_path / "lm")
+    # The weight lists: empty as stored, filled by init.
+    sprite_json = load_sprite(result.path)
+    emulator = ScratchEmulator(sprite_json)
+    emulator.run_procedure("cattorch init")
+    weights = {
+        entry[0]: len(emulator.lists[entry[0]]) for entry in sprite_json["lists"].values()
+        if not entry[1] and emulator.lists[entry[0]]
+    }
+    assert weights
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    results, lengths, logits = (
+        builder.global_list(name) for name in ("results", "lengths", "logits")
+    )
+    started, done = builder.global_variable("started", 0), builder.global_variable("done", 0)
+    flag = {"opcode": "event_whenflagclicked", "fields": {}}
+    status, initialized, tokens = "cattorch status", "cattorch initialized", "cattorch tokens"
+
+    def run(procedure, values):
+        return (
+            clear(tokens), *(append(tokens, value) for value in values),
+            call(procedure), append(results, var(status)),
+        )
+
+    builder.script(sprite, flag, (
+        set_var(started, 1), call("cattorch init"), set_var(done, 1),
+    ), variables=(started, done))
+    builder.script(sprite, flag, (
+        repeat_until(eq(var(started), 1), (change_var("waits", 1),)),
+        # 0 if the init was still running.
+        append(results, var(done)),
+        call("cattorch reset"), append(results, var(status)),
+        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
+        append(results, var(initialized)),
+        *(append(lengths, length(name)) for name in weights),
+        *run("cattorch prefill", [5, 3]),
+        *run("cattorch decode", [7]),
+        for_each("index", length("cattorch logits"), (
+            append(logits, item("cattorch logits", var("index"))),
+        )),
+    ), lists=(tokens, results, lengths, logits, "cattorch logits", *weights),
+        variables=(status, started, done, initialized, "waits", "index"), y=400)
+    path = tmp_path / "overlap.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["results"] == [0, "ok", 0, "ok", "ok"]
+    # It stopped part way, rather than decode them all again.
+    assert [int(value) for value in stage["lengths"]] != list(weights.values())
+    torch.testing.assert_close(
+        values(stage, "logits"), logits_of(model, [5, 3, 7]), atol=1e-4, rtol=0,
+    )

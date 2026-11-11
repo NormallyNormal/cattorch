@@ -180,3 +180,31 @@ def test_procedure_arguments_are_local_to_each_call():
     emulator.run_procedure("run")
     # Outside every procedure, an argument reports 0, as in Scratch.
     assert emulator.lists["seen"] == [2, 1, 0, 0, 1, 2, 0]
+
+
+def test_stop_this_script_returns_from_the_procedure_running_it():
+    from cattorch.sprite import _add_warp_procedure
+    from cattorch.util.scratch.dsl import Program, append, call, eq, if_
+
+    sprite = {"blocks": {}, "variables": {}, "lists": {}, "broadcasts": {}}
+    _add_warp_procedure(sprite, "inner", Program("inner", lists=("seen",), body=(
+        append("seen", 1), if_(eq(1, 1), (append("seen", "stop here"),)), append("seen", 2),
+    )), x=0, y=0)
+    _add_warp_procedure(sprite, "outer", Program("outer", lists=("seen",), body=(
+        call("inner"), append("seen", 3),
+    )), x=0, y=200)
+    stop = next(
+        block for block in sprite["blocks"].values()
+        if block["opcode"] == "data_addtolist" and block["inputs"]["ITEM"][1][1] == "stop here"
+    )
+    stop.update(
+        opcode="control_stop", inputs={}, fields={"STOP_OPTION": ["this script", None]},
+        mutation={"tagName": "mutation", "children": [], "hasnext": "false"},
+    )
+    emulator = ScratchEmulator(sprite)
+    # As in Scratch, the rest of the procedure doesn't run, and its caller
+    # carries on; run directly, the procedure just ends.
+    emulator.run_procedure("outer")
+    assert emulator.lists["seen"] == [1, 3]
+    emulator.run_procedure("inner")
+    assert emulator.lists["seen"] == [1, 3, 1]

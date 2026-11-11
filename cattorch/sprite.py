@@ -2009,8 +2009,9 @@ def _add_init_epoch_entry(sprite: dict, inner: str, prefix: str, *, x: int, y: i
     ``inner`` is init's epoch procedure, from ``_take_epoch_argument``. Calls
     to init inside the sprite, such as a step's check that the weights are
     decoded, run ``inner`` with the epoch as it is then, so that init checks
-    itself as when it's called directly. Loose blocks on the canvas keep
-    running the public block.
+    itself as when it's called directly; ``_stop_overtaken_decoding`` then
+    passes them the epoch of the call making them instead, where weights are
+    decoded. Loose blocks on the canvas keep running the public block.
     """
     from cattorch.util.scratch.dsl import argument_id
 
@@ -2040,7 +2041,262 @@ def _guard_generation_init(sprite: dict) -> dict:
     """
     _mark_init_decoding(sprite, "generation")
     inner = _take_epoch_argument(sprite, "cattorch init")
-    return _add_init_epoch_entry(sprite, inner, "generation", x=0, y=800)
+    sprite = _add_init_epoch_entry(sprite, inner, "generation", x=0, y=800)
+    _stop_overtaken_decoding(sprite)
+    return sprite
+
+
+_LOOPS = ("control_repeat", "control_for_each", "control_repeat_until")
+
+
+def _procedure_arguments(blocks: dict, definition: str) -> list[str]:
+    prototype = blocks[blocks[definition]["inputs"]["custom_block"][1]]
+    return json.loads(prototype["mutation"].get("argumentnames") or "[]")
+
+
+def _owning_definitions(blocks: dict) -> dict[str, str | None]:
+    """The procedure definition each block is part of, or None outside one."""
+    owners: dict[str, str | None] = {}
+    for identifier in blocks:
+        path = []
+        current: str | None = identifier
+        while current is not None and current not in owners:
+            path.append(current)
+            parent = blocks[current].get("parent")
+            if parent is None:
+                owners[current] = (
+                    current if blocks[current].get("opcode") == "procedures_definition" else None
+                )
+                break
+            current = parent
+        owner = owners[current] if current is not None else None
+        for visited in path:
+            owners[visited] = owner
+    return owners
+
+
+def _epoch_input(sprite: dict, call: str, owner: str | None, epoch_id: str) -> list:
+    """The ``epoch`` input of ``call``: the epoch its procedure runs in, or the current one.
+
+    A call made in a procedure with an ``epoch`` argument passes that on;
+    any other passes the epoch as it is when the call runs.
+    """
+    blocks = sprite["blocks"]
+    if owner is None or "epoch" not in _procedure_arguments(blocks, owner):
+        return [3, [12, _EPOCH, epoch_id], [10, ""]]
+    reporter = f"{call}_epoch"
+    blocks[reporter] = {
+        "opcode": "argument_reporter_string_number", "next": None, "parent": call,
+        "inputs": {}, "fields": {"VALUE": ["epoch", None]}, "shadow": False, "topLevel": False,
+    }
+    return [3, reporter, [10, ""]]
+
+
+def _stop_overtaken_decoding(sprite: dict) -> None:
+    """Stop decoding the weights at the first chance once another call has started.
+
+    Scratch can pause a warp block where it calls a procedure or repeats a
+    loop, and run other scripts meanwhile. A decode overtaken by a call that
+    decodes the weights too, or uses them, must not write to them, nor to
+    the decoder's shared lists and variables, once it resumes. Each
+    procedure that init's epoch procedure runs, the decoders, takes the
+    epoch it was started in and checks it before it writes anything after a
+    place Scratch can pause it: at its start, at the start of every repeat
+    of a loop, and after a loop or a call, whose callee may have stopped. An
+    overtaken one stops; init then finds the epoch changed and leaves the
+    weights for the next call to decode again.
+
+    A procedure that starts a decode without an epoch of its own, such as a
+    step's check that the weights are decoded, is given the epoch of the
+    call running it where every call to it can pass one on. Sprites whose
+    weights need no decoding are left as they are.
+    """
+    blocks = sprite["blocks"]
+    definitions = {}
+    for identifier, block in blocks.items():
+        if block.get("opcode") == "procedures_definition":
+            prototype = blocks[block["inputs"]["custom_block"][1]]
+            definitions[prototype["mutation"]["proccode"]] = identifier
+    root = _epoch_procedure("cattorch init")
+    if root not in definitions:
+        return
+    owners = _owning_definitions(blocks)
+    calls: dict[str, list[str]] = {}
+    for identifier, block in blocks.items():
+        if block.get("opcode") == "procedures_call":
+            calls.setdefault(owners[identifier] or "", []).append(identifier)
+
+    guarded: list[str] = []
+    pending = [definitions[root]]
+    while pending:
+        for call in calls.get(pending.pop(), []):
+            name = blocks[call]["mutation"]["proccode"]
+            definition = definitions.get(name)
+            if (
+                definition is None or name == root or name in guarded
+                or _procedure_arguments(blocks, definition)
+            ):
+                continue
+            guarded.append(name)
+            pending.append(definition)
+    # Weights stored uncompressed are decoded by no loop.
+    decoding = {definitions[name] for name in guarded}
+    if not any(
+        block.get("opcode") in _LOOPS and owners[identifier] in decoding
+        for identifier, block in blocks.items()
+    ):
+        return
+    epoch_id = next(
+        identifier for identifier, entry in sprite["variables"].items() if entry[0] == _EPOCH
+    )
+
+    from cattorch.util.scratch.dsl import argument_id
+
+    callers: dict[str, list[str]] = {}
+    for identifier, block in blocks.items():
+        if block.get("opcode") == "procedures_call":
+            callers.setdefault(block["mutation"]["proccode"], []).append(identifier)
+
+    def take_epoch(name: str) -> str:
+        prototype_id = blocks[definitions[name]]["inputs"]["custom_block"][1]
+        prototype = blocks[prototype_id]
+        new = f"{name} for epoch %s"
+        mutation = _procedure_mutation(new, warp=True, arguments=("epoch",))
+        mutation["warp"] = prototype["mutation"].get("warp", "false")
+        prototype["mutation"] = mutation
+        reporter = f"{prototype_id}_{argument_id('epoch')}"
+        prototype["inputs"] = {argument_id("epoch"): [1, reporter]}
+        blocks[reporter] = {
+            "opcode": "argument_reporter_string_number", "next": None,
+            "parent": prototype_id, "inputs": {}, "fields": {"VALUE": ["epoch", None]},
+            "shadow": True, "topLevel": False,
+        }
+        return new
+
+    renamed = {name: take_epoch(name) for name in guarded}
+
+    def with_epoch(definition: str | None) -> bool:
+        return definition is not None and "epoch" in _procedure_arguments(blocks, definition)
+
+    def passing(definition: str | None, found: set[str]) -> bool:
+        """Whether ``definition`` can take the epoch from every call to it, adding to ``found``.
+
+        Only an internal procedure without arguments, run only from other
+        procedures, each with an epoch or able to take one.
+        """
+        if definition is None:
+            return False
+        if with_epoch(definition) or definition in found:
+            return True
+        name = blocks[blocks[definition]["inputs"]["custom_block"][1]]["mutation"]["proccode"]
+        if not name.startswith("_") or _procedure_arguments(blocks, definition):
+            return False
+        found.add(definition)
+        return all(
+            not blocks[call].get("topLevel") and passing(owners[call], found)
+            for call in callers.get(name, [])
+        )
+
+    # A procedure that starts a decode, such as a forward's or step's check
+    # that the weights are decoded, starts it in the epoch the call running
+    # it started in, passed down to it; a call overtaken before it starts
+    # the decode then decodes nothing.
+    threaded: set[str] = set()
+    for name in (root, *guarded):
+        for call in callers.get(name, []):
+            found: set[str] = set()
+            if passing(owners[call], found):
+                threaded |= found
+    procedure_names = {
+        definition: blocks[blocks[definition]["inputs"]["custom_block"][1]]["mutation"][
+            "proccode"
+        ]
+        for definition in threaded
+    }
+    renamed.update({name: take_epoch(name) for name in procedure_names.values()})
+    for identifier, block in list(blocks.items()):
+        if block.get("opcode") != "procedures_call":
+            continue
+        name = block["mutation"]["proccode"]
+        new = renamed.get(name)
+        if new is None and name != root:
+            continue
+        block["mutation"] = _procedure_mutation(new or name, arguments=("epoch",))
+        block["inputs"] = {
+            argument_id("epoch"): _epoch_input(sprite, identifier, owners[identifier], epoch_id),
+        }
+
+    def check(parent: str, following: str | None) -> str:
+        token = uuid.uuid4().hex[:8]
+        guard = f"cattorch_overtaken_{token}"
+        condition, equal = f"{guard}_not", f"{guard}_current"
+        reporter, stop = f"{guard}_epoch", f"{guard}_stop"
+        blocks[guard] = {
+            "opcode": "control_if", "next": following, "parent": parent,
+            "inputs": {"CONDITION": [2, condition], "SUBSTACK": [2, stop]},
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[condition] = {
+            "opcode": "operator_not", "next": None, "parent": guard,
+            "inputs": {"OPERAND": [2, equal]}, "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[equal] = {
+            "opcode": "operator_equals", "next": None, "parent": condition,
+            "inputs": {
+                "OPERAND1": [3, reporter, [10, ""]],
+                "OPERAND2": [3, [12, _EPOCH, epoch_id], [10, ""]],
+            },
+            "fields": {}, "shadow": False, "topLevel": False,
+        }
+        blocks[reporter] = {
+            "opcode": "argument_reporter_string_number", "next": None, "parent": equal,
+            "inputs": {}, "fields": {"VALUE": ["epoch", None]}, "shadow": False,
+            "topLevel": False,
+        }
+        blocks[stop] = {
+            "opcode": "control_stop", "next": None, "parent": guard, "inputs": {},
+            "fields": {"STOP_OPTION": ["this script", None]}, "shadow": False,
+            "topLevel": False,
+            "mutation": {"tagName": "mutation", "children": [], "hasnext": "false"},
+        }
+        if following is not None:
+            blocks[following]["parent"] = guard
+        return guard
+
+    def pauses(identifier: str) -> bool:
+        # Where Scratch can pause: a loop, or a call, whose callee checks
+        # first but may have stopped part way.
+        return blocks[identifier]["opcode"] in (*_LOOPS, "procedures_call")
+
+    def guard(first: str, *, start: bool, after_last: bool) -> str:
+        """Check the chain from ``first``; returns its new first block."""
+        chain = [first]
+        while blocks[chain[-1]].get("next") is not None:
+            chain.append(blocks[chain[-1]]["next"])
+        for position, identifier in enumerate(chain):
+            block = blocks[identifier]
+            opcode = block["opcode"]
+            for key in ("SUBSTACK", "SUBSTACK2"):
+                substack = block.get("inputs", {}).get(key)
+                if not substack or substack[1] is None:
+                    continue
+                loop = opcode in _LOOPS
+                substack[1] = guard(substack[1], start=loop, after_last=not loop)
+            if pauses(identifier) and (position < len(chain) - 1 or after_last):
+                block["next"] = check(identifier, block.get("next"))
+        if start and not pauses(first):
+            parent = blocks[first]["parent"]
+            head = check(parent, first)
+            if blocks[parent].get("next") == first:
+                blocks[parent]["next"] = head
+            return head
+        return first
+
+    for name in guarded:
+        definition = definitions[name]
+        first = blocks[definition].get("next")
+        if first is not None:
+            blocks[definition]["next"] = guard(first, start=True, after_last=False)
 
 
 def _guard_plain_calls(sprite: dict, outputs: Sequence[str]) -> dict:
@@ -2088,6 +2344,7 @@ def _guard_plain_calls(sprite: dict, outputs: Sequence[str]) -> dict:
             and block["mutation"].get("proccode") in wrapped
         ):
             block["mutation"] = _procedure_mutation(forward)
+    _stop_overtaken_decoding(sprite)
     try:
         _find_procedure_definition(sprite, "cattorch prepare for save")
     except ValueError:

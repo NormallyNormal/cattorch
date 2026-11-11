@@ -377,9 +377,26 @@
   during this one; reset or prefill first`. A sprite has 12 more blocks;
   reset, prefill and decode run no more blocks, init 6 more.
   Uncompressed sprites decode nothing, so they had no such problem, and
-  `ExportProgram` sprites already guarded init. One more overlap, in these
-  sprites, plain exports and programs alike, is still not caught: a block
-  that runs while a taken-over init, resumed, still decodes the weights. See
+  `ExportProgram` sprites already guarded init. See
+  [overlapping calls](docs/generation.md#overlapping-calls).
+- In every kind of sprite with compressed weights (the default, and
+  quantized ones), a `cattorch init` taken over while it decoded the
+  weights, or a block taken over while it decoded them in a freshly loaded
+  project, carried on decoding once Scratch resumed it. A block that ran
+  while it did so, after the block that took over had ended, could report
+  `ok` with weights it half overwrote, and a block decoding the weights
+  meanwhile could report `ok` with weights decoded from the lists it
+  changed. Now the procedures that decode the weights take the epoch of the
+  block that started them, check it at their start, at every repeat of a
+  loop and after every loop and call, where Scratch can have paused them,
+  and stop once another block has started, before they write again; a
+  block taken over before it began decoding decodes nothing. In scratch-vm,
+  an init taken over 500 ms in now stops instead of decoding every weight
+  again. A compressed sprite has 5 more blocks per check, about 110 in a
+  tiny one and 970 in a four-layer generator; init runs 6 to 23% more
+  blocks. Forward, entry point, prefill and decode calls run no more, but
+  in a recurrent generator with a state filled at run time, prefill and
+  decode run 1 more per token. Uncompressed sprites are unchanged. See
   [overlapping calls](docs/generation.md#overlapping-calls).
 - Generation, recurrent generation and `ExportProgram` sprites had loose call
   blocks on the canvas that ran private procedures directly. The one in a

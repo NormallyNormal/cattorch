@@ -225,21 +225,21 @@ script can call `cattorch init`, `cattorch reset`, `cattorch prefill` or
 - `cattorch init` marks the weights undecoded while it decodes them, so a
   block started meanwhile decodes them itself. An init that another block
   started during, or one stopped part way, leaves them for the next block to
-  decode again. Init doesn't touch the cache, and still reports `ok`.
+  decode again; once taken over, init, or a block decoding the weights,
+  stops decoding where Scratch next lets it check, before it writes to them
+  or to the decoder's lists again. Init doesn't touch the cache, and still
+  reports `ok`.
 
 `cattorch reset` or `cattorch prefill`, run once nothing else is running,
-always recovers, and apart from two cases a block that reports `ok` ran
-alone. First, if the block that was taken over resumes while the newer
-block is itself paused, and is still unfinished when the newer block ends, or
-is stopped after it resumed, the newer block or a later decode can report
-`ok` with logits from caches the old block changed. Second, if a
-`cattorch init` that was taken over while it decoded the weights resumes
-after the newer block ended, a block that starts and ends while that init is
-still decoding can report `ok` with weights it half overwrote; the next block
-after the init decodes them again. A Scratch block can't stop another
-script's paused block, and checking at every loop would slow every step.
-Call the generation blocks from one script at a time; to reset from another
-script, stop the generating script first.
+always recovers, and apart from one case a block that reports `ok` ran
+alone: if the block that was taken over resumes while the newer block is
+itself paused, and is still unfinished when the newer block ends, or is
+stopped after it resumed, the newer block or a later decode can report `ok`
+with logits from caches, working lists or the prompt the old block changed.
+A Scratch block can't stop another script's paused block, and checking at
+every loop of a step, as decoding the weights does, would make every step
+run about an eighth more blocks. Call the generation blocks from one script
+at a time; to reset from another script, stop the generating script first.
 
 Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
 shrink the sprite, see layer sharing in

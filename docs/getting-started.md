@@ -110,27 +110,25 @@ the sprite's working lists and decoded weights. Scratch's stop sign, or a
   broadcast. If a forward it then resumed during is still running, that one
   fails the same way.
 - A `cattorch init` that another block started during, or a forward taken
-  over while it decoded the weights, leaves them for the next forward to
-  decode again. A forward started while `cattorch init` decodes the weights
-  decodes them itself.
+  over while it decoded the weights, stops decoding them where Scratch
+  next lets it check, before it writes to them again, and leaves them for
+  the next forward to decode again. A forward started while `cattorch init`
+  decodes the weights decodes them itself.
 - A forward stopped part way leaves nothing for the next call to fix, but its
   outputs are partly written and `cattorch status` keeps its earlier value.
 
-Apart from three cases, a forward that reports `ok` ran alone and its outputs
+Apart from two cases, a forward that reports `ok` ran alone and its outputs
 are right when it ends. First, as for
 [generation](generation.md#overlapping-calls): if the forward that was taken
 over resumes while the newer block is itself paused, and is still unfinished
 when the newer block ends, or is stopped after it resumed, the newer block
-can report `ok` with results from lists the old forward changed. Second, a
-forward writes its outputs as it computes, not at its end: if the forward
-that was taken over resumes after the newer one ended, it overwrites the
-newer one's outputs, and then clears them, after the newer one reported
-`ok`. Third, if a `cattorch init` that was taken over while it decoded the
-weights resumes after the newer block ended, a forward that starts and ends
-while that init is still decoding can report `ok` with weights it half
-overwrote; the next forward after the init decodes them again. Call
-`cattorch forward` from one script at a time; to call it from another
-script, stop the calling script first.
+can report `ok` with results from working lists the old forward changed.
+Second, a forward writes its outputs as it computes, not at its end: if the
+forward that was taken over resumes after the newer one ended, it overwrites
+the newer one's outputs, and then clears them, after the newer one reported
+`ok`. Neither involves the weights, which an overtaken block no longer
+writes. Call `cattorch forward` from one script at a time; to call it from
+another script, stop the calling script first.
 
 ## Connect another sprite
 

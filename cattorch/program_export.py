@@ -35,6 +35,7 @@ from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
     _BUSY, _CALL_OVERTAKEN, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
     _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
+    _stop_overtaken_decoding,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
@@ -989,6 +990,8 @@ def transpile_program(
     for old, new in procedure_renames.items():
         _rename_procedure(combined, old, new)
     _rename_broadcasts(combined, broadcast_renames)
+    if _guard_overlaps:
+        _stop_overtaken_decoding(combined)
     entry_results = [
         replace(
             entry_result,

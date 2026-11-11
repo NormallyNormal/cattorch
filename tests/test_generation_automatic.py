@@ -277,8 +277,8 @@ def stop_during(emulator, public, procedure, call, tokens=None):
 
 
 @pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
-    ("cattorch prefill", "_cattorch token step", 4, [1, 2, 3, 4, 5, 6]),
-    ("cattorch decode", "_cattorch token step", 1, [5]),
+    ("cattorch prefill", "_cattorch token step for epoch %s", 4, [1, 2, 3, 4, 5, 6]),
+    ("cattorch decode", "_cattorch token step for epoch %s", 1, [5]),
     ("cattorch reset", "_cattorch reset state", 1, None),
 ])
 def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(

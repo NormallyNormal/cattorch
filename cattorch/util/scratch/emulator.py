@@ -99,6 +99,10 @@ def _deep_reporters():
         sys.setrecursionlimit(limit)
 
 
+class _StopScript(Exception):
+    """``stop this script``: ends the procedure running it, or the script."""
+
+
 class _NameView:
     """Dict-like view that maps display names to underlying ID-keyed storage.
 
@@ -200,7 +204,7 @@ class ScratchEmulator:
         if root_index >= len(roots):
             raise ValueError(f"root_index {root_index} out of range, found {len(roots)} roots")
         with _deep_reporters():
-            self._exec_chain(roots[root_index])
+            self._exec_script(roots[root_index])
 
     def run_procedure(self, name: str) -> None:
         """Run a named custom block without relying on top-level stack order."""
@@ -208,7 +212,7 @@ class ScratchEmulator:
             available = ", ".join(sorted(self._procedures)) or "none"
             raise ValueError(f"procedure {name!r} not found; available: {available}")
         with _deep_reporters():
-            self._exec_chain(self._procedures[name])
+            self._exec_script(self._procedures[name])
 
     def _find_roots(self) -> list[str]:
         roots = [
@@ -254,6 +258,13 @@ class ScratchEmulator:
     # A chain is compiled the first time it runs and cached by its first
     # block; reporters evaluated through ``_eval_reporter`` compile afresh,
     # since tests may edit those blocks between calls.
+
+    def _exec_script(self, block_id: str | None):
+        """Run a script, or a procedure as a call to it does, to its end or ``stop``."""
+        try:
+            self._exec_chain(block_id)
+        except _StopScript:
+            pass
 
     def _exec_chain(self, block_id: str | None):
         if block_id is None:
@@ -424,7 +435,10 @@ class ScratchEmulator:
                     counts[opcode] += 1
                     if proccode not in procedures:
                         raise ValueError(f"procedure not found: {proccode}")
-                    exec_chain(procedures[proccode])
+                    try:
+                        exec_chain(procedures[proccode])
+                    except _StopScript:
+                        pass
             else:
                 names = self._argument_names(proccode)
                 arguments = [
@@ -440,8 +454,19 @@ class ScratchEmulator:
                     frames.append({name: value() for name, value in arguments})
                     try:
                         exec_chain(procedures[proccode])
+                    except _StopScript:
+                        pass
                     finally:
                         frames.pop()
+
+        elif opcode == "control_stop":
+            option = fields["STOP_OPTION"][0]
+            if option != "this script":
+                raise NotImplementedError(f"stop {option} is not supported")
+
+            def run():
+                counts[opcode] += 1
+                raise _StopScript
 
         elif opcode == "looks_switchcostumeto":
             requested_of = value_of(inputs["COSTUME"])
@@ -996,7 +1021,7 @@ class ProjectEmulator:
             ]
             for hat in hats:
                 with _deep_reporters():
-                    emulator._exec_chain(hat.get("next"))
+                    emulator._exec_script(hat.get("next"))
 
     def green_flag(self) -> None:
         self._run_hats("event_whenflagclicked")
