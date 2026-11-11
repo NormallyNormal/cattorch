@@ -794,3 +794,70 @@ def test_einsum_and_bilinear_weights_are_stored_as_integers_in_export_programs(
     assert {precision for _, precision in precisions} == {"int8"}
     comparison = verify(model, program, result, atol=1e-4, quantization=config)
     assert comparison.passed, comparison
+
+
+@torch.no_grad()
+def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypatch):
+    # A convolution maps every input window linearly, so GPTQ calibrates
+    # each group of kernels over its windows. Storage groups a kernel along
+    # its last dimension, so GPTQ's groups run along it too and the kernels
+    # stay integers.
+    import cattorch.sprite as sprite_module
+
+    torch.manual_seed(15)
+    model = _Functional(
+        lambda s, x: s.up(torch.relu(s.grouped(x.view(1, 4, 4, 4))).view(1, 8, 16)).flatten(),
+        grouped=torch.nn.Conv2d(4, 8, 3, padding=1, groups=2),
+        up=torch.nn.ConvTranspose1d(8, 4, 3, stride=2),
+    ).eval()
+    example = torch.randn(1, 64)
+    calibration = [torch.randn(1, 64) for _ in range(8)]
+    config = QuantizationConfig(
+        bits=4, method="gptq", group_size=8, min_quantized_values=1, min_calibration_rows=16,
+    )
+    expected_model = copy.deepcopy(model)
+    report = quantize_model(expected_model, config, calibration)
+    weights = {item.name: item for item in report.tensors if "weight" in item.name}
+    assert set(weights) == {
+        "grouped.weight[offset=0,shape=(4, 2, 3, 3)]",
+        "grouped.weight[offset=72,shape=(4, 2, 3, 3)]",
+        "up.weight",
+    }
+    for name, item in weights.items():
+        assert (item.method, item.fallback_reason, item.effective_group_size) == (
+            "gptq", None, 3,
+        )
+        # A window per output position: 4 x 4, and 33 from the transpose.
+        assert item.calibration_rows == 8 * (33 if name == "up.weight" else 16)
+    for parameter in expected_model.parameters():
+        if parameter.ndim == 1:
+            parameter.copy_(parameter.half().float())
+
+    precisions = []
+    original = sprite_module._static_storage_precision
+
+    def record(tensor, storage, *args):
+        precision = original(tensor, storage, *args)
+        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 3:
+            precisions.append((tuple(tensor.shape), precision))
+        return precision
+
+    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    result = transpile(
+        model, example, tmp_path / "convolutions", quantization=config,
+        calibration_inputs=calibration,
+    )
+    # The transposed kernel is stored flipped, as a plain convolution's.
+    kernels = {(8, 2, 3, 3), (4, 8, 3)}
+    assert kernels <= {shape for shape, _ in precisions}
+    assert {precision for shape, precision in precisions if shape in kernels} == {"int4"}
+    assert not [warning for warning in result.warnings if "GPTQ fallback" in warning]
+
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    torch.testing.assert_close(
+        torch.tensor([float(value) for value in emulator.lists["output"]]),
+        expected_model(example).flatten(),
+        atol=1e-4, rtol=1e-5,
+    )

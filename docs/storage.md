@@ -69,9 +69,13 @@ by `F.bilinear` and `nn.Bilinear` is grouped over its inputs, and GPTQ
 calibrates it. So are `nn.MultiheadAttention`'s input projection, its output
 projection when the call passes no mask, and the input
 weights of `nn.RNN`, `nn.LSTM` and `nn.GRU`, plus their hidden weights when
-there is one layer in one direction. Other matrices, such as embeddings and
-convolution kernels, are grouped along their last dimension and use symmetric
-quantization; with GPTQ, `result.warnings` names each of them.
+there is one layer in one direction. Convolution kernels are grouped along
+their last dimension, the kernel width, which is how storage reads them, so a
+3x3 kernel has a scale for every 3 values. GPTQ calibrates each group of
+kernels over the input windows it reads, for 1D, 2D and 3D, grouped,
+depthwise and transposed convolutions. Other matrices, such as embeddings,
+are grouped along their last dimension and use symmetric quantization; with
+GPTQ, `result.warnings` names each of them.
 
 Storage keeps a quantized matrix in integers only in the layout it was
 quantized in. A weight the model copies into another layout itself, such as

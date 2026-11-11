@@ -113,13 +113,66 @@ def effective_group_size(width: int, maximum: int) -> int:
     return 1
 
 
+Orientation = Literal["linear", "rhs_matmul", "conv", "conv_transpose"]
+
+
 @dataclass
 class _ActivationStats:
     name: str
     weight: torch.Tensor
-    orientation: Literal["linear", "rhs_matmul"]
+    orientation: Orientation
     hessian: torch.Tensor
     rows: int = 0
+
+
+def _matrix_width(weight: torch.Tensor, orientation: str) -> int | None:
+    """The input width of ``weight`` used in ``orientation``, if it can be."""
+    if orientation in {"linear", "rhs_matmul"}:
+        if weight.ndim != 2:
+            return None
+        return weight.shape[1] if orientation == "linear" else weight.shape[0]
+    if weight.ndim < 3:
+        return None
+    kernel = math.prod(weight.shape[2:])
+    return (weight.shape[1] if orientation == "conv" else weight.shape[0]) * kernel
+
+
+def _logical_matrix(weight: torch.Tensor, orientation: str) -> torch.Tensor:
+    """``weight`` as an output-major matrix over its inputs.
+
+    A group of convolution kernels has a row per output channel, over its
+    input channels and kernel positions in storage order.
+    """
+    if orientation == "linear":
+        return weight
+    if orientation == "rhs_matmul":
+        return weight.T
+    if orientation == "conv":
+        return weight.reshape(weight.shape[0], -1)
+    return weight.transpose(0, 1).reshape(weight.shape[1], -1)
+
+
+def _physical_weight(
+    matrix: torch.Tensor, weight: torch.Tensor, orientation: str,
+) -> torch.Tensor:
+    """Undo ``_logical_matrix`` for a matrix of ``weight``'s values."""
+    if orientation == "linear":
+        return matrix
+    if orientation == "rhs_matmul":
+        return matrix.T
+    if orientation == "conv":
+        return matrix.reshape(weight.shape)
+    swapped = (weight.shape[1], weight.shape[0], *weight.shape[2:])
+    return matrix.reshape(swapped).transpose(0, 1)
+
+
+def _storage_group_width(weight: torch.Tensor, orientation: str) -> int | None:
+    """The run of a logical row which storage groups together, if not all.
+
+    Storage groups a convolution kernel along its last dimension, which is
+    also the last in each logical row.
+    """
+    return int(weight.shape[-1]) if orientation in {"conv", "conv_transpose"} else None
 
 
 def _storage_key(value: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
@@ -162,18 +215,39 @@ class _GPTQCaptureMode(TorchDispatchMode):
         if not value.is_floating_point() or not weight.is_floating_point():
             return
         name = self._parameter_name(weight)
-        if name is None or weight.ndim != 2:
+        width = _matrix_width(weight, orientation)
+        if name is None or not width:
             return
-        width = weight.shape[1] if orientation == "linear" else weight.shape[0]
-        if value.shape[-1] != width:
+        if orientation in {"conv", "conv_transpose"}:
+            # Windows ``[batch, *positions, channels, *kernel]``: only GPTQ
+            # reads them. They are copied a few rows of positions at a time,
+            # so the copies stay far smaller than every window at once.
+            trailing = weight.ndim - 1
+            if (
+                not self.collect_hessian
+                or value.ndim <= trailing
+                or math.prod(value.shape[-trailing:]) != width
+            ):
+                return
+            windows = value.detach()
+            leading = windows.shape[:-trailing]
+            rows_seen = math.prod(leading)
+            if len(leading) == 1:
+                windows, leading = windows.unsqueeze(1), (1, *leading)
+            per_position = math.prod(leading[2:]) * width
+            step = max(1, _WINDOW_CHUNK_VALUES // max(1, per_position))
+            slices: Iterable[torch.Tensor] = (
+                windows[batch, start:start + step].reshape(-1, width)
+                for batch in range(leading[0])
+                for start in range(0, leading[1], step)
+            )
+        elif value.shape[-1] != width:
             return
-        rows = value.detach().reshape(-1, width)
-        if rows.numel() == 0:
+        else:
+            slices = (value.detach().reshape(-1, width),)
+            rows_seen = int(value.numel()) // width
+        if rows_seen == 0:
             return
-        if self.collect_hessian:
-            rows = rows.to(device="cpu", dtype=torch.float64)
-            if not bool(torch.isfinite(rows).all()):
-                raise ValueError(f"GPTQ calibration for {name!r} contains nonfinite activations")
         key = (*_storage_key(weight), orientation)
         stat = self.stats.get(key)
         if stat is None:
@@ -191,8 +265,14 @@ class _GPTQCaptureMode(TorchDispatchMode):
             )
             self.stats[key] = stat
         if self.collect_hessian:
-            stat.hessian.addmm_(rows.T, rows)
-        stat.rows += rows.shape[0]
+            for rows in slices:
+                rows = rows.to(device="cpu", dtype=torch.float64)
+                if not bool(torch.isfinite(rows).all()):
+                    raise ValueError(
+                        f"GPTQ calibration for {name!r} contains nonfinite activations"
+                    )
+                stat.hessian.addmm_(rows.T, rows)
+        stat.rows += rows_seen
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -225,9 +305,14 @@ def _normalize_batch(batch) -> tuple[torch.Tensor, ...]:
 
 
 def _symmetric_matrix(
-    matrix: torch.Tensor, config: QuantizationConfig,
+    matrix: torch.Tensor, config: QuantizationConfig, group_width: int | None = None,
 ) -> tuple[torch.Tensor, int]:
-    width = matrix.shape[1]
+    """Quantize an output-major matrix in groups along its rows.
+
+    ``group_width`` is a run of each row that groups must not cross, when
+    storage groups less than a whole row together.
+    """
+    width = matrix.shape[1] if group_width is None else group_width
     group = effective_group_size(width, config.group_size)
     source = matrix.detach().cpu()
     # Rows hold whole groups, so a few rows at a time quantize exactly as the
@@ -253,21 +338,29 @@ def _symmetric_matrix(
 
 # Values quantized per step by _symmetric_matrix.
 _SYMMETRIC_CHUNK_VALUES = 1 << 21
+# Convolution window values copied per step by GPTQ calibration.
+_WINDOW_CHUNK_VALUES = 1 << 20
 
 
 def _gptq_matrix(
     matrix: torch.Tensor,
     hessian: torch.Tensor,
     config: QuantizationConfig,
+    group_width: int | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """Quantize one output-major matrix with blocked GPTQ error feedback."""
+    """Quantize one output-major matrix with blocked GPTQ error feedback.
+
+    ``group_width`` is as for ``_symmetric_matrix``.
+    """
     original_device = matrix.device
     original_dtype = matrix.dtype
     work = matrix.detach().to(device="cpu", dtype=torch.float64).clone()
     if not bool(torch.isfinite(work).all()):
         raise ValueError("GPTQ requires finite matrix weights")
     width = work.shape[1]
-    group = effective_group_size(width, config.group_size)
+    group = effective_group_size(
+        width if group_width is None else group_width, config.group_size,
+    )
     hessian = hessian.clone()
     diagonal = torch.diag(hessian)
     damp = float(config.damp_percent) * float(diagonal.mean())
@@ -428,6 +521,7 @@ def quantize_model(
     reports: list[TensorQuantizationReport] = []
     handled: set[tuple] = set()
     fully_handled_storage: set[int] = set()
+    covered: dict[int, int] = {}
     gptq = config.method == "gptq"
     total_rows = sum(stat.rows for stat in capture.stats.values()) if gptq else 0
     with torch.no_grad():
@@ -498,37 +592,43 @@ def quantize_model(
             if base_parameter is not None and stat.weight.numel() == base_parameter[1].numel():
                 # A full view such as a tied ``weight.T`` covers the parameter.
                 fully_handled_storage.add(pointer)
-            logical = stat.weight if stat.orientation == "linear" else stat.weight.T
+            elif base_parameter is not None and stat.orientation in {"conv", "conv_transpose"}:
+                # So do a grouped convolution's groups together. Views of one
+                # parameter that overlap were excluded above.
+                covered[pointer] = covered.get(pointer, 0) + stat.weight.numel()
+                if covered[pointer] == base_parameter[1].numel():
+                    fully_handled_storage.add(pointer)
+            logical = _logical_matrix(stat.weight, stat.orientation)
+            group_width = _storage_group_width(stat.weight, stat.orientation)
             method: Literal["gptq", "symmetric"] = "gptq"
             fallback_reason = None
             if not gptq:
                 method = "symmetric"
-                reconstructed, group = _symmetric_matrix(logical, config)
+                reconstructed, group = _symmetric_matrix(logical, config, group_width)
             elif stat.rows < config.min_calibration_rows:
                 method = "symmetric"
                 fallback_reason = (
                     f"only {stat.rows} calibration rows; "
                     f"requires {config.min_calibration_rows}"
                 )
-                reconstructed, group = _symmetric_matrix(logical, config)
+                reconstructed, group = _symmetric_matrix(logical, config, group_width)
             else:
                 try:
                     reconstructed, group = _gptq_matrix(
-                        logical, stat.hessian, config,
+                        logical, stat.hessian, config, group_width,
                     )
                     # Canonicalize through the physical symmetric codec. This
                     # makes the reconstructed tensor an exact fixed point of
                     # the existing Scratch storage encoder, including its one
                     # deliberately-unused signed code.
                     reconstructed, group = _symmetric_matrix(
-                        reconstructed, config,
+                        reconstructed, config, group_width,
                     )
                 except ValueError as error:
                     method = "symmetric"
                     fallback_reason = str(error)
-                    reconstructed, group = _symmetric_matrix(logical, config)
-            target = reconstructed if stat.orientation == "linear" else reconstructed.T
-            stat.weight.copy_(target)
+                    reconstructed, group = _symmetric_matrix(logical, config, group_width)
+            stat.weight.copy_(_physical_weight(reconstructed, stat.weight, stat.orientation))
             reports.append(TensorQuantizationReport(
                 name=stat.name,
                 method=method,

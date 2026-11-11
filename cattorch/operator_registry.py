@@ -750,6 +750,113 @@ def _observe_recurrent(_func, args, _kwargs, result):
     return tuple(observations)
 
 
+def _observe_convolution(func, args, kwargs, _result):
+    """Each group of a convolution's kernels, with the windows it reads.
+
+    A convolution is a linear map of every input window (im2col), so each
+    group's kernels are observed as one matrix over its input channels and
+    kernel positions, in the order storage keeps them. A transposed
+    convolution is the plain convolution, with its kernel flipped, of the
+    input spread by its stride and padded; flipping that input instead keeps
+    the windows in the weight's own kernel order, and only reorders them.
+
+    The windows are returned as views, ``[..., channels, *kernel]``, for the
+    capture to read a slice at a time; the orientation tells it the weight
+    is a group of output-major (``conv``) or input-major
+    (``conv_transpose``) kernels.
+    """
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return ()
+    bound = {
+        argument.name: argument.default_value
+        for argument in schema.arguments if argument.has_default_value()
+    }
+    bound.update(zip((argument.name for argument in schema.arguments), args))
+    bound.update(kwargs)
+    value, weight = bound.get("input"), bound.get("weight")
+    if (
+        not isinstance(value, torch.Tensor) or not isinstance(weight, torch.Tensor)
+        or weight.ndim < 3
+    ):
+        return ()
+    dimensions = weight.ndim - 2
+    transposed = bool(bound.get("transposed", "conv_transpose" in str(func)))
+    groups = int(bound.get("groups", 1))
+    kernel = list(weight.shape[2:])
+
+    def per_dimension(name, default):
+        item = bound.get(name, default)
+        item = list(item) if isinstance(item, (list, tuple)) else [item]
+        return item * dimensions if len(item) == 1 else item
+
+    stride = per_dimension("stride", 1)
+    dilation = per_dimension("dilation", 1)
+    padding = bound.get("padding", 0)
+    if value.ndim == dimensions + 1:
+        value = value.unsqueeze(0)
+    if value.ndim != dimensions + 2 or len(stride) != dimensions:
+        return ()
+    if transposed:
+        output_padding = per_dimension("output_padding", 0)
+        for index in range(dimensions):
+            axis = 2 + index
+            if stride[index] > 1:
+                shape = list(value.shape)
+                shape[axis] = (shape[axis] - 1) * stride[index] + 1
+                spread = value.new_zeros(shape)
+                every = [slice(None)] * value.ndim
+                every[axis] = slice(None, None, stride[index])
+                spread[tuple(every)] = value
+                value = spread
+        explicit = per_dimension("padding", 0)
+        pads = []
+        for index in range(dimensions):
+            before = dilation[index] * (kernel[index] - 1) - int(explicit[index])
+            pads.append((before, before + int(output_padding[index])))
+        stride = [1] * dimensions
+    elif padding == "valid":
+        pads = [(0, 0)] * dimensions
+    elif padding == "same":
+        pads = []
+        for index in range(dimensions):
+            total = dilation[index] * (kernel[index] - 1)
+            pads.append((total // 2, total - total // 2))
+    else:
+        pads = [(int(item), int(item)) for item in per_dimension("padding", 0)]
+    flat_pads: list[int] = []
+    for before, after in reversed(pads):
+        flat_pads += [before, after]
+    if any(flat_pads):
+        # Negative padding crops, as a transposed convolution's does.
+        value = torch.nn.functional.pad(value, flat_pads)
+    if transposed:
+        value = value.flip(list(range(2, 2 + dimensions)))
+    for index in range(dimensions):
+        span = dilation[index] * (kernel[index] - 1) + 1
+        if value.shape[2 + index] < span:
+            return ()
+        value = value.unfold(2 + index, span, stride[index])
+        if dilation[index] > 1:
+            value = value[..., ::dilation[index]]
+    # [batch, *positions, channels, *kernel]
+    windows = value.permute(
+        0, *range(2, 2 + dimensions), 1, *range(2 + dimensions, 2 + 2 * dimensions),
+    )
+    channels = windows.shape[dimensions + 1] // groups
+    outputs = weight.shape[0] // groups
+    observations: list[Observation] = []
+    for group in range(groups):
+        rows = windows.narrow(dimensions + 1, group * channels, channels)
+        if transposed:
+            kernels = weight.narrow(0, group * channels, channels)
+            observations.append((rows, kernels, "conv_transpose"))
+        else:
+            kernels = weight.narrow(0, group * outputs, outputs)
+            observations.append((rows, kernels, "conv"))
+    return observations
+
+
 # Operations the frontend rewrites before lowering, so they have no rule of
 # their own, but which eager calibration still sees under their own name.
 _DECOMPOSED_OBSERVERS: dict[str, Observer] = {
@@ -765,6 +872,15 @@ _DECOMPOSED_OBSERVERS: dict[str, Observer] = {
     "aten.gru.input": _observe_recurrent,
     "aten.rnn_tanh.input": _observe_recurrent,
     "aten.rnn_relu.input": _observe_recurrent,
+    **{
+        target: _observe_convolution
+        for target in (
+            "aten.conv1d.default", "aten.conv2d.default", "aten.conv3d.default",
+            "aten.conv1d.padding", "aten.conv2d.padding", "aten.conv3d.padding",
+            "aten.conv_transpose1d.default", "aten.conv_transpose2d.input",
+            "aten.conv_transpose3d.input", "aten.convolution.default",
+        )
+    },
 }
 
 

@@ -314,6 +314,16 @@
   keeps in float16, because the model copies it into another layout itself,
   such as `F.linear(x, weight.t().contiguous())`, now gets a warning in
   `result.warnings`.
+- GPTQ now calibrates convolution kernels (`nn.Conv1d`, `nn.Conv2d`,
+  `nn.Conv3d`, grouped and depthwise ones, and their transposed forms) over
+  the input windows each group of kernels reads, instead of falling back to
+  symmetric quantization with a warning. Its groups run along the kernel's
+  last dimension, as storage reads them, so the kernels stay in int8 or
+  int4. In small CNNs trained briefly on synthetic images, int4 GPTQ instead
+  of int4 symmetric lowers the output error relative to the float model from
+  1.4% to 0.8% for plain 3x3 convolutions, 4.5% to 1.2% with grouped ones,
+  3.5% to 1.1% with depthwise ones, 4.0% to 0.6% for a 1D network and 10.7%
+  to 4.0% for an autoencoder with transposed convolutions.
 - A quantized export could fail with `grouped weight sharding must preserve
   complete four-row groups` when compressed storage keeps a weight that runs
   four output rows at a time in float16 or float32, whose lists hold fewer
