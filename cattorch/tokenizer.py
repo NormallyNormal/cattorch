@@ -78,6 +78,76 @@ _SENTENCEPIECE_METHODS = (
 _SENTENCEPIECE_MODEL_TYPES = {1: "unigram", 2: "bpe", 3: "word", 4: "char"}
 # ``SentencePiece.Type``.
 _SENTENCEPIECE_USER_DEFINED = 4
+# The costume shown between lookups; never the name of a single character.
+_LOOKUP_COSTUME = "cat"
+
+
+class _CharacterLookup:
+    """Find each input character in a table of single characters.
+
+    Scratch's ``item # of`` compares text case-insensitively, so it can look
+    characters up only when none of them has another case (or when, as for a
+    case-folding SentencePiece model, that is the intended meaning).
+    Otherwise the sprite gets a costume named after each character and
+    switches to the character: ``switch costume to`` matches costume names
+    exactly, so ``A`` and ``a`` stay apart, and the costume number gives the
+    character's position. A character with no costume leaves the lookup
+    costume on, which marks it unknown. Every digit has a costume, since
+    Scratch reads an unmatched digit as a costume number.
+    """
+
+    def __init__(self, characters: Sequence[str], *, case_insensitive: bool = False):
+        self.characters = list(characters)
+        self.exact = not case_insensitive and any(
+            _scratch_cased(character) for character in self.characters
+        )
+        present = set(self.characters)
+        unknown_digits = [digit for digit in "0123456789" if digit not in present]
+        self.offset = 1 + len(unknown_digits)
+        self.costume_names: tuple[str, ...] | None = (
+            (_LOOKUP_COSTUME, *unknown_digits, *self.characters) if self.exact else None
+        )
+
+    def lists(self, characters_list: str) -> tuple[str, ...]:
+        """The character list ``find`` searches, if any."""
+        return () if self.exact else (characters_list,)
+
+    def find(self, characters_list: str, character: Expr, result: str) -> tuple[Statement, ...]:
+        """Set ``result`` to the character's 1-based position in the table."""
+        if not self.exact:
+            return (set_var(result, index_of(characters_list, character)),)
+        return (
+            switch_costume(_LOOKUP_COSTUME),
+            switch_costume(character),
+            set_var(result, sub(costume_number(), self.offset)),
+        )
+
+    def missing(self, result: str) -> Expr:
+        """Whether ``find`` found no character."""
+        return lt(var(result), 1) if self.exact else eq(var(result), 0)
+
+    def finish(self) -> tuple[Statement, ...]:
+        """Show the lookup costume again after encoding."""
+        return (switch_costume(_LOOKUP_COSTUME),) if self.exact else ()
+
+
+_LOWERCASE_TARGETS: frozenset[str] | None = None
+
+
+def _scratch_cased(character: str) -> bool:
+    """Whether Scratch's case-insensitive comparison equates ``character`` with another."""
+    global _LOWERCASE_TARGETS
+    if character.lower() != character.upper():
+        return True
+    if _LOWERCASE_TARGETS is None:
+        # Characters such as the Kelvin sign lower-case to another one.
+        _LOWERCASE_TARGETS = frozenset(
+            lowered
+            for character in map(chr, range(0x10000))
+            for lowered in (character.lower(),)
+            if lowered != character and len(lowered) == 1
+        )
+    return character in _LOWERCASE_TARGETS
 
 
 def _is_sentencepiece(processor) -> bool:
@@ -188,7 +258,7 @@ class _TokenizerBase(ABC):
 
     Subclasses construct their Scratch program with the typed DSL.
     """
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer) -> None:
         """
         Parameters
         ----------
@@ -196,6 +266,8 @@ class _TokenizerBase(ABC):
             A HuggingFace tokenizer. Must expose a ``.get_vocab()`` method.
         """
         self.tokenizer = tokenizer
+        # Set by ``_build_sprite`` when the sprite looks characters up by costume.
+        self._costume_names: tuple[str, ...] | None = None
 
     def _build_tokens_list(self) -> list[str]:
         vocab = self.tokenizer.get_vocab()
@@ -276,6 +348,7 @@ class _TokenizerBase(ABC):
             raise ValueError("name must be a non-empty string")
         finalized = finalize_sprite(
             sprite, output_path, sprite_name=sprite_name, codegen=codegen,
+            costume_names=self._costume_names,
         )
         return TokenizerResult(
             path=finalized.path,
@@ -291,27 +364,18 @@ class _TokenizerBase(ABC):
         )
 
 
-def _reject_scratch_text_ambiguity(
-    tokens: Sequence[str], *, characters_only: bool,
-) -> None:
-    """Reject vocab entries Scratch cannot distinguish or iterate safely."""
-    seen: dict[str, str] = {}
+def _reject_non_bmp(tokens: Sequence[str]) -> None:
+    """Reject vocab entries vanilla Scratch can't read one character at a time.
+
+    Characters which Scratch compares as equal, such as ``a`` and ``A``, are
+    told apart by ``_CharacterLookup``.
+    """
     for token in tokens:
-        if characters_only and len(token) != 1:
-            continue
         if any(ord(character) > 0xFFFF for character in token):
             raise ValueError(
                 "tokenizer vocabulary contains a non-BMP character which "
                 "vanilla Scratch splits into UTF-16 surrogate halves"
             )
-        key = token.lower()
-        previous = seen.get(key)
-        if previous is not None and previous != token:
-            raise ValueError(
-                "tokenizer vocabulary contains text which Scratch compares "
-                f"as equal: {previous!r} and {token!r}"
-            )
-        seen[key] = token
 
 
 def _check_encodes_characters(
@@ -390,7 +454,7 @@ class CharTokenizer(_TokenizerBase):
                 "CharTokenizer needs a tokenizer whose tokens are single characters, "
                 f"but this vocabulary has multi-character tokens such as {words[0]!r}"
             )
-        _reject_scratch_text_ambiguity(tokens, characters_only=True)
+        _reject_non_bmp([token for token in tokens if len(token) == 1])
         backend = _backend(self.tokenizer)
         if backend is not None:
             normalizer = _backend_settings(backend).get("normalizer")
@@ -401,9 +465,10 @@ class CharTokenizer(_TokenizerBase):
                     "raw text, so tokens would differ"
                 )
         _check_encodes_characters(self.tokenizer, tokens, special, unknown_id)
-        return _build_character_tokenizer_sprite(
+        sprite, self._costume_names = _build_character_tokenizer_sprite(
             tokens, bpe=False, unknown_id=unknown_id,
         )
+        return sprite
 
 
 class BPETokenizer(_TokenizerBase):
@@ -424,7 +489,9 @@ class BPETokenizer(_TokenizerBase):
         BPETokenizer(tokenizer).save("my_bpe_tok")
     """
     def _build_sprite(self, tokens: list[str]) -> dict:
-        _reject_scratch_text_ambiguity(tokens, characters_only=False)
+        # Merges combine token IDs, so tokens are never compared as text and
+        # may differ only in case.
+        _reject_non_bmp(tokens)
         backend = _backend(self.tokenizer)
         if backend is None:
             raise TypeError(
@@ -472,12 +539,13 @@ class BPETokenizer(_TokenizerBase):
                     f"BPE merge {left!r} + {right!r} has no matching vocabulary entry"
                 )
             merges.append((int(vocab[left]), int(vocab[right]), int(vocab[merged])))
-        return _build_character_tokenizer_sprite(
+        sprite, self._costume_names = _build_character_tokenizer_sprite(
             tokens,
             bpe=True,
             unknown_id=self._unknown_id(),
             merges=merges,
         )
+        return sprite
 
 
 def _build_character_tokenizer_sprite(
@@ -486,18 +554,18 @@ def _build_character_tokenizer_sprite(
     bpe: bool,
     unknown_id: int | None,
     merges: Sequence[tuple[int, int, int]] = (),
-) -> dict:
-    """Build the character/raw-BPE contract with the typed DSL."""
+) -> tuple[dict, tuple[str, ...] | None]:
+    """Build the character/raw-BPE contract with the typed DSL.
+
+    Returns the sprite and, when it looks characters up by costume, the
+    costume names.
+    """
     variables = (
         (
             "input", "output", "idx", "lookup", "candidate",
             "best_rank", "best_idx", "merging",
         )
         if bpe else ("input", "output", "idx", "lookup")
-    )
-    lists = (
-        ("tokens", "token_ids", "_characters", "_character ids")
-        + (("splitlist", "merge_keys", "merge_ids") if bpe else ())
     )
     # Look characters up among single-character tokens only. Scratch's
     # item # of compares numbers by value, so searching every token would let
@@ -508,10 +576,17 @@ def _build_character_tokenizer_sprite(
         if len(token) == 1:
             characters.append(token)
             character_ids.append(token_id)
+    lookup = _CharacterLookup(characters)
+    lists = (
+        ("tokens", "token_ids", *lookup.lists("_characters"), "_character ids")
+        + (("splitlist", "merge_keys", "merge_ids") if bpe else ())
+    )
     values: dict[str, Sequence[int | float | str]] = {
         "tokens": tokens, "token_ids": [],
         "_characters": characters, "_character ids": character_ids,
     }
+    if lookup.exact:
+        del values["_characters"]
     if bpe:
         values["splitlist"] = []
         vocab_size = len(tokens)
@@ -521,9 +596,9 @@ def _build_character_tokenizer_sprite(
     def append_lookup(destination: str) -> tuple[Statement, ...]:
         missing = () if unknown_id is None else (append(destination, unknown_id),)
         return (
-            set_var("lookup", index_of("_characters", letter(var("input"), var("idx")))),
+            *lookup.find("_characters", letter(var("input"), var("idx")), "lookup"),
             if_else(
-                eq(var("lookup"), 0),
+                lookup.missing("lookup"),
                 missing,
                 (append(destination, item("_character ids", var("lookup"))),),
             ),
@@ -602,6 +677,7 @@ def _build_character_tokenizer_sprite(
                     append("token_ids", item("splitlist", var("idx"))),
                 ),
             ),
+            *lookup.finish(),
         )
     else:
         encode_body = (
@@ -613,6 +689,7 @@ def _build_character_tokenizer_sprite(
                     *append_lookup("token_ids"),
                 ),
             ),
+            *lookup.finish(),
         )
     tokenize = Program(
         "BPE encode" if bpe else "character encode",
@@ -656,7 +733,7 @@ def _build_character_tokenizer_sprite(
     _add_warp_procedure(sprite, "cattorch detokenize", detokenize, x=320, y=320)
     _add_top_level_call(sprite, "cattorch tokenize", x=0, y=0)
     _add_top_level_call(sprite, "cattorch detokenize", x=0, y=100)
-    return sprite
+    return sprite, lookup.costume_names
 
 
 def _add_top_level_call(sprite: dict, procedure: str, *, x: int, y: int) -> None:
@@ -684,12 +761,14 @@ class SentencePieceBPETokenizer(_TokenizerBase):
     well as one clickable stack for each procedure. SentencePiece's whitespace
     marker and control tokens are handled by the sprite.
 
-    Scratch string comparisons are case-insensitive. ``scratch_casefold=True``
-    therefore supports SentencePiece models trained with an NFKC case-folding
-    normalizer for ASCII input without requiring a separate lowercase pass.
-    Arbitrary out-of-vocabulary Unicode byte fallback cannot be reproduced by
-    vanilla Scratch, which has no character-code reporter; characters present
-    directly in the vocabulary and all ASCII input are supported.
+    Characters are told apart by case, as SentencePiece does, using one
+    costume per character (see ``_CharacterLookup``). Scratch's own string
+    comparisons are case-insensitive, so ``scratch_casefold=True`` supports
+    models trained with an NFKC case-folding normalizer for ASCII input
+    without a separate lowercase pass or the costumes. Byte fallback works
+    for ASCII; arbitrary out-of-vocabulary Unicode byte fallback cannot be
+    reproduced by vanilla Scratch, which has no character-code reporter, so
+    such characters encode as the unknown token.
 
     Parameters
     ----------
@@ -801,8 +880,11 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             self.processor.id_to_piece(token_id)
             for token_id in range(self.processor.get_piece_size())
         ]
+        # A case-folding model is looked up case-insensitively, as Scratch
+        # compares; any other model's characters are told apart exactly.
+        fold = str.casefold if self.scratch_casefold else str
         normal_pieces = {
-            piece.replace("▁", " ").casefold()
+            fold(piece.replace("▁", " "))
             for token_id, piece in enumerate(raw_pieces)
             if not self.processor.is_byte(token_id)
             and not self.processor.is_control(token_id)
@@ -824,9 +906,10 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                         f"malformed SentencePiece byte token: {raw_piece!r}"
                     ) from exc
                 literal = chr(byte_value)
-                # Do not expose byte forms which would shadow a normal token
-                # under Scratch's case-insensitive list comparison.
-                if byte_value < 128 and literal.casefold() not in normal_pieces:
+                # A byte stands for its ASCII character when no normal
+                # token does (under Scratch's case-insensitive comparison,
+                # for a case-folding model).
+                if byte_value < 128 and fold(literal) not in normal_pieces:
                     piece = literal
             pieces.append(piece)
         return pieces
@@ -857,13 +940,13 @@ class SentencePieceBPETokenizer(_TokenizerBase):
 
             if len(piece) != 1 or token_id in self._special_ids:
                 continue
+            if not self.scratch_casefold:
+                # ``_CharacterLookup`` tells characters of different case apart.
+                characters.append(piece)
+                character_ids.append(token_id)
+                continue
             comparison_key = piece.casefold()
             if comparison_key in seen_characters:
-                if not self.scratch_casefold:
-                    raise ValueError(
-                        "SentencePiece vocabulary contains characters which "
-                        "Scratch compares as equal; use a case-folded model"
-                    )
                 if piece == comparison_key:
                     # The model case-folds its input, so the folded form,
                     # such as the byte for "q" rather than "Q", is the match.
@@ -880,17 +963,22 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         # adjacent pair. Encode a pair of token IDs as one exact Scratch number
         # so the hot scan uses numeric lookup instead of joining strings and
         # searching the entire piece vocabulary.
+        # A case-folding model's pieces are matched as Scratch compares them.
+        # Otherwise they match exactly, and byte tokens, which SentencePiece
+        # only emits for characters outside the vocabulary, never merge.
+        fold = str.casefold if self.scratch_casefold else str
         piece_ids: dict[str, int] = {}
         for token_id, piece in enumerate(pieces):
-            piece_ids.setdefault(piece.casefold(), token_id)
+            if self.scratch_casefold or not self.processor.is_byte(token_id):
+                piece_ids.setdefault(fold(piece), token_id)
         vocab_size = len(pieces)
         merge_entries: list[tuple[float, int, int]] = []
         for merged_id, piece in enumerate(pieces):
             if merged_id in self._special_ids or self.processor.is_byte(merged_id):
                 continue
             for split_at in range(1, len(piece)):
-                left_id = piece_ids.get(piece[:split_at].casefold())
-                right_id = piece_ids.get(piece[split_at:].casefold())
+                left_id = piece_ids.get(fold(piece[:split_at]))
+                right_id = piece_ids.get(fold(piece[split_at:]))
                 if left_id is None or right_id is None:
                     continue
                 if left_id in self._special_ids or right_id in self._special_ids:
@@ -915,6 +1003,8 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             merge_keys,
             merge_ids,
         ) = self._tables(pieces)
+        lookup = _CharacterLookup(characters, case_insensitive=self.scratch_casefold)
+        self._costume_names = lookup.costume_names
         variables = (
             "input",
             "output",
@@ -930,7 +1020,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             "tokens",
             "token_ids",
             "_sp split",
-            "_sp characters",
+            *lookup.lists("_sp characters"),
             "_sp character ids",
             "_sp decoded tokens",
             "_sp merge keys",
@@ -946,6 +1036,8 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             "_sp merge keys": merge_keys,
             "_sp merge ids": merge_ids,
         }
+        if lookup.exact:
+            del list_values["_sp characters"]
 
         scan_pair = (
             change_var("_sp i", 1),
@@ -1012,15 +1104,13 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                     string_length(var("input")),
                     (
                         change_var("_sp i", 1),
-                        set_var(
+                        *lookup.find(
+                            "_sp characters",
+                            letter(var("input"), var("_sp i")),
                             "_sp lookup",
-                            index_of(
-                                "_sp characters",
-                                letter(var("input"), var("_sp i")),
-                            ),
                         ),
                         if_else(
-                            eq(var("_sp lookup"), 0),
+                            lookup.missing("_sp lookup"),
                             # SentencePiece reads a run of unknown characters
                             # as one unknown token.
                             (
@@ -1056,6 +1146,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                         ),
                     ),
                 ),
+                *lookup.finish(),
             ),
         )
         detokenize = Program(
@@ -1114,8 +1205,10 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         if not self._decode_has_non_ascii_bytes:
             return result
         warning = (
-            "Vanilla Scratch cannot convert arbitrary UTF-8 byte-fallback "
-            "sequences to characters. ASCII bytes decode exactly; sampled "
+            "Vanilla Scratch cannot convert between characters and arbitrary "
+            "UTF-8 byte-fallback sequences. ASCII bytes encode and decode "
+            "exactly; a non-ASCII character outside the vocabulary encodes as "
+            "the unknown token rather than its UTF-8 bytes, and sampled "
             "non-ASCII byte tokens remain visible as <0xNN> markers.",
         )
         return TokenizerResult(

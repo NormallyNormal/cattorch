@@ -22,6 +22,7 @@ import tempfile
 import uuid
 import warnings
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -219,6 +220,7 @@ def finalize_sprite(
     public_data_names: frozenset[str] = frozenset(),
     public_procedures: frozenset[str] = frozenset(),
     public_interface: bool = True,
+    costume_names: Sequence[str] | None = None,
 ) -> FinalizedSprite:
     """
     Finalize a sprite dict and write it as a .sprite3 zip file.
@@ -231,6 +233,11 @@ def finalize_sprite(
         Path for the output .sprite3 file, e.g. "my_model.sprite3".
     sprite_name : str
         Name for the sprite inside Scratch. Also used to derive the asset ID.
+    costume_names : sequence of str, optional
+        The costumes' names, all sharing the one SVG. Scratch's ``switch
+        costume to`` matches names exactly, so a sprite can name costumes after
+        characters to tell ``A`` from ``a``. Defaults to the Base92 codec
+        alphabet when the sprite switches costumes, else one costume.
 
     Returns
     -------
@@ -282,7 +289,8 @@ def finalize_sprite(
         block.get("opcode") == "looks_switchcostumeto"
         for block in sprite.get("blocks", {}).values()
     )
-    costume_names = BASE92_ALPHABET if uses_costume_codec else ("cat",)
+    if costume_names is None:
+        costume_names = BASE92_ALPHABET if uses_costume_codec else ("cat",)
 
     # Codec costumes share one physical SVG, adding only their JSON metadata.
     sprite.update({

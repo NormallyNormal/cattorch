@@ -32,6 +32,13 @@ def combine_sprites(
     """
     primary = _read_sprite(primary_path)
     attached = _read_sprite(attached_path)
+    if len(attached.get("costumes", ())) > 1:
+        # A tokenizer that tells characters apart by case finds them by
+        # costume name, and the combined sprite has the primary's costumes.
+        raise ValueError(
+            f"{attached_path} looks characters up by costume, so it can't be "
+            "attached to another sprite; keep it a separate sprite"
+        )
     mapping = {
         identifier: f"cattorch_attached_{section}_{identifier}"
         for section in ("blocks", "variables", "lists", "broadcasts")

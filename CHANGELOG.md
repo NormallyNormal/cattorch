@@ -694,6 +694,20 @@
   token IDs. It now rejects multi-character tokens, a normalizer, and any
   tokenizer that doesn't encode text one character at a time, such as a
   single-character vocabulary behind a `Whitespace` pre-tokenizer.
+- Tokenizer sprites looked characters up with Scratch's case-insensitive
+  `item # of`, so a letter whose case wasn't in the vocabulary was read as the
+  other case (`The` encoded like `the`), and vocabularies with both cases
+  were rejected. That included every real SentencePiece model with
+  `byte_fallback=True` that lacked some ASCII letter as a normal piece, since
+  its byte pieces for `B` and `b` collide. Sprites whose vocabulary has
+  letters now get a costume per character and find characters by costume
+  name, which Scratch matches exactly; `scratch_casefold=True` remains for
+  case-folding models. Such tokenizer sprites change; one without letters is
+  unchanged. The sprite adds 4 blocks and about 140 bytes of JSON per
+  character, and runs at about the same speed.
+- A SentencePiece byte-fallback export now also warns that a non-ASCII
+  character outside the vocabulary encodes as the unknown token, where
+  SentencePiece emits its UTF-8 bytes.
 
 ## Deprecations
 

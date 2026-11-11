@@ -265,6 +265,55 @@ def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
     assert "the cat" + text in said
 
 
+def test_tokenizers_tell_characters_apart_by_case(tmp_path):
+    # Scratch compares text case-insensitively, so tokenizer sprites look
+    # characters up by costume name, which the VM matches exactly.
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        append, call, clear, for_each, item, join, length, set_var, var,
+    )
+    from test_tokenizer import (
+        _MIXED_CASE_CORPUS, _make_bpe_tokenizer, _mixed_case_strings, _train_sentencepiece,
+    )
+    from cattorch import BPETokenizer, SentencePieceBPETokenizer
+
+    processor = _train_sentencepiece(
+        corpus=_MIXED_CASE_CORPUS, vocab_size=400, byte_fallback=True, character_coverage=0.98,
+    )
+    bpe = _make_bpe_tokenizer(_MIXED_CASE_CORPUS, vocab_size=120)
+    texts = [text for text in _mixed_case_strings(60) if "☃" not in text]
+    builder = _Builder()
+    expected = {}
+    for name, result, encode in (
+        ("sp", SentencePieceBPETokenizer(processor).save(tmp_path / "sp"), processor.encode),
+        ("bpe", BPETokenizer(bpe).save(tmp_path / "bpe"), bpe.encode),
+    ):
+        sprite = builder.add_sprite(result.path, visible=False)
+        inputs = builder.global_list(f"{name} texts", texts)
+        outputs = builder.global_list(f"{name} ids")
+        builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
+            clear(outputs),
+            for_each("text index", length(inputs), (
+                set_var("cattorch text", item(inputs, var("text index"))),
+                call("cattorch tokenize"),
+                set_var("joined", ""),
+                for_each("id index", length("cattorch token ids"), (
+                    set_var("joined", join(var("joined"), join(
+                        item("cattorch token ids", var("id index")), " ",
+                    ))),
+                )),
+                append(outputs, var("joined")),
+            )),
+        ), lists=(inputs, outputs, "cattorch token ids"),
+            variables=("cattorch text", "text index", "id index", "joined"))
+        expected[outputs] = ["".join(f"{token} " for token in encode(text)) for text in texts]
+    path = tmp_path / "tokenizers.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    for outputs, want in expected.items():
+        assert stage[outputs] == want
+
+
 def test_a_benchmark_suite_runs(tmp_path):
     from cattorch import build_benchmark_suite
 

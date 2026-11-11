@@ -62,6 +62,33 @@ def _decode(sprite: dict, token_ids: list) -> str:
     return emu.variables["cattorch text"]
 
 
+_MIXED_CASE_CORPUS = [
+    "The quick brown Fox jumps over the lazy dog.", "the cat sat on the mat",
+    "A Cat and a DOG sat together, 12 times!", "Hello World: hello world?",
+    "Numbers 0 1 2 3 4 5 6 7 8 9 and 42.", "tabs\tand  double  spaces",
+] * 10
+
+
+def _mixed_case_strings(count: int) -> list[str]:
+    """Corpus fragments with flipped case, and random printable ASCII."""
+    import random
+
+    rng = random.Random(0)
+    alphabet = "".join(map(chr, range(32, 127))) + "\t\n☃"
+    texts = ["The Cat", "THE CAT", "Bb bB", "Q", "q", "1 01 10", "  x  "]
+    while len(texts) < count:
+        if rng.random() < 0.5:
+            line = rng.choice(_MIXED_CASE_CORPUS)
+            start = rng.randrange(len(line))
+            texts.append("".join(
+                c.swapcase() if rng.random() < 0.2 else c
+                for c in line[start:start + rng.randint(1, 20)]
+            ))
+        else:
+            texts.append("".join(rng.choice(alphabet) for _ in range(rng.randint(1, 20))))
+    return texts
+
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
@@ -183,17 +210,22 @@ class TestCharTokenizerRoundTrip:
         with pytest.raises(ValueError, match="unknown-token ID"):
             CharTokenizer(tokenizer).save(SPRITE_PATH)
 
-    def test_rejects_case_collisions_and_non_bmp_characters(self):
-        case_backend = Tokenizer(
-            models.WordLevel(vocab={"<unk>": 0, "a": 1, "A": 2}, unk_token="<unk>")
-        )
-        case_backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
-        case_tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=case_backend, unk_token="<unk>",
-        )
-        with pytest.raises(ValueError, match="Scratch compares as equal"):
-            CharTokenizer(case_tokenizer).save(SPRITE_PATH)
+    def test_tells_characters_apart_by_case(self):
+        # Scratch compares "a" and "A" as equal; costume names don't.
+        backend = Tokenizer(models.WordLevel(
+            vocab={"<unk>": 0, "a": 1, "A": 2, "b": 3, "7": 4, " ": 5}, unk_token="<unk>",
+        ))
+        backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+        CharTokenizer(tokenizer).save(SPRITE_PATH)
+        sprite = _load_sprite()
 
+        # "B" has no token of its own, and an unknown digit or whitespace
+        # must not select a costume by number.
+        for text in ("aAbB", "Aa", "B", "1 7 9", "\t a"):
+            assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text)
+
+    def test_rejects_non_bmp_characters(self):
         emoji_backend = Tokenizer(
             models.WordLevel(vocab={"<unk>": 0, "😀": 1}, unk_token="<unk>")
         )
@@ -319,15 +351,13 @@ class TestBPETokenizerEncode:
         for text in ("a1 1", "1", "01 0"):
             assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text)
 
-    def test_rejects_case_colliding_bpe_vocab(self):
-        backend = Tokenizer(models.BPE(
-            vocab={"<unk>": 0, "a": 1, "A": 2}, merges=[], unk_token="<unk>",
-        ))
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend, unk_token="<unk>",
-        )
-        with pytest.raises(ValueError, match="Scratch compares as equal"):
-            BPETokenizer(tokenizer).save(SPRITE_PATH)
+    def test_real_mixed_case_bpe_matches_hugging_face(self):
+        tokenizer = _make_bpe_tokenizer(_MIXED_CASE_CORPUS, vocab_size=120)
+        BPETokenizer(tokenizer).save(SPRITE_PATH)
+        sprite = _load_sprite()
+
+        for text in _mixed_case_strings(200):
+            assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text), text
 
 
 class TestBPESettingsTheSpriteCantReproduce:
@@ -678,6 +708,26 @@ def _train_sentencepiece(model_type="bpe", corpus=_CORPUS, **options):
         sentence_iterator=iter(corpus), model_writer=model, model_type=model_type, **settings,
     )
     return sentencepiece.SentencePieceProcessor(model_proto=model.getvalue())
+
+
+@pytest.mark.parametrize("options", [
+    # Byte pieces for "B" and "b" used to be rejected as equal in Scratch.
+    dict(vocab_size=400, byte_fallback=True, character_coverage=0.98),
+    dict(vocab_size=120),
+], ids=["byte-fallback", "no-byte-fallback"])
+def test_real_mixed_case_sentencepiece_matches_sentencepiece(tmp_path, options):
+    processor = _train_sentencepiece(corpus=_MIXED_CASE_CORPUS, **options)
+    result = SentencePieceBPETokenizer(processor).save(tmp_path / "sentencepiece")
+    texts = _mixed_case_strings(300)
+    if options.get("byte_fallback"):
+        # SentencePiece encodes "☃" as UTF-8 bytes, which vanilla
+        # Scratch can't find; the sprite gives the unknown token and warns.
+        assert "☃" not in "".join(map(processor.id_to_piece, range(len(processor))))
+        assert _tokenize(result, "☃") == [processor.unk_id()]
+        assert any("encodes as the unknown token" in warning for warning in result.warnings)
+        texts = [text for text in texts if "☃" not in text]
+    for text in texts:
+        assert _tokenize(result, text) == processor.encode(text), text
 
 
 @pytest.mark.parametrize("model_type", ["unigram", "word", "char"])

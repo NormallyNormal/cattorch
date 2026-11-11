@@ -63,13 +63,18 @@ if the tokenizer has one. `CharTokenizer` requires an unknown token. A raw
 Hugging Face BPE tokenizer without one drops unknown characters, and the
 exported sprite does the same.
 
-Scratch compares text without regard to ASCII case, so export fails if the
-vocabulary contains entries that differ only by case, such as `a` and `A`.
-For the same reason, a letter whose case is missing from the vocabulary is
-read as the other case: with only lowercase entries, `The` is encoded like
-`the` instead of starting with the unknown token.
-Export also fails on characters outside the Basic Multilingual Plane, such as
-emoji, because Scratch treats each one as two separate characters.
+Characters are told apart by case, as the tokenizer does: `a` and `A` can
+both be tokens, and with only lowercase entries `The` starts with the unknown
+token. Scratch compares text without regard to case, so when the vocabulary
+has letters, the sprite gets a costume named after each character and finds
+a character by switching to its costume, since costume names match exactly.
+Don't rename, reorder, or delete a tokenizer sprite's costumes. A vocabulary
+without letters, such as digits and punctuation, is looked up with
+`item # of` and has one costume.
+
+Export fails on characters outside the Basic Multilingual Plane, such as
+emoji, because Scratch treats each one as two separate characters. For the
+same reason an emoji in the text reads as two unknown characters.
 
 ## SentencePiece BPE
 
@@ -95,8 +100,11 @@ transpile_tokenizer(
 ```
 
 Set `scratch_casefold=True` only if the SentencePiece model was trained with
-case-folding normalization. The sprite then relies on Scratch's
-case-insensitive comparisons, so you don't need to lowercase text first.
+case-folding normalization (`nfkc_cf`). The sprite then relies on Scratch's
+case-insensitive comparisons for ASCII letters, so you don't need to
+lowercase text first, and needs no character costumes. Any other model, with
+the `identity` normalizer, tells characters apart by case like the other
+tokenizers.
 
 The SentencePiece model must be trained with `add_dummy_prefix=False` and
 `remove_extra_whitespaces=False`, and use the `identity` or `nfkc_cf`
@@ -105,9 +113,12 @@ anything else. Any other normalization has to be done by your project before
 tokenizing.
 
 Scratch can't get a character's Unicode code point, so byte fallback only works
-for ASCII. ASCII text and characters that appear in the vocabulary tokenize
-normally. Other characters can't be encoded. When decoding, non-ASCII byte
-tokens are shown as `<0xNN>` rather than turned into wrong text.
+for ASCII. ASCII text, in either case, and characters that appear in the
+vocabulary tokenize as SentencePiece does. A non-ASCII character outside the
+vocabulary, which SentencePiece encodes as its UTF-8 bytes, becomes the
+unknown token instead, and the export result warns about this. When
+decoding, non-ASCII byte tokens are shown as `<0xNN>` rather than turned into
+wrong text.
 
 ## Compatibility
 

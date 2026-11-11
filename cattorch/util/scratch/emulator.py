@@ -555,7 +555,10 @@ class ScratchEmulator:
             return _zero
         type_code = input_spec[0]
         if type_code == 1:
-            # [1, literal] or [1, [type, value]]
+            # [1, literal] or [1, [type, value]], or [1, shadow_id] for a menu
+            # such as a costume menu.
+            if isinstance(input_spec[1], str) and input_spec[1] in self.blocks:
+                return self._compile_reporter(input_spec[1])
             return self._compile_literal(input_spec[1])
         if type_code == 2:
             # [2, block_id] — block reference (used for SUBSTACK)
@@ -778,6 +781,10 @@ class ScratchEmulator:
 
         if opcode == "looks_costumenumbername":
             return lambda: self._current_costume + 1
+
+        if opcode == "looks_costume":
+            # The costume menu's shadow reports the chosen costume's name.
+            return _constant(fields["COSTUME"][0])
 
         def unknown():
             raise NotImplementedError(f"unknown reporter opcode: {opcode}")
