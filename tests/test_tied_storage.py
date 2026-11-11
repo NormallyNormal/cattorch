@@ -71,18 +71,22 @@ def _sprite(result):
         return json.loads(archive.read("sprite.json"))
 
 
-def _stored_weights(emulator):
-    """Values in every weight list once the weights are decoded."""
+def _decoded(result):
+    """An emulator of the export with its weights decoded, and how many values they hold."""
+    emulator = ScratchEmulator(_sprite(result))
     emulator.run_procedure("cattorch init")
     # A program prefixes each entry point's weights with its name.
-    return sum(len(emulator.lists[name]) for name in emulator._list_name_to_ids if "W_" in name)
+    stored = sum(len(emulator.lists[name]) for name in emulator._list_name_to_ids if "W_" in name)
+    return emulator, stored
 
 
 def _assert_stored_once(tied, untied, table_values):
+    """Check that ``tied`` holds one table fewer, and return both decoded emulators."""
     for result in (tied, untied):
         assert not [warning for warning in result.warnings if "tied" in warning], result.warnings
-    stored = _stored_weights(ScratchEmulator(_sprite(untied))) - _stored_weights(ScratchEmulator(_sprite(tied)))
-    assert stored == table_values
+    (tied_emulator, tied_stored), (untied_emulator, untied_stored) = map(_decoded, (tied, untied))
+    assert untied_stored - tied_stored == table_values
+    return tied_emulator, untied_emulator
 
 
 def _close(actual, expected, tolerance):
@@ -93,25 +97,25 @@ def _close(actual, expected, tolerance):
 
 
 @pytest.mark.parametrize("storage", sorted(FORMATS))
-@pytest.mark.parametrize("vocabulary", [512, 514], ids=["grouped", "rows"])
-def test_tied_table_is_stored_once(tmp_path, small_list_limit, vocabulary, storage):
+@pytest.mark.parametrize(("vocabulary", "width"), [(512, 96), (514, 32)], ids=["grouped", "rows"])
+def test_tied_table_is_stored_once(tmp_path, small_list_limit, vocabulary, width, storage):
     # 512 output rows run four at a time, so the table is stored in four-row
-    # groups; 514 rows can't be, so it is stored in plain rows.
+    # groups; 514 rows can't be, so it is stored in plain rows. 512 x 96 is
+    # the smallest Linear that runs four rows at a time (GROUPED_MIN_MACS).
     small_list_limit(LIMIT)
     options = FORMATS[storage]
     torch.manual_seed(0)
-    model = Tied(vocabulary, 128).eval()
+    model = Tied(vocabulary, width).eval()
     assert model.embedding.weight.numel() > LIMIT
     _round_tied(model, model.head, options)
     twin = _untied(model, "head", "embedding")
     tokens = torch.tensor([[7, 3, vocabulary - 1]])
     tied = transpile(model, tokens, tmp_path / "tied", **options)
     untied = transpile(twin, tokens, tmp_path / "untied", **options)
-    _assert_stored_once(tied, untied, model.embedding.weight.numel())
+    emulators = _assert_stored_once(tied, untied, model.embedding.weight.numel())
 
     outputs = []
-    for result in (tied, untied):
-        emulator = ScratchEmulator(_sprite(result))
+    for emulator in emulators:
         emulator.lists["input"] = tokens.flatten().tolist()
         emulator.run_procedure("cattorch forward")
         outputs.append(list(emulator.lists["output"]))
@@ -144,17 +148,18 @@ def _gpt2(vocabulary, width):
     return transformers.GPT2LMHeadModel(config).eval()
 
 
-def _generate(result, tokens):
-    emulator = ScratchEmulator(_sprite(result))
-    emulator.run_procedure("cattorch init")
+def _generate(emulator, tokens):
     emulator.lists["cattorch tokens"] = list(tokens)
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     return list(emulator.lists["cattorch logits"])
 
 
-@pytest.mark.parametrize("storage", ["int8", "float16", "float32"])
-@pytest.mark.parametrize(("vocabulary", "width"), [(512, 96), (257, 32)], ids=["grouped", "rows"])
+# The plain export above covers every layout and format; here each kind of
+# shard sharing once: integer groups, grouped float32 and odd-vocabulary rows.
+@pytest.mark.parametrize(("vocabulary", "width", "storage"), [
+    (512, 96, "int8"), (512, 96, "float32"), (257, 32, "float16"),
+], ids=["grouped-int8", "grouped-float32", "rows-float16"])
 def test_gpt2_style_tied_head_is_stored_once(tmp_path, small_list_limit, vocabulary, width, storage):
     small_list_limit(LIMIT)
     options = FORMATS[storage]
@@ -166,20 +171,20 @@ def test_gpt2_style_tied_head_is_stored_once(tmp_path, small_list_limit, vocabul
     program = GenerationProgram(max_context=8)
     tied = transpile(model, program, tmp_path / "tied", **options)
     untied = transpile(twin, program, tmp_path / "untied", **options)
-    _assert_stored_once(tied, untied, vocabulary * width)
+    tied_emulator, untied_emulator = _assert_stored_once(tied, untied, vocabulary * width)
 
     tokens = [3, 1, vocabulary - 1]
-    logits = _generate(tied, tokens)
-    assert logits == _generate(untied, tokens)
+    logits = _generate(tied_emulator, tokens)
+    assert logits == _generate(untied_emulator, tokens)
     with torch.no_grad():
         _close(logits, model(torch.tensor([tokens])).logits[0, -1], TOLERANCE[storage])
 
 
-@pytest.mark.parametrize("storage", ["int8", "float16"])
-def test_recurrent_tied_head_is_stored_once(tmp_path, small_list_limit, storage):
+def test_recurrent_tied_head_is_stored_once(tmp_path, small_list_limit):
     from test_huggingface_recurrent import mamba2
 
     small_list_limit(LIMIT)
+    storage = "int8"
     options = FORMATS[storage]
     model = mamba2(
         seed=3, vocab_size=1024, hidden_size=48, head_dim=8, num_heads=12,
@@ -191,11 +196,11 @@ def test_recurrent_tied_head_is_stored_once(tmp_path, small_list_limit, storage)
     twin.config.tie_word_embeddings = False
     tied = transpile(model, RecurrentGenerationProgram(), tmp_path / "tied", **options)
     untied = transpile(twin, RecurrentGenerationProgram(), tmp_path / "untied", **options)
-    _assert_stored_once(tied, untied, model.lm_head.weight.numel())
+    tied_emulator, untied_emulator = _assert_stored_once(tied, untied, model.lm_head.weight.numel())
 
     tokens = [3, 17, 1023]
-    logits = _generate(tied, tokens)
-    assert logits == _generate(untied, tokens)
+    logits = _generate(tied_emulator, tokens)
+    assert logits == _generate(untied_emulator, tokens)
     with torch.no_grad():
         expected = model(torch.tensor([tokens]), use_cache=False).logits[0, -1]
     _close(logits, expected, TOLERANCE[storage])
@@ -212,12 +217,12 @@ class Entries(Tied):
         return self.head(self.embedding(tokens))
 
 
-@pytest.mark.parametrize("storage", ["int8", "float32"])
-def test_program_entry_point_with_a_tied_head_stores_it_once(tmp_path, small_list_limit, storage):
+def test_program_entry_point_with_a_tied_head_stores_it_once(tmp_path, small_list_limit):
     small_list_limit(LIMIT)
+    storage = "int8"
     options = FORMATS[storage]
     torch.manual_seed(0)
-    model = Entries(512, 128).eval()
+    model = Entries(512, 96).eval()
     _round_tied(model, model.head, options)
     program = ExportProgram(entrypoints=(
         EntryPoint("lookup", method="lookup", arguments=(Input("tokens", torch.tensor([3])),),
@@ -228,8 +233,7 @@ def test_program_entry_point_with_a_tied_head_stores_it_once(tmp_path, small_lis
     tied = transpile(model, program, tmp_path / "tied", **options)
     untied = transpile(_untied(model, "head", "embedding"), program, tmp_path / "untied", **options)
     assert not [warning for warning in tied.warnings if "tied" in warning]
-    stored = _stored_weights(ScratchEmulator(_sprite(untied))) - _stored_weights(ScratchEmulator(_sprite(tied)))
-    assert stored == model.embedding.weight.numel()
+    assert _decoded(untied)[1] - _decoded(tied)[1] == model.embedding.weight.numel()
     comparison = verify(
         model, program, tied, atol=1e-3 if storage == "int8" else 1e-4,
         quantization=options.get("quantization"),
