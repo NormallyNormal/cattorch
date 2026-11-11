@@ -723,30 +723,60 @@ def _observe_native_attention(_func, args, _kwargs, result):
     return tuple(observations)
 
 
-def _observe_recurrent(_func, args, _kwargs, result):
-    """``nn.RNN``, ``nn.LSTM`` and ``nn.GRU`` weights that see known inputs.
+def _observe_recurrent(func, args, _kwargs, result):
+    """``nn.RNN``, ``nn.LSTM`` and ``nn.GRU`` weights, with the rows they read.
 
-    Every first-layer input weight reads the sequence. A single-layer,
-    one-direction hidden weight reads the previous hidden states, which are
-    the output shifted by one step after the initial state.
+    A layer's input weight reads the layer's input sequence: the model's
+    for the first layer, the previous layer's output for the others, which
+    replaying the first layers alone gives. A hidden weight reads the
+    initial state and every step's output but the last its direction
+    computes. The order of rows doesn't matter to calibration. A projected
+    LSTM's projection reads the cell output before projection, which no
+    output shows, so it isn't observed. With dropout between layers in
+    training mode a replay would differ, so only the first layer is.
     """
     if len(args) < 9 or not isinstance(args[0], torch.Tensor):
         return ()
-    sequence, hidden, params, biases, layers, _dropout, _train, bidirectional, batch_first = args[:9]
+    sequence, hidden, params, biases, layers, dropout, train, bidirectional, batch_first = args[:9]
     directions = 2 if bidirectional else 1
-    per_layer = 4 if biases else 2
-    if len(params) != layers * directions * per_layer:
-        return ()  # Projected LSTMs carry another weight per layer.
-    observations = [
-        (sequence, params[direction * per_layer], "linear") for direction in range(directions)
-    ]
     output = result[0] if isinstance(result, tuple) else result
-    initial = hidden[0] if isinstance(hidden, (list, tuple)) else hidden
-    if layers == 1 and directions == 1 and isinstance(output, torch.Tensor):
-        time = 1 if batch_first and sequence.ndim == 3 else 0
-        first = initial[0].unsqueeze(time)
-        steps = output.narrow(time, 0, output.shape[time] - 1)
-        observations.append((torch.cat((first, steps), time), params[1], "linear"))
+    if not layers or len(params) % (layers * directions) or not isinstance(output, torch.Tensor):
+        return ()
+    per_layer = len(params) // (layers * directions)
+    # Projected LSTMs carry a projection after the biases.
+    if per_layer not in ({4, 5} if biases else {2, 3}):
+        return ()
+    states = tuple(hidden) if isinstance(hidden, (list, tuple)) else (hidden,)
+    replayable = not (train and dropout)
+    time = 1 if batch_first and sequence.ndim == 3 else 0
+    observations = []
+    layer_input = sequence
+    for layer in range(layers if replayable else 1):
+        if layer + 1 == layers:
+            layer_output = output
+        else:
+            count = (layer + 1) * directions
+            replayed = func(
+                sequence,
+                tuple(state[:count] for state in states)
+                if isinstance(hidden, (list, tuple)) else hidden[:count],
+                params[:count * per_layer], biases, layer + 1, dropout, train,
+                bidirectional, batch_first,
+            )
+            layer_output = replayed[0] if isinstance(replayed, tuple) else replayed
+        width = layer_output.shape[-1] // directions
+        for direction in range(directions):
+            index = layer * directions + direction
+            weights = params[index * per_layer:(index + 1) * per_layer]
+            observations.append((layer_input, weights[0], "linear"))
+            initial = states[0][index].unsqueeze(time)
+            steps = layer_output[..., direction * width:(direction + 1) * width]
+            # The forward direction ends at the last step, the reverse one
+            # at the first.
+            length = steps.shape[time] - 1
+            steps = steps.narrow(time, 1 if direction else 0, length)
+            observations.append((torch.cat((initial, steps), time), weights[1], "linear"))
+        layer_input = layer_output
     return tuple(observations)
 
 
