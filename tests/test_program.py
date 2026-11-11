@@ -506,12 +506,14 @@ def _floats(values) -> list[float]:
     return [float(value) for value in values]
 
 
-def test_constant_initial_state_is_filled_instead_of_stored(tmp_path):
+def test_constant_initial_state_is_refilled_without_a_stored_copy(tmp_path):
     initial = torch.zeros(3)
     program = _accumulator_program(initial)
     result = transpile(_Accumulator().eval(), program, tmp_path / "zeros")
     stored = _stored_lists(result)
-    assert stored["cattorch state total"] == []
+    # The public list holds its value from the start, for sprites that read
+    # it before any call; reset refills it with a loop, not from a copy.
+    assert stored["cattorch state total"] == [0.0, 0.0, 0.0]
     assert not any(name.startswith("_cattorch initial state") for name in stored)
 
     emulator = _emulator(result)
@@ -563,10 +565,11 @@ def test_non_constant_initial_state_is_still_stored(tmp_path):
 def test_constant_non_zero_initial_state(tmp_path, initial):
     program = _accumulator_program(initial)
     result = transpile(_Accumulator().eval(), program, tmp_path / "fill")
-    assert _stored_lists(result)["cattorch state total"] == []
-    emulator = _emulator(result)
-    emulator.run_procedure("cattorch reset")
     expected = _floats(initial.flatten().tolist())
+    assert _floats(_stored_lists(result)["cattorch state total"]) == expected
+    emulator = _emulator(result)
+    emulator.lists["cattorch state total"] = []
+    emulator.run_procedure("cattorch reset")
     assert _floats(emulator.lists["cattorch state total"]) == expected
     comparison = verify(
         _Accumulator().eval(), program, result,
@@ -591,7 +594,7 @@ def test_sharded_constant_initial_state(tmp_path, small_list_limit):
     assert "cattorch state total" in result.sharded_lists
     stored = _stored_lists(result)
     shards = ("cattorch state total", "cattorch state total shard 2", "cattorch state total shard 3")
-    assert all(stored[name] == [] for name in shards)
+    assert [len(stored[name]) for name in shards] == [limit, limit, limit // 2]
     assert not any(name.startswith("_cattorch initial state") for name in stored)
 
     emulator = _emulator(result)

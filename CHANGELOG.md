@@ -878,6 +878,13 @@
   instead of 744 at 20 million, and 52 s to export at 100 million), although
   a prompt arrives in the one `cattorch tokens` list, which holds at most
   200,000 items. The buffer is now sized by what can arrive.
+- A public program state that starts as one constant, such as zeros, was
+  saved as an empty list until the first call, `cattorch init` or
+  `cattorch reset`, so another sprite reading `cattorch state NAME` before
+  any call saw an empty list. Public states keep their stored value again;
+  only the initial copy is still left out, and reset refills them with a
+  loop. Private states, such as a `RecurrentGenerationProgram`'s, are still
+  saved empty. A 100,000-value zero state adds about 0.5 KB to the archive.
 
 ## Deprecations
 

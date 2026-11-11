@@ -624,8 +624,16 @@ def transpile_program(
     registry = default_registry().for_export(adapters=adapters, kernels=kernels)
 
     states = {state.name: state for state in program.states}
+    # A state that starts as one constant is refilled by a loop on reset,
+    # with no stored copy of its initial value. A private state's own list
+    # is saved empty too, and filled by the first call or init. A public
+    # state's list keeps its stored value: other sprites may read it before
+    # any call, and a project has no hook that runs on load to fill it.
     fills = {state.name: _constant_fill(state) for state in program.states}
-    any_filled = any(value is not None for value in fills.values())
+    empty_on_load = {
+        name for name, value in fills.items() if value is not None and _private_states
+    }
+    any_filled = bool(empty_on_load)
     calls = tuple(calibration_calls or ())
     known_entries = {entry.name for entry in program.entrypoints}
     if any(call_value.entrypoint not in known_entries for call_value in calls):
@@ -873,13 +881,14 @@ def transpile_program(
     assert combined is not None
     _deduplicate_program_payloads(combined, payload_names)
     for state in program.states:
-        if fills[state.name] is not None:
-            # A constant state is filled by a loop at run time instead.
+        if state.name in empty_on_load:
+            # Filled by a loop at run time instead.
             _set_list_contents(combined, _state_list(state.name), [])
             continue
         values = state.initial.detach().cpu().flatten().tolist()
         _set_list_contents(combined, _state_list(state.name), values)
-        _set_list_contents(combined, f"_cattorch initial state {state.name}", values)
+        if fills[state.name] is None:
+            _set_list_contents(combined, f"_cattorch initial state {state.name}", values)
 
     lifecycle_lists = {_state_list(state.name) for state in program.states} | {
         f"_cattorch initial state {state.name}"
@@ -910,7 +919,7 @@ def transpile_program(
         fill_empty = tuple(
             if_(eq(length(_state_list(state.name)), 0), (call(_fill_procedure(index)),))
             for index, state in enumerate(program.states)
-            if fills[state.name] is not None
+            if state.name in empty_on_load
         )
         # The first call or init fills the constant states still empty in a
         # freshly loaded project. Later, as before, only reset refills them.
