@@ -614,10 +614,22 @@ def _dims(node, ndim: int, spec) -> set[int]:
     return {_normalize(int(dim), ndim) for dim in value}
 
 
+_RECURRENT_OPERATIONS = frozenset({
+    "recurrent_scan", "recurrent_final", "gru", "lstm", "rnn_tanh", "rnn_relu",
+})
+
+
 def _mixing(node, detail: str):
-    return _unsupported_operation(
-        node, f"{detail}; automatic generation allows mixing tokens only in causal attention"
-    )
+    detail = f"{detail}; automatic generation allows mixing tokens only in causal attention"
+    if _op_name(node) in _RECURRENT_OPERATIONS:
+        # A GRU, LSTM or RNN carries a state from one token to the next.
+        detail += (
+            ". This is a recurrent layer: export the model with a "
+            "RecurrentGenerationProgram and a step method that takes and returns "
+            "its state (see https://github.com/NormallyNormal/cattorch/blob/main/"
+            "docs/recurrent-generation.md)"
+        )
+    return _unsupported_operation(node, detail)
 
 
 def _check_row_wise(nodes, live, static, infos, internal) -> None:
@@ -714,11 +726,10 @@ def _check_node(node, info, inputs, infos) -> None:
         if ndim - 1 in axes:
             raise _mixing(node, "experts mix the sequence as features")
         return
-    raise _unsupported_operation(
+    raise _mixing(
         node,
         "not known to act on each token independently, but its input has a "
-        "sequence axis; automatic generation allows mixing tokens only in "
-        "causal attention",
+        "sequence axis",
     )
 
 

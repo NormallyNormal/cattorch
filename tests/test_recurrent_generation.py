@@ -524,6 +524,14 @@ def test_the_reference_check_runs_the_traced_step(monkeypatch, tmp_path):
         export(SharedZerosLSTM().eval(), tmp_path / "merged", reference="forward")
 
 
+@pytest.mark.parametrize("name", ["gru", "lstm"])
+def test_a_recurrent_model_given_a_generation_program_is_pointed_here(tmp_path, name):
+    from cattorch import CattorchError, GenerationProgram
+
+    with pytest.raises(CattorchError, match="RecurrentGenerationProgram"):
+        transpile(make(name), GenerationProgram(max_context=8), tmp_path / name)
+
+
 def test_reference_must_return_one_row_per_token(tmp_path):
     class LastOnly(GRULM):
         def last(self, tokens):

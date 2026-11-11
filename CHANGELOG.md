@@ -908,6 +908,10 @@
   numeric differences that remain (NaN results, integer overflow, rounding at
   float32 boundaries, signed zeros) are listed in
   [supported models](docs/supported-models.md).
+- A GRU, LSTM or RNN language model given a `GenerationProgram` failed with
+  an error about mixing tokens outside causal attention that never mentioned
+  `RecurrentGenerationProgram`; the error now says the layer is recurrent
+  and points to it.
 
 ## Deprecations
 
