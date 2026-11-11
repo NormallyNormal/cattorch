@@ -8,6 +8,7 @@ import logging
 import math
 import re
 import uuid
+import weakref
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
@@ -1170,34 +1171,121 @@ def _on_integer_codec_grid(
     Grouped kernels keep static tensors in a four-row physical order. Storage
     quantizes the logical order, so undo that permutation first.
     """
-    values = tensor.detach().cpu().flatten()
-    if interleave_segments:
-        # One gather through the composed segment permutations.
-        order = torch.arange(values.numel())
-        for start, rows, inner in interleave_segments:
-            end = start + rows * inner
-            if rows % 4 or start < 0 or end > values.numel():
-                return False
-            order[start:end] = order[start:end].reshape(rows // 4, inner, 4).transpose(1, 2).flatten()
-        values = values[order]
     group_size = _static_storage_group_size(tensor, storage)
-    if values.numel() == 0 or values.numel() % group_size:
-        return False
-    work = values.to(torch.float64).reshape(-1, group_size)
-    if not bool(torch.isfinite(work).all()):
+    # Compilation, sharding and storage each ask about the same tensors.
+    key = (
+        storage.precision, storage.scale_precision, group_size,
+        tuple(interleave_segments), tensor._version,
+    )
+    cached = _CODEC_GRID_CACHE.get(id(tensor))
+    if cached is not None and cached[0]() is tensor and cached[1] == key:
+        return cached[2]
+    result = _check_integer_codec_grid(tensor, storage, group_size, interleave_segments)
+    if cached is None or cached[0]() is not tensor:
+        weakref.finalize(tensor, _CODEC_GRID_CACHE.pop, id(tensor), None)
+    _CODEC_GRID_CACHE[id(tensor)] = (weakref.ref(tensor), key, result)
+    return result
+
+
+# id(tensor) -> (weak reference, the question's key, answer).
+_CODEC_GRID_CACHE: dict[int, tuple[weakref.ref, tuple, bool]] = {}
+# Groups checked per step, to bound the float64 temporaries for large tables.
+_CODEC_GRID_CHUNK_GROUPS = 1 << 13
+
+
+def _check_integer_codec_grid(
+    tensor: torch.Tensor,
+    storage: StorageConfig,
+    group_size: int,
+    interleave_segments: tuple[tuple[int, int, int], ...],
+) -> bool:
+    # NumPy rather than torch: these are many small passes, and torch's
+    # thread pool makes each one much slower on a busy machine.
+    flat = tensor.detach().cpu().reshape(-1)
+    native = flat.dtype in (torch.float16, torch.float32, torch.float64)
+    # A format NumPy lacks, such as bfloat16, widens exactly to float64 and
+    # rounds back through torch.
+    values = flat.numpy(force=True) if native else flat.to(torch.float64).numpy()
+    for start, rows, inner in interleave_segments:
+        if rows % 4 or start < 0 or start + rows * inner > values.size:
+            return False
+    if values.size == 0 or values.size % group_size:
         return False
     maximum_code = {"int8": 127, "int6": 31, "int4": 7}[storage.precision]
-    maximum = work.abs().amax(dim=1, keepdim=True)
-    scale_dtype = torch.float16 if storage.scale_precision == "float16" else torch.float32
-    scale = (maximum / maximum_code).to(scale_dtype).to(torch.float64)
-    if not bool(torch.isfinite(scale).all()):
-        return False
+    scale_dtype = np.float16 if storage.scale_precision == "float16" else np.float32
     tiny = math.ldexp(1.0, -24 if storage.scale_precision == "float16" else -149)
-    scale = torch.where((maximum > 0) & (scale == 0), torch.full_like(scale, tiny), scale)
-    scale = torch.where(maximum > 0, scale, torch.ones_like(scale))
-    codes = torch.round(work / scale).clamp(-maximum_code, maximum_code)
-    reconstructed = (codes * scale).to(values.dtype).reshape(values.shape)
-    return torch.equal(reconstructed, values)
+    # Every group is checked on its own, so whole groups at a time, in
+    # logical order, give the same answer as all of them at once.
+    for groups in _logical_group_chunks(values, interleave_segments, group_size):
+        work = groups.astype(np.float64)
+        if not np.isfinite(work).all():
+            return False
+        maximum = np.abs(work).max(axis=1, keepdims=True)
+        with np.errstate(over="ignore"):
+            scale = (maximum / maximum_code).astype(scale_dtype).astype(np.float64)
+        if not np.isfinite(scale).all():
+            return False
+        scale[(maximum > 0) & (scale == 0)] = tiny
+        scale[maximum <= 0] = 1.0
+        reconstructed = np.clip(np.round(work / scale), -maximum_code, maximum_code) * scale
+        if native:
+            rounded = reconstructed.astype(values.dtype)
+        else:
+            rounded = torch.from_numpy(reconstructed).to(flat.dtype).double().numpy()
+        if not np.array_equal(rounded, groups):
+            return False
+    return True
+
+
+def _logical_group_chunks(
+    values: np.ndarray,
+    segments: tuple[tuple[int, int, int], ...],
+    group_size: int,
+):
+    """Yield ``values`` in logical order as ``(groups, group_size)`` blocks.
+
+    Grouped kernels store four-row blocks column-interleaved; each segment
+    is undone on its own as it is reached, instead of through one gather of
+    the whole tensor.
+    """
+    chunk_values = _CODEC_GRID_CHUNK_GROUPS * group_size
+    carry = values[:0]
+    for piece in _logical_pieces(values, segments, chunk_values):
+        if carry.size:
+            piece = np.concatenate((carry, piece))
+        usable = piece.size - piece.size % group_size
+        if usable:
+            yield piece[:usable].reshape(-1, group_size)
+        carry = piece[usable:]
+
+
+def _logical_pieces(
+    values: np.ndarray,
+    segments: tuple[tuple[int, int, int], ...],
+    chunk_values: int,
+):
+    """Yield ``values`` in logical order, about ``chunk_values`` at a time."""
+    ordered = sorted(segments)
+    if any(
+        ordered[index][0] + ordered[index][1] * ordered[index][2] > ordered[index + 1][0]
+        for index in range(len(ordered) - 1)
+    ):
+        # Overlapping segments compose; gather through every permutation.
+        order = np.arange(values.size)
+        for start, rows, inner in segments:
+            end = start + rows * inner
+            order[start:end] = order[start:end].reshape(rows // 4, inner, 4).transpose(0, 2, 1).reshape(-1)
+        values = values[order]
+        ordered = []
+    position = 0
+    for start, rows, inner in [*ordered, (values.size, 0, 1)]:
+        for offset in range(position, start, chunk_values):
+            yield values[offset:min(start, offset + chunk_values)]
+        blocks = values[start:start + rows * inner].reshape(rows // 4, inner, 4)
+        step = max(1, chunk_values // (4 * inner))
+        for block in range(0, rows // 4, step):
+            yield blocks[block:block + step].transpose(0, 2, 1).reshape(-1)
+        position = start + rows * inner
 
 
 def _static_storage_group_size(

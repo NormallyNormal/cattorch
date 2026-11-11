@@ -63,6 +63,33 @@ def _codec_sprite(program):
     return sprite
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_integer_codec_grid_checks_every_chunk_and_notices_changes(monkeypatch, dtype):
+    import cattorch.sprite as sprite_module
+    from cattorch import QuantizationConfig
+    from cattorch.storage import StorageConfig as Storage, quantized_storage
+
+    monkeypatch.setattr(sprite_module, "_CODEC_GRID_CHUNK_GROUPS", 2)
+    storage = quantized_storage(Storage(), QuantizationConfig(bits=8, group_size=4))
+    torch.manual_seed(0)
+    # Codes with a 127 in every group at a power-of-two scale: exact in every
+    # format, so on the grid whatever the dtype.
+    codes = torch.randint(-126, 127, (8 * 3, 4))
+    codes[:, 0] = 127
+    codes[4:6] = 0
+    tensor = (codes.reshape(8, 12) * 2.0**-3).to(dtype)
+    assert sprite_module._on_integer_codec_grid(tensor, storage) is True
+    # The four-row physical order is undone before checking.
+    physical = tensor.reshape(2, 4, 12).transpose(1, 2).reshape(8, 12).contiguous()
+    assert sprite_module._on_integer_codec_grid(physical, storage, ((0, 8, 12),)) is True
+    # A value off the grid in the last chunk only; the cached answer follows
+    # an in-place change.
+    tensor[-1, -1] = 0.3
+    assert sprite_module._on_integer_codec_grid(tensor, storage) is False
+    assert sprite_module._on_integer_codec_grid(torch.ones(8, 12).log(), storage) is True
+    assert sprite_module._on_integer_codec_grid(torch.full((8, 12), float("inf")), storage) is False
+
+
 def test_base92_uses_all_safe_costume_digits_and_exact_52_bit_groups():
     assert len(BASE92_ALPHABET) == 92
     assert '"' not in BASE92_ALPHABET
