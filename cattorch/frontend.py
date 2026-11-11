@@ -257,7 +257,7 @@ def _extreme_with_index(extreme, argument):
     return decomposition
 
 
-def _prims_var(value, dims, correction, *, output_dtype=None):
+def _prims_var(value, dims, correction=1, *, output_dtype=None):
     dims = list(range(value.ndim)) if dims is None else list(dims)
     count = 1
     for dim in dims:
@@ -469,6 +469,33 @@ def _decompose_when_rejected(operator, validator, decomposition):
 _DECOMPOSE_WHEN_REJECTED = frozenset({"aten.batch_norm.default"})
 
 
+def own_decompositions() -> dict:
+    """The ATen decompositions cattorch writes itself, by operator overload.
+
+    The tracer calls each with the arguments the caller gave, leaving out
+    those at their schema default, so every argument with a default needs
+    one in the decomposition too; ``tests/test_frontend.py`` checks this.
+    """
+    table = {
+        torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
+        torch.ops.aten.select.int: _select_decomposition,
+        torch.ops.aten.scaled_dot_product_attention.default: _sdpa_decomposition,
+        torch.ops.aten.max.dim: _extreme_with_index(
+            torch.ops.aten.amax.default, torch.ops.aten.argmax.default,
+        ),
+        torch.ops.aten.min.dim: _extreme_with_index(
+            torch.ops.aten.amin.default, torch.ops.aten.argmin.default,
+        ),
+        torch.ops.aten.topk.default: _topk_decomposition,
+    }
+    table.update(_POINTWISE_DECOMPOSITIONS)
+    for operator in (
+        torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
+    ):
+        table[operator] = _static_scalar_decomposition(operator)
+    return table
+
+
 def _fx_decompositions() -> dict:
     """Decompose every operation cattorch can't lower directly.
 
@@ -501,23 +528,7 @@ def _fx_decompositions() -> dict:
                 operator, rule.validator, decomposition,
             ))
     table.update(get_decompositions((torch.ops.aten.stack.default,)))
-    table.update({
-        torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
-        torch.ops.aten.select.int: _select_decomposition,
-        torch.ops.aten.scaled_dot_product_attention.default: _sdpa_decomposition,
-        torch.ops.aten.max.dim: _extreme_with_index(
-            torch.ops.aten.amax.default, torch.ops.aten.argmax.default,
-        ),
-        torch.ops.aten.min.dim: _extreme_with_index(
-            torch.ops.aten.amin.default, torch.ops.aten.argmin.default,
-        ),
-        torch.ops.aten.topk.default: _topk_decomposition,
-    })
-    table.update(_POINTWISE_DECOMPOSITIONS)
-    for operator in (
-        torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
-    ):
-        table[operator] = _static_scalar_decomposition(operator)
+    table.update(own_decompositions())
     for name, decomposition in primitives.items():
         table[getattr(torch.ops.prims, name).default] = decomposition
     kept_by_export = _KEPT_OPERATIONS.get()

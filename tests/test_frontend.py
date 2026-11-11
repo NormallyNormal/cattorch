@@ -355,6 +355,71 @@ def test_python_conversions_of_constants_still_fold():
     assert torch.equal(captured.graph_module(torch.ones(2))[0], torch.full((2,), 3.0))
 
 
+def _default_mismatches(operator, handler) -> list[str]:
+    """Schema arguments with a default that ``handler`` can't be called without."""
+    import inspect
+
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return []
+    parameters = list(signature.parameters.values())
+    kinds = {parameter.kind for parameter in parameters}
+    positional = [
+        parameter for parameter in parameters
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    problems = []
+    schema_positional = 0
+    for argument in operator._schema.arguments:
+        if argument.kwarg_only:
+            parameter = signature.parameters.get(argument.name)
+            if parameter is None:
+                if inspect.Parameter.VAR_KEYWORD not in kinds:
+                    problems.append(f"keyword {argument.name!r} isn't accepted")
+            elif argument.has_default_value() and parameter.default is parameter.empty:
+                problems.append(f"keyword {argument.name!r} has no default")
+            continue
+        if schema_positional < len(positional):
+            parameter = positional[schema_positional]
+            if argument.has_default_value() and parameter.default is parameter.empty:
+                problems.append(f"argument {argument.name!r} has no default")
+        elif inspect.Parameter.VAR_POSITIONAL not in kinds:
+            problems.append(f"argument {argument.name!r} isn't accepted")
+        schema_positional += 1
+    return problems
+
+
+def test_decompositions_accept_every_schema_default_omitted():
+    # The tracer leaves out arguments at their schema default (torch.cdist's
+    # p=2), so a decomposition must not require one.
+    from cattorch.frontend import _primitive_decompositions, own_decompositions
+
+    table = dict(own_decompositions())
+    for name, decomposition in _primitive_decompositions().items():
+        table[getattr(torch.ops.prims, name).default] = decomposition
+    problems = {
+        str(operator): found for operator, handler in table.items()
+        if (found := _default_mismatches(operator, handler))
+    }
+    assert not problems
+
+
+def test_cdist_exports_with_its_default_p(tmp_path):
+    class Distances(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.points = nn.Parameter(torch.randn(5, 4))
+
+        def forward(self, value):
+            return torch.cdist(value, self.points)
+
+    model = Distances().eval()
+    value = torch.randn(3, 4)
+    result = transpile(model, value, tmp_path / "cdist")
+    assert verify(model, value, result).passed
+
+
 class TwoInputsAndBuffer(nn.Module):
     def __init__(self):
         super().__init__()

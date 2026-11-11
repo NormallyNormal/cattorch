@@ -818,6 +818,13 @@
   is now traced from its own copy. The reference check of a
   `RecurrentGenerationProgram` now runs the traced step graph rather than the
   model's `step` method, so it checks what is exported.
+- `torch.cdist` with its default `p=2` (or `p=2` given explicitly) failed to
+  export: the tracer leaves out arguments at their schema default, and the
+  decomposition required `p`. A test now checks every decomposition cattorch
+  writes against its operator's schema defaults, which also found
+  `prims.var`'s `correction`. The OpInfo conformance run also tries later
+  samples whose non-tensor arguments differ from the first four, which all
+  used `p=1` for `cdist`.
 
 ## Deprecations
 

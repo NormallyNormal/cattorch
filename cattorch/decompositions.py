@@ -357,7 +357,7 @@ def _distance(differences, p):
     return _aten.pow.Tensor_Scalar(total, 1 / p)
 
 
-def _cdist(left, right, p, compute_mode=None):
+def _cdist(left, right, p=2.0, compute_mode=None):
     differences = _aten.sub.Tensor(_aten.unsqueeze.default(left, -2), _aten.unsqueeze.default(right, -3))
     return _distance(differences, p)
 

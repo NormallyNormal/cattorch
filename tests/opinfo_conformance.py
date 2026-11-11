@@ -39,6 +39,10 @@ COVERAGE = ROOT / "docs" / "operator-coverage.md"
 # Samples tried per operator variant; OpInfo's later samples mostly repeat the
 # first ones with other broadcasting or keyword combinations.
 SAMPLES_PER_OPERATOR = 4
+# Later samples tried for argument values the first ones don't use, and how
+# far into an operator's samples to look for them.
+EXTRA_SAMPLES = 4
+SCANNED_SAMPLES = 64
 # A guard against hangs, not a speed limit: the slowest recorded case, a 3D
 # transposed convolution, emulates for about 30 s locally and over 60 s on CI
 # runners.
@@ -119,17 +123,38 @@ def operator_db():
     ]
 
 
+def _arguments(sample) -> tuple[str, ...]:
+    """A sample's non-tensor arguments, such as ``p`` or a reduction mode."""
+    leaves = pytree.tree_leaves((sample.input, sample.args, sample.kwargs))
+    return tuple(repr(leaf) for leaf in leaves if not isinstance(leaf, torch.Tensor))
+
+
 def _samples(op):
-    """The first samples of ``op``, reproducibly."""
+    """The first samples of ``op``, then later ones with new arguments, reproducibly.
+
+    OpInfo often lists one argument value many times before the next (all of
+    ``cdist``'s first samples use ``p=1``), so after the first samples up to
+    ``EXTRA_SAMPLES`` more are taken, each with non-tensor arguments no
+    earlier one has. They are numbered after the first ones, so the first
+    samples keep their keys.
+    """
     torch.manual_seed(_seed(_operator_name(op)))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         samples = op.sample_inputs("cpu", torch.float32, requires_grad=False)
         result = []
-        for sample in samples:
-            result.append(sample)
-            if len(result) == SAMPLES_PER_OPERATOR:
+        seen = set()
+        extra = 0
+        for index, sample in enumerate(samples):
+            if index == SCANNED_SAMPLES or extra == EXTRA_SAMPLES:
                 break
+            arguments = _arguments(sample)
+            if index < SAMPLES_PER_OPERATOR:
+                result.append(sample)
+            elif arguments not in seen:
+                result.append(sample)
+                extra += 1
+            seen.add(arguments)
     return result
 
 
@@ -362,7 +387,8 @@ def write_coverage(results) -> str:
         "",
         "This page lists how PyTorch's own operator samples (OpInfo) fare when",
         "exported with cattorch and run in its Scratch emulator. Each operator is",
-        f"tried with up to {SAMPLES_PER_OPERATOR} float32 samples, and a sample",
+        f"tried with up to {SAMPLES_PER_OPERATOR} float32 samples, and up to",
+        f"{EXTRA_SAMPLES} more whose other arguments differ from those, and a sample",
         "passes when its export matches eager PyTorch. A sample can fail for",
         "an argument a model rarely uses, so a partial or failing operator may",
         "still work in your model; see [supported models](supported-models.md)",
