@@ -392,6 +392,11 @@ def _fill(value, fill):
     return _aten.full_like.default(value, fill)
 
 
+def _fill_tensor(value, fill):
+    """``fill.Tensor``: a one-value tensor, such as the 0 of ``x[0] = 0``, spread."""
+    return _aten.expand.default(_aten.to.dtype(fill, value.dtype), list(value.shape))
+
+
 def _per_dimension(value, dimensions):
     value = list(value) if isinstance(value, (list, tuple)) else [value]
     return value * dimensions if len(value) == 1 else value
@@ -1277,6 +1282,7 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.logical_xor.default: _logical("xor"),
     _aten.full_like.default: _full_like,
     _aten.fill.Scalar: _fill,
+    _aten.fill.Tensor: _fill_tensor,
     _aten.sinh.default: _sinh,
     _aten.cosh.default: _cosh,
     _aten.asinh.default: _asinh,

@@ -1897,6 +1897,44 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
     return aliases, split_meta
 
 
+def _reject_in_place_updates(nodes) -> None:
+    """Explain an in-place update the capture couldn't turn into dataflow.
+
+    Updates of computed tensors and of inputs become ordinary operations
+    during capture; a ``copy_`` left over writes to a parameter or buffer, or
+    through a view the rewrite can't follow.
+    """
+    for node in nodes:
+        if node.op != "call_function" or str(node.target) != "aten.copy_.default":
+            continue
+        base = node.args[0]
+        while isinstance(base, torch.fx.Node) and base.op == "call_function" and (
+            _returns_alias_node(base)
+        ):
+            base = base.args[0]
+        if isinstance(base, torch.fx.Node) and base.op == "get_attr":
+            detail = (
+                "the model updates one of its parameters or buffers in place, as "
+                "self.count += 1 in forward does. A sprite's forward keeps nothing "
+                "between calls; export the method with @cattorch.entrypoint, which "
+                "makes each buffer it updates a state list, or with an ExportProgram "
+                "and State (see https://github.com/NormallyNormal/cattorch/blob/main/"
+                "docs/markers.md)"
+            )
+        else:
+            detail = (
+                "an in-place update through a view cattorch can't follow, such as a "
+                "strided slice (x[:, ::2] = y) or a view read again after the update; "
+                "write it out of place, for example with torch.cat or torch.where"
+            )
+        raise _unsupported_operation(node, detail)
+
+
+def _returns_alias_node(node) -> bool:
+    schema = getattr(node.target, "_schema", None)
+    return schema is not None and any(value.alias_info is not None for value in schema.returns)
+
+
 def _reject_unsupported_variants(
     nodes, generated_weights, registry, fast, fast_config, dynamic_axes, resolve_weight,
 ) -> None:
@@ -2567,6 +2605,7 @@ def _prepare_graph(
         return state_inputs.get(arg_name)
 
     input_names = _model_input_names(nodes, captured.user_input_names, resolve_weight)
+    _reject_in_place_updates(nodes)
     aliases, split_meta = _aliases_and_splits(nodes, generated_weights, runtime_axes.axes)
     _reject_unsupported_variants(
         nodes, generated_weights, registry, fast, fast_config, runtime_axes.axes, resolve_weight,

@@ -297,6 +297,40 @@ def test_slice_and_select_assignment_become_dataflow(tmp_path):
     assert verify(model, value, result).passed
 
 
+class UpdatesItsInput(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 2)
+
+    def forward(self, x):
+        x += 1
+        x.clamp_(-1.5, 1.5)
+        x[0] = 0
+        return self.linear(x)
+
+
+def test_in_place_updates_of_an_input_become_dataflow(tmp_path):
+    torch.manual_seed(0)
+    model = UpdatesItsInput().eval()
+    result = transpile(model, torch.randn(3, 4), tmp_path / "input")
+    value = torch.randn(3, 4)
+    assert verify(model, value.clone(), result).passed
+
+
+def test_a_buffer_updated_in_forward_points_to_entry_points(tmp_path):
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("count", torch.zeros(1))
+
+        def forward(self, x):
+            self.count += 1
+            return x + self.count
+
+    with pytest.raises(UnsupportedOperationError, match=r"copy_.*cattorch\.entrypoint"):
+        transpile(Counter().eval(), torch.randn(3), tmp_path / "counter")
+
+
 def test_strided_slice_assignment_stays_unsupported(tmp_path):
     class EveryOther(nn.Module):
         def forward(self, value):

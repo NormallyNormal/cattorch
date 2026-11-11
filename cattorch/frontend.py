@@ -760,8 +760,11 @@ def _replace_intermediate_copies(graph: Graph) -> None:
     other view of it taken before the copy is read afterwards, the copy
     becomes a new tensor: the source itself, or ``x`` with the sliced region
     replaced (a ``cat`` of the untouched parts and the source). Later reads of
-    ``x`` take that tensor. Copies into inputs, state, strided slices, or other
-    views are left for the compiler to reject.
+    ``x`` take that tensor. An input updated in place, as ``x += 1`` or
+    ``x.clamp_(-1, 1)`` in ``forward`` do, is rewritten the same way: the
+    sprite computes the updated value without writing to the input's list.
+    Copies into parameters and buffers, strided slices, or other views are
+    left for graph analysis to reject.
     """
     def read_after(node: Node, position: int) -> bool:
         return any(
@@ -774,19 +777,22 @@ def _replace_intermediate_copies(graph: Graph) -> None:
         target, source = copy.args[:2]
         if (
             not isinstance(target, Node) or not isinstance(source, Node)
-            or target.op != "call_function" or copy.kwargs.get("non_blocking", False)
+            or target.op not in {"call_function", "placeholder"}
+            or copy.kwargs.get("non_blocking", False)
         ):
             continue
         # Walk slice and select views up to the tensor that owns the storage.
         chain: list[tuple[Node, tuple[int, int, int], bool]] = []
         base = target
-        while _returns_alias(base):
-            region = _region_view(base) if base.op == "call_function" else None
+        while base.op == "call_function" and _returns_alias(base):
+            region = _region_view(base)
             if region is None:
                 break
             chain.append((base, region, base.target is _VIEW_SELECT))
             base = base.args[0]
-        if base.op != "call_function" or _returns_alias(base):
+        if base.op == "placeholder":
+            pass  # an input: the caller's tensor, which nothing else aliases
+        elif base.op != "call_function" or _returns_alias(base):
             continue
         if chain and copy.users:
             continue

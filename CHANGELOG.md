@@ -890,6 +890,14 @@
   `arguments=()` that writes a state, was rejected with "an entrypoint must
   declare at least one argument". Nothing needed the rule; such entry points
   now export.
+- In-place updates of a `forward` input, such as `x += 1`,
+  `x.clamp_(-1, 1)` or `x[0] = 0`, failed with a bare "Unsupported
+  operation: aten.copy_.default". They now export as ordinary operations:
+  the sprite computes the updated value without writing to the input's
+  list. A parameter or buffer updated in place in `forward`
+  (`self.count += 1`) still fails, now with an error that points to
+  `@entrypoint` and `State`, and other in-place updates cattorch can't
+  follow say what to write instead.
 
 ## Deprecations
 
