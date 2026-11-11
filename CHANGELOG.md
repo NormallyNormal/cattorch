@@ -715,6 +715,11 @@
   which Scratch reads as numbers. The command line's JSON output is strict
   too, and `benchmarks/run_project_vm.cjs` and the other VM runners write
   these values as the same strings instead of `null`.
+- `cattorch generate -o build/demo.sprite3 --project` wrote the tokenizer as
+  `demo.sprite3_tokenizer.sprite3`, and `-o y.sb3 --project` wrote
+  `y.sb3.sprite3` and `y.sb3.sb3`. Every output path now comes from `-o` with
+  any `.sprite3` or `.sb3` removed: `PATH.sprite3`, `PATH_tokenizer.sprite3`,
+  and `PATH.sb3`.
 
 ## Deprecations
 

@@ -124,7 +124,7 @@ Both commands take:
 
 | Option | Effect |
 |---|---|
-| `-o PATH` | Output path without an extension; defaults to the model's name. |
+| `-o PATH` | Output path, with or without `.sprite3` or `.sb3`. The sprite is `PATH.sprite3` and `generate`'s tokenizer `PATH_tokenizer.sprite3`. Defaults to the model's name. |
 | `--project` | Also write `PATH.sb3` with `build_project`. |
 | `--fast` | Use [approximate kernels](optimization.md). |
 | `--precision` | `float16` stores weights at half precision, and `int8` or `int4` [quantize](storage.md) matrices. Lossy exports are verified to within 0.05. |

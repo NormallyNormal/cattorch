@@ -138,6 +138,22 @@ def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
     assert code == 1 and "needs a tokenizer" in message
 
 
+@pytest.mark.parametrize("output", ["build/demo", "build/demo.sprite3", "build/demo.sb3"])
+def test_every_output_is_named_after_the_output_option(models, capsys, output):
+    save_characters(models / "chars")
+    code, report = run(
+        capsys, "generate", "models.py:Language", "--tokenizer", "chars",
+        "--max-context", "4", "--project", "-o", output,
+    )
+    assert code == 0
+    assert (report["sprite"], report["tokenizer"], report["project"]) == (
+        "build/demo.sprite3", "build/demo_tokenizer.sprite3", "build/demo.sb3",
+    )
+    assert sorted(path.name for path in (models / "build").iterdir()) == [
+        "demo.sb3", "demo.sprite3", "demo_tokenizer.sprite3",
+    ]
+
+
 def max_context(sprite_path):
     with zipfile.ZipFile(sprite_path) as archive:
         sprite = json.loads(archive.read("sprite.json"))

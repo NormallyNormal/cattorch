@@ -16,6 +16,7 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -124,11 +125,28 @@ def _summary(result, extra: dict) -> dict:
     return report
 
 
-def _project_path(output: Path) -> Path:
-    """The project beside the sprite, which keeps any dots in its name."""
-    if output.suffix.lower() == ".sprite3":
-        return output.with_suffix(".sb3")
-    return output.with_name(f"{output.name}.sb3")
+class _Outputs(NamedTuple):
+    sprite: Path
+    tokenizer: Path
+    project: Path
+
+
+def _outputs(output: str | None, name: str) -> _Outputs:
+    """Every file a command writes, from ``-o`` or the model's name.
+
+    ``-o`` may be a bare path or end in ``.sprite3`` or ``.sb3``; other dots
+    stay in the name, so ``-o net.v2`` writes ``net.v2.sprite3``.
+    """
+    path = Path(output or name)
+    if path.suffix.lower() in {".sprite3", ".sb3"}:
+        path = path.with_suffix("")
+    if not path.name:
+        raise CommandError(f"-o {output!r} doesn't name a file")
+    return _Outputs(
+        sprite=path.with_name(f"{path.name}.sprite3"),
+        tokenizer=path.with_name(f"{path.name}_tokenizer.sprite3"),
+        project=path.with_name(f"{path.name}.sb3"),
+    )
 
 
 def _export(args) -> int:
@@ -141,9 +159,9 @@ def _export(args) -> int:
     dynamic: dict[int, dict[int, tuple[int, int]]] = {}
     for index, dim, low, high in args.dynamic:
         dynamic.setdefault(index, {})[dim] = (low, high)
-    output = Path(args.output or name)
+    outputs = _outputs(args.output, name)
     result = transpile(
-        model, example, output, optimization="fast" if args.fast else "exact",
+        model, example, outputs.sprite, optimization="fast" if args.fast else "exact",
         dynamic=dynamic or None, **_storage(args),
     )
     extra: dict = {}
@@ -160,7 +178,7 @@ def _export(args) -> int:
     if args.project:
         labels = args.labels.split(",") if args.labels else None
         project = build_project(
-            _project_path(output), result, example_inputs=example or (), labels=labels,
+            outputs.project, result, example_inputs=example or (), labels=labels,
         )
         extra["project"] = str(project.path)
     print(dumps(_summary(result, extra), indent=2))
@@ -191,7 +209,7 @@ def _generate(args) -> int:
             tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     else:
         raise CommandError("give a MODEL or --hf REPO")
-    output = Path(args.output or name)
+    outputs = _outputs(args.output, name)
     program: GenerationProgram | RecurrentGenerationProgram
     if recurrent_family(model) is not None:
         # Without --max-context a recurrent model takes any number of tokens.
@@ -201,15 +219,14 @@ def _generate(args) -> int:
         max_context = 64 if args.max_context is None else args.max_context
         program = GenerationProgram(max_context=max_context, top_k=args.top_k)
     result = transpile(
-        model, program, output, optimization="fast" if args.fast else "exact", **_storage(args),
+        model, program, outputs.sprite, optimization="fast" if args.fast else "exact",
+        **_storage(args),
     )
     extra: dict = {"max_context": max_context}
     tokenizer_result = None
     if tokenizer is not None:
         try:
-            tokenizer_result = transpile_tokenizer(
-                tokenizer, output.with_name(f"{output.name}_tokenizer"), name="tokenizer",
-            )
+            tokenizer_result = transpile_tokenizer(tokenizer, outputs.tokenizer, name="tokenizer")
             extra["tokenizer"] = str(tokenizer_result.path)
         except (ValueError, TypeError) as error:
             extra["tokenizer_error"] = str(error)
@@ -223,7 +240,7 @@ def _generate(args) -> int:
         if eos is None and tokenizer is not None:
             eos = getattr(tokenizer, "eos_token_id", None)
         project = build_project(
-            _project_path(output), result, tokenizer=tokenizer_result,
+            outputs.project, result, tokenizer=tokenizer_result,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             eos_token_id=eos,
         )
@@ -246,7 +263,12 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def options(command):
-        command.add_argument("-o", "--output", help="output path, without an extension")
+        command.add_argument(
+            "-o", "--output",
+            help="output path, with or without .sprite3 or .sb3; the sprite, tokenizer "
+            "(NAME_tokenizer.sprite3) and project (NAME.sb3) are named after it "
+            "(default: the model's name, lowercased)",
+        )
         command.add_argument("--fast", action="store_true", help="use approximate kernels")
         command.add_argument(
             "--precision", choices=("float32", "float16", "int8", "int4"), default="float32",
