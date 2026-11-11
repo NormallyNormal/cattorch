@@ -9,6 +9,7 @@ without them unless ``CATTORCH_REQUIRE_VM`` is set, as it is in CI.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from cattorch import (
     CharTokenizer, CodegenConfig, GenerationProgram, QuantizationConfig, StorageConfig, build_project,
     entrypoint, transpile,
 )
+from cattorch.util.scratch.archive import dumps
 from cattorch.util.scratch.emulator import ProjectEmulator
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,9 +54,9 @@ def run_vm(project, tmp_path, *, answers=(), lists=None, calls=(), flag=True) ->
     output = tmp_path / "vm.json"
     command = ["node", str(RUNNER), str(project.path), f"--out={output}"]
     command += [f"--answer={answer}" for answer in answers]
-    command += [f"--list={name}={json.dumps(values)}" for name, values in (lists or {}).items()]
+    command += [f"--list={name}={dumps(values)}" for name, values in (lists or {}).items()]
     for message, inputs in calls:
-        command += [f"--list={name}={json.dumps(values)}" for name, values in inputs.items()]
+        command += [f"--list={name}={dumps(values)}" for name, values in inputs.items()]
         command.append(f"--broadcast={message}")
     if not flag:
         command.append("--no-flag")
@@ -67,6 +69,7 @@ def run_vm(project, tmp_path, *, answers=(), lists=None, calls=(), flag=True) ->
 
 
 def values(stage, name) -> torch.Tensor:
+    # The runner writes infinities and NaN as strings, which float() reads.
     return torch.tensor([float(value) for value in stage[name]])
 
 
@@ -263,6 +266,27 @@ def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
     said = [entry["text"] for entry in run_vm(project, tmp_path, answers=["the cat", ""])["said"]]
     text = "".join(CHARACTERS[index] for index in greedy(model, "the cat", 6))
     assert "the cat" + text in said
+
+
+def test_non_finite_example_values_load_and_round_trip(tmp_path):
+    # Bare Infinity and NaN aren't JSON; the VM refused such a project.
+    class Scale(nn.Module):
+        def forward(self, x):
+            return x * 2
+
+    value = torch.tensor([1.5, math.inf, -math.inf, math.nan])
+    result = transpile(Scale().eval(), value, tmp_path / "scale")
+    project = build_project(tmp_path / "scale", result, example_inputs=value)
+    with zipfile.ZipFile(project.path) as archive:
+        stored = json.loads(archive.read("project.json"), parse_constant=pytest.fail)
+    assert [1.5, "Infinity", "-Infinity", "NaN"] in [
+        entry[1] for entry in stored["targets"][0]["lists"].values()
+    ]
+    stage = run_vm(project, tmp_path)["stage"]
+    # Scratch reads "NaN" as 0 wherever it wants a number.
+    assert stage["scale output"] == [3, "Infinity", "-Infinity", 0]
+    stage = run_vm(project, tmp_path, lists={"scale input": [math.inf, 2.0, 0.0, -1.0]})["stage"]
+    assert values(stage, "scale output").tolist() == [math.inf, 4.0, 0.0, -2.0]
 
 
 def test_tokenizers_tell_characters_apart_by_case(tmp_path):

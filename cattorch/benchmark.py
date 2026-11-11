@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import random
 import statistics
 import tempfile
@@ -34,7 +33,9 @@ from cattorch.util.scratch.dsl import (
     timer, var,
 )
 from cattorch.util.scratch.remap import remap_ids
-from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, read_json, write_archive
+from cattorch.util.scratch.archive import (
+    PROJECT_JSON, dumps, read_archive, read_json, write_archive,
+)
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.interface import (
     logical_list_chunks, read_logical_list, write_sprite_list,
@@ -1102,7 +1103,7 @@ def main() -> None:
     )
     parser.add_argument("project", help="benchmark .sb3 saved after running in Scratch")
     args = parser.parse_args()
-    print(json.dumps(analyze_benchmark(args.project), indent=2))
+    print(dumps(analyze_benchmark(args.project), indent=2))
 
 
 if __name__ == "__main__":

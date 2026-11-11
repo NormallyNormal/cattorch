@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
-import json
 import re
 import sys
 from pathlib import Path
@@ -22,6 +21,7 @@ import torch
 from torch import nn
 
 from cattorch.errors import CattorchError
+from cattorch.util.scratch.archive import dumps
 
 
 class CommandError(Exception):
@@ -163,7 +163,7 @@ def _export(args) -> int:
             _project_path(output), result, example_inputs=example or (), labels=labels,
         )
         extra["project"] = str(project.path)
-    print(json.dumps(_summary(result, extra), indent=2))
+    print(dumps(_summary(result, extra), indent=2))
     return 0 if extra.get("verified", True) else 1
 
 
@@ -228,14 +228,14 @@ def _generate(args) -> int:
             eos_token_id=eos,
         )
         extra["project"] = str(project.path)
-    print(json.dumps(_summary(result, extra), indent=2))
+    print(dumps(_summary(result, extra), indent=2))
     return 0
 
 
 def _analyze(args) -> int:
     from cattorch.benchmark import analyze_benchmark
 
-    print(json.dumps(analyze_benchmark(args.project), indent=2))
+    print(dumps(analyze_benchmark(args.project), indent=2))
     return 0
 
 

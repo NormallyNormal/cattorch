@@ -13,7 +13,9 @@ and waits for the project to stop. The remaining options run in order: a
 or --var is set, so each call can get its own inputs. Each "ask and wait"
 gets the next --answer (an empty answer once they run out). Prints the
 stage's global lists and variables plus everything sprites said, as JSON, or
-writes it to --out, since the VM logs warnings to stdout.
+writes it to --out, since the VM logs warnings to stdout. Infinities and NaN
+are written as the strings "Infinity", "-Infinity" and "NaN", as Scratch
+writes them, since JSON has no such numbers; a --list may use them too.
 */
 
 'use strict';
@@ -24,6 +26,11 @@ const VirtualMachine = require('@scratch/scratch-vm');
 const values = prefix => process.argv
     .filter(argument => argument.startsWith(prefix))
     .map(argument => argument.slice(prefix.length));
+
+// JSON.stringify writes non-finite numbers as null; keep them as strings.
+const nonFinite = (key, value) => (
+    typeof value === 'number' && !Number.isFinite(value) ? String(value) : value
+);
 
 const assignment = text => {
     const split = text.indexOf('=');
@@ -99,7 +106,7 @@ const main = async () => {
     for (const variable of Object.values(stage.variables)) {
         if (variable.type !== 'broadcast_msg') data[variable.name] = variable.value;
     }
-    const result = JSON.stringify({questions, said, stage: data}, null, 1);
+    const result = JSON.stringify({questions, said, stage: data}, nonFinite, 1);
     if (output) {
         fs.writeFileSync(output, result);
     } else {

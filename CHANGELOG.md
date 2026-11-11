@@ -708,6 +708,13 @@
 - A SentencePiece byte-fallback export now also warns that a non-ASCII
   character outside the vocabulary encodes as the unknown token, where
   SentencePiece emits its UTF-8 bytes.
+- `build_project` and the benchmark builders wrote an infinite or NaN example
+  value as a bare `Infinity` or `NaN`, which isn't JSON, so the Scratch VM
+  refused to load the project. Every Scratch archive now holds strict JSON,
+  with these values as the strings `"Infinity"`, `"-Infinity"` and `"NaN"`,
+  which Scratch reads as numbers. The command line's JSON output is strict
+  too, and `benchmarks/run_project_vm.cjs` and the other VM runners write
+  these values as the same strings instead of `null`.
 
 ## Deprecations
 

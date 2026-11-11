@@ -7,6 +7,12 @@ const fs = require('fs');
 const path = require('path');
 const VirtualMachine = require('@scratch/scratch-vm');
 
+// JSON.stringify writes non-finite numbers as null; keep them as the strings
+// Scratch uses.
+const nonFinite = (key, value) => (
+    typeof value === 'number' && !Number.isFinite(value) ? String(value) : value
+);
+
 const RESULTS_NAME = 'cattorch benchmark results';
 
 const compare = (baseline, candidate) => {
@@ -124,7 +130,7 @@ const main = async () => {
         wall_seconds: wallSeconds,
         results: results.value.map(String),
         comparisons: {dense, quantized_compute: quantizedCompute, softmax, decode}
-    }, null, 2)}\n`);
+    }, nonFinite, 2)}\n`);
     vm.quit();
 };
 

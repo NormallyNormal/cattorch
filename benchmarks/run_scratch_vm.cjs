@@ -18,6 +18,12 @@ const VirtualMachine = require('@scratch/scratch-vm');
 
 const RESULTS_NAME = 'cattorch benchmark results';
 
+// JSON.stringify writes non-finite numbers as null; keep them as the strings
+// Scratch uses.
+const nonFinite = (key, value) => (
+    typeof value === 'number' && !Number.isFinite(value) ? String(value) : value
+);
+
 const main = async () => {
     const projectPath = process.argv[2];
     const inspectOutput = process.argv.includes('--inspect-output');
@@ -131,7 +137,7 @@ const main = async () => {
                 }))
             );
     }
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify(report, nonFinite, 2));
     vm.quit();
 };
 

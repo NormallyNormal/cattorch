@@ -17,6 +17,27 @@ from cattorch.util.scratch.dsl import Program
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 
 
+def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
+    # Bare Infinity and NaN aren't JSON, and the Scratch VM refuses them.
+    import json
+    import zipfile
+
+    value = torch.tensor([1.5, math.inf, -math.inf, math.nan])
+    result = transpile(nn.Identity().eval(), value, tmp_path / "same")
+    project = build_project(tmp_path / "same", result, example_inputs=value)
+    with zipfile.ZipFile(project.path) as archive:
+        stored = json.loads(archive.read("project.json"), parse_constant=pytest.fail)
+    stage = stored["targets"][0]
+    assert stage["lists"] and all(
+        entry[1] == [1.5, "Infinity", "-Infinity", "NaN"] for entry in stage["lists"].values()
+        if entry[0] == "same input"
+    )
+    emulator = ProjectEmulator(project.path)
+    emulator.green_flag()
+    output = [float(value) for value in emulator.stage.lists["same output"]]
+    assert output[:3] == [1.5, math.inf, -math.inf]
+
+
 def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(3, 6), nn.Tanh(), nn.Linear(6, 3)).eval()

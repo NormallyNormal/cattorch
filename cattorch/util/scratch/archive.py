@@ -7,11 +7,36 @@ each next to the costume and sound files it names.
 from __future__ import annotations
 
 import json
+import math
 import zipfile
 from pathlib import Path
 
 SPRITE_JSON = "sprite.json"
 PROJECT_JSON = "project.json"
+
+
+def json_safe_numbers(value):
+    """Replace non-finite numbers with the strings Scratch uses for them.
+
+    Python's ``json`` writes bare ``Infinity`` and ``NaN``, which aren't JSON
+    and which the Scratch VM refuses to load. Scratch reads the strings
+    ``"Infinity"``, ``"-Infinity"`` and ``"NaN"`` as those numbers wherever
+    it expects a number.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: json_safe_numbers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_numbers(item) for item in value]
+    return value
+
+
+def dumps(data, **options) -> str:
+    """``json.dumps`` that writes strict JSON, with non-finite numbers as strings."""
+    return json.dumps(json_safe_numbers(data), allow_nan=False, **options)
 
 
 def read_archive(path: str | Path, document: str = SPRITE_JSON) -> tuple[dict, dict[str, bytes]]:
@@ -35,7 +60,7 @@ def write_archive(
 
     Returns the JSON text, whose size Scratch limits.
     """
-    text = json.dumps(data, separators=(",", ":"))
+    text = dumps(data, separators=(",", ":"))
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(document, text)
         for name, content in assets.items():
@@ -43,4 +68,7 @@ def write_archive(
     return text
 
 
-__all__ = ["PROJECT_JSON", "SPRITE_JSON", "read_archive", "read_json", "write_archive"]
+__all__ = [
+    "PROJECT_JSON", "SPRITE_JSON", "dumps", "json_safe_numbers", "read_archive", "read_json",
+    "write_archive",
+]
