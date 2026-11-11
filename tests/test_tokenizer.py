@@ -657,3 +657,85 @@ def test_tokenizer_export_returns_metadata_and_separates_name(tmp_path):
     with zipfile.ZipFile(result.path) as archive:
         sprite = json.loads(archive.read("sprite.json"))
     assert sprite["name"] == "Friendly tokenizer"
+
+
+# ── Tokenizer kinds the sprite can't reproduce ───────────────────────────────
+
+_CORPUS = ["the cat sat on the mat", "the dog sat on the log", "a big cat"] * 10
+
+
+def _train_sentencepiece(model_type="bpe", corpus=_CORPUS, **options):
+    import io
+
+    sentencepiece = pytest.importorskip("sentencepiece")
+    settings = dict(
+        vocab_size=30, add_dummy_prefix=False, remove_extra_whitespaces=False,
+        normalization_rule_name="identity", minloglevel=3, hard_vocab_limit=False,
+    )
+    settings.update(options)
+    model = io.BytesIO()
+    sentencepiece.SentencePieceTrainer.train(
+        sentence_iterator=iter(corpus), model_writer=model, model_type=model_type, **settings,
+    )
+    return sentencepiece.SentencePieceProcessor(model_proto=model.getvalue())
+
+
+@pytest.mark.parametrize("model_type", ["unigram", "word", "char"])
+def test_sentencepiece_models_other_than_bpe_are_rejected(tmp_path, model_type):
+    processor = _train_sentencepiece(model_type)
+    for export in (
+        lambda: transpile_tokenizer(processor, tmp_path / "auto"),
+        lambda: SentencePieceBPETokenizer(processor).save(tmp_path / "bpe"),
+    ):
+        with pytest.raises(ValueError, match=f"is a {model_type} model.*model_type='bpe'"):
+            export()
+
+
+def test_sentencepiece_user_defined_symbols_are_rejected():
+    processor = _train_sentencepiece(user_defined_symbols=["<cat>"])
+    with pytest.raises(ValueError, match="user-defined symbols such as '<cat>'"):
+        SentencePieceBPETokenizer(processor)
+
+
+def _word_tokenizers():
+    from tokenizers import normalizers
+
+    wordpiece = Tokenizer(models.WordPiece(unk_token="[UNK]"))
+    wordpiece.normalizer = normalizers.BertNormalizer(lowercase=True)
+    wordpiece.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    wordpiece.train_from_iterator(
+        _CORPUS, trainers.WordPieceTrainer(vocab_size=60, special_tokens=["[UNK]"]),
+    )
+    unigram = Tokenizer(models.Unigram())
+    unigram.train_from_iterator(
+        _CORPUS,
+        trainers.UnigramTrainer(vocab_size=30, special_tokens=["<unk>"], unk_token="<unk>"),
+    )
+    words = Tokenizer(models.WordLevel({"[UNK]": 0, "the": 1, "cat": 2}, unk_token="[UNK]"))
+    words.pre_tokenizer = pre_tokenizers.Whitespace()
+    # Single-character vocabularies whose models still don't read one
+    # character at a time.
+    spaced = Tokenizer(models.WordLevel(
+        {character: index for index, character in enumerate("?thecasdoglm ")}, unk_token="?",
+    ))
+    spaced.pre_tokenizer = pre_tokenizers.Whitespace()
+    pieces = Tokenizer(models.WordPiece(
+        {character: index for index, character in enumerate("?thecasdoglm ")}, unk_token="?",
+    ))
+    return {
+        "wordpiece": (wordpiece, "[UNK]", "WordPiece tokenizers"),
+        "unigram": (unigram, "<unk>", "Unigram tokenizers"),
+        "wordlevel": (words, "[UNK]", "WordLevel tokenizers"),
+        "wordlevel-characters": (spaced, "?", "one character at a"),
+        "wordpiece-characters": (pieces, "?", "one character at a"),
+    }
+
+
+@pytest.mark.parametrize("kind", list(_word_tokenizers()))
+def test_hugging_face_models_other_than_bpe_and_characters_are_rejected(kind):
+    backend, unknown, message = _word_tokenizers()[kind]
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token=unknown)
+    with pytest.raises(ValueError, match=message):
+        transpile_tokenizer(tokenizer, SPRITE_PATH)
+    with pytest.raises(ValueError, match="single characters|one character at a"):
+        CharTokenizer(tokenizer).save(SPRITE_PATH)

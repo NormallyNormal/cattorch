@@ -8,9 +8,9 @@ supported:
 
 | Exporter | Use for | Main requirement |
 |---|---|---|
-| `CharTokenizer` | Very small character vocabularies | Requires a valid unknown-token ID. |
+| `CharTokenizer` | Very small character vocabularies | Single-character tokens, read one character at a time, and a valid unknown-token ID. |
 | `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`. |
-| `SentencePieceBPETokenizer` | Raw SentencePiece BPE with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
+| `SentencePieceBPETokenizer` | Raw SentencePiece BPE (`model_type="bpe"`) with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
 
 Hugging Face tokenizers need the optional dependencies:
 
@@ -27,6 +27,16 @@ result = BPETokenizer(tokenizer).save("build/my_tokenizer")
 # character lookup only if every token is one character.
 result = transpile_tokenizer(tokenizer, "build/my_tokenizer")
 ```
+
+Other kinds of tokenizer are rejected with an error rather than exported with
+different token IDs: Hugging Face WordPiece (BERT), Unigram (T5, ALBERT,
+XLNet) and word-level tokenizers, and SentencePiece models trained with
+`model_type` `unigram`, `word` or `char`, or with user-defined symbols. A
+WordPiece, Unigram or word-level tokenizer whose tokens are all single
+characters is exported only if it really encodes text one character at a
+time; `CharTokenizer` checks this by encoding every vocabulary character, and
+rejects a normalizer or a pre-tokenizer, such as `Whitespace`, that changes
+the result.
 
 The returned `TokenizerResult` gives the saved path, size, and any warnings.
 As with `transpile`, parent directories are created, `.sprite3` is added if

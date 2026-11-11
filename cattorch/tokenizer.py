@@ -4,6 +4,8 @@ tokenizer.py
 Transpile a HuggingFace tokenizer into a Scratch sprite.
 
 Supports character-level, raw-text BPE, and SentencePiece BPE tokenizers.
+Every other kind (WordPiece, Unigram, word-level, and SentencePiece Unigram,
+word and char models) is rejected with an error rather than exported wrong.
 
 Usage
 -----
@@ -27,12 +29,14 @@ from cattorch.sprite import (
     _procedure_mutation,
 )
 from cattorch.util.scratch.dsl import (
+    Expr,
     Program,
     Statement,
     add,
     append,
     change_var,
     clear,
+    costume_number,
     delete,
     eq,
     gt,
@@ -51,6 +55,7 @@ from cattorch.util.scratch.dsl import (
     set_var,
     string_length,
     sub,
+    switch_costume,
     var,
 )
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
@@ -60,6 +65,122 @@ from cattorch.util.scratch.ids import uniquify_data_ids
 # The Scratch interface; see ``docs/scratch-interface.md``.
 TEXT_VARIABLE = "cattorch text"
 TOKEN_IDS_LIST = "cattorch token ids"
+
+_SENTENCEPIECE_METHODS = (
+    "get_piece_size",
+    "id_to_piece",
+    "is_byte",
+    "is_control",
+    "get_score",
+    "unk_id",
+)
+# ``TrainerSpec.ModelType`` in sentencepiece_model.proto.
+_SENTENCEPIECE_MODEL_TYPES = {1: "unigram", 2: "bpe", 3: "word", 4: "char"}
+# ``SentencePiece.Type``.
+_SENTENCEPIECE_USER_DEFINED = 4
+
+
+def _is_sentencepiece(processor) -> bool:
+    return all(hasattr(processor, method) for method in _SENTENCEPIECE_METHODS)
+
+
+def _backend(tokenizer):
+    """The ``tokenizers.Tokenizer`` behind a Hugging Face tokenizer, if any.
+
+    A ``tokenizers.Tokenizer`` is its own backend.
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None and hasattr(tokenizer, "model"):
+        backend = tokenizer
+    if backend is None or not callable(getattr(backend, "to_str", None)):
+        return None
+    return backend
+
+
+def _backend_settings(backend) -> dict:
+    try:
+        settings = json.loads(backend.to_str())
+    except (TypeError, ValueError) as exc:
+        raise TypeError("unable to read the Hugging Face tokenizer's settings") from exc
+    if not isinstance(settings, dict) or not isinstance(settings.get("model"), dict):
+        raise TypeError("unable to read the Hugging Face tokenizer's model")
+    return settings
+
+
+def _special_tokens(tokenizer) -> set[str]:
+    """Tokens the tokenizer never produces from ordinary text."""
+    special = getattr(tokenizer, "all_special_tokens", None)
+    if special is not None:
+        return set(special)
+    added = getattr(tokenizer, "get_added_tokens_decoder", None)
+    if callable(added):
+        # A tokenizers.Tokenizer marks its special added tokens.
+        return {
+            token.content for token in added().values() if getattr(token, "special", False)
+        }
+    return set()
+
+
+def _protobuf_fields(data: bytes):
+    """Yield ``(field number, value)`` for each field of a protobuf message.
+
+    Enough of the wire format to read a SentencePiece model's type without
+    depending on protobuf, which sentencepiece doesn't require.
+    """
+    position = 0
+
+    def varint() -> int:
+        nonlocal position
+        result = shift = 0
+        while True:
+            if position >= len(data):
+                raise ValueError("truncated protobuf message")
+            byte = data[position]
+            position += 1
+            result |= (byte & 0x7F) << shift
+            if byte < 0x80:
+                return result
+            shift += 7
+
+    while position < len(data):
+        key = varint()
+        field, wire_type = key >> 3, key & 7
+        value: int | bytes
+        if wire_type == 0:
+            value = varint()
+        elif wire_type == 1:
+            value, position = data[position:position + 8], position + 8
+        elif wire_type == 2:
+            size = varint()
+            value, position = data[position:position + size], position + size
+        elif wire_type == 5:
+            value, position = data[position:position + 4], position + 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire_type}")
+        if position > len(data):
+            raise ValueError("truncated protobuf message")
+        yield field, value
+
+
+def _sentencepiece_model_summary(serialized: bytes) -> tuple[str, list[str]]:
+    """The model's type and its user-defined pieces."""
+    model_type = 1  # The proto2 default for TrainerSpec.model_type.
+    user_defined: list[str] = []
+    for field, value in _protobuf_fields(serialized):
+        if field == 1 and isinstance(value, bytes):  # ModelProto.pieces
+            piece, piece_type = "", 1
+            for piece_field, piece_value in _protobuf_fields(value):
+                if piece_field == 1 and isinstance(piece_value, bytes):
+                    piece = piece_value.decode("utf-8", "replace")
+                elif piece_field == 3 and isinstance(piece_value, int):
+                    piece_type = piece_value
+            if piece_type == _SENTENCEPIECE_USER_DEFINED:
+                user_defined.append(piece)
+        elif field == 2 and isinstance(value, bytes):  # ModelProto.trainer_spec
+            for spec_field, spec_value in _protobuf_fields(value):
+                if spec_field == 3 and isinstance(spec_value, int):
+                    model_type = spec_value
+    return _SENTENCEPIECE_MODEL_TYPES.get(model_type, f"type {model_type}"), user_defined
 
 
 class _TokenizerBase(ABC):
@@ -95,8 +216,8 @@ class _TokenizerBase(ABC):
         if isinstance(unknown, str) and unknown in vocab:
             return int(vocab[unknown])
 
-        backend = getattr(self.tokenizer, "backend_tokenizer", None)
-        if backend is not None and hasattr(backend, "to_str"):
+        backend = _backend(self.tokenizer)
+        if backend is not None:
             try:
                 model = json.loads(backend.to_str()).get("model", {})
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -193,11 +314,59 @@ def _reject_scratch_text_ambiguity(
         seen[key] = token
 
 
+def _check_encodes_characters(
+    tokenizer, tokens: Sequence[str], special: set[str], unknown_id: int,
+) -> None:
+    """Check that ``tokenizer`` maps each character to its own token.
+
+    A word-level or WordPiece tokenizer whose vocabulary happens to be single
+    characters, or one with a pre-tokenizer or a normalizer, encodes text
+    differently from a character table. Encode a probe of every character,
+    their other cases and unknown characters, and compare.
+    """
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        return
+    ids: dict[str, int] = {}
+    for token_id, token in enumerate(tokens):
+        if len(token) == 1 and token not in special:
+            ids.setdefault(token, token_id)
+    unknown = next(
+        character for character in "☃¤�⁂〓" if character not in ids
+    )
+    other_cases = [
+        swapped for character in ids
+        for swapped in (character.swapcase(),)
+        if len(swapped) == 1 and swapped not in ids
+    ]
+    probe = "".join(ids) + unknown * 2 + "".join(other_cases) + "".join(ids)[:1]
+    try:
+        encoded = encode(probe, add_special_tokens=False)
+    except TypeError:
+        encoded = encode(probe)
+    actual = [int(value) for value in getattr(encoded, "ids", encoded)]
+    expected = [ids.get(character, unknown_id) for character in probe]
+    if actual != expected:
+        at = next(
+            (index for index, pair in enumerate(zip(actual, expected)) if pair[0] != pair[1]),
+            min(len(actual), len(expected)),
+        )
+        window = slice(max(0, at - 2), at + 3)
+        raise ValueError(
+            "CharTokenizer needs a tokenizer that encodes text one character at a "
+            f"time, but this one doesn't: {probe[window]!r} gives token IDs "
+            f"{actual[window]} rather than {expected[window]}. A pre-tokenizer, "
+            "normalizer, or word-level model makes the difference"
+        )
+
+
 class CharTokenizer(_TokenizerBase):
     """Transpile a character-level tokenizer into a Scratch sprite.
 
     Each character in the input is mapped to a token ID via a vocab lookup.
-    No merging is performed.
+    No merging is performed. The tokenizer's tokens must be single characters
+    (special tokens aside), and it must encode text one character at a time,
+    which is checked by encoding the vocabulary when it has ``encode``.
 
     Example
     -------
@@ -208,12 +377,30 @@ class CharTokenizer(_TokenizerBase):
         CharTokenizer(tokenizer).save("my_char_tok")
     """
     def _build_sprite(self, tokens: list[str]) -> dict:
-        _reject_scratch_text_ambiguity(tokens, characters_only=True)
         unknown_id = self._unknown_id()
         if unknown_id is None:
             raise ValueError(
                 "CharTokenizer requires a tokenizer with a valid unknown-token ID"
             )
+        # The unknown token is never read from text, whatever its length.
+        special = _special_tokens(self.tokenizer) | {tokens[unknown_id]}
+        words = [token for token in tokens if len(token) > 1 and token not in special]
+        if words:
+            raise ValueError(
+                "CharTokenizer needs a tokenizer whose tokens are single characters, "
+                f"but this vocabulary has multi-character tokens such as {words[0]!r}"
+            )
+        _reject_scratch_text_ambiguity(tokens, characters_only=True)
+        backend = _backend(self.tokenizer)
+        if backend is not None:
+            normalizer = _backend_settings(backend).get("normalizer")
+            if normalizer is not None:
+                raise ValueError(
+                    "CharTokenizer doesn't support a normalizer "
+                    f"({normalizer.get('type', 'unknown')}); the sprite looks up the "
+                    "raw text, so tokens would differ"
+                )
+        _check_encodes_characters(self.tokenizer, tokens, special, unknown_id)
         return _build_character_tokenizer_sprite(
             tokens, bpe=False, unknown_id=unknown_id,
         )
@@ -238,25 +425,24 @@ class BPETokenizer(_TokenizerBase):
     """
     def _build_sprite(self, tokens: list[str]) -> dict:
         _reject_scratch_text_ambiguity(tokens, characters_only=False)
-        backend = getattr(self.tokenizer, "backend_tokenizer", None)
-        if backend is None or not hasattr(backend, "to_str"):
+        backend = _backend(self.tokenizer)
+        if backend is None:
             raise TypeError(
                 "BPETokenizer requires a Hugging Face fast tokenizer backend "
                 "whose canonical merge order can be exported"
             )
-        try:
-            model = json.loads(backend.to_str())["model"]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise TypeError("unable to read the tokenizer's BPE model") from exc
+        settings = _backend_settings(backend)
+        model = settings["model"]
         if model.get("type") != "BPE":
-            raise TypeError("BPETokenizer requires a BPE backend model")
+            raise TypeError(
+                f"BPETokenizer requires a BPE model, not {model.get('type', 'unknown')}"
+            )
         if model.get("dropout") is not None:
             raise ValueError("BPE dropout is nondeterministic and cannot be exported")
         if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):
             raise ValueError(
                 "raw-text BPETokenizer does not support subword prefixes or suffixes"
             )
-        settings = json.loads(backend.to_str())
         for stage in ("normalizer", "pre_tokenizer"):
             if settings.get(stage) is not None:
                 kind = settings[stage].get("type", "unknown")
@@ -517,15 +703,9 @@ class SentencePieceBPETokenizer(_TokenizerBase):
     def __init__(self, tokenizer, *, scratch_casefold: bool = False):
         super().__init__(tokenizer)
         self.processor = getattr(tokenizer, "processor", tokenizer)
-        required = (
-            "get_piece_size",
-            "id_to_piece",
-            "is_byte",
-            "is_control",
-            "get_score",
-            "unk_id",
-        )
-        missing = [name for name in required if not hasattr(self.processor, name)]
+        missing = [
+            name for name in _SENTENCEPIECE_METHODS if not hasattr(self.processor, name)
+        ]
         if missing:
             raise TypeError(
                 "SentencePieceBPETokenizer requires a SentencePiece processor; "
@@ -549,6 +729,23 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         """Reject SentencePiece preprocessing Scratch cannot reproduce."""
         serialized = getattr(self.processor, "serialized_model_proto", None)
         if callable(serialized):
+            try:
+                model_type, user_defined = _sentencepiece_model_summary(serialized())
+            except ValueError as exc:
+                raise ValueError("unable to inspect the SentencePiece model") from exc
+            if model_type != "bpe":
+                raise ValueError(
+                    f"this SentencePiece model is a {model_type} model, which "
+                    "SentencePieceBPETokenizer can't reproduce; cattorch exports "
+                    "SentencePiece models trained with model_type='bpe'"
+                )
+            if user_defined:
+                raise ValueError(
+                    "SentencePiece user-defined symbols such as "
+                    f"{user_defined[0]!r} are matched before BPE, which the Scratch "
+                    "tokenizer doesn't reproduce; train the model without "
+                    "user_defined_symbols"
+                )
             try:
                 from sentencepiece import sentencepiece_model_pb2
             except ImportError:
@@ -945,8 +1142,10 @@ def transpile_tokenizer(
 ) -> TokenizerResult:
     """Transpile a HuggingFace tokenizer into a Scratch .sprite3 file.
 
-    Auto-detects BPE vs character-level from the tokenizer backend.
-    For explicit control, use ``CharTokenizer`` or ``BPETokenizer`` directly.
+    Auto-detects SentencePiece BPE, Hugging Face BPE, or character-level from
+    the tokenizer. Every other kind, such as WordPiece, Unigram, or a
+    SentencePiece Unigram model, raises ``ValueError``. For explicit control,
+    use ``CharTokenizer``, ``BPETokenizer`` or ``SentencePieceBPETokenizer``.
 
     Parameters
     ----------
@@ -962,39 +1161,35 @@ def transpile_tokenizer(
         JSON-size, loop-unrolling, and compact-ID controls.
     """
     processor = getattr(tokenizer, "processor", tokenizer)
-    sentencepiece_methods = (
-        "get_piece_size",
-        "id_to_piece",
-        "is_byte",
-        "is_control",
-        "get_score",
-        "unk_id",
-    )
-    if all(hasattr(processor, method) for method in sentencepiece_methods):
+    if _is_sentencepiece(processor):
+        # The constructor rejects SentencePiece models other than BPE.
         return SentencePieceBPETokenizer(
             tokenizer,
             scratch_casefold=scratch_casefold,
         ).save(output_path, name=name, codegen=codegen)
 
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is None:
-        return CharTokenizer(tokenizer).save(output_path, name=name, codegen=codegen)
-    try:
-        from tokenizers import models
-    except ImportError as exc:
-        raise ImportError(
-            "Hugging Face tokenizer auto-detection requires the "
-            "'cattorch[tokenizers]' optional dependencies"
-        ) from exc
-    if isinstance(backend.model, models.BPE):
-        return BPETokenizer(tokenizer).save(output_path, name=name, codegen=codegen)
-    special = set(getattr(tokenizer, "all_special_tokens", ()))
-    if any(len(token) != 1 for token in tokenizer.get_vocab() if token not in special):
-        # A WordPiece, WordLevel or Unigram vocabulary of words would be
-        # encoded one character at a time.
+    backend = _backend(tokenizer)
+    if backend is not None:
+        model_type = _backend_settings(backend)["model"].get("type", "unknown")
+        if model_type == "BPE":
+            return BPETokenizer(tokenizer).save(output_path, name=name, codegen=codegen)
+    else:
+        model_type = type(tokenizer).__name__
+    # Anything else must be a character tokenizer: a WordPiece, WordLevel or
+    # Unigram vocabulary of words would be encoded one character at a time.
+    # CharTokenizer also checks that the tokenizer encodes characters alone.
+    special = _special_tokens(tokenizer)
+    unknown = getattr(tokenizer, "unk_token", None)
+    if isinstance(unknown, str):
+        special.add(unknown)
+    if backend is not None:
+        backend_unknown = _backend_settings(backend)["model"].get("unk_token")
+        if isinstance(backend_unknown, str):
+            special.add(backend_unknown)
+    if any(len(token) > 1 for token in tokenizer.get_vocab() if token not in special):
         raise ValueError(
-            f"{type(backend.model).__name__} tokenizers with multi-character tokens "
-            "can't be exported; transpile_tokenizer supports BPE, SentencePiece BPE, "
-            "and tokenizers whose tokens are single characters"
+            f"{model_type} tokenizers with multi-character tokens can't be exported; "
+            "transpile_tokenizer supports BPE, SentencePiece BPE, and tokenizers "
+            "whose tokens are single characters"
         )
     return CharTokenizer(tokenizer).save(output_path, name=name, codegen=codegen)

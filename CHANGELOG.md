@@ -684,6 +684,16 @@
   later were affected the same way.
 - `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
   failed during export.
+- A SentencePiece Unigram model was exported as a BPE tokenizer with
+  different token IDs, and SentencePiece `word` and `char` models were also
+  accepted. `SentencePieceBPETokenizer` and `transpile_tokenizer` now read the
+  model type and reject anything but BPE, as well as models with user-defined
+  symbols, which SentencePiece matches before BPE.
+- `CharTokenizer` exported any tokenizer, so a WordPiece, word-level or
+  Unigram tokenizer gave a sprite that looked up characters with different
+  token IDs. It now rejects multi-character tokens, a normalizer, and any
+  tokenizer that doesn't encode text one character at a time, such as a
+  single-character vocabulary behind a `Whitespace` pre-tokenizer.
 
 ## Deprecations
 

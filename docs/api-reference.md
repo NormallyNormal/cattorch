@@ -147,7 +147,9 @@ transpile_tokenizer(
 ```
 
 Detect the tokenizer type (character, raw-text Hugging Face BPE, or
-SentencePiece BPE) and export it. Use `scratch_casefold=True` only for a
+SentencePiece BPE) and export it. Any other type, such as WordPiece, Unigram,
+or a SentencePiece Unigram model, raises `ValueError`; see
+[tokenizers](tokenizers.md). Use `scratch_casefold=True` only for a
 SentencePiece model trained with case-folding normalization.
 
 ### `CharTokenizer` and `BPETokenizer`
