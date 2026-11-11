@@ -430,22 +430,16 @@ class _GPTQCaptureMode(TorchDispatchMode):
         registry: OperatorRegistry,
         *,
         collect_hessian: bool = True,
-        bases: dict[int, torch.Tensor] | None = None,
         static_storages: Iterable[int] = (),
     ):
         super().__init__()
+        # Parameters, and weights computed from them (see
+        # ``_ComputedWeightCapture``), by storage.
         self.parameters = parameters
         self.registry = registry
         # Symmetric quantization only needs to know how each matrix is used.
         self.collect_hessian = collect_hessian
         self.stats: dict[tuple, _ActivationStats] = {}
-        self.bases = dict(bases or {})
-        # A copy's storage -> (a weak reference to it, the copy's layout in
-        # it, the parameter view it copied), for weights a model copies
-        # before using them. Views made in inference mode don't keep the
-        # copy itself alive, only its storage. An operation that writes to a
-        # copy forgets it.
-        self.copies: dict[int, tuple[StorageWeakRef, tuple, torch.Tensor]] = {}
         # A storage known before any input arrives -> (a weak reference to
         # it, or None for the model's own tensors, the parameters whose
         # values it holds, whether it holds them unchanged). This covers
@@ -527,75 +521,26 @@ class _GPTQCaptureMode(TorchDispatchMode):
     def _parameter_name(self, weight: torch.Tensor) -> str | None:
         return self.parameters.get(weight.untyped_storage().data_ptr())
 
-    def _track_copy(self, source: torch.Tensor, copy: torch.Tensor) -> None:
-        """Remember ``copy`` as the parameter values ``source`` holds."""
-        pointer = copy.untyped_storage().data_ptr()
-        if (
-            copy.shape != source.shape or copy.dtype != source.dtype
-            or not copy.is_floating_point()
-            or pointer == source.untyped_storage().data_ptr()
-            or pointer in self.parameters
-        ):
-            return
-        view = self._parameter_view(source)
-        if view is None:
-            return
-        self.copies = {
-            key: entry for key, entry in self.copies.items() if not entry[0].expired()
-        }
-        self.copies[pointer] = (
-            StorageWeakRef(copy.untyped_storage()), _storage_key(copy), view,
+    def add_computed(self, tensor: torch.Tensor, name: str, sources: Iterable[int]) -> None:
+        """Follow a weight computed from the parameters at ``sources`` as one
+        of its own: they are its ingredients, and reading it reads only it."""
+        pointer = tensor.untyped_storage().data_ptr()
+        self.parameters[pointer] = name
+        self.static[pointer] = (
+            StorageWeakRef(tensor.untyped_storage()), frozenset({pointer}), True,
         )
+        self.derivations.update(sources)
+
+    def remove_computed(self, tensor: torch.Tensor) -> None:
+        self.parameters.pop(tensor.untyped_storage().data_ptr(), None)
 
     def _parameter_view(self, tensor: torch.Tensor) -> torch.Tensor | None:
-        """``tensor`` as a view of a parameter, through any copies of one.
+        """``tensor`` if it is a view of a parameter or computed weight.
 
-        A model can copy a weight into another layout before using it, as in
-        ``F.linear(x, weight.t().contiguous())``. Quantizing the parameter
-        through the view the copy was made from groups it as it is used, and
-        the copy the model makes from it then holds the quantized values.
+        A copy the model makes of a weight before using it, as in
+        ``F.linear(x, weight.t().contiguous())``, is a computed weight too.
         """
-        pointer = tensor.untyped_storage().data_ptr()
-        if pointer in self.parameters:
-            return tensor
-        entry = self.copies.get(pointer)
-        if entry is None:
-            return None
-        storage, layout, view = entry
-        if storage.expired():
-            return None
-        if _storage_key(tensor) == layout:
-            return view
-        _, copy_offset, copy_shape, copy_stride = layout
-        # A view of the copy reads the parameter positions the copy holds at
-        # the places it reads.
-        base = self.bases.get(view.untyped_storage().data_ptr())
-        if base is None:
-            return None
-        values = base.untyped_storage().nbytes() // base.element_size()
-        positions = torch.arange(values).as_strided(
-            view.shape, view.stride(), view.storage_offset(),
-        )
-        held = torch.full(
-            (tensor.untyped_storage().nbytes() // tensor.element_size(),), -1,
-            dtype=torch.long,
-        )
-        held.as_strided(copy_shape, copy_stride, copy_offset).copy_(positions)
-        read = held.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
-        if read.numel() == 0 or bool((read < 0).any()):
-            return None
-        origin = int(read[(0,) * read.ndim])
-        strides = []
-        for dimension, size in enumerate(read.shape):
-            step = [0] * read.ndim
-            step[dimension] = min(1, size - 1)
-            strides.append(int(read[tuple(step)]) - origin if size > 1 else 1)
-        last = origin + sum((size - 1) * stride for size, stride in zip(read.shape, strides))
-        if min(strides, default=1) < 0 or last >= values or not torch.equal(
-            torch.arange(values).as_strided(read.shape, strides, origin), read,
-        ):
-            return None
-        return base.as_strided(read.shape, strides, origin)
+        return tensor if tensor.untyped_storage().data_ptr() in self.parameters else None
 
     def _record(self, value: torch.Tensor, weight: torch.Tensor, orientation: str) -> None:
         if not value.is_floating_point() or not weight.is_floating_point():
@@ -671,15 +616,6 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # selected-expert activations without recursively observing themselves.
         with torch._C._DisableTorchDispatch():
             observations = self.registry.observe(target, func, args, kwargs, result)
-            if self.copies and func._schema.is_mutable:
-                for argument in (*args, *kwargs.values()):
-                    if isinstance(argument, torch.Tensor):
-                        self.copies.pop(argument.untyped_storage().data_ptr(), None)
-            if (
-                target in _COPY_TARGETS and args
-                and isinstance(args[0], torch.Tensor) and isinstance(result, torch.Tensor)
-            ):
-                self._track_copy(args[0], result)
             # An operation on known tensors alone is folded at export: it
             # computes another weight, and reads no matrix at run time.
             folded = self._track_static(func, target, args, kwargs, result)
@@ -711,14 +647,6 @@ _REARRANGEMENTS = frozenset({
     "aten.squeeze_copy.dim", "aten.split_with_sizes_copy.default",
     "aten.unbind_copy.int", "aten.alias_copy.default", "aten.narrow_copy.default",
     "aten._unsafe_view.default",
-})
-
-
-# Operations whose result is a copy of their first argument's values, when it
-# has the same shape and dtype.
-_COPY_TARGETS = frozenset({
-    "aten.clone.default", "aten.contiguous.default", "aten._to_copy.default",
-    "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.to.other",
 })
 
 
@@ -1224,7 +1152,7 @@ class _RecipeTracker:
         ]
         entries = [self._entry(item) for item in tensors]
         name = getattr(func, "__name__", "")
-        writes = name.endswith("_") or name == "__setitem__" or "out" in kwargs
+        writes = _writes(func, kwargs)
         if not tensors or any(entry is None for entry in entries):
             if writes:
                 # A known tensor written with unknown values is no longer known.
@@ -1257,6 +1185,22 @@ class _RecipeTracker:
             for index, item in enumerate(result):
                 if isinstance(item, torch.Tensor) and self.recipe_of(item) is None:
                     self.remember(item, (recipe, index), computed)
+
+
+def _writes(func, kwargs) -> bool:
+    """Whether a torch function writes to a tensor argument."""
+    name = getattr(func, "__name__", "")
+    return (
+        (name.endswith("_") and not name.endswith("__"))
+        or name in _IN_PLACE_OPERATORS or "out" in kwargs
+    )
+
+
+_IN_PLACE_OPERATORS = frozenset({
+    "__setitem__", "__iadd__", "__isub__", "__imul__", "__itruediv__", "__ifloordiv__",
+    "__imod__", "__ipow__", "__imatmul__", "__iand__", "__ior__", "__ixor__",
+    "__ilshift__", "__irshift__",
+})
 
 
 # Functions, by name, that only rearrange, select or copy their arguments'
@@ -1314,6 +1258,8 @@ class _DerivedWeight:
     owner: torch.nn.Module | None
     owner_path: str
     sources: frozenset[int]
+    # Made by rearranging or copying, not computing new values.
+    copy: bool = False
 
 
 class _ComputedWeightCapture(TorchFunctionMode):
@@ -1327,7 +1273,7 @@ class _ComputedWeightCapture(TorchFunctionMode):
     back; ``owners`` is the caller's model, not a wrapper export replaces.
     """
 
-    def __init__(self, model: torch.nn.Module, owners: torch.nn.Module, on_new):
+    def __init__(self, model: torch.nn.Module, owners: torch.nn.Module, on_new, on_written):
         super().__init__()
         self.tracker = _RecipeTracker(_module_leaves(model))
         self.owners = {id(module) for module in owners.modules()}
@@ -1340,6 +1286,7 @@ class _ComputedWeightCapture(TorchFunctionMode):
             name: tensor.untyped_storage().data_ptr() for name, tensor in _module_leaves(model)
         }
         self.on_new = on_new
+        self.on_written = on_written
         self._hooks: list = []
 
     def __enter__(self):
@@ -1367,12 +1314,23 @@ class _ComputedWeightCapture(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if self.computed and _writes(func, kwargs):
+            # A weight the model writes to is not one value across calls:
+            # each call computes its own again, and it isn't quantized.
+            written = {
+                item.untyped_storage().data_ptr()
+                for item in pytree.tree_leaves((args, kwargs)) if isinstance(item, torch.Tensor)
+            }
+            for recipe, weight in list(self.computed.items()):
+                if weight.tensor.untyped_storage().data_ptr() in written:
+                    del self.computed[recipe]
+                    self.on_written(weight)
         result = func(*args, **kwargs)
         found = self.tracker.call_recipe(func, args, kwargs, result)
         if found is None:
             return result
         recipe, computed_values = found
-        if isinstance(result, torch.Tensor) and result.is_floating_point() and computed_values:
+        if isinstance(result, torch.Tensor) and result.is_floating_point():
             computed = self.computed.get(recipe)
             if computed is not None:
                 result = computed.tensor
@@ -1398,6 +1356,7 @@ class _ComputedWeightCapture(TorchFunctionMode):
                     sources=frozenset(
                         self.leaf_storages[leaf] for leaf in leaves if leaf in self.leaf_storages
                     ),
+                    copy=not computed_values,
                 )
                 self.computed[recipe] = computed
                 self.on_new(computed)
@@ -1420,7 +1379,7 @@ class _ComputedWeights(TorchFunctionMode):
         if found is None:
             return result
         recipe, computed = found
-        stored = self.table.get(recipe) if computed else None
+        stored = self.table.get(recipe)
         if stored is not None and isinstance(result, torch.Tensor):
             result = stored
         self.tracker.remember_result(result, recipe, computed)
@@ -1468,11 +1427,13 @@ def _computed_weight_name(
 ) -> str:
     """The name a weight computed from ``source_names`` is reported under.
 
-    A parametrized attribute, or one ``torch.nn.utils.weight_norm`` or
-    ``spectral_norm`` computes, is named as the attribute; any other weight
-    after the parameters it is computed from.
+    A copy of one parameter is named after it; a parametrized attribute, or
+    one ``torch.nn.utils.weight_norm`` or ``spectral_norm`` computes, as the
+    attribute; any other weight after the parameters it is computed from.
     """
     import re
+    if weight.copy and len(source_names) == 1:
+        return source_names[0]
     parametrized = {
         match.groups() for match in (
             re.fullmatch(r"(?:(.*)\.)?parametrizations\.([^.]+)\.original\d*", name)
@@ -1577,7 +1538,6 @@ def quantize_model(
     capture = _GPTQCaptureMode(
         parameters_by_storage, registry,
         collect_hessian=config.method == "gptq",
-        bases={pointer: parameter for pointer, (_, parameter) in base_parameters.items()},
         static_storages=[
             buffer.untyped_storage().data_ptr() for buffer in model.buffers()
         ],
@@ -1592,11 +1552,18 @@ def quantize_model(
             all_names[source][0] for source in weight.sources if source in all_names
         }))
         name = _computed_weight_name(names_module, weight, list(sources))
-        computed[pointer] = (weight, name, sources)
-        capture.parameters[pointer] = name
-        capture.bases[pointer] = weight.tensor
+        # A copy of a parameter is reported as the parameter.
+        computed[pointer] = (weight, name, () if name in sources else sources)
+        capture.add_computed(weight.tensor, name, weight.sources)
 
-    computed_capture = _ComputedWeightCapture(model, names_module, computed_weight)
+    def written_weight(weight: _DerivedWeight) -> None:
+        pointer = weight.tensor.untyped_storage().data_ptr()
+        computed.pop(pointer, None)
+        capture.remove_computed(weight.tensor)
+
+    computed_capture = _ComputedWeightCapture(
+        model, names_module, computed_weight, written_weight,
+    )
     batches = 0
     if config.method == "gptq":
         if calibration_inputs is None:
