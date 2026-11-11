@@ -214,13 +214,11 @@ To reduce size, try lower-precision storage and
 ## Save after running
 
 After a run, the sprite holds both the compressed weights and the decoded
-copies. Model and `ExportProgram` sprites have a `cattorch prepare for save`
+copies. Model, program and generation sprites have a `cattorch prepare for save`
 block that clears the decoded weights and working data. Call it before saving;
-the next model call initializes the sprite again.
-
-`GenerationProgram` sprites don't have this block. Their `cattorch reset`
-clears the cache and outputs but leaves the decoded weights loaded, so a
-project saved after generating will be larger.
+the next call initializes the sprite again. A generation sprite's
+`cattorch prepare for save` also resets it, as `cattorch reset` does, since its
+cache is too large to save: prefill again afterwards.
 
 Related: [verification](verification-and-benchmarking.md) and
 [result types](api-reference.md#result-types).

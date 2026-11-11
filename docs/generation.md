@@ -118,8 +118,9 @@ The sprite has these My Blocks, all of which run without screen refresh:
 |---|---|---|
 | `cattorch init` | none | Decodes static storage and prepares the model. |
 | `cattorch reset` | none | Clears the K/V cache, logits, and top-k lists. |
-| `cattorch prefill` | one or more prompt IDs in `cattorch tokens` | Resets state, caches the prompt, and leaves final-token logits in `cattorch logits`. |
-| `cattorch decode` | exactly one token ID in `cattorch tokens` | Adds the token to the cache and writes next-token logits. |
+| `cattorch prefill` | one or more prompt IDs in `cattorch token ids` | Resets state, caches the prompt, and leaves final-token logits in `cattorch logits`. |
+| `cattorch decode` | exactly one token ID in `cattorch token ids` | Adds the token to the cache and writes next-token logits. |
+| `cattorch prepare for save` | none | Clears the decoded weights and resets, before saving the project. |
 
 The variables and lists you use are:
 
@@ -127,8 +128,8 @@ The variables and lists you use are:
 |---|---|
 | `cattorch cache length` | Number of tokens currently in the cache. |
 | `cattorch max context` | The `max_context` set at export. |
-| `cattorch status` | `ok` after a successful reset, prefill, or decode; otherwise an error message. |
-| `cattorch tokens` | Prompt tokens for prefill, or one token for decode. |
+| `cattorch status` | `ok` after a successful block; otherwise why it failed, from the [status table](scratch-interface.md#status-values). |
+| `cattorch token ids` | Prompt tokens for prefill, or one token for decode. The blocks don't change it. |
 | `cattorch logits` | Logits for every token, indexed by zero-based token ID. |
 | `cattorch top k values`, `cattorch top k ids` | When `top_k` is set, the largest logits in descending order and their zero-based token IDs. |
 
@@ -149,9 +150,11 @@ tokenizer, bridges, and a generation loop already wired together.
 
 ## Lifecycle notifications
 
-When each block finishes, it does a `broadcast and wait` of `cattorch init
-complete`, `cattorch reset complete`, `cattorch prefill complete`, or
-`cattorch decode complete`.
+When each block ends, whether or not it succeeded, it does a
+`broadcast and wait` of `cattorch init complete`, `cattorch reset complete`,
+`cattorch prefill complete`, `cattorch decode complete`, or
+`cattorch prepare for save complete`. A prefill or decode that decodes the
+weights first also sends `cattorch init complete`.
 
 Other sprites can use these to update a UI, for example showing "loading" until
 `cattorch init complete` and "thinking" until `cattorch prefill complete`.
@@ -163,7 +166,7 @@ broadcasts don't give other sprites access to the generated sprite's lists.
 A typical loop looks like this:
 
 ```text
-copy prompt token IDs into local [cattorch tokens]
+copy prompt token IDs into local [cattorch token ids]
 cattorch prefill
 
 set [finished] to [false]
@@ -174,8 +177,8 @@ repeat until <(finished) = [true] or (cattorch status) != [ok] or
         set [finished] to [true]
     else
         stream or detokenize the sampled token
-        delete all of [cattorch tokens]
-        add (sampled token) to [cattorch tokens]
+        delete all of [cattorch token ids]
+        add (sampled token) to [cattorch token ids]
         cattorch decode
     end
 end
@@ -186,15 +189,19 @@ reaches `cattorch max context`.
 
 ## Invalid input
 
-| Situation | Result | `cattorch status` |
-|---|---|---|
-| Decode with zero or several tokens | Cache unchanged; logits and top-k lists cleared | `decode requires exactly one token` |
-| Decode when the cache is full | Cache unchanged; logits and top-k lists cleared | `maximum context exceeded` |
-| Prefill with no tokens | Cache reset; logits empty | `prefill requires at least one token` |
-| Prefill longer than `max_context` | Cache reset; logits empty | `prefill exceeds maximum context` |
-| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: cache reset, logits empty. Decode: cache unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
-| Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | Cache unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
-| A reset, prefill or decode that another one, or `cattorch init`, ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill, decode or init ran during this one; reset or prefill first` |
+Prefill and decode check `cattorch token ids` before they change anything. A
+block that fails writes no logits and leaves the cache as it was: a prefill
+that fails doesn't reset first. TOK below is `cattorch token ids`.
+
+| Situation | `cattorch status` |
+|---|---|
+| Decode with zero or several tokens | `wrong number of items: TOK` |
+| Decode when the cache is full | `context full` |
+| Prefill with no tokens | `too few items: TOK` |
+| Prefill longer than `max_context` | `too many items: TOK` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: TOK` |
+| Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
+| A block that another of the sprite's blocks started during | `another call ran during this one` |
 
 ## Cache behavior
 
@@ -210,49 +217,16 @@ whatever value the stopped block left.
 
 ### Overlapping calls
 
-Scratch pauses a block that has run for half a second where it calls a
-procedure or repeats a loop, and runs other scripts meanwhile, so another
-script can call `cattorch init`, `cattorch reset`, `cattorch prefill` or
-`cattorch decode` while one is still running:
-
-- `cattorch init`, `cattorch reset` and `cattorch prefill` take over and run;
-  they can't tell a paused block from a stopped one.
-- `cattorch decode` refuses, as after a stop, and the block it found running
-  then fails too.
-- A reset, prefill or decode that another block ran during, `cattorch init`
-  included, reports the last status in the table instead of `ok` when it
-  ends, clears the logits, and leaves every decode failing until the next
-  reset or prefill; it still sends its completion broadcast. A reset or
-  prefill running at that moment fails the same way. If it was decoding the
-  weights, in a freshly loaded project, it leaves them for the next block to
-  decode again.
-- `cattorch init` marks the weights undecoded while it decodes them, so a
-  block started meanwhile decodes them itself. An init that another block
-  started during, or one stopped part way, leaves them for the next block to
-  decode again. Init doesn't touch the cache, and still reports `ok`.
-
-`cattorch reset` or `cattorch prefill`, run once nothing else is running,
-always recovers, and apart from two cases a block that reports `ok` ran
-alone. First, if the block that was taken over resumes while the newer
-block is itself paused, and is still unfinished when the newer block ends, or
-is stopped after it resumed, the newer block or a later decode can report
-`ok` with logits from caches, working lists or the prompt the old block
-changed. Second, a `cattorch init`, or a block in a freshly loaded project,
-taken over while it decoded the weights carries on decoding them when it
-resumes: a block that runs while it does, whether it finds the weights
-decoded or decodes them too, can report `ok` with weights the old block half
-overwrote; the next block after the old one ends decodes them again. A
-Scratch block can't stop another script's paused block, and checking at
-every loop would slow every step, and init. Call the generation blocks from
-one script at a time; to reset from another script, stop the generating
-script first.
+Call the sprite's blocks from one script at a time. What happens when calls
+from several scripts overlap, or a block is stopped part way, is the same for
+every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
 
 Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
 shrink the sprite, see layer sharing in
 [code generation](code-generation.md#optional-compaction).
 
-Generation sprites don't have `cattorch prepare for save`; see
-[save after running](storage.md#save-after-running).
+Before saving a project that has generated, call `cattorch prepare for save`;
+see [save after running](storage.md#save-after-running).
 
 Related: [recurrent generation](recurrent-generation.md),
 [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),

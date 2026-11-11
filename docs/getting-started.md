@@ -89,49 +89,18 @@ If an input or output exceeds 200,000 values, use all its
 
 `cattorch forward` initializes the sprite on its first call. Call
 `cattorch init` yourself to load the weights ahead of time, for example
-before timing a run. Both blocks run without screen refresh, and when each
-finishes it sets `cattorch status` to `ok` and broadcasts
-`cattorch forward complete` or `cattorch init complete`. The
-[Scratch interface](scratch-interface.md) lists every name a sprite offers;
-they won't change within cattorch 1.x.
+before timing a run. Both blocks run without screen refresh. When each ends,
+it sets `cattorch status` to `ok`, or to why it failed, such as an input list
+with the wrong number of items, and broadcasts `cattorch forward complete` or
+`cattorch init complete`. A forward that fails writes no output. The
+[Scratch interface](scratch-interface.md) lists every name a sprite offers and
+every status; they won't change within cattorch 1.x.
 
 ### Overlapping calls
 
-Scratch pauses a block that has run for half a second where it calls a
-procedure or repeats a loop, and runs other scripts meanwhile, so another
-script can call `cattorch forward` while one is still running. Calls share
-the sprite's working lists and decoded weights. Scratch's stop sign, or a
-`stop all` block, can stop a block part way.
-
-- Every block runs as it starts; none is refused. A `cattorch forward` that
-  another `cattorch forward`, `cattorch init` or `cattorch prepare for save`
-  started during sets `cattorch status` to `another call ran during this one`
-  when it ends, clears its outputs, and sends no `cattorch forward complete`
-  broadcast. If a forward it then resumed during is still running, that one
-  fails the same way.
-- A `cattorch init` that another block started during, or a forward taken
-  over while it decoded the weights, leaves them for the next forward to
-  decode again. A forward started while `cattorch init` decodes the weights
-  decodes them itself.
-- A forward stopped part way leaves nothing for the next call to fix, but its
-  outputs are partly written and `cattorch status` keeps its earlier value.
-
-Apart from three cases, a forward that reports `ok` ran alone and its outputs
-are right when it ends. First, as for
-[generation](generation.md#overlapping-calls): if the forward that was taken
-over resumes while the newer block is itself paused, and is still unfinished
-when the newer block ends, or is stopped after it resumed, the newer block
-can report `ok` with results from working lists the old forward changed.
-Second, a forward writes its outputs as it computes, not at its end: if the
-forward that was taken over resumes after the newer one ended, it overwrites
-the newer one's outputs, and then clears them, after the newer one reported
-`ok`. Third, a `cattorch init` or forward taken over while it decoded the
-weights carries on decoding them when it resumes: a forward that runs while
-it does, whether it finds the weights decoded or decodes them too, can
-report `ok` with weights the old block half overwrote; the next forward
-after the old block ends decodes them again. Call `cattorch forward` from
-one script at a time; to call it from another script, stop the calling
-script first.
+Call the sprite's blocks from one script at a time. What happens when calls
+from several scripts overlap, or a block is stopped part way, is the same for
+every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
 
 ## Connect another sprite
 
@@ -174,8 +143,8 @@ Tokenizer sprites have the same locality rule. See
 
 Before saving a project that has run, call `cattorch prepare for save`. It
 clears the decoded weights and working data but keeps the compressed weights,
-so the saved project doesn't store both. Input lists and a program's state are
-kept. The next forward call initializes the
+so the saved project doesn't store both. Input and output lists and a
+program's state are kept. The next forward call initializes the
 sprite again.
 
 Don't edit the generated sprite's costumes: the sprite uses them to decode the

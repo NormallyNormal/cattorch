@@ -191,7 +191,8 @@ differences:
   context)` then never ends generation; stop on a token count or an end token
   instead.
 - `cattorch reset` restores every state's initial value and clears the logits
-  and top-k lists, and so does `cattorch prefill` before it reads the prompt.
+  and top-k lists. `cattorch prefill` restores the states too, once it has
+  checked the prompt.
 
 ## Invalid input
 
@@ -201,34 +202,28 @@ committed only after it succeeds.
 Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
 `cattorch prefill` or `cattorch decode` partway, even while a step commits its
 states, so some states may be updated and others not. Every `cattorch decode`
-after that fails as in the last row below and changes nothing, until
+after that fails as in the table below and changes nothing, until
 `cattorch reset` or `cattorch prefill` runs; both start from the initial
 states. `cattorch init` doesn't clear the condition. `cattorch cache length`
 keeps whatever value the stopped block left.
 
-Calls from several scripts at once behave as for a K/V cache: see
-[overlapping calls](generation.md#overlapping-calls). A reset, prefill or
-decode that another block ran during, `cattorch init` included, reports the
-last status below, and decode then fails until reset or prefill, which always
-recover once nothing else is running. An init that another block started
-during, or one stopped part way, leaves the weights for the next block to
-decode again. The same two cases aren't caught: a block that was taken over,
-resumed while the newer block is paused, and unfinished when it ends, or
-stopped after resuming, can leave the newer block or a later decode reporting
-`ok` with logits from states or working lists it changed; and a block that
-runs while a taken-over `cattorch init`, or a taken-over block decoding the
-weights in a freshly loaded project, still decodes them can report `ok` with
-weights the old block half overwrote.
+Call the sprite's blocks from one script at a time. What happens when calls
+from several scripts overlap, or a block is stopped part way, is the same for
+every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
 
-| Situation | Result | `cattorch status` |
-|---|---|---|
-| Decode with zero or several tokens | States unchanged; logits and top-k lists cleared | `decode requires exactly one token` |
-| Decode after `max_tokens` tokens | States unchanged; logits and top-k lists cleared | `maximum context exceeded` |
-| Prefill with no tokens | States restored to their initial values; logits empty | `prefill requires at least one token` |
-| Prefill longer than `max_tokens` | States restored; logits empty | `prefill exceeds maximum context` |
-| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | Prefill: states restored, logits empty. Decode: states unchanged, logits cleared | `token ids must be whole numbers from 0 to N` |
-| Decode after a reset, prefill or decode was stopped partway, or while one runs in another script | States unchanged; logits and top-k lists cleared | `an earlier reset, prefill or decode was stopped or is still running; reset or prefill first` |
-| A reset, prefill or decode that another one, or `cattorch init`, ran during, from another script | Logits and top-k lists cleared; every decode fails as above until reset or prefill | `another reset, prefill, decode or init ran during this one; reset or prefill first` |
+Prefill and decode check `cattorch token ids` before they change anything, and
+a block that fails writes no logits and leaves the states as they were. The
+statuses are those of a K/V cache, with `max_tokens` as the context:
+
+| Situation | `cattorch status` |
+|---|---|
+| Decode with zero or several tokens | `wrong number of items: cattorch token ids` |
+| Decode after `max_tokens` tokens | `context full` |
+| Prefill with no tokens | `too few items: cattorch token ids` |
+| Prefill longer than `max_tokens` | `too many items: cattorch token ids` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: cattorch token ids` |
+| Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
+| A block that another of the sprite's blocks started during | `another call ran during this one` |
 
 ## Hugging Face models
 

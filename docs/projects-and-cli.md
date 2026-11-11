@@ -59,17 +59,20 @@ demo, since only you know what its calls mean.
 Every operation in the project is bridged to global lists and variables, so
 any sprite can use the model with `broadcast and wait`. A bridge copies the
 global inputs into the sprite's own lists, runs the operation, and copies the
-results back, inside a block that runs without screen refresh. The names
-start with the sprite's name:
+results back, inside a block that runs without screen refresh. It sets
+`NAME status` to the sprite's `cattorch status`, copies the results only when
+it is `ok`, and ends with a `broadcast and wait` of the message followed by
+` complete`, such as `NAME run complete`. The names start with the sprite's
+name; the [Scratch interface](scratch-interface.md#projects) lists them all:
 
 | Model | Broadcast | Reads | Writes |
 |---|---|---|---|
-| Plain model | `NAME run` | `NAME input`, `NAME input_1`, ... | `NAME output`, ... |
+| Plain model | `NAME run` | `NAME input`, `NAME input_1`, ... | `NAME output`, ..., `NAME status` |
 | Classifier (with `labels`) | `NAME predict`, after `NAME run` | `NAME output`, `NAME labels` | `NAME prediction` |
-| Entry point | `NAME ENTRY` | `NAME ` + each input list | `NAME ` + each output list |
-| Text generator | `NAME prefill`, `NAME decode` | `NAME tokens`, `NAME temperature` | `NAME next token`, `NAME status` |
-| Tokenizer | `NAME tokenize` | `NAME text` | `NAME token ids` |
-| Tokenizer | `NAME detokenize` | `NAME token ids` | `NAME text` |
+| Entry point | `NAME ENTRY` | `NAME ENTRY INPUT` for each input | `NAME ENTRY OUTPUT` for each output, `NAME status` |
+| Text generator | `NAME prefill`, `NAME decode` | `NAME token ids`, `NAME temperature` | `NAME next token`, `NAME status` |
+| Tokenizer | `NAME tokenize` | `NAME text` | `NAME token ids`, `NAME status` |
+| Tokenizer | `NAME detokenize` | `NAME token ids` | `NAME text`, `NAME status` |
 
 `NAME prefill` takes a whole prompt and `NAME decode` one token, as the
 [generation blocks](generation.md#scratch-interface) do. Both sample the next

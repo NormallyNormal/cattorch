@@ -49,7 +49,12 @@ refresh, and a clickable stack for each (see the
 - `cattorch tokenize` reads the `cattorch text` variable and writes token IDs
   to the `cattorch token ids` list.
 - `cattorch detokenize` reads `cattorch token ids` and writes the text to
-  `cattorch text`.
+  `cattorch text`. A token ID that isn't a whole number in the vocabulary
+  sets `cattorch status` to `invalid item: cattorch token ids`, and the text
+  is left as it was.
+
+Like every sprite's blocks, each sets `cattorch status` when it ends and then
+broadcasts `cattorch tokenize complete` or `cattorch detokenize complete`.
 
 Token IDs are zero-based, as in Python, even though Scratch list positions
 start at 1. The variables and lists belong to the tokenizer sprite; to use them

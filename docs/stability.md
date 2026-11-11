@@ -41,7 +41,8 @@ names, and supported operations. A name that is replaced keeps working, with a
   quantization, which can change as approximations improve. Exact exports keep
   matching PyTorch.
 - **Wording:** the text of warnings and error messages. Exception classes
-  don't change.
+  don't change. The values of a sprite's `cattorch status` aren't wording:
+  they're part of the [Scratch interface](scratch-interface.md#status-values).
 
 Programs, markers, and adapters were imported from `cattorch.experimental`
 before 1.0. Those imports still work, with a `DeprecationWarning`.
