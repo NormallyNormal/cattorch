@@ -791,6 +791,12 @@
   width, raised PyTorch's error without saying which item. The error now
   names the item's index and its input shapes. "requires finite values"
   errors now name the parameter.
+- `x @ W` failed with "grouped Linear shards must contain four-row groups"
+  when a list couldn't hold four of the weight's output rows, as for a
+  60,000 x 16 weight, in every storage format. With quantization it also hit
+  smaller weights stored in float16, such as a 25,600 x 96 buffer. Such a
+  weight is now read through the generic list sharder, kept output-major
+  under integer storage.
 
 ## Deprecations
 

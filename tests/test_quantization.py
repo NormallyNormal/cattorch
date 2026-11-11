@@ -1102,3 +1102,59 @@ def test_quantization_errors_name_the_calibration_item_and_the_parameter():
         model.weight[0, 0] = float("inf")
     with pytest.raises(ValueError, match=r"finite values \(parameter 'weight'\)"):
         quantize_model(model, config, [torch.randn(2, 8)])
+
+
+def _forward(result, example):
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    return torch.tensor([float(value) for value in emulator.lists["output"]])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("quantized", [False, True], ids=["float32", "int8"])
+def test_right_hand_matmul_weight_whose_four_rows_never_fit_a_list(
+    tmp_path, small_list_limit, monkeypatch, quantized,
+):
+    # The weight runs as 36 outputs of 1,500 inputs, four at a time, but a
+    # list holds at most two of its rows: it was cut into one- or two-row
+    # shards, which the four-row kernel rejects. Float storage reads it with
+    # the plain matmul instead; integer storage keeps it whole in the
+    # output-major layout it was quantized in, for the generic sharder.
+    small_list_limit(4000)
+    torch.manual_seed(0)
+    model = _Functional(lambda s, x: x @ s.w, w=(1500, 36)).eval()
+    example = torch.randn(1, 1500)
+    config = QuantizationConfig(bits=8, min_quantized_values=1024) if quantized else None
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(model, example, tmp_path / "matmul", quantization=config)
+    expected_model = copy.deepcopy(model)
+    if quantized:
+        quantize_model(expected_model, config, None, orientation_inputs=[(example,)])
+        assert set(precisions) == {((36, 1500), "int8")}
+    torch.testing.assert_close(
+        _forward(result, example), expected_model(example).flatten(), atol=1e-4, rtol=1e-4,
+    )
+
+
+@torch.no_grad()
+def test_grouped_weight_stored_in_float16_beside_integers_is_cut_at_its_cap(
+    tmp_path, small_list_limit,
+):
+    # Integer storage keeps the buffer in float16, capping each of its lists
+    # at half a list: 2,000 values, which ends inside a four-row group of its
+    # 96-value rows. The Linear's row shards must be cut to that cap, not to
+    # the list limit, or storage splits a group.
+    small_list_limit(4000)
+    torch.manual_seed(0)
+    model = _Functional(lambda s, x: F.linear(s.linear(x), s.table), linear=torch.nn.Linear(96, 96))
+    model.register_buffer("table", torch.randn(512, 96) * 0.05)
+    model.eval()
+    example = torch.randn(1, 96)
+    config = QuantizationConfig(bits=8, min_quantized_values=1024)
+    result = transpile(model, example, tmp_path / "linear", quantization=config)
+    expected_model = copy.deepcopy(model)
+    quantize_model(expected_model, config, None, orientation_inputs=[(example,)])
+    torch.testing.assert_close(
+        _forward(result, example), expected_model(example).flatten(), atol=1e-3, rtol=1e-3,
+    )

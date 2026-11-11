@@ -4,10 +4,11 @@ import re
 import operator
 import dataclasses
 import warnings
+import weakref
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, NamedTuple
 
 import torch
 
@@ -383,6 +384,30 @@ class _LayerSharingUnavailable(Exception):
     """Banked caches were requested but the layers could not be factored."""
 
 
+def _tensor_identity(tensor: torch.Tensor) -> tuple:
+    """What makes two tensors the same stored values: one view of one storage.
+
+    Quantization keys its parameter views the same way (without the dtype),
+    in ``quantization._storage_key``.
+    """
+    return (
+        tensor.untyped_storage().data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+    )
+
+
+class _RowShards(NamedTuple):
+    """How the library Linear kernel's weight is cut into row shards."""
+
+    # Whether the kernel runs four outputs at a time; its shards then hold
+    # whole four-row groups, stored interleaved.
+    grouped: bool
+    rows: int
+
+
 def _layers_can_share_caches(graph: _GraphInfo) -> bool:
     """Whether each automatic attention block sits in its own ``blocks.N`` layer."""
     by_name = {node.name: node for node in graph.nodes}
@@ -417,29 +442,13 @@ class _Compiler:
         self.tied_storage_copies: dict[str, str] = {}
         self.storage = storage
         self.row_aligned_weights = storage.grouping == "row"
-        self._storage_shard_limits: dict[tuple, int] = {}
+        # id(weight) -> (weak reference to it, its storage list cap).
+        self._storage_shard_limits: dict[int, tuple[weakref.ref, int]] = {}
         self.interleaved_static_layouts: dict[str, tuple[tuple[int, int, int], ...]] = {}
         self._tied_weights, self._grouped_tied_weights = self._find_tied_weights()
         self._compiled_output_lists: tuple[str, ...] = ()
 
-    @staticmethod
-    def _weight_identity(tensor: torch.Tensor) -> tuple:
-        return (
-            tensor.untyped_storage().data_ptr(),
-            tensor.storage_offset(),
-            tensor.dtype,
-            tuple(tensor.shape),
-            tensor.stride(),
-        )
-
-    def _row_shard_limit(
-        self,
-        weight: torch.Tensor,
-        *,
-        grouped: bool,
-        tied: bool = False,
-        source: torch.Tensor | None = None,
-    ) -> int:
+    def _row_shard_limit(self, weight: torch.Tensor, *, grouped: bool, tied: bool = False) -> int:
         """The most values in each row shard of an output-major ``weight``.
 
         Storage caps each physical list by its encoded size, which is below
@@ -448,28 +457,73 @@ class _Compiler:
         physical list ends inside a four-row group the codec must undo, and
         so is a tied weight larger than a list, so the table, sharded at the
         same row boundaries, can share the head's lists.
-
-        A ``weight`` derived from a stored tensor, such as a transposed copy,
-        names that tensor as ``source``: the limit is cached by the tensor's
-        identity, and a temporary's address can be reused by the next one.
         """
         if weight.numel() <= SCRATCH_LIST_LIMIT // 4 or not (
             # No storage caps a list below a quarter of the limit.
             (grouped and self.row_aligned_weights) or (tied and weight.numel() > SCRATCH_LIST_LIMIT)
         ):
             return SCRATCH_LIST_LIMIT
-        identity = (
-            self._weight_identity(weight)
-            if source is None
-            else ("derived", self._weight_identity(source))
-        )
-        if identity not in self._storage_shard_limits:
-            self._storage_shard_limits[identity] = _static_storage_shard_limits(
-                {"weight": weight},
-                self.storage,
-            ).get("W_weight", SCRATCH_LIST_LIMIT)
-        limit = self._storage_shard_limits[identity]
+        # Cached by the tensor object, not its address: a transposed copy is
+        # a temporary, and the next one can reuse the address.
+        cached = self._storage_shard_limits.get(id(weight))
+        if cached is not None and cached[0]() is weight:
+            limit = cached[1]
+        else:
+            limit = _static_storage_shard_limits({"weight": weight}, self.storage).get(
+                "W_weight", SCRATCH_LIST_LIMIT
+            )
+            self._storage_shard_limits[id(weight)] = (weakref.ref(weight), limit)
         return limit if weight.numel() > limit else SCRATCH_LIST_LIMIT
+
+    def _row_shards(self, weight: torch.Tensor, *, tied: bool = False) -> _RowShards | None:
+        """How to cut the library Linear kernel's output-major ``weight`` into
+        row shards, or ``None`` when no list holds a complete one.
+
+        The kernel runs four outputs at a time exactly when ``grouped_linear``
+        says so for the whole weight, however it is cut, so each shard of a
+        grouped weight holds whole four-row groups. When not even one row (or
+        one four-row group) fits, the caller keeps the weight whole and lets
+        the generic sharder split it.
+        """
+        columns, inner = weight.shape
+        grouped = grouped_linear(columns, inner)
+        rows = self._row_shard_limit(weight, grouped=grouped, tied=tied) // inner
+        if grouped:
+            rows -= rows % 4
+        if rows < (4 if grouped else 1):
+            return None
+        return _RowShards(grouped, rows)
+
+    def _store_row_shards(
+        self,
+        weight: torch.Tensor,
+        rows: int,
+        *,
+        interleaved: bool,
+        key: Callable[[int], str],
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Store output-major ``weight`` as static lists of ``rows`` rows each.
+
+        Shard ``index`` (from 1) is stored as ``key(index)``. An
+        ``interleaved`` shard is stored in the grouped kernel's four-row
+        layout, and under integer storage that layout is recorded so storage
+        can undo it to find the quantized grid. Returns each shard's list name
+        and values.
+        """
+        inner = weight.shape[1]
+        shards = []
+        for index, start in enumerate(range(0, weight.shape[0], rows), 1):
+            shard = weight[start : start + rows].detach().clone()
+            if interleaved:
+                shard = (
+                    shard.reshape(-1, 4, inner).permute(0, 2, 1).contiguous().reshape(shard.shape)
+                )
+            name = key(index)
+            self.static_lists[name] = shard
+            if interleaved and self.row_aligned_weights:
+                self.interleaved_static_layouts[name] = ((0, shard.shape[0], inner),)
+            shards.append((f"W_{name}", shard))
+        return shards
 
     def _find_tied_weights(self) -> tuple[set[tuple], set[tuple]]:
         """Weights a library Linear reads that something else reads too, and
@@ -499,9 +553,8 @@ class _Compiler:
         )
 
         def interleavable(tensor):
-            columns, inner = tensor.shape
-            rows_per_shard = self._row_shard_limit(tensor, grouped=True, tied=True) // inner
-            return grouped_linear(columns, inner) and rows_per_shard - rows_per_shard % 4 >= 4
+            shards = self._row_shards(tensor, tied=True)
+            return shards is not None and shards.grouped
 
         readers: dict[tuple, set[str]] = {}
         tensors: dict[tuple, torch.Tensor] = {}
@@ -525,7 +578,7 @@ class _Compiler:
                         kind = "linear"
                     else:
                         kind = "other"
-                    identity = self._weight_identity(tensor)
+                    identity = _tensor_identity(tensor)
                     readers.setdefault(identity, set()).add(kind)
                     tensors[identity] = tensor
         tied = {
@@ -547,7 +600,7 @@ class _Compiler:
         tensor = self.graph.resolve_weight(node.args[weight_index].name)
         return (
             isinstance(tensor, torch.Tensor)
-            and self._weight_identity(tensor) in self._grouped_tied_weights
+            and _tensor_identity(tensor) in self._grouped_tied_weights
         )
 
     def _argument(self, name: str, node) -> Argument:
@@ -1610,37 +1663,18 @@ class _Compiler:
             # low-rank replacement may also rewrite the surrounding graph.
             return input_lists, (), False
         columns, inner = weight.shape
-        grouped = grouped_linear(columns, inner)
-        identity = self._weight_identity(weight)
+        identity = _tensor_identity(weight)
         table = input_lists[1] if input_lists[1].startswith("W_") else None
         tied = table is not None and identity in self._tied_weights
-        shard_limit = self._row_shard_limit(weight, grouped=grouped, tied=tied)
-        oversized = weight.numel() > shard_limit
+        plan = self._row_shards(weight, tied=tied)
+        if plan is None:
+            # Not one complete row (four-row group) fits in a list. The kernel
+            # reads the whole weight through the generic sharder instead.
+            return input_lists, (), False
+        grouped, rows_per_shard = plan
+        oversized = rows_per_shard < columns
         if not grouped and not oversized:
             return input_lists, (), False
-
-        rows_per_shard = shard_limit // inner
-        if rows_per_shard < 1:
-            # A single output row crosses a shard boundary. The generic
-            # sharder remains the correctness fallback for this rare shape.
-            return input_lists, (), False
-        if grouped:
-            rows_per_shard -= rows_per_shard % 4
-            if rows_per_shard < 4:
-                return input_lists, (), False
-        elif not oversized:
-            rows_per_shard = columns
-
-        tensors = []
-        row_counts = []
-        for start in range(0, columns, rows_per_shard):
-            shard = weight[start : start + rows_per_shard].detach().clone()
-            if grouped:
-                shard = (
-                    shard.reshape(-1, 4, inner).permute(0, 2, 1).contiguous().reshape(shard.shape)
-                )
-            tensors.append(shard)
-            row_counts.append(shard.shape[0])
 
         interleaved_table = tied and grouped and identity in self._grouped_tied_weights
         if interleaved_table and not oversized:
@@ -1648,24 +1682,18 @@ class _Compiler:
             # The embedding kernel reads this four-row interleaved layout with
             # a stride-four inner loop.
             original_key = table.removeprefix("W_")
-            self.static_lists[original_key] = tensors[0]
-            if self.row_aligned_weights:
-                self.interleaved_static_layouts[original_key] = ((0, columns, inner),)
+            self._store_row_shards(weight, columns, interleaved=True, key=lambda _: original_key)
             return input_lists, (columns,), True
 
-        names = []
-        for index, tensor in enumerate(tensors, 1):
-            key = f"linear_{node.name}_weight_{index}"
-            self.static_lists[key] = tensor
-            if grouped and self.row_aligned_weights:
-                self.interleaved_static_layouts[key] = (
-                    (
-                        0,
-                        tensor.shape[0],
-                        inner,
-                    ),
-                )
-            names.append(f"W_{key}")
+        shards = self._store_row_shards(
+            weight,
+            rows_per_shard,
+            interleaved=grouped,
+            key=lambda index: f"linear_{node.name}_weight_{index}",
+        )
+        names = [name for name, _ in shards]
+        tensors = [tensor for _, tensor in shards]
+        row_counts = [tensor.shape[0] for tensor in tensors]
         if interleaved_table:
             # The table becomes the shards end to end, sharded at the same
             # row boundaries, so each table shard can be the head's list.
@@ -1743,49 +1771,35 @@ class _Compiler:
         """Use row-aligned output-major weights only when sharding dominates."""
         weight = rhs.T.contiguous()
         columns, inner = weight.shape
-        rows_per_shard = (
-            self._row_shard_limit(
-                weight,
-                grouped=grouped_linear(columns, inner),
-                source=rhs,
-            )
-            // inner
-        )
-        grouped = grouped_linear(columns, inner) and rows_per_shard >= 4
-        if grouped:
-            rows_per_shard -= rows_per_shard % 4
-        if rows_per_shard < 1:
-            # One output row crosses a list boundary; the plain matmul reads
-            # the stored weight through the general sharder instead.
+        plan = self._row_shards(weight)
+        if plan is not None:
+            interleaved, rows_per_shard = plan
+        elif self.row_aligned_weights:
+            # Not one complete row (four-row group) fits in a list. Integer
+            # storage needs the weight output-major, as it was quantized, so
+            # keep it whole and plain, as a Linear's weight of this shape is
+            # kept, for the generic sharder to split.
+            interleaved, rows_per_shard = False, columns
+        else:
+            # The plain matmul reads the stored weight through the generic
+            # sharder instead.
             return None
 
-        names = []
-        row_counts = []
-        for index, start in enumerate(range(0, columns, rows_per_shard), 1):
-            shard = weight[start : start + rows_per_shard].detach().clone()
-            if grouped:
-                shard = (
-                    shard.reshape(-1, 4, inner).permute(0, 2, 1).contiguous().reshape(shard.shape)
-                )
-            key = f"matmul_{node.name}_weight_{index}"
-            self.static_lists[key] = shard
-            if grouped and self.row_aligned_weights:
-                self.interleaved_static_layouts[key] = (
-                    (
-                        0,
-                        shard.shape[0],
-                        inner,
-                    ),
-                )
-            names.append(f"W_{key}")
-            row_counts.append(shard.shape[0])
+        shards = self._store_row_shards(
+            weight,
+            rows_per_shard,
+            interleaved=interleaved,
+            key=lambda index: f"matmul_{node.name}_weight_{index}",
+        )
+        names = [name for name, _ in shards]
+        row_counts = [tensor.shape[0] for _, tensor in shards]
 
         matrix_inputs = [left_arg.name, *names, "_none", "_none"]
         empty = Argument("_none", torch.Size([]), value=None)
         instruction = self._linear_instruction(
             target_list,
             (left_arg, *self._weight_shards(names, row_counts, inner), empty, empty),
-            interleaved=grouped,
+            interleaved=interleaved,
         )
         return instruction, matrix_inputs
 
@@ -1807,19 +1821,13 @@ class _Compiler:
             return self.graph.input_names[arg_name]
         tensor = self.graph.resolve_weight(arg_name)
         if isinstance(tensor, torch.Tensor):
-            signature = (
-                tensor.untyped_storage().data_ptr(),
-                tensor.storage_offset(),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.dtype,
-            )
-            if signature in self._static_tensor_names:
-                return self._static_tensor_names[signature]
+            identity = _tensor_identity(tensor)
+            if identity in self._static_tensor_names:
+                return self._static_tensor_names[identity]
         name = f"W_{arg_name}"
         self.static_lists[arg_name] = tensor
         if isinstance(tensor, torch.Tensor):
-            self._static_tensor_names[signature] = name
+            self._static_tensor_names[identity] = name
         return name
 
     def _emit(self, instruction, input_lists, target_list):
@@ -1949,13 +1957,7 @@ def _select_unroll_factor(
     for tensor in (
         static_tensors() if static_tensors is not None else (*model.parameters(), *model.buffers())
     ):
-        identity = (
-            tensor.untyped_storage().data_ptr(),
-            tensor.storage_offset(),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.dtype,
-        )
+        identity = _tensor_identity(tensor)
         if identity in seen:
             continue
         seen.add(identity)
