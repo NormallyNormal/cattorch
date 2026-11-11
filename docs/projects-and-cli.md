@@ -100,7 +100,11 @@ status 1 if the check fails. `MODEL` is one of:
 - `file.py:name` or `package.module:name`, naming a module, a class to
   construct without arguments, or a function returning a module.
 - A `.pt` file saved with `torch.save(model)`. Loading it unpickles it, which
-  can run code, so only load files you trust.
+  can run code, so only load files you trust. The file names the model's
+  class by module, so that module must be importable: cattorch also looks in
+  the working directory and the `.pt` file's directory. A class defined in
+  the script that saved the model can't be found; define it in a module
+  instead.
 
 The inputs come from the model's [`@cattorch.example`](markers.md) marker or
 `@entrypoint` methods, or from `--shape 1,28,28` for random float inputs and

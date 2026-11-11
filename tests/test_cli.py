@@ -109,6 +109,45 @@ def test_errors_are_reported_without_a_traceback(models, capsys):
         main(["export", "models.py:Marked", "--dynamic", "zero"])
 
 
+def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path_factory):
+    import subprocess
+    import sys
+
+    for argv in (["--shape", "1,x"], ["--tokens", "1,2", "--vocab", "0"]):
+        with pytest.raises(SystemExit):
+            main(["export", "models.py:Marked", *argv])
+    code, message = run(
+        capsys, "export", "models.py:Marked", "--shape", "3,3",
+        "--dynamic", "0=1:4", "--dynamic", "0.0=1:8",
+    )
+    assert code == 1 and "dimension 0 twice" in message
+    code, message = run(capsys, "export", "no_such_module:Net", "--shape", "1,2")
+    assert code == 1 and "no module named 'no_such_module'" in message
+    for path in ("missing.sb3", "models.py"):
+        code, message = run(capsys, "analyze-benchmark", path)
+        assert code == 1 and path in message
+
+    # A model's class must be importable to unpickle it. Its module beside
+    # the .pt file is found from any directory.
+    saved = tmp_path_factory.mktemp("saved")
+    (saved / "saved_models.py").write_text(MODELS)
+    script = (
+        "import sys, torch; sys.path.insert(0, sys.argv[1]); import saved_models; "
+        "torch.save(saved_models.Marked(), sys.argv[1] + '/beside.pt')"
+    )
+    subprocess.run([sys.executable, "-c", script, str(saved)], check=True)
+    code, report = run(capsys, "export", str(saved / "beside.pt"), "--shape", "2,3")
+    assert code == 0 and report["verified"]
+    # A class defined in the script that saved the model can't be found.
+    script = (
+        "import sys, torch\nclass Net(torch.nn.Linear): pass\n"
+        "torch.save(Net(2, 2), sys.argv[1] + '/main.pt')\n"
+    )
+    subprocess.run([sys.executable, "-c", script, str(saved)], check=True)
+    code, message = run(capsys, "export", str(saved / "main.pt"), "--shape", "1,2")
+    assert code == 1 and "must be importable" in message and "script that saved" in message
+
+
 CHARACTERS = "?abcdefghij "
 
 

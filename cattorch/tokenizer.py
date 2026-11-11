@@ -150,6 +150,20 @@ def _scratch_cased(character: str) -> bool:
     return character in _LOWERCASE_TARGETS
 
 
+_SUPPORTED_TYPES = (
+    "a Hugging Face tokenizer (transformers' PreTrainedTokenizerFast or "
+    "PreTrainedTokenizer, or a tokenizers.Tokenizer) or a "
+    "sentencepiece.SentencePieceProcessor"
+)
+
+
+def _require_vocabulary(tokenizer, exporter: str) -> None:
+    if not callable(getattr(tokenizer, "get_vocab", None)):
+        raise TypeError(
+            f"{exporter} needs {_SUPPORTED_TYPES}, not {type(tokenizer).__name__}"
+        )
+
+
 def _is_sentencepiece(processor) -> bool:
     return all(hasattr(processor, method) for method in _SENTENCEPIECE_METHODS)
 
@@ -265,6 +279,8 @@ class _TokenizerBase(ABC):
         tokenizer : PreTrainedTokenizerBase
             A HuggingFace tokenizer. Must expose a ``.get_vocab()`` method.
         """
+        if not isinstance(self, SentencePieceBPETokenizer):
+            _require_vocabulary(tokenizer, type(self).__name__)
         self.tokenizer = tokenizer
         # Set by ``_build_sprite`` when the sprite looks characters up by costume.
         self._costume_names: tuple[str, ...] | None = None
@@ -1261,6 +1277,7 @@ def transpile_tokenizer(
             scratch_casefold=scratch_casefold,
         ).save(output_path, name=name, codegen=codegen)
 
+    _require_vocabulary(tokenizer, "transpile_tokenizer")
     backend = _backend(tokenizer)
     if backend is not None:
         model_type = _backend_settings(backend)["model"].get("type", "unknown")

@@ -730,6 +730,16 @@ def test_real_mixed_case_sentencepiece_matches_sentencepiece(tmp_path, options):
         assert _tokenize(result, text) == processor.encode(text), text
 
 
+def test_objects_that_are_not_tokenizers_are_rejected_with_a_type_error(tmp_path):
+    for export in (
+        lambda: transpile_tokenizer(object(), tmp_path / "auto"),
+        lambda: CharTokenizer(object()),
+        lambda: BPETokenizer(object()),
+    ):
+        with pytest.raises(TypeError, match="needs a Hugging Face tokenizer.*not object"):
+            export()
+
+
 @pytest.mark.parametrize("model_type", ["unigram", "word", "char"])
 def test_sentencepiece_models_other_than_bpe_are_rejected(tmp_path, model_type):
     processor = _train_sentencepiece(model_type)

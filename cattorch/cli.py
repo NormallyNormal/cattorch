@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import pickle
 import re
 import sys
 from pathlib import Path
@@ -45,7 +46,19 @@ def load_model(spec: str) -> tuple[nn.Module, str]:
             module_spec.loader.exec_module(module)
         else:
             sys.path.insert(0, str(Path.cwd()))
-            module = importlib.import_module(location)
+            try:
+                module = importlib.import_module(location)
+            except ModuleNotFoundError as error:
+                # Only the named module; a missing import inside it is the
+                # module's own problem, best shown with its traceback.
+                if error.name is None or not (
+                    location == error.name or location.startswith(f"{error.name}.")
+                ):
+                    raise
+                raise CommandError(
+                    f"no module named {error.name!r}; run cattorch from the directory that "
+                    "contains it, put it on PYTHONPATH, or use file.py:name"
+                ) from None
         try:
             value = getattr(module, attribute)
         except AttributeError:
@@ -57,22 +70,66 @@ def load_model(spec: str) -> tuple[nn.Module, str]:
         path = Path(spec)
         if not path.exists():
             raise CommandError(f"no such file: {spec}; use module:name or file.py:name")
-        # A whole pickled module can only be loaded by unpickling it.
-        value = torch.load(path, weights_only=False, map_location="cpu")
+        if not path.is_file():
+            raise CommandError(f"{spec} is not a file")
+        value = _load_pickled_module(path)
         name = path.stem
     if not isinstance(value, nn.Module):
         raise CommandError(f"{spec} is a {type(value).__name__}, not an nn.Module")
     return value.eval(), name.lower()
 
 
-def _shape(text: str) -> tuple[int, ...]:
+def _load_pickled_module(path: Path):
+    """Unpickle a ``torch.save(model)`` file, explaining a missing class."""
+    # Pickle stores the model's class by module and name, so the module must
+    # be importable. Look beside the file and in the working directory too,
+    # as ``python`` run there would; appended, so they shadow nothing.
+    for directory in (str(Path.cwd()), str(path.resolve().parent)):
+        if directory not in sys.path:
+            sys.path.append(directory)
     try:
-        shape = tuple(int(part) for part in text.replace("x", ",").split(",") if part)
+        # A whole pickled module can only be loaded by unpickling it.
+        return torch.load(path, weights_only=False, map_location="cpu")
+    except (ModuleNotFoundError, AttributeError) as error:
+        if isinstance(error, AttributeError) and "Can't get attribute" not in str(error):
+            raise
+        defined_in_main = "__main__" in str(error)
+        raise CommandError(
+            f"can't load {path}: {error}. torch.save(model) stores the model's class by "
+            "module and name, so that class must be importable when the file is loaded: "
+            "run cattorch where its module is, or put the module on PYTHONPATH. "
+            + (
+                "This class was defined in the script that saved the model; move it to a "
+                "module and save the model again, or "
+                if defined_in_main else "Or "
+            )
+            + "export it with file.py:name, naming a function that builds the model"
+        ) from None
+    except (pickle.UnpicklingError, EOFError, RuntimeError) as error:
+        raise CommandError(
+            f"can't load {path} as a model saved with torch.save(model): {error}"
+        ) from None
+
+
+def _shape(text: str) -> tuple[int, ...]:
+    message = f"{text!r} is not a shape such as 1,28,28"
+    try:
+        shape = tuple(int(part) for part in re.split(r"[,x]", text))
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a shape such as 1,28,28") from None
-    if not shape or any(extent < 1 for extent in shape):
-        raise argparse.ArgumentTypeError(f"{text!r} is not a shape such as 1,28,28")
+        raise argparse.ArgumentTypeError(message) from None
+    if any(extent < 1 for extent in shape):
+        raise argparse.ArgumentTypeError(message)
     return shape
+
+
+def _positive(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a positive whole number")
+    return value
 
 
 def _dynamic(text: str) -> tuple[int, int, int, int]:
@@ -158,6 +215,8 @@ def _export(args) -> int:
     example = _example_inputs(args, model)
     dynamic: dict[int, dict[int, tuple[int, int]]] = {}
     for index, dim, low, high in args.dynamic:
+        if dim in dynamic.get(index, {}):
+            raise CommandError(f"--dynamic gives input {index}'s dimension {dim} twice")
         dynamic.setdefault(index, {})[dim] = (low, high)
     outputs = _outputs(args.output, name)
     result = transpile(
@@ -250,9 +309,17 @@ def _generate(args) -> int:
 
 
 def _analyze(args) -> int:
+    import zipfile
+
     from cattorch.benchmark import analyze_benchmark
 
-    print(dumps(analyze_benchmark(args.project), indent=2))
+    try:
+        analysis = analyze_benchmark(args.project)
+    except (zipfile.BadZipFile, KeyError, StopIteration):
+        raise CommandError(
+            f"{args.project} is not a cattorch benchmark project (.sb3) saved after running"
+        ) from None
+    print(dumps(analysis, indent=2))
     return 0
 
 
@@ -289,7 +356,7 @@ def _parser() -> argparse.ArgumentParser:
         "--tokens", type=_shape, action="append", default=[],
         help="a token-ID input of this shape, after the --shape inputs",
     )
-    export.add_argument("--vocab", type=int, default=2, help="token IDs range below this")
+    export.add_argument("--vocab", type=_positive, default=2, help="token IDs range below this")
     export.add_argument(
         "--dynamic", type=_dynamic, action="append", default=[],
         help="let an input's length vary: INPUT[.DIM]=MIN:MAX, such as 0=1:32",
@@ -330,7 +397,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return args.run(args)
-    except (CommandError, CattorchError, ValueError, TypeError) as error:
+    # OSError covers a missing or unreadable file, an unwritable output, and a
+    # Hugging Face model or tokenizer that can't be found.
+    except (CommandError, CattorchError, ValueError, TypeError, OSError) as error:
         print(f"cattorch: error: {error}", file=sys.stderr)
         return 1
 

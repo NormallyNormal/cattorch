@@ -720,6 +720,18 @@
   `y.sb3.sprite3` and `y.sb3.sb3`. Every output path now comes from `-o` with
   any `.sprite3` or `.sb3` removed: `PATH.sprite3`, `PATH_tokenizer.sprite3`,
   and `PATH.sb3`.
+- The command line showed a raw traceback for common mistakes: a missing,
+  unreadable, or wrong kind of file (including `analyze-benchmark` on a
+  missing file), an unwritable output, a `.pt` whose model class can't be
+  imported, an unknown module, a Hugging Face model or tokenizer that can't
+  be found, and `--vocab 0`. These are now `cattorch: error:` messages; the
+  `.pt` one says the class must be importable and how. Loading a `.pt` also
+  looks for the class's module in the working directory and beside the file.
+  `--shape 1,x` was read as `1`, and a repeated `--dynamic` for the same
+  dimension was accepted silently; both are now errors.
+- `transpile_tokenizer`, `CharTokenizer`, and `BPETokenizer` given an object
+  that isn't a tokenizer raised `AttributeError: ... 'get_vocab'`; they now
+  raise a `TypeError` naming the supported tokenizer types.
 
 ## Deprecations
 
