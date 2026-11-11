@@ -1208,3 +1208,148 @@ def test_grouped_weight_stored_in_float16_beside_integers_is_cut_at_its_cap(
     torch.testing.assert_close(
         _forward(result, example), expected_model(example).flatten(), atol=1e-3, rtol=1e-3,
     )
+
+
+@torch.no_grad()
+def test_integers_no_smaller_than_float16_stay_float16(tmp_path, monkeypatch):
+    # A prime input width has only groups of one value, so int8 codes and a
+    # float16 scale each take 24 bits, more than float16's 16; the matrix
+    # stays float16, unrounded, and the report says why. A 1x1 convolution is
+    # grouped over its input channels like a linear layer, so it is int8.
+    torch.manual_seed(25)
+    model = _Functional(
+        lambda s, x: s.prime(x) + s.point(x[:, :64].reshape(1, 64, 1, 1)).flatten()[None, :97],
+        prime=torch.nn.Linear(97, 97, bias=False), point=torch.nn.Conv2d(64, 128, 1, bias=False),
+    ).eval()
+    example = torch.randn(1, 97)
+    config = QuantizationConfig(bits=8, min_quantized_values=1024)
+    precisions = []
+    import cattorch.sprite as sprite_module
+    original = sprite_module._static_storage_precision
+
+    def record(tensor, storage, *args):
+        precision = original(tensor, storage, *args)
+        if isinstance(tensor, torch.Tensor) and tensor.numel() >= 1024:
+            precisions.append((tuple(tensor.shape), precision))
+        return precision
+
+    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    result = transpile(model, example, tmp_path / "skip", quantization=config)
+    report = {item.name: item for item in result.quantization.tensors}
+    assert (report["prime.weight"].method, report["prime.weight"].fallback_reason) == (
+        "float16",
+        "int8 storage would take 24 bits per value (groups of 1, each with a 16-bit "
+        "scale), no fewer than float16's 16",
+    )
+    assert (report["point.weight"].method, report["point.weight"].effective_group_size) == (
+        "symmetric", 64,
+    )
+    assert sorted(set(precisions)) == [((97, 97), "float16"), ((128, 64, 1, 1), "int8")]
+    reference = copy.deepcopy(model)
+    quantize_model(reference, config, None, orientation_inputs=[(example,)])
+    assert torch.equal(reference.prime.weight, model.prime.weight)
+    round_as_stored(reference, StorageConfig(), quantization=config)
+    torch.testing.assert_close(
+        _forward(result, example), reference(example).flatten(), atol=1e-5, rtol=1e-5,
+    )
+
+
+@torch.no_grad()
+def test_overrides_choose_each_weights_precision(tmp_path, monkeypatch):
+    # Everything int4 but the tied embedding, read as the output head, which
+    # an override keeps in int8; one sprite decodes both formats.
+    from cattorch import QuantizationOverride
+
+    torch.manual_seed(26)
+    model = _TiedHead().eval()
+    example = torch.tensor([3, 7, 95])
+    config = QuantizationConfig(bits=4, min_quantized_values=1, overrides={"embedding": 8})
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(model, example, tmp_path / "tied", quantization=config)
+    assert sorted(set(precisions)) == [((32, 32), "int4"), ((96, 32), "int8")]
+    assert [
+        (item.name, item.bits, item.override) for item in result.quantization.tensors
+    ] == [("mix.weight", 4, None), ("embedding.weight", 8, "embedding")]
+    reference = copy.deepcopy(model)
+    quantize_model(reference, config, None, orientation_inputs=[(example,)])
+    torch.testing.assert_close(
+        _forward(result, example), reference(example).flatten(), atol=1e-5, rtol=1e-5,
+    )
+
+    # The longest key wins; None keeps float16; a QuantizationOverride sets
+    # the group size too.
+    config = QuantizationConfig(bits=8, min_quantized_values=1, overrides={
+        "mix": QuantizationOverride(bits=4, group_size=8), "embedding.weight": None,
+        "embedding": 6,
+    })
+    report = quantize_model(
+        copy.deepcopy(model), config, None, orientation_inputs=[(example,)],
+    )
+    assert [
+        (item.name, item.method, item.bits, item.effective_group_size, item.override)
+        for item in report.tensors
+    ] == [
+        ("mix.weight", "symmetric", 4, 8, "mix"),
+        ("embedding.weight", "float16", None, None, "embedding.weight"),
+    ]
+    with pytest.raises(ValueError, match="unknown quantization override key.*'head'"):
+        quantize_model(
+            copy.deepcopy(model), QuantizationConfig(bits=4, overrides={"head": 8}), None,
+            orientation_inputs=[(example,)],
+        )
+    with pytest.raises(ValueError, match="needs a QuantizationConfig with method='gptq'"):
+        QuantizationConfig(bits=4, overrides={"mix": QuantizationOverride(bits=4, method="gptq")})
+
+
+def _sequential_gptq(matrix, hessian, config):
+    """GPTQ with its error feedback applied after every column."""
+    from cattorch.storage import group_scales
+
+    work = matrix.double().clone()
+    width = work.shape[1]
+    group = effective_group_size(width, config.group_size)
+    hessian = hessian.clone()
+    hessian.diagonal().add_(config.damp_percent * float(hessian.diagonal().mean()))
+    factor = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(hessian)), upper=True,
+    )
+    qmax = (1 << (config.bits - 1)) - 1
+    result = torch.empty_like(work)
+    for column in range(width):
+        if column % group == 0:
+            scales = torch.from_numpy(group_scales(
+                work[:, column:column + group].abs().amax(dim=1).numpy(), qmax,
+                config.scale_precision,
+            ))
+        result[:, column] = torch.round(work[:, column] / scales).clamp(-qmax, qmax) * scales
+        error = (work[:, column] - result[:, column]) / factor[column, column]
+        work[:, column + 1:] -= error[:, None] * factor[column, column + 1:]
+    return result
+
+
+def test_blocked_gptq_matches_column_by_column_error_feedback(monkeypatch):
+    # Lazy batch updates only reorder the arithmetic; blocks hold whole
+    # groups, so every group's scale sees the same columns.
+    from cattorch.quantization import _gptq_matrix
+
+    torch.manual_seed(27)
+    matrix = torch.randn(12, 48, dtype=torch.float64) * 0.2
+    inputs = torch.randn(200, 48, dtype=torch.float64) @ torch.randn(48, 48, dtype=torch.float64)
+    hessian = inputs.T @ inputs
+    config = QuantizationConfig(bits=4, method="gptq", group_size=12, block_size=20)
+    blocked, group = _gptq_matrix(matrix, hessian, config)
+    assert group == 12
+    torch.testing.assert_close(blocked, _sequential_gptq(matrix, hessian, config), rtol=0, atol=1e-12)
+
+    # A matrix too wide for a Hessian falls back to symmetric quantization.
+    import cattorch.quantization as quantization
+
+    monkeypatch.setattr(quantization, "_GPTQ_MAX_WIDTH", 16)
+    model = _Functional(lambda s, x: F.linear(x, s.w), w=(8, 32)).eval()
+    report = quantize_model(model, QuantizationConfig(
+        bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1,
+    ), [torch.randn(4, 32)])
+    (item,) = report.tensors
+    assert (item.method, item.fallback_reason) == (
+        "symmetric", "input width 32 is above 16; its GPTQ Hessian would take 0.0 GiB",
+    )
