@@ -361,6 +361,16 @@ def test_max_tokens_limits_decode_and_prefill(tmp_path):
     )
 
 
+def test_a_max_tokens_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_list_limit):
+    # A prompt arrives in the one `cattorch tokens` list, so the buffer that
+    # copies it never needs more than a list holds.
+    limit = small_list_limit(400)
+    model = make("gru")
+    emulator, result = export(model, tmp_path / "long", max_tokens=50 * limit)
+    assert not [name for name in result.sharded_lists if "prefill" in name]
+    assert run(emulator, "cattorch prefill", [1, 2, 3]) == "ok"
+
+
 def test_unbounded_generation_runs_past_any_small_limit(tmp_path):
     model = make("gru")
     emulator, _ = export(model, tmp_path / "unbounded", hidden_prefill=False)

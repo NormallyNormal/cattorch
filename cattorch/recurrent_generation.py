@@ -46,6 +46,7 @@ from cattorch.sprite import (
 from cattorch.storage import StorageConfig
 from cattorch.util.scratch.dsl import Program, call, clear, eq, if_, not_, set_var, var
 from cattorch.util.scratch.interface import rename_list, rename_procedure, rename_variable
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 _ENTRY = "step"
 _COMPUTE = "_cattorch token compute"
@@ -261,7 +262,12 @@ def _generation_interface(
             ]
         rename_list(sprite, "cattorch prefill buffer", "_cattorch prefill buffer")
         if program.max_tokens is not None:
-            assembly.capacities["_cattorch prefill buffer"] = program.max_tokens
+            # The buffer holds a copy of the prompt, which arrives in the one
+            # `cattorch tokens` list: no more than a Scratch list holds,
+            # however large max_tokens is.
+            assembly.capacities["_cattorch prefill buffer"] = min(
+                program.max_tokens, SCRATCH_LIST_LIMIT,
+            )
         assembly.public_procedures.update(("cattorch prefill", "cattorch decode"))
 
         _remove_completion_broadcast(sprite, "cattorch init complete")

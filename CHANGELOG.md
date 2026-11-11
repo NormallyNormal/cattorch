@@ -873,6 +873,11 @@
   fixed dimension run as runtime kernels. Broadcasting a variable-length
   operand there is still rejected, with an error that says why and suggests
   transposing the items to the front.
+- A `RecurrentGenerationProgram` with a large `max_tokens` sharded its
+  private prefill buffer into `max_tokens / 200,000` lists (22,920 blocks
+  instead of 744 at 20 million, and 52 s to export at 100 million), although
+  a prompt arrives in the one `cattorch tokens` list, which holds at most
+  200,000 items. The buffer is now sized by what can arrive.
 
 ## Deprecations
 
