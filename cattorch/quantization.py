@@ -121,7 +121,7 @@ class QuantizationConfig:
                     "parameter name"
                 )
             if value is None or (isinstance(value, int) and not isinstance(value, bool)):
-                value = QuantizationOverride(bits=value)
+                value = QuantizationOverride(bits=cast(Literal[4, 6, 8] | None, value))
             elif not isinstance(value, QuantizationOverride):
                 raise TypeError(
                     f"quantization override {key!r} must be bits (4, 6 or 8), None, "
@@ -135,6 +135,13 @@ class QuantizationConfig:
             normalized[key] = value
         object.__setattr__(self, "overrides", normalized)
 
+    def __hash__(self) -> int:
+        # The overrides are a dict; a config stays hashable, as before them.
+        return hash(tuple(
+            frozenset(cast(dict, value).items()) if name == "overrides" else value
+            for name, value in vars(self).items()
+        ))
+
     @property
     def precision(self) -> Literal["int4", "int6", "int8"]:
         return cast(
@@ -144,7 +151,7 @@ class QuantizationConfig:
 
     def _integer_formats(self) -> tuple[tuple[str, int], ...]:
         """Every (precision, maximum group size) the config may store."""
-        formats = [(self.precision, self.group_size)]
+        formats: list[tuple[str, int]] = [(self.precision, self.group_size)]
         for override in cast(dict, self.overrides).values():
             if override.bits is not None:
                 item = (f"int{override.bits}", override.group_size or self.group_size)
@@ -870,10 +877,10 @@ def _gptq_matrix(
             column = columns[:, index]
             quantized = np.clip(np.rint(column / scales), -qmax, qmax) * scales
             result[:, block_start + index] = quantized
-            error = (column - quantized) / local[index, index]
-            errors[:, index] = error
+            feedback = (column - quantized) / local[index, index]
+            errors[:, index] = feedback
             if index + 1 < count:
-                columns[:, index + 1:] -= np.outer(error, local[index, index + 1:])
+                columns[:, index + 1:] -= np.outer(feedback, local[index, index + 1:])
         if block_end < width:
             values[:, block_end:] -= errors @ factor[block_start:block_end, block_end:]
     return (
@@ -1689,14 +1696,12 @@ def quantize_model(
                 quantized_storage.add(pointer)
                 views = (_canonical_spec(stat.weight),)
                 rows = stat.rows if gptq else 0
-                described = dict(
-                    sources=sources_by_storage.get(pointer, ()), override=settings.key,
-                )
+                sources = sources_by_storage.get(pointer, ())
                 if settings.bits is None:
                     report(replace(kept_float16(
                         stat.name, stat.weight.numel(),
                         f"override {settings.key!r} keeps it in float16", rows,
-                    ), **described), pointer, views)
+                    ), sources=sources, override=settings.key), pointer, views)
                     continue
                 weight_config = settings.config(config)
                 outcome = _named(name, lambda: _quantize_matrix(
@@ -1706,7 +1711,7 @@ def quantize_model(
                 if outcome.reconstructed is None:
                     report(replace(kept_float16(
                         stat.name, stat.weight.numel(), str(outcome.reason), rows,
-                    ), **described), pointer, views)
+                    ), sources=sources, override=settings.key), pointer, views)
                     continue
                 stat.weight.copy_(_physical_weight(
                     outcome.reconstructed, stat.weight, stat.orientation,
@@ -1719,7 +1724,8 @@ def quantize_model(
                     calibration_rows=rows,
                     effective_group_size=outcome.group,
                     fallback_reason=outcome.reason,
-                    **described,
+                    sources=sources,
+                    override=settings.key,
                 ), pointer, views)
 
         # Elements no use reads as a matrix, such as an untied embedding, are
