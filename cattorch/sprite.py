@@ -2048,6 +2048,18 @@ def _guard_generation_init(sprite: dict) -> dict:
 
 _LOOPS = ("control_repeat", "control_for_each", "control_repeat_until")
 
+# Whether the weight decoders check the epoch at every place Scratch can
+# pause them (``_stop_overtaken_decoding``), so that a ``cattorch init``, or
+# a block decoding the weights in a freshly loaded project, stops once
+# another block has taken over instead of decoding on when it resumes, where
+# a block running meanwhile can report ok with weights it half overwrote.
+# Off for now: it costs a compressed sprite 110 to 380 blocks in small and
+# medium exports (nearly 1,000 in a four-layer int8 generator) and makes
+# init run 6 to 23% more blocks, about 30% longer in scratch-vm for a
+# medium int8 MLP. The docs name the overlap it would close as a known
+# limit. Internal: tests switch it on to keep it working.
+_GUARD_DECODERS = False
+
 
 def _procedure_arguments(blocks: dict, definition: str) -> list[str]:
     prototype = blocks[blocks[definition]["inputs"]["custom_block"][1]]
@@ -2093,23 +2105,30 @@ def _epoch_input(sprite: dict, call: str, owner: str | None, epoch_id: str) -> l
 
 
 def _stop_overtaken_decoding(sprite: dict) -> None:
-    """Stop decoding the weights at the first chance once another call has started.
+    """Keep a call from decoding the weights once another call has started.
 
+    The procedures init's epoch procedure runs directly, such as each entry
+    point's init, a recurrent sprite's state fill or a plain sprite's
+    unpacking, take the epoch of the call that started them and check it as
+    they start. A procedure that starts a decode without an epoch of its
+    own, such as a step's check that the weights are decoded, is given the
+    epoch of the call running it where every call to it can pass one on. A
+    call taken over before it began decoding then decodes nothing, rather
+    than decode in the epoch of the call that took over, as if current.
+
+    With ``_GUARD_DECODERS``, a decode taken over part way stops too.
     Scratch can pause a warp block where it calls a procedure or repeats a
     loop, and run other scripts meanwhile. A decode overtaken by a call that
     decodes the weights too, or uses them, must not write to them, nor to
-    the decoder's shared lists and variables, once it resumes. Each
+    the decoder's shared lists and variables, once it resumes. Then each
     procedure that init's epoch procedure runs, the decoders, takes the
-    epoch it was started in and checks it before it writes anything after a
-    place Scratch can pause it: at its start, at the start of every repeat
-    of a loop, and after a loop or a call, whose callee may have stopped. An
-    overtaken one stops; init then finds the epoch changed and leaves the
-    weights for the next call to decode again.
+    epoch and checks it before it writes anything after a place Scratch can
+    pause it: at its start, at the start of every repeat of a loop, and
+    after a loop or a call, whose callee may have stopped. An overtaken one
+    stops; init then finds the epoch changed and leaves the weights for the
+    next call to decode again.
 
-    A procedure that starts a decode without an epoch of its own, such as a
-    step's check that the weights are decoded, is given the epoch of the
-    call running it where every call to it can pass one on. Sprites whose
-    weights need no decoding are left as they are.
+    Sprites whose weights need no decoding are left as they are.
     """
     blocks = sprite["blocks"]
     definitions = {}
@@ -2146,6 +2165,9 @@ def _stop_overtaken_decoding(sprite: dict) -> None:
         for identifier, block in blocks.items()
     ):
         return
+    if not _GUARD_DECODERS:
+        direct = {blocks[call]["mutation"]["proccode"] for call in calls[definitions[root]]}
+        guarded = [name for name in guarded if name in direct]
     epoch_id = next(
         identifier for identifier, entry in sprite["variables"].items() if entry[0] == _EPOCH
     )
@@ -2295,7 +2317,9 @@ def _stop_overtaken_decoding(sprite: dict) -> None:
     for name in guarded:
         definition = definitions[name]
         first = blocks[definition].get("next")
-        if first is not None:
+        if first is not None and not _GUARD_DECODERS:
+            blocks[definition]["next"] = check(definition, first)
+        elif first is not None:
             blocks[definition]["next"] = guard(first, start=True, after_last=False)
 
 

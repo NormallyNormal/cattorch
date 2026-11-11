@@ -7,6 +7,10 @@ decode that another call started during must stop before it writes to the
 weights or to the decoder's shared lists and variables again: one that
 resumed after that call ended, or while it was decoding the weights itself,
 left them half overwritten, and later calls reported ok with them.
+
+That guard is switched off by default, for its cost in blocks and init
+time (see ``cattorch.sprite._GUARD_DECODERS``); the sprites of ``kind``
+have it switched on.
 """
 
 from __future__ import annotations
@@ -254,11 +258,13 @@ KINDS = [
 def kind(request, tmp_path_factory):
     name, storage = request.param.split()
     path = tmp_path_factory.mktemp(request.param.replace(" ", "_"))
-    if name == "plain":
-        return Plain(path, STORAGES[storage])
-    if name == "program":
-        return Program(path, STORAGES[storage])
-    return Generator(path, name, STORAGES[storage])
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("cattorch.sprite._GUARD_DECODERS", True)
+        if name == "plain":
+            return Plain(path, STORAGES[storage])
+        if name == "program":
+            return Program(path, STORAGES[storage])
+        return Generator(path, name, STORAGES[storage])
 
 
 def test_an_init_resumed_after_the_call_that_took_over_writes_no_weights(kind):
@@ -296,7 +302,8 @@ def test_a_call_taken_over_before_it_decodes_decodes_nothing(tmp_path, storage):
     # weights. The first call, paused as it started and resumed while the
     # second decoded another entry point's weights with the same lists,
     # decoded its own in the epoch the second had started, as if it were
-    # current, and the second reported ok with wrong outputs.
+    # current, and the second reported ok with wrong outputs. This check is
+    # on by default.
     sprite = Program(tmp_path, STORAGES[storage])
     sprite.setup = []
     first, second, _ = sprite.calls
@@ -306,3 +313,16 @@ def test_a_call_taken_over_before_it_decodes_decodes_nothing(tmp_path, storage):
             sprite.interleave(
                 [[first], [second]], [(0, 0), (1, other), (0, resumed), (1, None), (0, None)],
             )
+
+
+def test_the_decoders_are_unguarded_by_default(tmp_path):
+    # The guard costs blocks in every compressed sprite, and init time. By
+    # default only the unpacking checks the epoch, as it starts.
+    result = transpile(plain.Tiny().eval(), torch.zeros(1, 4), tmp_path / "tiny")
+    blocks = load_sprite(result.path)["blocks"].values()
+    assert sum(block["opcode"] == "control_stop" for block in blocks) == 1
+    assert not any(
+        "decode" in block["mutation"]["proccode"]
+        for block in blocks if block["opcode"] == "procedures_prototype"
+        and "epoch" in block["mutation"]["argumentnames"]
+    )
