@@ -841,6 +841,15 @@
   `top_k` real token IDs, as `torch.topk` does, ranks a NaN logit first, and
   lists equal logits lowest token ID first (documented in
   [generation](docs/generation.md)).
+- A `RecurrentGenerationProgram` export ran the step and reference checks on
+  the caller's own model, so a model whose methods change its state (an
+  embedding with `max_norm`, a buffer the step reassigns) was changed by
+  exporting it, even when the export then failed. A variable-length
+  (`dynamic=`) export ran `forward` on the caller's model too, in its length
+  check and its check that items are independent. Both now run on copies; a
+  test checks that every kind of export leaves the caller's parameters,
+  buffers, dtypes and training flags as they were, whether it succeeds or
+  fails.
 
 ## Deprecations
 

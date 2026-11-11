@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from cattorch import (
+    CattorchError,
     CodegenConfig,
     FastConfig,
     GenerationProgram,
@@ -19,7 +20,7 @@ from cattorch import (
 )
 from cattorch import (
     EntryPoint, ExportProgram, Input, ModuleAdapter, Output, ProgramCall, State,
-    StateInput, StateUpdate,
+    StateInput, StateUpdate, entrypoint,
 )
 from cattorch.experimental import analyze
 from cattorch.graph_transforms import fold_eval_batch_norms
@@ -717,3 +718,135 @@ def test_sig_figs_keeps_integer_buffers_exact(tmp_path):
     inputs = (torch.randn(1, 300), torch.tensor([0, 299, 150]))
     result = transpile(model, inputs, tmp_path / "shuffle", sig_figs=2)
     assert verify(model, inputs, result).passed
+
+
+class Counting(nn.Module):
+    """A model whose methods change its state every time they run.
+
+    They reassign a buffer, which tracing leaves out of the graph, so the
+    export succeeds. ``broken`` updates the buffer in place and adds an FFT,
+    which cattorch can't export, so the export fails after running the model.
+    """
+
+    def __init__(self, broken=False, attention=True):
+        super().__init__()
+        self.attention = attention
+        self.embed = nn.Embedding(8, 4)
+        self.head = nn.Linear(4, 8)
+        self.register_buffer("calls", torch.zeros(1))
+        self.register_buffer("unused", torch.arange(3))
+        self.broken = broken
+
+    def logits(self, hidden):
+        if self.broken:
+            self.calls.add_(1)
+            hidden = hidden + torch.fft.rfft(hidden).abs().sum(-1, keepdim=True)
+        else:
+            self.calls = self.calls + 1
+        return self.head(hidden)
+
+    def forward(self, tokens):
+        hidden = self.embed(tokens)
+        if self.attention:
+            # Causal attention, for a GenerationProgram to cache.
+            hidden = hidden + torch.nn.functional.scaled_dot_product_attention(
+                hidden, hidden, hidden, is_causal=True,
+            )
+        return self.logits(hidden)
+
+    def accumulated(self, tokens):
+        return self.logits(self.embed(tokens).cumsum(1))
+
+    def step(self, token, hidden):
+        hidden = hidden + self.embed(token)[0, 0]
+        return self.logits(hidden), hidden
+
+
+class MarkedCounting(Counting):
+    def __init__(self, broken=False):
+        super().__init__(broken)
+        self.register_buffer("hidden", torch.zeros(4))
+
+    @entrypoint(example=lambda: (torch.tensor([[1]]),))
+    def advance(self, token):
+        logits, self.hidden = self.step(token, self.hidden)
+        return logits
+
+
+def _export_kinds():
+    from cattorch import RecurrentGenerationProgram
+
+    state = State("hidden", torch.zeros(4))
+    step = ExportProgram(
+        states=(state,),
+        entrypoints=(EntryPoint(
+            "step", method="step",
+            arguments=(Input("token", torch.tensor([[1]])), StateInput("hidden")),
+            returns=(Output("logits"), StateUpdate("hidden")),
+        ),),
+    )
+    tokens = torch.tensor([[1, 5, 2]])
+    return {
+        "plain": (Counting, tokens, {}),
+        "dynamic": (
+            lambda broken: Counting(broken, attention=False), tokens, {"dynamic": {0: {1: (1, 4)}}},
+        ),
+        "program": (Counting, step, {}),
+        "marked": (MarkedCounting, None, {}),
+        "generation": (Counting, GenerationProgram(max_context=4), {}),
+        "recurrent": (Counting, RecurrentGenerationProgram((state,), reference="accumulated"), {}),
+    }
+
+
+def _snapshot(model):
+    tensors = {
+        name: (value.detach().clone(), value.dtype, value.requires_grad)
+        for name, value in (*model.named_parameters(), *model.named_buffers())
+    }
+    return tensors, {name: module.training for name, module in model.named_modules()}
+
+
+def _assert_same(before, after):
+    (tensors, training), (tensors_after, training_after) = before, after
+    assert training == training_after
+    assert tensors.keys() == tensors_after.keys()
+    for name, (value, dtype, grad) in tensors.items():
+        value_after, dtype_after, grad_after = tensors_after[name]
+        assert (dtype, grad) == (dtype_after, grad_after), name
+        assert torch.equal(value, value_after), name
+
+
+@pytest.mark.parametrize("broken", [False, True])
+@pytest.mark.parametrize("kind", list(_export_kinds()))
+def test_an_export_never_changes_the_callers_model(tmp_path, kind, broken):
+    factory, interface, options = _export_kinds()[kind]
+    torch.manual_seed(0)
+    model = factory(broken).eval()
+    before = _snapshot(model)
+    if broken:
+        with pytest.raises(CattorchError):
+            transpile(model, interface, tmp_path / kind, **options)
+    else:
+        transpile(model, interface, tmp_path / kind, **options)
+    _assert_same(before, _snapshot(model))
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_a_hugging_face_recurrent_export_never_changes_the_callers_model(tmp_path, broken):
+    # RWKV rescales its weights in place on its first evaluation-mode forward.
+    transformers = pytest.importorskip("transformers")
+    from cattorch import RecurrentGenerationProgram
+
+    torch.manual_seed(0)
+    model = transformers.RwkvForCausalLM(transformers.RwkvConfig(
+        vocab_size=16, hidden_size=8, num_hidden_layers=2, attention_hidden_size=8,
+        intermediate_size=16, context_length=16, rescale_every=1,
+    )).eval()
+    before = _snapshot(model)
+    if broken:
+        # Fails after the step and the reference check have run.
+        with pytest.raises(ValueError, match="exceeds output size"):
+            transpile(model, RecurrentGenerationProgram(top_k=20), tmp_path / "rwkv")
+    else:
+        transpile(model, RecurrentGenerationProgram(), tmp_path / "rwkv")
+    _assert_same(before, _snapshot(model))

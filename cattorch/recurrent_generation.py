@@ -30,6 +30,7 @@ from cattorch.huggingface_recurrent import (
     adapt_recurrent_model, find_recurrent_model, version_hint,
 )
 from cattorch.interface import STATUS_VARIABLE
+from cattorch.operator_registry import eval_mode_copy_warning
 from cattorch.program import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, RecurrentGenerationProgram, State,
     StateInput, StateUpdate,
@@ -111,12 +112,15 @@ def _check_reference(
     generator = torch.Generator().manual_seed(0)
     tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
     states = [state.initial for state in program.states]
+    with torch.no_grad():
+        expected = tensor_output_leaves(getattr(model, program.reference)(tokens), warn=False)[0]
+    # Traced after the reference has run, as the export traces it: a
+    # model's first forward may change it once, as RWKV rescales its weights.
     step = capture_model(
         MethodModule(model, program.step), (tokens[:, :1], *states),
     ).graph_module
     rows = []
     with torch.no_grad():
-        expected = tensor_output_leaves(getattr(model, program.reference)(tokens), warn=False)[0]
         for position in range(length):
             logits, *states = tensor_output_leaves(
                 step(tokens[:, position:position + 1], *states), warn=False,
@@ -322,14 +326,22 @@ def transpile_recurrent_generation(
         quantization is None or quantization.method != "gptq"
     ):
         raise ValueError("calibration_sequences can only be used with GPTQ quantization")
+    if not owned:
+        # The checks below run the step, which may change module state (an
+        # embedding with max_norm renormalizes its rows): they run on the
+        # export's copy, never on the caller's model.
+        model = copy.deepcopy(model)
+        owned = True
+    if any(module.training for module in model.modules()):
+        eval_mode_copy_warning()
+        model.eval()
     if any(
         value.is_floating_point() and value.dtype != torch.float32
         for value in (*model.parameters(), *model.buffers())
     ):
         # Scratch computes in doubles either way; in float32 the step can be
         # checked against the reference without bfloat16 rounding noise.
-        model = copy.deepcopy(model).float()
-        owned = True
+        model.float()
     states = tuple(
         State(state.name, state.initial.float())
         if state.initial.is_floating_point() else state
@@ -343,15 +355,11 @@ def transpile_recurrent_generation(
         top_k=program.top_k,
         reference=program.reference,
     )
-    checked = (
-        copy.deepcopy(model).eval() if any(module.training for module in model.modules())
-        else model
-    )
-    vocabulary, logit_count = _check_step(checked, program)
+    vocabulary, logit_count = _check_step(model, program)
     if program.top_k is not None and program.top_k > logit_count:
         raise ValueError(f"top_k ({program.top_k}) exceeds output size ({logit_count})")
     if program.reference is not None:
-        _check_reference(checked, program, vocabulary, hint)
+        _check_reference(model, program, vocabulary, hint)
 
     calls, resets = (
         _calibration_calls(calibration_sequences, vocabulary)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 
 import torch
@@ -134,8 +135,10 @@ def check_lengths(
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
         tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
+        # verify runs the model; a fresh copy each time keeps a forward that
+        # changes module state away from the caller's model.
         return verify(
-            model, tuple(values[:positional]), result,
+            copy.deepcopy(model), tuple(values[:positional]), result,
             example_kwargs=keywords or None, **tolerance,
         )
 
@@ -270,8 +273,12 @@ def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> l
         values[index] = value
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
+        # Each run on a fresh copy: a forward that changes module state
+        # must not reach the caller's model, nor the next run.
         with torch.no_grad():
-            return tensor_output_leaves(model(*values[:positional], **keywords), warn=False)
+            return tensor_output_leaves(
+                copy.deepcopy(model)(*values[:positional], **keywords), warn=False,
+            )
 
     both = run(pair)
     first, second = run(pair.narrow(axis, 0, 1)), run(pair.narrow(axis, 1, 1))

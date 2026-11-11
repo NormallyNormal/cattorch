@@ -2178,6 +2178,8 @@ def _transpile_dynamic(
     **options,
 ):
     """Trace one row of the dynamic input, export, and check other lengths."""
+    import copy
+
     from cattorch.dynamic import (
         at_length,
         check_lengths,
@@ -2228,7 +2230,7 @@ def _transpile_dynamic(
             # the declared minimum.
             try:
                 with torch.no_grad():
-                    model(*representative[:positional], **traced_kwargs)
+                    copy.deepcopy(model)(*representative[:positional], **traced_kwargs)
             except Exception as reason:  # noqa: BLE001 - reported to the user
                 raise UnsupportedModelError(
                     "a variable-length export traces the model with one item along "
