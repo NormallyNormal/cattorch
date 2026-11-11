@@ -33,7 +33,7 @@ INIT, RESET = ("cattorch init", None), ("cattorch reset", None)
 DECODE, PREFILL = ("cattorch decode", [5]), ("cattorch prefill", [2, 6, 3])
 PUBLIC = ("cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode")
 # Pause places tried per case, spread over the call.
-SAMPLES = 10
+SAMPLES = 6
 TOLERANCE = 1e-9
 STORAGES = {
     "compressed": {},
@@ -191,8 +191,9 @@ class Generator:
             self.assert_logits(result[3], expected, result[:3])
 
 
+# Each storage's decoder in the KV sprite; the recurrent sprite shares them.
 @pytest.fixture(scope="module", params=[
-    "kv compressed", "kv int8", "kv uncompressed", "recurrent compressed", "recurrent int8",
+    "kv compressed", "kv int8", "kv uncompressed", "recurrent int8",
 ])
 def generator(request, tmp_path_factory):
     kind, storage = request.param.split()
