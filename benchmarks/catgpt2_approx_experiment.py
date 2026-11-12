@@ -83,38 +83,38 @@ def policies() -> dict[str, FastConfig]:
             overrides={"lm_head": FastLayerConfig(rank=64)},
         ),
         "rank75": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(rank_ratio=0.75),
+            **exact_arithmetic, layers=FastLayerConfig(rank_ratio=0.75),
         ),
         "rank50": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(rank_ratio=0.50),
+            **exact_arithmetic, layers=FastLayerConfig(rank_ratio=0.50),
         ),
         "rank25": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(rank_ratio=0.25),
+            **exact_arithmetic, layers=FastLayerConfig(rank_ratio=0.25),
         ),
         "sparse25": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(pruning=0.25),
+            **exact_arithmetic, layers=FastLayerConfig(block_pruning=0.25),
         ),
         "sparse50": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(pruning=0.50),
+            **exact_arithmetic, layers=FastLayerConfig(block_pruning=0.50),
         ),
         "sparse75": FastConfig(
-            **exact_arithmetic, weights=FastLayerConfig(pruning=0.75),
+            **exact_arithmetic, layers=FastLayerConfig(block_pruning=0.75),
         ),
         "body_sparse25": FastConfig(
             **exact_arithmetic,
-            overrides={name: FastLayerConfig(pruning=0.25) for name in body_names},
+            overrides={name: FastLayerConfig(block_pruning=0.25) for name in body_names},
         ),
         "body_sparse50": FastConfig(
             **exact_arithmetic,
-            overrides={name: FastLayerConfig(pruning=0.50) for name in body_names},
+            overrides={name: FastLayerConfig(block_pruning=0.50) for name in body_names},
         ),
         "ffn_sparse25": FastConfig(
             **exact_arithmetic,
-            overrides={name: FastLayerConfig(pruning=0.25) for name in ffn_names},
+            overrides={name: FastLayerConfig(block_pruning=0.25) for name in ffn_names},
         ),
         "qkv_sparse25": FastConfig(
             **exact_arithmetic,
-            overrides={name: FastLayerConfig(pruning=0.25) for name in qkv_names},
+            overrides={name: FastLayerConfig(block_pruning=0.25) for name in qkv_names},
         ),
         "ffn_rank80": FastConfig(
             **exact_arithmetic,

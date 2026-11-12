@@ -305,7 +305,7 @@ def kv_generator(tmp_path, sharing, hidden_prefill=True):
     result = transpile(
         model, GenerationProgram(max_context=16, top_k=2, hidden_prefill=hidden_prefill),
         tmp_path / f"kv_{sharing}",
-        codegen=CodegenConfig(layer_sharing=sharing, unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=sharing == "auto", unrolling="compact"),
     )
     return Generator(load_sprite(result.path), lambda prefix: logits_of(model, prefix))
 

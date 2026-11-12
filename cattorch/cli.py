@@ -27,6 +27,13 @@ from cattorch.errors import CattorchError
 from cattorch.util.scratch.archive import dumps
 
 
+# Exit statuses, documented in docs/projects-and-cli.md.
+EXIT_OK = 0
+EXIT_EXPORT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_VERIFY_FAILED = 3
+
+
 class CommandError(Exception):
     """A problem with the command's arguments, reported without a traceback."""
 
@@ -148,38 +155,82 @@ def _example_inputs(args, model):
     inputs += [torch.randint(0, args.vocab, shape) for shape in args.tokens]
     if inputs:
         return tuple(inputs)
-    from cattorch.markers import example_inputs, has_entrypoints
+    from cattorch.markers import has_entrypoints, marked_example_inputs
 
-    if has_entrypoints(model) or example_inputs(model) is not None:
+    if has_entrypoints(model) or marked_example_inputs(model) is not None:
         return None
     raise CommandError(
         "give the model's inputs with --shape (floats) or --tokens (token IDs), "
-        "or mark it with @cattorch.example"
+        "or mark it with @cattorch.example_inputs"
     )
 
 
-def _storage(args):
-    from cattorch import QuantizationConfig, StorageConfig
+def _calibration(path: str | None):
+    """``--calibration FILE``: a ``torch.save``'d list of calibration items."""
+    if path is None:
+        return None
+    try:
+        items = torch.load(path, weights_only=True, map_location="cpu")
+    except (OSError, pickle.UnpicklingError, RuntimeError, EOFError) as error:
+        raise CommandError(f"can't load --calibration {path}: {error}") from None
+    if isinstance(items, torch.Tensor) or not isinstance(items, (list, tuple)):
+        raise CommandError(
+            f"--calibration {path} must hold a list saved with torch.save, such as a list "
+            "of input tensors (export) or of [1, length] token tensors (generate)"
+        )
+    return list(items)
 
-    if args.precision == "float16":
-        return {"storage": StorageConfig(precision="float16")}
-    if args.precision in {"int8", "int4"}:
-        return {"quantization": QuantizationConfig(bits=int(args.precision[3:]))}
-    return {}
+
+def _quantization(args):
+    """The ``QuantizationConfig`` the quantization flags ask for, or ``None``.
+
+    The flags mirror ``QuantizationConfig``'s fields; per-weight settings
+    belong here too.
+    """
+    from cattorch import QuantizationConfig
+
+    if args.quantize is None:
+        for flag, value in (("--quantize-method", args.quantize_method),
+                            ("--calibration", args.calibration)):
+            if value is not None:
+                raise CommandError(f"{flag} needs --quantize")
+        return None
+    method = args.quantize_method or "symmetric"
+    if method == "gptq" and args.calibration is None:
+        raise CommandError("--quantize-method gptq needs --calibration")
+    if method != "gptq" and args.calibration is not None:
+        raise CommandError("--calibration is only used by --quantize-method gptq")
+    return QuantizationConfig(bits=args.quantize, method=method)
 
 
-def _summary(result, extra: dict) -> dict:
-    report = {
-        "sprite": str(result.path),
-        "archive_bytes": result.archive_bytes,
-        "blocks": result.block_count,
-        **extra,
+def _export_options(args) -> dict:
+    """The ``transpile`` options the common flags ask for."""
+    from cattorch import StorageConfig
+
+    options: dict = {
+        "optimization": args.optimization,
+        "storage": StorageConfig(precision=args.precision),
+        "quantization": _quantization(args),
+        "calibration": _calibration(args.calibration),
+        "sig_figs": args.sig_figs,
     }
-    fallbacks = getattr(result, "fallback_operations", ())
-    if fallbacks:
-        report["fallback_operations"] = dict(fallbacks)
-    if result.warnings:
-        report["warnings"] = list(result.warnings)
+    if args.name is not None:
+        options["name"] = args.name
+    return options
+
+
+def _summary(result) -> dict:
+    """A result's fields, by their Python names, for the JSON summary."""
+    fields = [
+        "path", "sprite_name", "archive_bytes", "expanded_json_bytes", "block_count",
+        "list_count", "sharded_lists", "warnings", "max_context", "vocabulary_size", "top_k",
+        "tokenizer_type", "token_count", "fallback_operations", "approximate_operations",
+    ]
+    report = {}
+    for field in fields:
+        if hasattr(result, field):
+            value = getattr(result, field)
+            report[field] = str(value) if isinstance(value, Path) else value
     return report
 
 
@@ -212,6 +263,7 @@ def _export(args) -> int:
     from cattorch.verify import verify
     from cattorch.project import build_project
 
+    options = _export_options(args)
     model, name = load_model(args.model)
     example = _example_inputs(args, model)
     dynamic: dict[int, dict[int, tuple[int, int]]] = {}
@@ -220,29 +272,38 @@ def _export(args) -> int:
             raise CommandError(f"--dynamic gives input {index}'s dimension {dim} twice")
         dynamic.setdefault(index, {})[dim] = (low, high)
     outputs = _outputs(args.output, name)
-    result = transpile(
-        model, example, outputs.sprite, optimization="fast" if args.fast else "exact",
-        dynamic=dynamic or None, **_storage(args),
-    )
-    extra: dict = {}
+    result = transpile(model, example, outputs.sprite, dynamic=dynamic or None, **options)
+    report = _summary(result)
+    passed = True
     if not args.no_verify:
-        # Lossy weight storage and approximate kernels are checked against
-        # what they can reach.
-        tolerance = 1e-4 if args.precision == "float32" and not args.fast else 0.05
-        report = verify(
-            model, example, result, atol=tolerance, rtol=1e-5 if tolerance < 0.05 else 0.05,
+        # PyTorch runs with the values the sprite stores, so lossy storage
+        # is checked tightly; approximate kernels need a looser tolerance.
+        quantization = options["quantization"]
+        # GPTQ can't be reproduced, so it is checked against the float model.
+        gptq = quantization is not None and quantization.method == "gptq"
+        stored: dict = {} if gptq else dict(
+            quantization=quantization, storage=options["storage"], sig_figs=options["sig_figs"],
         )
-        extra["verified"] = report.passed
-        if hasattr(report, "max_abs_error"):
-            extra["max_abs_error"] = report.max_abs_error
+        if args.optimization == "fast" or gptq:
+            tolerance = {"atol": 0.05, "rtol": 0.05}
+        elif quantization is not None or args.precision != "float32" or args.sig_figs:
+            # Long sums over stored values accumulate float32 rounding.
+            tolerance = {"atol": 1e-3, "rtol": 1e-4}
+        else:
+            tolerance = {"atol": 1e-4, "rtol": 1e-5}
+        check = verify(model, example, result, **tolerance, **stored)
+        passed = check.passed
+        report["verify"] = {"passed": check.passed}
+        if hasattr(check, "max_abs_error"):
+            report["verify"]["max_abs_error"] = check.max_abs_error
     if args.project:
         labels = args.labels.split(",") if args.labels else None
         project = build_project(
-            outputs.project, result, example_inputs=example or (), labels=labels,
+            result, outputs.project, example_inputs=example or (), labels=labels,
         )
-        extra["project"] = str(project.path)
-    print(dumps(_summary(result, extra), indent=2))
-    return 0 if extra.get("verified", True) else 1
+        report["project"] = {"path": str(project.path)}
+    print(dumps(report, indent=2))
+    return EXIT_OK if passed else EXIT_VERIFY_FAILED
 
 
 def _generate(args) -> int:
@@ -252,6 +313,7 @@ def _generate(args) -> int:
     from cattorch.huggingface_recurrent import recurrent_family
     from cattorch.project import build_project
 
+    options = _export_options(args)
     tokenizer = None
     if args.hf:
         try:
@@ -273,43 +335,43 @@ def _generate(args) -> int:
     program: GenerationProgram | RecurrentGenerationProgram
     if recurrent_family(model) is not None:
         # Without --max-context a recurrent model takes any number of tokens.
-        max_context = args.max_context
-        program = RecurrentGenerationProgram(max_tokens=max_context, top_k=args.top_k)
+        program = RecurrentGenerationProgram(max_context=args.max_context, top_k=args.top_k)
     else:
-        max_context = 64 if args.max_context is None else args.max_context
-        program = GenerationProgram(max_context=max_context, top_k=args.top_k)
-    result = transpile(
-        model, program, outputs.sprite, optimization="fast" if args.fast else "exact",
-        **_storage(args),
-    )
-    extra: dict = {"max_context": max_context}
+        program = GenerationProgram(
+            64 if args.max_context is None else args.max_context, top_k=args.top_k,
+        )
+    result = transpile(model, program, outputs.sprite, **options)
+    report = _summary(result)
     tokenizer_result = None
+    tokenizer_error = None
     if tokenizer is not None:
         try:
             tokenizer_result = transpile_tokenizer(tokenizer, outputs.tokenizer, name="tokenizer")
-            extra["tokenizer"] = str(tokenizer_result.path)
+            report["tokenizer"] = _summary(tokenizer_result)
         except (ValueError, TypeError) as error:
-            extra["tokenizer_error"] = str(error)
+            tokenizer_error = str(error)
+            report["tokenizer"] = {"error": tokenizer_error}
     if args.project:
         if tokenizer_result is None:
             raise CommandError(
                 "--project needs a tokenizer that exports to Scratch; "
-                + extra.get("tokenizer_error", "pass --tokenizer")
+                + (tokenizer_error or "pass --tokenizer")
             )
-        eos = args.eos
+        eos = args.eos_token_id
         if eos is None and tokenizer is not None:
             eos = getattr(tokenizer, "eos_token_id", None)
         project = build_project(
-            outputs.project, result, tokenizer=tokenizer_result,
+            result, outputs.project, tokenizer=tokenizer_result,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             eos_token_id=eos,
         )
-        extra["project"] = str(project.path)
-    print(dumps(_summary(result, extra), indent=2))
-    return 0
+        report["project"] = {"path": str(project.path)}
+    print(dumps(report, indent=2))
+    return EXIT_OK
 
 
 def _analyze(args) -> int:
+    import dataclasses
     import zipfile
 
     from cattorch.benchmark import analyze_benchmark
@@ -320,13 +382,32 @@ def _analyze(args) -> int:
         raise CommandError(
             f"{args.project} is not a cattorch benchmark project (.sb3) saved after running"
         ) from None
-    print(dumps(analysis, indent=2))
-    return 0
+    print(dumps(dataclasses.asdict(analysis), indent=2))
+    return EXIT_OK
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """Shows each option's default, unless its help already says it."""
+
+    def _get_help_string(self, action):
+        help_text = action.help or ""
+        if (
+            action.option_strings and "default" not in help_text
+            and action.default not in (None, False, [], argparse.SUPPRESS)
+        ):
+            help_text += " (default: %(default)s)"
+        return help_text
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cattorch", description="Export PyTorch models to Scratch.",
+        formatter_class=_HelpFormatter,
+        epilog=(
+            f"exit status: {EXIT_OK} success, {EXIT_EXPORT_FAILED} the export failed, "
+            f"{EXIT_USAGE} invalid arguments, {EXIT_VERIFY_FAILED} the sprite didn't "
+            "match PyTorch"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"cattorch {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -338,74 +419,114 @@ def _parser() -> argparse.ArgumentParser:
             "(NAME_tokenizer.sprite3) and project (NAME.sb3) are named after it "
             "(default: the model's name, lowercased)",
         )
-        command.add_argument("--fast", action="store_true", help="use approximate kernels")
         command.add_argument(
-            "--precision", choices=("float32", "float16", "int8", "int4"), default="float32",
-            help="weight storage; int8 and int4 quantize matrices (default: float32)",
+            "--name", help="the sprite's name in Scratch (default: the output file's name)",
+        )
+        command.add_argument(
+            "--optimization", choices=("exact", "fast"), default="exact",
+            help="fast uses approximate kernels",
+        )
+        command.add_argument(
+            "--precision", choices=("float32", "float16"), default="float32",
+            help="how stored weights are kept: StorageConfig(precision=...)",
+        )
+        command.add_argument(
+            "--quantize", type=int, choices=(4, 6, 8), metavar="BITS",
+            help="quantize matrix weights to 4, 6 or 8 bits: QuantizationConfig(bits=...) "
+            "(default: no quantization)",
+        )
+        command.add_argument(
+            "--quantize-method", choices=("symmetric", "gptq"),
+            help="how --quantize quantizes; gptq needs --calibration (default: symmetric)",
+        )
+        command.add_argument(
+            "--calibration", metavar="FILE",
+            help="GPTQ calibration data: a list saved with torch.save, of input tensors "
+            "(export) or [1, length] token tensors (generate) (default: none)",
+        )
+        command.add_argument(
+            "--sig-figs", type=_positive, metavar="N",
+            help="round stored values to N significant figures (default: no rounding)",
         )
         command.add_argument(
             "--project", action="store_true",
             help="also write a runnable .sb3 project around the sprite",
         )
 
-    export = commands.add_parser("export", help="export a model as a sprite and verify it")
+    export = commands.add_parser(
+        "export", help="export a model as a sprite and verify it", formatter_class=_HelpFormatter,
+    )
     export.add_argument("model", help="module:name, file.py:name, or a torch.save'd .pt file")
     export.add_argument(
         "--shape", type=_shape, action="append", default=[],
-        help="a random float input of this shape, such as 1,28,28; repeat for more inputs",
+        help="a random float input of this shape, such as 1,28,28; repeat for more inputs "
+        "(default: the model's @example_inputs)",
     )
     export.add_argument(
         "--tokens", type=_shape, action="append", default=[],
-        help="a token-ID input of this shape, after the --shape inputs",
+        help="a token-ID input of this shape, after the --shape inputs (default: none)",
     )
     export.add_argument(
         "--vocab", type=_positive, default=2,
-        help="--tokens IDs are random, below this (default: 2)",
+        help="--tokens IDs are random, below this",
     )
     export.add_argument(
         "--dynamic", type=_dynamic, action="append", default=[],
-        help="let an input's length vary: INPUT[.DIM]=MIN:MAX, such as 0=1:32",
+        help="let an input's length vary: INPUT[.DIM]=MIN:MAX, such as 0=1:32, like "
+        "transpile(dynamic=...) (default: fixed lengths)",
     )
-    export.add_argument("--labels", help="comma-separated output labels for the project")
-    export.add_argument("--no-verify", action="store_true", help="skip the check against PyTorch")
+    export.add_argument(
+        "--labels", help="comma-separated output labels for the project (default: none)",
+    )
+    export.add_argument(
+        "--no-verify", action="store_true", help="skip the check against PyTorch",
+    )
     options(export)
     export.set_defaults(run=_export)
 
-    generate = commands.add_parser("generate", help="export a text generator")
+    generate = commands.add_parser(
+        "generate", help="export a text generator", formatter_class=_HelpFormatter,
+    )
     generate.add_argument(
         "model", nargs="?",
         help="a forward(tokens) -> logits model, or a Hugging Face Mamba, Mamba-2 or RWKV model",
     )
-    generate.add_argument("--hf", metavar="REPO", help="a Hugging Face model name or directory")
-    generate.add_argument("--tokenizer", help="a Hugging Face tokenizer name or directory")
     generate.add_argument(
-        "--max-context", type=int,
-        help="the most tokens the generator takes between resets (default: 64; "
+        "--hf", metavar="REPO",
+        help="a Hugging Face model name or directory, instead of MODEL (default: none)",
+    )
+    generate.add_argument(
+        "--tokenizer",
+        help="a Hugging Face tokenizer name or directory (default: --hf's tokenizer)",
+    )
+    generate.add_argument(
+        "--max-context", type=_positive, metavar="N",
+        help="the most tokens the generator reads between resets (default: 64; "
         "unlimited for a Mamba, Mamba-2 or RWKV model)",
     )
     generate.add_argument(
-        "--top-k", type=int, metavar="K",
+        "--top-k", type=_positive, metavar="K",
         help="also list the K largest logits and their token IDs, 1 to 64, in the "
         "sprite's top k lists (default: none)",
     )
     generate.add_argument(
-        "--max-new-tokens", type=int, default=40, metavar="N",
-        help="the most tokens the project's demo adds to a prompt (default: 40)",
+        "--max-new-tokens", type=_positive, default=40, metavar="N",
+        help="the most tokens the project's demo adds to a prompt",
     )
     generate.add_argument(
         "--temperature", type=float, default=0.8,
-        help="the demo's starting sampling temperature; 0 always picks the likeliest "
-        "token (default: 0.8)",
+        help="the demo's starting sampling temperature; 0 always picks the likeliest token",
     )
     generate.add_argument(
-        "--eos", type=int, metavar="ID",
-        help="token ID that ends a continuation (default: the tokenizer's end token)",
+        "--eos-token-id", type=int, metavar="ID",
+        help="the token ID that ends a continuation (default: the tokenizer's end token)",
     )
     options(generate)
     generate.set_defaults(run=_generate)
 
     analyze = commands.add_parser(
-        "analyze-benchmark", help="print a saved benchmark project's timings",
+        "analyze-benchmark", help="print a saved benchmark project's results as JSON",
+        formatter_class=_HelpFormatter,
     )
     analyze.add_argument(
         "project", help="a benchmark .sb3 saved from Scratch after it ran",
@@ -415,14 +536,32 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    """Run the command line; return its exit status.
+
+    ``EXIT_USAGE`` (2) is invalid arguments, from argparse or from cattorch's
+    own checks of them (``ValueError`` and ``TypeError``, which cattorch
+    raises for invalid arguments); ``EXIT_EXPORT_FAILED`` (1) an export that
+    failed (a ``CattorchError``, or a file that can't be read or written);
+    ``EXIT_VERIFY_FAILED`` (3) a sprite that didn't match PyTorch.
+    """
+    parser = _parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exit:
+        return int(exit.code or 0)
     try:
         return args.run(args)
-    # OSError covers a missing or unreadable file, an unwritable output, and a
-    # Hugging Face model or tokenizer that can't be found.
-    except (CommandError, CattorchError, ValueError, TypeError, OSError) as error:
+    except CattorchError as error:
         print(f"cattorch: error: {error}", file=sys.stderr)
-        return 1
+        return EXIT_EXPORT_FAILED
+    except (CommandError, ValueError, TypeError) as error:
+        print(f"cattorch: error: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    # OSError covers an unreadable file, an unwritable output, and a Hugging
+    # Face model or tokenizer that can't be found.
+    except OSError as error:
+        print(f"cattorch: error: {error}", file=sys.stderr)
+        return EXIT_EXPORT_FAILED
 
 
 if __name__ == "__main__":

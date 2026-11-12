@@ -120,7 +120,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
         compact_internal_names=True,
         compact_schema=True,
         id_namespace="",
-        layer_sharing="auto",
+        layer_sharing=True,
     )
     quantization = QuantizationConfig(
         bits=4,
@@ -199,7 +199,7 @@ def build(checkpoint: Path, output_dir: Path, stem: str = DEFAULT_STEM) -> dict:
             "unrolling": "compact",
             "compact_schema": True,
             "compact_internal_names": True,
-            "layer_sharing": "auto",
+            "layer_sharing": True,
         },
         "sampling": {
             "temperature": TEMPERATURE,

@@ -8,8 +8,6 @@ Programs, markers and adapters were experimental before 1.0 and are now
 stable top-level names; importing them from here still works but warns.
 """
 
-import warnings
-
 from cattorch import scratch
 from cattorch.analysis import AnalysisReport, EntryPointAnalysis, analyze
 from cattorch.benchmark import build_kernel_benchmark
@@ -22,7 +20,7 @@ from cattorch.experts import (
 )
 
 _GRADUATED = frozenset({
-    "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",
+    "adapter", "entrypoint", "export_forward", "generate", "marked_program", "moe",
     "AdapterContext", "ModuleAdapter", "CustomMoEWarning", "EntryPoint", "ExportProgram",
     "GenerationProgram", "Input", "Output", "ProgramCall", "State", "StateInput", "StateUpdate",
 })
@@ -30,6 +28,8 @@ _GRADUATED = frozenset({
 
 def __getattr__(name):
     if name in _GRADUATED:
+        import warnings
+
         import cattorch
 
         warnings.warn(

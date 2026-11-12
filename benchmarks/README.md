@@ -113,7 +113,7 @@ from cattorch import FastConfig, FastLayerConfig, build_benchmark_suite
 build_benchmark_suite(
     cases,
     "fast_weights.sb3",
-    fast_config=FastConfig(weights=FastLayerConfig(rank_ratio=0.25)),
+    fast_config=FastConfig(layers=FastLayerConfig(rank_ratio=0.25)),
 )
 ```
 

@@ -753,7 +753,7 @@ def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
 def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
     case_config = FastConfig(
         activations=False,
-        weights=FastLayerConfig(pruning=0.5),
+        layers=FastLayerConfig(block_pruning=0.5),
     )
     suite_path = build_benchmark_suite(
         [("linear", nn.Linear(16, 12).eval(), torch.randn(2, 16), case_config)],
@@ -961,8 +961,8 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
     "policy",
     [
         FastLayerConfig(rank=4),
-        FastLayerConfig(pruning=0.5),
-        FastLayerConfig(rank=4, pruning=0.5),
+        FastLayerConfig(block_pruning=0.5),
+        FastLayerConfig(rank=4, block_pruning=0.5),
     ],
     ids=("low_rank", "pruned", "low_rank_pruned"),
 )
@@ -987,7 +987,7 @@ def test_fast_weight_transforms_match_the_transformed_pytorch_model(tmp_path, po
 def test_fast_module_override_replaces_global_weight_policy():
     model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
     config = FastConfig(
-        weights=FastLayerConfig(pruning=0.5),
+        layers=FastLayerConfig(block_pruning=0.5),
         overrides={"1": FastLayerConfig()},
     )
     transformed = prepare_fast_model(model, config)
@@ -999,7 +999,7 @@ def test_fast_unknown_module_override_is_rejected():
     with pytest.raises(ValueError, match="missing"):
         prepare_fast_model(
             nn.Linear(8, 8),
-            FastConfig(overrides={"missing": FastLayerConfig(pruning=0.5)}),
+            FastConfig(overrides={"missing": FastLayerConfig(block_pruning=0.5)}),
         )
 
 
@@ -1007,7 +1007,7 @@ def test_fast_pruned_linear_preserves_non_block_remainder(tmp_path):
     torch.manual_seed(31)
     model = nn.Linear(10, 8).eval()
     x = torch.randn(3, 10)
-    config = FastConfig(weights=FastLayerConfig(pruning=0.5))
+    config = FastConfig(layers=FastLayerConfig(block_pruning=0.5))
     expected = prepare_fast_model(model, config)(x)
     path = tmp_path / "pruned_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
@@ -1020,9 +1020,9 @@ def test_fast_pruned_linear_preserves_non_block_remainder(tmp_path):
 @pytest.mark.parametrize(
     "policy",
     [
-        FastLayerConfig(pruning=0.5),
+        FastLayerConfig(block_pruning=0.5),
         FastLayerConfig(rank=4),
-        FastLayerConfig(rank=4, pruning=0.5),
+        FastLayerConfig(rank=4, block_pruning=0.5),
     ],
     ids=("pruned", "low_rank", "low_rank_pruned"),
 )
@@ -1054,7 +1054,7 @@ def test_fast_static_matmul_pruning_preserves_remainder(tmp_path):
     torch.manual_seed(35)
     model = StaticMatmul(inner=10, columns=8).eval()
     x = torch.randn(3, 10)
-    policy = FastLayerConfig(pruning=0.5)
+    policy = FastLayerConfig(block_pruning=0.5)
     expected = x @ prepare_fast_matmul_weights(model.weight, policy)[0]
     config = FastConfig(weights=policy)
     path = tmp_path / "static_matmul_remainder"
@@ -1091,7 +1091,7 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
     path = tmp_path / "dynamic_matmul"
     transpile(
         model, (left, right), str(path), optimization="fast",
-        fast_config=FastConfig(weights=FastLayerConfig(rank_ratio=0.25)),
+        fast_config=FastConfig(layers=FastLayerConfig(rank_ratio=0.25)),
     )
     sprite = _load_sprite(path.with_suffix(".sprite3"))
     # Multiple inputs occupy distinct Scratch lists; use the emulator directly.
@@ -1109,8 +1109,8 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
 @pytest.mark.parametrize(
     ("model", "x", "policy"),
     [
-        (nn.Conv1d(4, 8, 3, padding=1), torch.randn(1, 4, 7), FastLayerConfig(pruning=0.5)),
-        (nn.Conv2d(4, 8, 3, padding=1), torch.randn(1, 4, 4, 5), FastLayerConfig(pruning=0.5)),
+        (nn.Conv1d(4, 8, 3, padding=1), torch.randn(1, 4, 7), FastLayerConfig(block_pruning=0.5)),
+        (nn.Conv2d(4, 8, 3, padding=1), torch.randn(1, 4, 4, 5), FastLayerConfig(block_pruning=0.5)),
         (nn.Conv1d(8, 12, 3, padding=1), torch.randn(1, 8, 7), FastLayerConfig(rank=3)),
         (nn.Conv2d(8, 12, 3, padding=1), torch.randn(1, 8, 4, 5), FastLayerConfig(rank=3)),
     ],
@@ -1278,13 +1278,13 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
         model,
         GenerationProgram(max_context=5),
         path,
-        codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=True, unrolling="compact"),
     )
     baseline = transpile(
         model,
         GenerationProgram(max_context=5),
         tmp_path / "cached_unshared_layers",
-        codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
     assert result.block_count < baseline.block_count * 0.8
     sprite = _load_sprite(result.path)

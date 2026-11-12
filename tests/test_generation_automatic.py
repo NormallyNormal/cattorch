@@ -163,7 +163,7 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, shari
     for hidden in (False, True):
         emulator, _ = emulator_for(
             model, tmp_path, f"{sharing}_{hidden}", max_context=16,
-            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing),
+            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing == "auto"),
         )
         shared = "_cattorch shared transformer layer" in emulator._procedures
         assert shared == (sharing == "auto")
@@ -185,7 +185,7 @@ def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
     torch.manual_seed(13)
     model = CachedLM(context=8, layers=2).eval()
     emulator, _ = emulator_for(
-        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing),
+        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing == "auto"),
     )
     emulator.lists[TOKEN_IDS] = [3]
     emulator.run_procedure("cattorch decode")
@@ -232,7 +232,7 @@ def test_private_procedures_run_only_from_public_ones(tmp_path, sharing):
     model = CachedLM(context=8, layers=2).eval()
     result = transpile(
         model, GenerationProgram(max_context=8, top_k=2), tmp_path / "gen",
-        codegen=CodegenConfig(layer_sharing=sharing),
+        codegen=CodegenConfig(layer_sharing=sharing == "auto"),
     )
     sprite = load_sprite(result.path)
     callers = procedure_callers(sprite)
@@ -359,7 +359,7 @@ def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
     torch.manual_seed(0)
     model = Scaled().eval()
     emulator, _ = emulator_for(
-        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing="auto"),
+        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing=True),
     )
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, model, [1, 2, 3], [4])
@@ -466,11 +466,11 @@ def test_layer_sharing_banks_the_caches(tmp_path):
     model = CachedLM(context=8, layers=3).eval()
     shared = transpile(
         model, GenerationProgram(max_context=8), tmp_path / "shared",
-        codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=True, unrolling="compact"),
     )
     plain = transpile(
         model, GenerationProgram(max_context=8), tmp_path / "plain",
-        codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
     assert shared.block_count < plain.block_count * 0.8
     emulator = ScratchEmulator(load_sprite(shared.path))
@@ -484,7 +484,7 @@ def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
     hf = tiny_decoder("gpt2").eval()
     result = transpile(
         hf, GenerationProgram(max_context=8), tmp_path / "hf",
-        codegen=CodegenConfig(layer_sharing="auto"),
+        codegen=CodegenConfig(layer_sharing=True),
     )
     emulator = ScratchEmulator(load_sprite(result.path))
     assert "_cattorch shared transformer layer" not in emulator._procedures
@@ -500,7 +500,7 @@ def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
     model.eval()
     with caplog.at_level("WARNING", logger="cattorch"):
         emulator, _ = emulator_for(
-            model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing="auto"),
+            model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=True),
         )
     assert "exporting without layer sharing" in caplog.text
     assert "_cattorch shared transformer layer" not in emulator._procedures

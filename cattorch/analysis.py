@@ -89,21 +89,61 @@ def _storage_density(storage: StorageConfig) -> float:
     }[storage.precision]
 
 
+def _forward_program(model: nn.Module, example_inputs) -> ExportProgram:
+    """``forward`` on tensor inputs, as a one-entry-point program."""
+    import torch
+
+    from cattorch.frontend import tensor_output_leaves
+    from cattorch.interface import input_name, output_name
+    from cattorch.program import EntryPoint, Input
+
+    inputs = (example_inputs,) if isinstance(example_inputs, torch.Tensor) else tuple(example_inputs)
+    if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs):
+        raise TypeError(
+            "example_inputs must be a tensor, a tuple of tensors, an ExportProgram, or None"
+        )
+    import copy
+
+    with torch.no_grad():
+        leaves = tensor_output_leaves(copy.deepcopy(model).eval()(*inputs), warn=False)
+    return ExportProgram((EntryPoint(
+        "forward",
+        arguments=tuple(Input(input_name(index), value) for index, value in enumerate(inputs)),
+        returns=tuple(Output(output_name(index)) for index in range(len(leaves))),
+    ),))
+
+
 def analyze(
     model: nn.Module,
-    program: ExportProgram,
+    example_inputs=None,
     *,
     adapters: tuple[ModuleAdapter, ...] = (),
     storage: StorageConfig | None = None,
     optimization: str = "exact",
     kernels=(),
 ) -> AnalysisReport:
-    """Capture every entrypoint and report compatibility and approximate size.
+    """Capture every entry point and report compatibility and approximate size.
 
+    ``example_inputs`` is what ``transpile`` would take: tensors for
+    ``forward``, an ``ExportProgram``, or ``None`` for the model's markers
+    (its ``@entrypoint`` methods, or ``forward``'s ``@example_inputs``).
     ``kernels`` are the experimental ``Kernel`` lowerings the export would use.
     """
-    if not isinstance(program, ExportProgram):
-        raise TypeError("program must be an ExportProgram")
+    from cattorch.program import GenerationProgram, RecurrentGenerationProgram
+
+    if example_inputs is None:
+        from cattorch.transpiler import interface_from_markers
+
+        model, example_inputs = interface_from_markers(model)
+    if isinstance(example_inputs, (GenerationProgram, RecurrentGenerationProgram)):
+        raise TypeError(
+            f"analyze doesn't take a {type(example_inputs).__name__}; analyze the model's "
+            "forward with example token IDs instead"
+        )
+    program = (
+        example_inputs if isinstance(example_inputs, ExportProgram)
+        else _forward_program(model, example_inputs)
+    )
     validate_export_options(optimization=optimization, storage=storage, adapters=adapters)
     kernels = validate_kernels(kernels)
     with keep_operations(active_kernel_targets(

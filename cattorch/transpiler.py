@@ -563,7 +563,7 @@ class _Compiler:
         embedding = registry.kernel("aten.embedding.default", fast=fast, config=config)
         interleaving = (
             # Weight pruning owns the Linear's layout.
-            not (fast and config.weights.enabled)
+            not (fast and config.layers.enabled)
             and getattr(linear, "kernel", None) is LINEAR_KERNEL
             and embedding
             is default_registry().kernel(
@@ -1284,7 +1284,7 @@ class _Compiler:
             and aten_op not in self.graph.protected
             and len(node.args) > 1
             and hasattr(node.args[1], "name")
-            and not (self.graph.fast and self.graph.fast_config.weights.enabled)
+            and not (self.graph.fast and self.graph.fast_config.layers.enabled)
         ):
             rhs = self.graph.resolve_weight(node.args[1].name)
             if (
@@ -1352,7 +1352,7 @@ class _Compiler:
             and aten_op not in self.graph.protected
             and len(node.args) > 1
             and hasattr(node.args[1], "name")
-            and self.graph.fast_config.weights.enabled
+            and self.graph.fast_config.layers.enabled
         ):
             candidate = self.graph.resolve_weight(node.args[1].name)
             if isinstance(candidate, torch.Tensor) and candidate.ndim == 2:
@@ -1363,7 +1363,7 @@ class _Compiler:
 
             factors = prepare_fast_matmul_weights(
                 static_rhs,
-                self.graph.fast_config.weights,
+                self.graph.fast_config.layers,
             )
             if len(factors) == 2:
                 factor_lists = []
@@ -1681,7 +1681,7 @@ class _Compiler:
         weight = self.graph.resolve_weight(node.args[1].name)
         if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
             return input_lists, (), False
-        if self.graph.fast and self.graph.fast_config.weights.enabled:
+        if self.graph.fast and self.graph.fast_config.layers.enabled:
             # Structured pruning owns this weight's layout and sparse metadata;
             # low-rank replacement may also rewrite the surrounding graph.
             return input_lists, (), False
@@ -2714,7 +2714,7 @@ def _transpile_automatic_generation(
         # Tracing runs the step, so every attempt gets its own copy. Without
         # layer sharing there is no second attempt.
         result = _transpile(
-            copy.deepcopy(step) if codegen.layer_sharing == "auto" else step,
+            copy.deepcopy(step) if codegen.layer_sharing else step,
             (example,),
             output_path,
             sig_figs,
@@ -2723,7 +2723,7 @@ def _transpile_automatic_generation(
         )
     except _LayerSharingUnavailable:
         warn(
-            "layer_sharing='auto' couldn't share this model's layers; it was "
+            "layer_sharing=True couldn't share this model's layers; it was "
             "exported without layer sharing"
         )
         result = _transpile(
@@ -2731,7 +2731,7 @@ def _transpile_automatic_generation(
             (example,),
             output_path,
             sig_figs,
-            codegen=replace(codegen, layer_sharing="off"),
+            codegen=replace(codegen, layer_sharing=False),
             **options,
         )
     return generation_result(
@@ -2840,7 +2840,7 @@ def _transpile(
         dynamic_inputs=_dynamic_inputs,
         example_kwargs=example_kwargs,
     )
-    if generation is not None and codegen.layer_sharing == "auto":
+    if generation is not None and codegen.layer_sharing:
         if not _layers_can_share_caches(graph):
             log.info(
                 "Banked generation caches skipped: attention blocks are not in "
@@ -2897,7 +2897,7 @@ def _transpile(
         sig_figs=sig_figs,
     )
     sprite = tensor_adder.apply(sprite, list(graph.input_names.values()))
-    if codegen.layer_sharing == "auto":
+    if codegen.layer_sharing:
         hidden_layers = (
             generation is not None
             and graph.generation.banked_caches

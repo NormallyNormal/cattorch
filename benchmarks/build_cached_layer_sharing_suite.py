@@ -74,7 +74,7 @@ def _compile_variant(model, directory: Path, label: str, sharing: str, namespace
             unrolling="compact",
             compact_internal_names=True,
             compact_schema=True,
-            layer_sharing=sharing,
+            layer_sharing=sharing == "auto",
         ),
         adapters=(_stacked_experts,),
     )

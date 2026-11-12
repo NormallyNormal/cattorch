@@ -154,8 +154,8 @@ def test_codegen_config_validates_new_compaction_controls():
         CodegenConfig(compact_internal_names=1)
     with pytest.raises(TypeError, match="compact_schema"):
         CodegenConfig(compact_schema=1)
-    with pytest.raises(ValueError, match="layer_sharing"):
-        CodegenConfig(layer_sharing="force")
+    with pytest.raises(TypeError, match="layer_sharing"):
+        CodegenConfig(layer_sharing="auto")
 
 
 def test_finalizer_repairs_costume_menu_shadow_for_editor(tmp_path):
@@ -322,7 +322,7 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
             value,
             tmp_path / mode,
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
         sprites[mode] = _load(results[mode].path)
@@ -385,7 +385,7 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
                 bits=4, method="symmetric", min_quantized_values=1,
             ),
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
         sprites[mode] = ScratchEmulator(_load(result.path))

@@ -21,22 +21,22 @@ class FastLayerConfig:
     """Approximation policy for an eligible static-weight layer.
 
     ``rank`` is an explicit truncated-SVD rank. ``rank_ratio`` selects a
-    fraction of the matrix's full rank. ``pruning`` removes that fraction of
-    Scratch-friendly weight blocks by magnitude. Module overrides replace the
-    global policy rather than merging with it.
+    fraction of the matrix's full rank. ``block_pruning`` removes that
+    fraction of Scratch-friendly weight blocks by magnitude. Module overrides
+    replace the global policy rather than merging with it.
     """
 
-    pruning: float = 0.0
+    block_pruning: float = 0.0
     rank: int | None = None
     rank_ratio: float | None = None
 
     def __post_init__(self):
         if (
-            isinstance(self.pruning, bool)
-            or not isinstance(self.pruning, (int, float))
-            or not 0 <= self.pruning < 1
+            isinstance(self.block_pruning, bool)
+            or not isinstance(self.block_pruning, (int, float))
+            or not 0 <= self.block_pruning < 1
         ):
-            raise ValueError("pruning must be in [0, 1)")
+            raise ValueError("block_pruning must be in [0, 1)")
         if self.rank is not None and (
             isinstance(self.rank, bool)
             or not isinstance(self.rank, int)
@@ -54,18 +54,26 @@ class FastLayerConfig:
 
     @property
     def enabled(self) -> bool:
-        return self.pruning > 0 or self.rank is not None or self.rank_ratio is not None
+        return self.block_pruning > 0 or self.rank is not None or self.rank_ratio is not None
 
 
 @dataclass(frozen=True)
 class FastConfig:
-    """Controls approximate kernels and optional static-weight transforms."""
+    """Controls approximate kernels and optional static-weight transforms.
+
+    ``activations``, ``layer_norm`` and ``softmax`` select approximate
+    kernels for those operations. ``neuron_pruning`` removes that fraction
+    of the hidden neurons of each Linear, activation, Linear chain.
+    ``layers`` is the weight-transform policy for every eligible Linear and
+    convolution layer, and ``overrides`` replaces it for the layers it names
+    by module path.
+    """
 
     activations: bool = True
     layer_norm: bool = True
     softmax: bool = True
     neuron_pruning: float = 0.0
-    weights: FastLayerConfig = field(default_factory=FastLayerConfig)
+    layers: FastLayerConfig = field(default_factory=FastLayerConfig)
     overrides: Mapping[str, FastLayerConfig] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -78,8 +86,8 @@ class FastConfig:
             or not 0 <= self.neuron_pruning < 1
         ):
             raise ValueError("neuron_pruning must be in [0, 1)")
-        if not isinstance(self.weights, FastLayerConfig):
-            raise TypeError("weights must be a FastLayerConfig")
+        if not isinstance(self.layers, FastLayerConfig):
+            raise TypeError("layers must be a FastLayerConfig")
         normalized = dict(self.overrides)
         if any(not isinstance(name, str) or not name for name in normalized):
             raise ValueError("fast override names must be non-empty module names")
@@ -91,12 +99,12 @@ class FastConfig:
     def has_weight_transforms(self) -> bool:
         return (
             self.neuron_pruning > 0
-            or self.weights.enabled
+            or self.layers.enabled
             or any(policy.enabled for policy in self.overrides.values())
         )
 
     def policy_for(self, module_name: str) -> FastLayerConfig:
-        return self.overrides.get(module_name, self.weights)
+        return self.overrides.get(module_name, self.layers)
 
 
 def _selected_rank(weight: torch.Tensor, policy: FastLayerConfig) -> int | None:
@@ -237,8 +245,10 @@ def prepare_fast_matmul_weights(
         factors = (first, second)
     else:
         factors = (weight.detach().clone(),)
-    if policy.pruning:
-        factors = tuple(_prune_matmul_blocks(factor, policy.pruning) for factor in factors)
+    if policy.block_pruning:
+        factors = tuple(
+            _prune_matmul_blocks(factor, policy.block_pruning) for factor in factors
+        )
     return factors
 
 
@@ -457,7 +467,7 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
                     f"{rank}, which would not make it smaller or faster"
                 )
         target = replacement if replacement is not None else transformed
-        _apply_pruning(target, policy.pruning)
+        _apply_pruning(target, policy.block_pruning)
         return target
 
     eligible = [
@@ -494,7 +504,9 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
                 setattr(parent, child_name, replacement)
                 log.info("Fast factorized %s at rank %d", name, rank)
         target = replacement if replacement is not None else module
-        _apply_pruning(target, policy.pruning)
-        if policy.pruning:
-            log.info("Fast pruned %.1f%% of Scratch blocks in %s", policy.pruning * 100, name)
+        _apply_pruning(target, policy.block_pruning)
+        if policy.block_pruning:
+            log.info(
+                "Fast pruned %.1f%% of Scratch blocks in %s", policy.block_pruning * 100, name,
+            )
     return transformed

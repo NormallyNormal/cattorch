@@ -577,7 +577,7 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
                 bits=4, method="symmetric", min_quantized_values=1,
             ),
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
         with zipfile.ZipFile(result.path) as archive:

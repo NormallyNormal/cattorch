@@ -58,7 +58,7 @@ off by default, because how much accuracy they cost depends on the model.
 from cattorch import FastConfig, FastLayerConfig, transpile
 
 config = FastConfig(
-    weights=FastLayerConfig(rank_ratio=0.5, pruning=0.25),
+    layers=FastLayerConfig(rank_ratio=0.5, block_pruning=0.25),
     neuron_pruning=0.25,
     overrides={
         "head": FastLayerConfig(),

@@ -45,13 +45,13 @@ def build_json_size_suite(
     inputs = (torch.tensor([[1]]),)
     variants = {
         "baseline": CodegenConfig(
-            id_namespace="b00", unrolling="compact", layer_sharing="off",
+            id_namespace="b00", unrolling="compact", layer_sharing=False,
         ),
         "shared": CodegenConfig(
-            id_namespace="s00", unrolling="compact", layer_sharing="auto",
+            id_namespace="s00", unrolling="compact", layer_sharing=True,
         ),
         "compact": CodegenConfig(
-            id_namespace="c00", unrolling="compact", layer_sharing="auto",
+            id_namespace="c00", unrolling="compact", layer_sharing=True,
             compact_internal_names=True, compact_schema=True,
         ),
     }

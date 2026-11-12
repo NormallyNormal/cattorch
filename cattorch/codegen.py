@@ -33,7 +33,7 @@ class CodegenConfig:
     opt-in until it has been tested more widely in browser import, edit, and
     save.
 
-    ``layer_sharing="auto"`` factors compatible ``blocks.N`` transformer
+    ``layer_sharing=True`` factors compatible ``blocks.N`` transformer
     stacks into one procedure and banks their weights. Cached generation also
     interleaves equal-width per-layer K/V rows into shared banks. It falls back
     when incompatible layouts make the transform unsafe, and is opt-in for now.
@@ -44,7 +44,7 @@ class CodegenConfig:
     id_namespace: str | None = None
     compact_internal_names: bool = False
     compact_schema: bool = False
-    layer_sharing: Literal["auto", "off"] = "off"
+    layer_sharing: bool = False
 
     def __post_init__(self) -> None:
         if self.target_json_bytes is not None and (
@@ -75,8 +75,8 @@ class CodegenConfig:
             raise TypeError("compact_internal_names must be a bool")
         if not isinstance(self.compact_schema, bool):
             raise TypeError("compact_schema must be a bool")
-        if self.layer_sharing not in {"auto", "off"}:
-            raise ValueError("layer_sharing must be 'auto' or 'off'")
+        if not isinstance(self.layer_sharing, bool):
+            raise TypeError("layer_sharing must be a bool")
 
 
 __all__ = ["CodegenConfig"]

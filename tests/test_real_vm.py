@@ -256,7 +256,7 @@ def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
     model = (Language() if sharing == "off" else _layered_language()).eval()
     result = transpile(
         model, GenerationProgram(max_context=16), tmp_path / "lm",
-        codegen=CodegenConfig(layer_sharing=sharing),
+        codegen=CodegenConfig(layer_sharing=sharing == "auto"),
     )
     if sharing == "auto":
         with zipfile.ZipFile(result.path) as archive:

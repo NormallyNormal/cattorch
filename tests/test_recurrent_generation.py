@@ -446,7 +446,7 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
 
 def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
     model = make("ssm")
-    emulator, _ = export(model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing="auto"))
+    emulator, _ = export(model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True))
     run(emulator, "cattorch prefill", [3, 1, 4])
     run(emulator, "cattorch decode", [1])
     torch.testing.assert_close(

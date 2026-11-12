@@ -123,7 +123,7 @@ def test_hidden_prefill_skips_the_final_query_projection(tmp_path, monkeypatch):
     import cattorch.transpiler as transpiler
 
     model = nano()
-    options = dict(codegen=CodegenConfig(layer_sharing="off"))
+    options = dict(codegen=CodegenConfig(layer_sharing=False))
     guarded = load_sprite(transpile(
         model, GenerationProgram(max_context=12), tmp_path / "hidden", **options,
     ).path)

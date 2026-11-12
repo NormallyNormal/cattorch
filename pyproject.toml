@@ -36,7 +36,6 @@ Changelog = "https://github.com/NormallyNormal/cattorch/blob/main/CHANGELOG.md"
 
 [project.scripts]
 cattorch = "cattorch.cli:main"
-cattorch-benchmark = "cattorch.benchmark:main"
 
 [tool.setuptools.packages.find]
 include = ["cattorch*"]

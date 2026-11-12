@@ -52,7 +52,7 @@ def build_cases():
             "static_matmul_prune50",
             StaticMatmul(32, 96).eval(),
             matrix_input,
-            _weight_only(FastLayerConfig(pruning=0.5)),
+            _weight_only(FastLayerConfig(block_pruning=0.5)),
         ),
         (
             "static_matmul_rank25",

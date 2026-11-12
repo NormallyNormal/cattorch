@@ -48,7 +48,8 @@ from cattorch.project import build_project
 
 _BENCHMARK_EXPORTS = {
     "analyze_benchmark", "build_benchmark_suite", "build_generation_benchmark_suite",
-    "build_paired_benchmark", "build_storage_benchmark_suite",
+    "build_paired_benchmark", "build_storage_benchmark_suite", "BenchmarkAnalysis",
+    "BenchmarkCase", "StorageBenchmarkCase", "StorageBenchmarkVariant",
 }
 
 
@@ -81,5 +82,6 @@ __all__ = [
     "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project", "ProjectResult",
     "build_paired_benchmark", "build_benchmark_suite", "analyze_benchmark",
     "build_generation_benchmark_suite",
-    "build_storage_benchmark_suite",
+    "build_storage_benchmark_suite", "BenchmarkAnalysis", "BenchmarkCase",
+    "StorageBenchmarkCase", "StorageBenchmarkVariant",
 ]

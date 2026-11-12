@@ -72,7 +72,7 @@ def test_tied_table_read_by_a_third_operation(tmp_path):
 
 def test_tied_table_with_fast_weights_that_change_nothing(tmp_path):
     torch.manual_seed(0)
-    fast = FastConfig(weights=FastLayerConfig(rank=100_000))
+    fast = FastConfig(layers=FastLayerConfig(rank=100_000))
     _check(Tied(), torch.tensor([[7, 3]]), tmp_path / "tied", optimization="fast", fast_config=fast)
 
 
@@ -88,7 +88,7 @@ def test_fast_pruning_of_a_matmul_leaves_other_readers_alone(tmp_path):
     torch.manual_seed(0)
     model = Shared().eval()
     inputs = (torch.tensor([1, 5]), torch.randn(2, 32))
-    fast = FastConfig(weights=FastLayerConfig(pruning=0.5))
+    fast = FastConfig(layers=FastLayerConfig(block_pruning=0.5))
     result = transpile(model, inputs, tmp_path / "shared", optimization="fast", fast_config=fast)
     report = verify(model, inputs, result)
     assert report.outputs[1].max_abs_error == 0
@@ -451,7 +451,7 @@ def test_fast_low_rank_matmul_with_a_variable_length_input(tmp_path):
 
     torch.manual_seed(0)
     model, value = Product().eval(), torch.randn(3, 32)
-    fast = FastConfig(weights=FastLayerConfig(rank=4))
+    fast = FastConfig(layers=FastLayerConfig(rank=4))
     result = transpile(model, value, tmp_path / "low_rank", optimization="fast",
                        fast_config=fast, dynamic={0: (1, 8)})
     report = verify(model, value, result, atol=1e-3)

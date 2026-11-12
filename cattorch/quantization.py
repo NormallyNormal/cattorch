@@ -61,9 +61,9 @@ class QuantizationConfig:
     ``min_quantized_values`` leaves smaller eligible matrices in float16.
     GPTQ additionally uses ``damp_percent`` for positive Hessian diagonal
     damping, ``block_size`` for sequential compensation blocks, and
-    ``min_calibration_rows`` before accepting captured statistics. The only
-    current fallback for an eligible matrix without compatible statistics is
-    symmetric quantization.
+    ``min_calibration_rows`` before accepting captured statistics. An
+    eligible matrix without compatible statistics falls back to symmetric
+    quantization.
 
     ``overrides`` maps a module path or parameter name, as
     ``model.named_parameters()`` spells it, to other settings for the
@@ -82,7 +82,6 @@ class QuantizationConfig:
     damp_percent: float = 0.01
     block_size: int = 128
     min_calibration_rows: int = 128
-    fallback: Literal["symmetric"] = "symmetric"
     overrides: Mapping[str, int | QuantizationOverride | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -109,8 +108,6 @@ class QuantizationConfig:
             or self.damp_percent <= 0
         ):
             raise ValueError("damp_percent must be a positive finite number")
-        if self.fallback != "symmetric":
-            raise ValueError("fallback must be 'symmetric'")
         if not isinstance(self.overrides, Mapping):
             raise TypeError("overrides must be a mapping of names to settings")
         normalized: dict[str, QuantizationOverride] = {}
