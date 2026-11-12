@@ -308,6 +308,42 @@
   same values. The report names such a weight by its attribute
   (`fc.weight`) or as `weight computed from <parameters>`, and the new
   `TensorQuantizationReport.sources` lists its parameters.
+- `verify` works for every kind of export. A tensor-input export takes
+  `adapters`, `quantization`, `storage` and `sig_figs`, as programs did, so an
+  adapted or quantized export can be verified against a model holding the
+  values the sprite stores. A `GenerationProgram` or
+  `RecurrentGenerationProgram` export runs `ProgramCall("prefill", ...)`,
+  `"decode"` and `"reset"` calls in the emulator and compares each call's
+  logits, top-k lists and `cattorch status` with PyTorch, including the
+  statuses invalid calls should give; by default a prefill and a few
+  decodes. `ProgramCallVerifyResult.expected_status` says which status was
+  expected.
+- `analyze` (experimental) takes what `transpile` takes: tensors, an
+  `ExportProgram`, or `None` for the model's markers, including a marked
+  program.
+- `CattorchWarning`, the base class of every warning cattorch emits.
+  `CustomMoEWarning` is one. Every warning an export gives is in its result's
+  `warnings` and is emitted as a `CattorchWarning`: a layer-sharing
+  fallback, a skipped low-rank transform, size warnings, GPTQ fallbacks,
+  a tied weight stored twice, and the others that were only in one channel.
+- `cattorch.INTERFACE_VERSION` is importable from `cattorch`, as the docs
+  promised for `cattorch.interface.INTERFACE_VERSION`.
+- `MarkedProgram`, the named result of `marked_program`; it still unpacks as
+  `model, program`.
+- The command line: `--quantize {4,6,8}`, `--quantize-method` and
+  `--calibration FILE` for quantization, `--optimization`, `--name` and
+  `--sig-figs`; documented exit statuses (0 success, 1 export failed, 2
+  invalid arguments, 3 the sprite didn't match PyTorch); every option shows
+  its default in `--help`. `export` verifies float16, symmetric quantization
+  and `--sig-figs` against the values the sprite stores, with tight
+  tolerances.
+- Generation benchmarks take a `GenerationProgram` or
+  `RecurrentGenerationProgram`, as `transpile` does. Every benchmark builder
+  takes `repeats`, `warmups` and `transpile`'s export options (`fast_config`,
+  `storage`, `quantization`, `calibration`, `sig_figs`, `codegen`,
+  `adapters`, `kernels`), and the storage suite takes `warmups`.
+- `tests/test_stability.py` pins every stable callable's parameters, every
+  stable class's fields, and every command-line option.
 
 ## Performance
 
@@ -1023,6 +1059,35 @@
   instead of 8.5e-3 relative to the output; int4 without GPTQ loses some
   accuracy with the larger groups (4.1% to 4.6% here), which a smaller
   `group_size`, also per layer through `overrides`, recovers.
+- With `dynamic=`, a model using causal attention over a sequence of one
+  token, such as an `[n, 1, d]` input, was rejected as not matching the
+  model; any fixed-shape export of such an input computed the wrong result.
+  A one-token causal mask no longer selects the causal attention kernels.
+- A wrongly shaped example input was reported as a tracing failure with a
+  hint about control flow; the error now says the model raised on inputs of
+  the shapes given, with its own message.
+- `GenerationProgram(method="forward")` was overridden by a `@generate`
+  method; an explicit `method` now wins, and `None` (the default) means the
+  `@generate` method or `forward`.
+- `FastConfig(neuron_pruning=...)` was skipped, with only a log line, for a
+  model `torch.fx` can't trace symbolically, such as every
+  `GenerationProgram` export; it now raises `UnsupportedModelError`.
+- The training-mode warning fired for any model not in evaluation mode; it
+  now fires only when a module whose output depends on the mode (dropout,
+  batch norm, a `forward` reading `self.training`, ...) is in training mode,
+  and names them.
+- Error messages no longer show `None`, `<root>`, graph node names or
+  "exported node" where a module path is available, start in lower case,
+  and say "can't" throughout. A missing step method names
+  `RecurrentGenerationProgram(step=...)`; an entry point without returns, or
+  an append state without a capacity, names the parameter to pass.
+- `transpile_tokenizer(..., scratch_casefold=True)` was ignored for a
+  tokenizer that isn't a SentencePiece model; it now raises `ValueError`.
+- `CharTokenizer`'s check could raise `StopIteration` for a vocabulary
+  holding all of its five probe characters.
+- `cattorch.experimental` no longer exposes a `warnings` attribute.
+- Benchmark analysis rejected kernel benchmarks' `builtin` and `kernel`
+  results as unknown variants.
 
 ## Breaking changes
 
@@ -1098,6 +1163,82 @@
 - `transpile(..., frontend=...)` is removed, with the `torch.export` tracing
   path it selected: `frontend="export"` supported a subset of what FX
   tracing does. Drop the argument; every export is traced with FX.
+- `transpile`: every parameter after `model, example_inputs, output_path`
+  is keyword-only, including `sig_figs` (`transpile(m, x, path, 3)` →
+  `transpile(m, x, path, sig_figs=3)`).
+- `calibration_inputs=`, `calibration_calls=` and `calibration_sequences=`
+  are one parameter, `calibration=`, whose items take the form the export is
+  called with: tensors or tuples, `ProgramCall`s, or `[1, length]` token
+  tensors. GPTQ without it, or it without GPTQ, raises `ValueError` naming
+  the expected form.
+- Generation exports return a `GenerationResult` instead of a
+  `TranspileResult`, the same for KV and recurrent generation: `inputs`
+  describes `cattorch token ids` as `[1, 1..max_context]` (it was `(1, 1)`),
+  `outputs` holds `cattorch logits` as `(vocabulary,)` (it was `(1, 1, V)`
+  for recurrent generation) and the top-k lists, with `max_context`,
+  `vocabulary_size` and `top_k`.
+- `TranspileResult.output` and `.additional_outputs` → `.outputs`, a field;
+  `.output` is a property, `outputs[0]`.
+- `ProjectResult.messages` → `.broadcasts`, which lists each bridge's message
+  followed by its completion broadcast (`NAME run`, `NAME run complete`).
+- `TokenizerResult.tokenizer_type` values `"CharTokenizer"`,
+  `"BPETokenizer"`, `"SentencePieceBPETokenizer"` → `"char"`, `"bpe"`,
+  `"sentencepiece-bpe"`.
+- `ProgramCallVerifyResult.states`, a tuple of `(name, VerifyResult)` pairs →
+  a mapping from state name to `VerifyResult`.
+- `build_project(output_path, model, ...)` → `build_project(model,
+  output_path, ...)`, as `transpile` and the other builders take them.
+- `RecurrentGenerationProgram(max_tokens=)` → `max_context=`, the name
+  `GenerationProgram`, the sprite's `cattorch max context` and the command
+  line use.
+- `GenerationProgram.method` defaults to `None` instead of `"forward"`.
+- `@entrypoint(inputs=, outputs=, example=)` → `input_names=`,
+  `output_names=`, `example_inputs=`, so "inputs" means tensors everywhere.
+  The class marker `@example(...)` → `@example_inputs(...)`, the term
+  `transpile` and `verify` use.
+- `Input(dynamic=)` and `@entrypoint(dynamic=)` take the same per-dimension
+  form as `transpile(dynamic=)`: `{dimension: (minimum, maximum)}`, with
+  `(minimum, maximum)` short for the first dimension. `Input.dynamic` holds
+  the long form (`Input("x", t, dynamic=(1, 8)).dynamic == {0: (1, 8)}`), and
+  an entry point's input can now vary in a later dimension.
+- `marked_program` returns a `MarkedProgram` named tuple instead of a plain
+  tuple; unpacking still works.
+- Error classes follow one rule: invalid arguments raise `TypeError` or
+  `ValueError`; a model that can't be exported as it is raises
+  `UnsupportedModelError`; only an operation with no lowering raises
+  `UnsupportedOperationError`. A `GenerationProgram` requirement a model
+  doesn't meet (such as `cumsum` over the sequence, or attention cattorch
+  doesn't recognise) was an `UnsupportedOperationError` and is an
+  `UnsupportedModelError`. The `UnsupportedOperationError` message no
+  longer names the graph node (`node_name` stays an attribute).
+- `FastConfig.weights` → `FastConfig.layers`, and `FastLayerConfig.pruning` →
+  `FastLayerConfig.block_pruning`, beside `FastConfig.neuron_pruning`.
+- `CodegenConfig(layer_sharing="auto" | "off")` → `layer_sharing=True |
+  False`, like its other switches. The fallback when layers can't be shared
+  is a warning in `result.warnings` instead of a log line.
+- `QuantizationConfig.fallback` is removed; its only value was the
+  behaviour, and a field can be added back when there is a second.
+- Benchmark builders: `iterations=` → `repeats=` (`build_paired_benchmark`
+  already said `repeats`); `sig_figs` and the other export options are
+  keyword-only, after `repeats` and `warmups`. `build_generation_benchmark_suite`
+  cases are `(name, model, program, prompt)` instead of `(name, model,
+  stateless_input, prompt)`. `analyze_benchmark` returns a
+  `BenchmarkAnalysis` dataclass, with `BenchmarkCase`,
+  `StorageBenchmarkCase` and `StorageBenchmarkVariant`, instead of a dict;
+  a case's seconds are per call, not per timed total. Benchmark projects
+  name their broadcasts and helper blocks `_cattorch ...`, and their stage
+  variable `cattorch benchmark iterations` is `cattorch benchmark repeats`.
+- The `cattorch-benchmark` script is removed; `cattorch analyze-benchmark
+  PROJECT` does the same, printing `BenchmarkAnalysis`'s fields.
+- Command line: `--precision {float32,float16,int8,int4}` →
+  `--precision {float32,float16}` for storage plus `--quantize {4,6,8}` for
+  quantization; `--fast` → `--optimization fast`; `--eos` →
+  `--eos-token-id`. Invalid arguments exit with status 2 (cattorch's own
+  argument checks exited with 1), and a failed verification with 3 (it was
+  1). The JSON summary uses result field names: `sprite` → `path`, `blocks`
+  → `block_count`, `verified` → `verify.passed`, `max_abs_error` →
+  `verify.max_abs_error`, `project` and `tokenizer` → objects with `path`;
+  `tokenizer_error` → `tokenizer.error`.
 
 # 0.5.0 - 2026-09-14
 
