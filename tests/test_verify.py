@@ -19,13 +19,12 @@ class Outputs(torch.nn.Module):
         return self.function(value)
 
 
-@pytest.mark.parametrize("frontend", ["fx", "export"])
 @pytest.mark.parametrize("use_path", [False, True])
-def test_verify_nested_outputs_in_export_order(tmp_path, frontend, use_path):
+def test_verify_nested_outputs_in_export_order(tmp_path, use_path):
     model = Outputs(lambda x: {"z": x, "a": (-x, [x.mean(dim=1), x])})
     value = torch.tensor([[1.0, 2.0, 3.0], [-4.0, 5.0, -6.0]])
     artifact = transpile(
-        model, value, tmp_path / "nested", frontend=frontend,
+        model, value, tmp_path / "nested",
         codegen=CodegenConfig(compact_internal_names=True),
     )
     result = verify(model, value, artifact.path if use_path else artifact)

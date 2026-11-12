@@ -1555,7 +1555,7 @@ def quantize_model(
             object.__setattr__(
                 family, "_gptq_captured_template",
                 capture_model(
-                    family.template, (family.example_input,), frontend="fx",
+                    family.template, (family.example_input,),
                 ),
             )
     capture = _GPTQCaptureMode(

@@ -25,7 +25,7 @@ Where things live:
 
 | Module | Responsibility |
 |---|---|
-| `cattorch.frontend` | Turns FX and `torch.export` traces into one graph format. |
+| `cattorch.frontend` | Traces the model with FX and normalizes the graph. |
 | `cattorch.graph` | Constant folding, aliases, validation, and recognizing fusable patterns. |
 | `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
 | `cattorch.transpiler` | Turns graph nodes into instruction programs. |

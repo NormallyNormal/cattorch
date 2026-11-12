@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from cattorch import interface
-import contextlib
 import json
 import sys
 import zipfile
@@ -676,7 +675,6 @@ class Broken(GRULM):
     ({"top_k": 17}, ValueError, r"top_k \(17\) exceeds output size \(16\)"),
     ({"dynamic": {0: (1, 4)}}, ValueError, "dynamic= can't be used with a RecurrentGenerationProgram"),
     ({"example_kwargs": {}}, ValueError, "example_kwargs cannot be used with a RecurrentGenerationProgram"),
-    ({"frontend": "export"}, ValueError, "RecurrentGenerationProgram is supported only by the FX"),
     ({"calibration_inputs": [torch.zeros(1, 2)]}, ValueError,
      "RecurrentGenerationProgram uses calibration_sequences instead of calibration_inputs"),
     ({"calibration_calls": ()}, ValueError, "calibration_calls require an ExportProgram"),
@@ -700,10 +698,8 @@ class Broken(GRULM):
 def test_export_validation(tmp_path, options, error, message):
     torch.manual_seed(0)
     model = Broken().eval()
-    deprecated = options.get("frontend") == "export"
-    with pytest.warns(DeprecationWarning) if deprecated else contextlib.nullcontext():
-        with pytest.raises(error, match=message):
-            export(model, tmp_path / "broken", **options)
+    with pytest.raises(error, match=message):
+        export(model, tmp_path / "broken", **options)
 
 
 def max_error(emulator, model, tokens):

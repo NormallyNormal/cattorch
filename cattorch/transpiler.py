@@ -3,7 +3,6 @@ import math
 import re
 import operator
 import dataclasses
-import warnings
 import weakref
 from collections import Counter
 from dataclasses import replace
@@ -16,7 +15,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
-from cattorch.frontend import Frontend, flat_example_inputs, keep_operations
+from cattorch.frontend import flat_example_inputs, keep_operations
 from cattorch.graph import (
     _NOOP_OPS,
     _GenerationSpec,
@@ -2032,7 +2031,6 @@ def transpile(
     quantization: QuantizationConfig | None = None,
     calibration_inputs: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
     codegen: CodegenConfig | None = None,
-    frontend: Frontend = "fx",
     adapters: tuple[ModuleAdapter, ...] = (),
     calibration_calls: tuple[ProgramCall, ...] | None = None,
     calibration_sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
@@ -2083,10 +2081,6 @@ def transpile(
     codegen:
         Expanded-JSON budget, loop-unrolling, compact-ID, and optional
         structural-compaction policy.
-    frontend:
-        How the model is traced. ``"fx"`` (default) uses FX tracing.
-        ``"export"`` uses ``torch.export``; it is deprecated, supports fewer
-        operations, and will be removed in 2.0. Programs require ``"fx"``.
     adapters:
         Scoped module adapters for an ``ExportProgram``,
         ``GenerationProgram`` or ``RecurrentGenerationProgram``. They apply to
@@ -2129,17 +2123,9 @@ def transpile(
         quantization=quantization,
         codegen=codegen,
         sig_figs=sig_figs,
-        frontend=frontend,
         adapters=adapters,
         example_kwargs=example_kwargs,
     )
-    if frontend == "export":
-        warnings.warn(
-            "frontend='export' is deprecated and will be removed in cattorch 2.0; "
-            "the default frontend='fx' supports every model it does, and more",
-            DeprecationWarning,
-            stacklevel=2,
-        )
     kernels = validate_kernels(kernels)
     kept = active_kernel_targets(
         kernels,
@@ -2159,7 +2145,6 @@ def transpile(
             quantization=quantization,
             calibration_inputs=calibration_inputs,
             codegen=codegen,
-            frontend=frontend,
             adapters=adapters,
             calibration_calls=calibration_calls,
             calibration_sequences=calibration_sequences,
@@ -2284,7 +2269,6 @@ def _transpile_any(
     quantization,
     calibration_inputs,
     codegen,
-    frontend,
     adapters,
     calibration_calls,
     calibration_sequences,
@@ -2338,8 +2322,6 @@ def _transpile_any(
     if example_kwargs is not None and isinstance(example_inputs, RecurrentGenerationProgram):
         raise ValueError("example_kwargs cannot be used with a RecurrentGenerationProgram")
     if isinstance(example_inputs, ExportProgram):
-        if frontend != "fx":
-            raise ValueError("ExportProgram is supported only by the FX frontend")
         if calibration_inputs is not None:
             raise ValueError("ExportProgram uses calibration_calls instead of calibration_inputs")
         if calibration_sequences is not None:
@@ -2364,8 +2346,6 @@ def _transpile_any(
             kernels=kernels,
         )
     if isinstance(example_inputs, GenerationProgram):
-        if frontend != "fx":
-            raise ValueError("GenerationProgram is supported only by the FX frontend")
         if calibration_calls is not None:
             raise ValueError("calibration_calls require an ExportProgram")
         if calibration_inputs is not None:
@@ -2401,8 +2381,6 @@ def _transpile_any(
             registry=registry,
         )
     if isinstance(example_inputs, RecurrentGenerationProgram):
-        if frontend != "fx":
-            raise ValueError("RecurrentGenerationProgram is supported only by the FX frontend")
         if calibration_calls is not None:
             raise ValueError("calibration_calls require an ExportProgram")
         if calibration_inputs is not None:
@@ -2447,7 +2425,6 @@ def _transpile_any(
             quantization=quantization,
             calibration_inputs=calibration_inputs,
             codegen=codegen,
-            frontend=frontend,
             example_kwargs=example_kwargs,
             kernels=kernels,
             adapters=adapters,
@@ -2465,7 +2442,6 @@ def _transpile_any(
         quantization=quantization,
         calibration_inputs=calibration_inputs,
         codegen=codegen,
-        frontend=frontend,
         example_kwargs=example_kwargs,
         _registry=_registry_with(kernels, adapters) if kernels or adapters else None,
     )
@@ -2566,7 +2542,6 @@ def _transpile_automatic_generation(
         generation=spec,
         storage=storage,
         quantization=quantization,
-        frontend="fx",
         _registry=registry,
         _prepared_model=True,
         _prepared_quantization_report=report,
@@ -2612,7 +2587,6 @@ def _transpile(
     quantization: QuantizationConfig | None = None,
     calibration_inputs: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
     codegen: CodegenConfig | None = None,
-    frontend: Frontend = "fx",
     example_kwargs: dict[str, Any] | None = None,
     _registry: OperatorRegistry | None = None,
     _prepared_model: bool = False,
@@ -2692,7 +2666,6 @@ def _transpile(
         optimization=optimization,
         fast_config=config,
         generation=generation,
-        frontend=frontend,
         _registry=registry,
         dynamic_inputs=_dynamic_inputs,
         example_kwargs=example_kwargs,

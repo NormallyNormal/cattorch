@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import cattorch.frontend as frontend_module
 
 from cattorch import (
     CodegenConfig,
@@ -51,31 +50,6 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.instruction import optimized_linear
 from cattorch.interface import TOKEN_IDS
-
-
-def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
-    config = torch._dynamo.config
-    names = [
-        name
-        for name in (
-            "cache_size_limit",
-            "recompile_limit",
-            "accumulated_cache_size_limit",
-        )
-        if hasattr(config, name)
-    ]
-    observed = {}
-
-    def fake_export(model, inputs, kwargs=None):
-        observed.update({name: getattr(config, name) for name in names})
-        return "exported"
-
-    monkeypatch.setattr(frontend_module, "export", fake_export)
-    with config.patch(**{name: 1 for name in names}):
-        assert frontend_module._export_model(nn.Identity(), (torch.ones(1),)) == "exported"
-        assert all(getattr(config, name) == 1 for name in names)
-
-    assert all(value >= 1024 for value in observed.values())
 
 
 class LinearActivation(nn.Module):

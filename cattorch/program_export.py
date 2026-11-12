@@ -752,7 +752,6 @@ def transpile_program(
                 quantization=quantization,
                 calibration_inputs=None,
                 codegen=sub_codegen,
-                frontend="fx",
                 _registry=registry,
                 _prepared_model=True,
                 _prepared_quantization_report=quantization_report,

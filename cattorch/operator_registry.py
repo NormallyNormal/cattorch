@@ -986,7 +986,7 @@ def _observe_routed_family(value, ids, banks, handle):
     captured = getattr(family, "_gptq_captured_template", None)
     if captured is None:
         captured = capture_model(
-            family.template, (family.example_input,), frontend="fx",
+            family.template, (family.example_input,),
         )
     template_state = {}
     template_state.update(dict(

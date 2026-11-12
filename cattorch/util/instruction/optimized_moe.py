@@ -443,7 +443,7 @@ def expert_program(
     """
     from cattorch.frontend import capture_model
 
-    captured = capture_model(family.template.eval(), (family.example_input,), frontend="fx")
+    captured = capture_model(family.template.eval(), (family.example_input,))
     state_banks = _expert_state_banks(family, captured, bank_lists)
     nodes = list(captured.graph.nodes)
     placeholder = next(node for node in nodes if node.op == "placeholder")

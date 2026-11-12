@@ -314,7 +314,6 @@ Experts that receive too little data fall back to symmetric quantization; see
 
 ## Limitations
 
-- Programs require the FX frontend (`frontend="fx"`, the default).
 - Adapters must return PyTorch modules; they can't emit Scratch blocks directly.
 - State can't be updated in place by index.
 - Training and autograd aren't supported.

@@ -1024,13 +1024,6 @@
   accuracy with the larger groups (4.1% to 4.6% here), which a smaller
   `group_size`, also per layer through `overrides`, recovers.
 
-## Deprecations
-
-- `transpile(..., frontend="export")` is deprecated and will be removed in
-  2.0. It supports a subset of what the default `frontend="fx"` does, without
-  its decompositions and pattern recognition. It now warns with a
-  `DeprecationWarning`.
-
 ## Breaking changes
 
 - cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from
@@ -1102,6 +1095,9 @@
   `decode bits`, `add copy 0`), and `CodegenConfig(compact_internal_names=True)`
   names them `_v0`, `_l0` and `_p0`. The `build_project` demo's blocks are
   `_cattorch demo ...`.
+- `transpile(..., frontend=...)` is removed, with the `torch.export` tracing
+  path it selected: `frontend="export"` supported a subset of what FX
+  tracing does. Drop the argument; every export is traced with FX.
 
 # 0.5.0 - 2026-09-14
 

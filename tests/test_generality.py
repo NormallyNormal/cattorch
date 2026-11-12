@@ -467,17 +467,6 @@ def test_tensor_keyword_becomes_next_input(tmp_path):
     assert verify(model, (x,), result, example_kwargs=kwargs).passed
 
 
-def test_tensor_keyword_with_export_frontend(tmp_path):
-    x, mask = torch.randn(2, 4), torch.ones(1, 4)
-    kwargs = {"mask": mask}
-    model = KeywordMask().eval()
-    with pytest.warns(DeprecationWarning):
-        result = transpile(
-            model, (x,), tmp_path / "model", example_kwargs=kwargs, frontend="export",
-        )
-    assert verify(model, (x,), result, example_kwargs=kwargs).passed
-
-
 class DictOutputs(nn.Module):
     def __init__(self, kind):
         super().__init__()

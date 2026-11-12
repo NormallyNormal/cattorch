@@ -144,7 +144,7 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
         args, dynamic_inputs = entry_examples(program, entrypoint)
         wrapper = MethodModule(owned, entrypoint.method)
         with _expert_family_context(registry.expert_families):
-            captured = capture_model(wrapper, args, frontend="fx")
+            captured = capture_model(wrapper, args)
         counts = Counter(
             str(node.target) for node in captured.graph.nodes if node.op == "call_function"
         )

@@ -1,4 +1,4 @@
-"""Graph capture backends normalized into cattorch's internal contract."""
+"""Graph capture (FX tracing) normalized into cattorch's internal contract."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
-from typing import Callable, Literal
+from typing import Callable
 
 import contextlib
 import functools
@@ -20,7 +20,6 @@ import torch
 from torch.fx import Graph, GraphModule, Node
 import torch.fx.experimental.proxy_tensor as proxy_tensor
 from torch.fx.experimental.proxy_tensor import make_fx
-from torch.export import export
 from torch.utils._pytree import tree_flatten
 from torch._decomp import core_aten_decompositions, get_decompositions
 
@@ -30,19 +29,17 @@ from cattorch.errors import UnsupportedModelError
 
 log = logging.getLogger(__name__)
 
-Frontend = Literal["fx", "export"]
 _CAPTURE_LOCK = RLock()
 
 
 @dataclass(frozen=True)
 class CapturedGraph:
-    """Frontend-neutral graph and model interface consumed by analysis.
+    """Traced graph and model interface consumed by analysis.
 
-    Parameters and buffers are normalized into ``state_inputs`` regardless of
-    whether the frontend represented them as placeholders or ``get_attr``
-    nodes. ``user_output_names`` contains one entry per returned pytree leaf;
-    ``None`` marks a non-node leaf so the common analyzer can report the same
-    unsupported-output error for every frontend.
+    Parameters and buffers are collected into ``state_inputs`` from their
+    ``get_attr`` nodes. ``user_output_names`` contains one entry per returned
+    pytree leaf; ``None`` marks a non-node leaf so the analyzer can report an
+    unsupported output.
     """
 
     graph: Graph
@@ -50,7 +47,6 @@ class CapturedGraph:
     state_inputs: dict[str, torch.Tensor]
     user_input_names: frozenset[str]
     user_output_names: tuple[str | None, ...]
-    frontend: Frontend
 
 
 def flat_example_inputs(example_inputs, example_kwargs=None) -> tuple[torch.Tensor, ...]:
@@ -99,77 +95,6 @@ def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
             stacklevel=2,
         )
     return leaves
-
-
-def _export_model(model, example_inputs, example_kwargs=None):
-    """Export without inheriting old TorchDynamo's tiny process-wide limit."""
-    config = getattr(getattr(torch, "_dynamo", None), "config", None)
-    overrides = {}
-    if config is not None:
-        for name in (
-            "cache_size_limit",
-            "recompile_limit",
-            "accumulated_cache_size_limit",
-        ):
-            value = getattr(config, name, None)
-            if isinstance(value, int) and value < 1024:
-                overrides[name] = 1024
-    if overrides and hasattr(config, "patch"):
-        with config.patch(**overrides):
-            return export(model, example_inputs, example_kwargs or None)
-    return export(model, example_inputs, example_kwargs or None)
-
-
-def _capture_export(model, example_inputs, example_kwargs=None) -> CapturedGraph:
-    try:
-        exported = _export_model(model, example_inputs, example_kwargs)
-    except Exception as exc:
-        raise UnsupportedModelError(
-            f"torch.export could not trace this model ({type(exc).__name__}: "
-            f"{str(exc).splitlines()[0] if str(exc) else ''}); a common cause is "
-            "control flow that depends on tensor values. The default frontend='fx' "
-            "supports more models"
-        ) from exc
-    symbolic = (torch.SymInt, torch.SymFloat, torch.SymBool)
-    if any(isinstance(node.meta.get("val"), symbolic) for node in exported.graph.nodes):
-        raise UnsupportedModelError(
-            "torch.export traced a value read from a tensor, such as .item(); "
-            "Scratch can't use it as a number at export. Keep the computation in "
-            "tensor operations"
-        )
-    state_inputs: dict[str, torch.Tensor] = {}
-    user_inputs: set[str] = set()
-    constants = getattr(exported, "constants", {})
-    for spec in exported.graph_signature.input_specs:
-        argument_name = getattr(spec.arg, "name", None)
-        if argument_name is None:
-            continue
-        kind = getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
-        if kind == "USER_INPUT":
-            user_inputs.add(argument_name)
-            continue
-        target = spec.target
-        if target in exported.state_dict:
-            state_inputs[argument_name] = exported.state_dict[target]
-        elif target in constants:
-            state_inputs[argument_name] = constants[target]
-
-    user_outputs = tuple(
-        getattr(spec.arg, "name", None)
-        for spec in exported.graph_signature.output_specs
-        if getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
-        == "USER_OUTPUT"
-    )
-    captured = CapturedGraph(
-        graph=exported.graph,
-        graph_module=exported.graph_module,
-        state_inputs=state_inputs,
-        user_input_names=frozenset(user_inputs),
-        user_output_names=user_outputs,
-        frontend="export",
-    )
-    _check_input_count(captured, example_inputs, example_kwargs)
-    return captured
 
 
 def _resolve_attr(module: GraphModule, target: str):
@@ -995,7 +920,6 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
             node.name for node in nodes if node.op == "placeholder"
         ),
         user_output_names=output_names,
-        frontend="fx",
     )
     _check_input_count(captured, example_inputs, example_kwargs)
     return captured
@@ -1037,24 +961,18 @@ def _check_input_count(captured: CapturedGraph, example_inputs, example_kwargs) 
         )
 
 
-def capture_model(
-    model, example_inputs, *, frontend: Frontend = "fx", example_kwargs=None,
-) -> CapturedGraph:
-    """Capture ``model`` and normalize frontend-specific state and outputs."""
+def capture_model(model, example_inputs, *, example_kwargs=None) -> CapturedGraph:
+    """Trace ``model`` with FX and normalize its state and outputs."""
     example_inputs, example_kwargs = distinct_example_inputs(example_inputs, example_kwargs)
     # ProxyTensor and TorchDynamo both manipulate process-global tracing state.
     # Concurrent captures can therefore corrupt one another even for unrelated
     # models. Serializing this short export-only phase makes the public API safe
     # to call from worker threads; RLock also permits internal nested captures.
     with _CAPTURE_LOCK:
-        if frontend == "fx":
-            return _capture_fx(model, example_inputs, example_kwargs)
-        if frontend == "export":
-            return _capture_export(model, example_inputs, example_kwargs)
-        raise ValueError(f"frontend must be 'fx' or 'export', got {frontend!r}")
+        return _capture_fx(model, example_inputs, example_kwargs)
 
 
 __all__ = [
-    "CapturedGraph", "Frontend", "capture_model", "flat_example_inputs",
+    "CapturedGraph", "capture_model", "flat_example_inputs",
     "tensor_output_leaves",
 ]

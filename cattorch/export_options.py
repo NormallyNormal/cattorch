@@ -16,7 +16,6 @@ def validate_export_options(
     quantization=None,
     codegen=None,
     sig_figs=None,
-    frontend="fx",
     adapters=(),
     example_kwargs=None,
 ) -> None:
@@ -24,8 +23,6 @@ def validate_export_options(
         raise ValueError("name must be a non-empty string")
     if optimization not in {"exact", "fast"}:
         raise ValueError(f"optimization must be 'exact' or 'fast', got {optimization!r}")
-    if frontend not in {"fx", "export"}:
-        raise ValueError(f"frontend must be 'fx' or 'export', got {frontend!r}")
     if optimization != "fast" and fast_config is not None:
         raise ValueError("fast_config can only be used with optimization='fast'")
     for label, value, expected in (

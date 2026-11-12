@@ -5,7 +5,7 @@
 Problems usually happen at one of three stages:
 
 1. **Tracing.** PyTorch couldn't trace the model's Python code. The exception
-   or its cause comes from `torch.fx` or `torch.export`.
+   or its cause comes from `torch.fx`.
 2. **Conversion.** cattorch traced the model but can't convert an operation.
    The exception is an `UnsupportedOperationError` or `UnsupportedModelError`.
 3. **Running in Scratch.** The sprite exported but doesn't work in a project.

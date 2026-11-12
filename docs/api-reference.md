@@ -32,7 +32,6 @@ transpile(
     quantization=None,
     calibration_inputs=None,
     codegen=None,
-    frontend="fx",
     adapters=(),
     calibration_calls=None,
     calibration_sequences=None,
@@ -55,7 +54,6 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 | `quantization` | A `QuantizationConfig` for symmetric or GPTQ integer weights. Don't combine with an integer `StorageConfig.precision`. |
 | `calibration_inputs` | Iterable of tensors or tensor tuples for GPTQ with tensor inputs. Read once. Only valid with `method="gptq"`. |
 | `codegen` | A `CodegenConfig` for JSON size target, loop unrolling, IDs, and compaction. |
-| `frontend` | How the model is traced: `"fx"` (default) or `"export"` (`torch.export`). `"export"` is deprecated and will be removed in 2.0. It supports fewer operations: integer indexing such as `x[:, 0]`, `cumsum`, `topk`, attention, and recurrent layers need `"fx"`, as do programs. |
 | `adapters` | `ModuleAdapter`s that replace module types for this export. |
 | `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
 | `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram` or `RecurrentGenerationProgram` (`[1, length]` tensors for the latter). |

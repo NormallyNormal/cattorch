@@ -117,7 +117,7 @@ def _expert_graph_signature(module: nn.Module, example_input: torch.Tensor) -> t
     """Capture scalar constants and dataflow, ignoring parameter values."""
     from cattorch.frontend import capture_model
 
-    captured = capture_model(module, (example_input,), frontend="fx")
+    captured = capture_model(module, (example_input,))
     named_state = {}
     named_state.update(dict(module.named_parameters(remove_duplicate=False)))
     named_state.update(dict(module.named_buffers(remove_duplicate=False)))
@@ -641,7 +641,7 @@ def _specialize_sparse_swiglu(source: "SparseMoE") -> "StackedSwiGLUMoE | None":
 
     try:
         router_graph = capture_model(
-            source.router.eval(), (source.expert_family.example_input,), frontend="fx",
+            source.router.eval(), (source.expert_family.example_input,),
         )
         router_calls = [
             node for node in router_graph.graph.nodes if node.op == "call_function"
@@ -661,7 +661,7 @@ def _specialize_sparse_swiglu(source: "SparseMoE") -> "StackedSwiGLUMoE | None":
 
         family = source.expert_family
         expert_graph = capture_model(
-            family.template.eval(), (family.example_input,), frontend="fx",
+            family.template.eval(), (family.example_input,),
         )
         calls = [node for node in expert_graph.graph.nodes if node.op == "call_function"]
         linears = [node for node in calls if str(node.target) == "aten.linear.default"]

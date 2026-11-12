@@ -13,7 +13,7 @@ import torch
 
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
-from cattorch.frontend import FALLBACK_META, CapturedGraph, Frontend, capture_model
+from cattorch.frontend import FALLBACK_META, CapturedGraph, capture_model
 from cattorch.results import _tensor_spec
 from cattorch.operator_registry import (
     ELEMENTWISE_OPS, MATMUL_OPS, OperatorRegistry, default_registry,
@@ -920,7 +920,7 @@ _RUNTIME_END = 2**63 - 1
 
 
 def _length_literals(
-    model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend, items=2,
+    model, example_inputs, example_kwargs, dynamic_inputs, captured, items=2,
     protected=frozenset(),
 ):
     """Literal arguments that change when each dynamic input has ``items`` items.
@@ -947,8 +947,7 @@ def _length_literals(
     keywords.update(zip(names, values[len(example_inputs):]))
     try:
         longer = capture_model(
-            model, tuple(values[:len(example_inputs)]), frontend=frontend,
-            example_kwargs=keywords or None,
+            model, tuple(values[:len(example_inputs)]), example_kwargs=keywords or None,
         )
     except Exception:  # noqa: BLE001 - without a second trace, literals stay as traced
         return None
@@ -1554,7 +1553,7 @@ class _RuntimeAxes:
 
 
 def _propagate_runtime_axes(
-    captured, nodes, dynamic_inputs, *, model, example_inputs, example_kwargs, frontend,
+    captured, nodes, dynamic_inputs, *, model, example_inputs, example_kwargs,
     registry, fast, fast_config,
 ) -> _RuntimeAxes:
     """Follow each variable-length input through the graph.
@@ -1595,7 +1594,7 @@ def _propagate_runtime_axes(
     if dynamic_inputs:
         with _expert_family_context(registry.expert_families):
             length_literals = _length_literals(
-                model, example_inputs, example_kwargs, dynamic_inputs, captured, frontend,
+                model, example_inputs, example_kwargs, dynamic_inputs, captured,
                 protected=registry.replaced_targets(fast=fast, config=fast_config),
             )
             # A third trace tells how arithmetic constants depend on the length.
@@ -1605,7 +1604,7 @@ def _propagate_runtime_axes(
             ):
                 third_literals = _length_literals(
                     model, example_inputs, example_kwargs, dynamic_inputs, captured,
-                    frontend, items=3,
+                    items=3,
                     protected=registry.replaced_targets(fast=fast, config=fast_config),
                 ) or {}
     graph = captured.graph
@@ -2556,7 +2555,6 @@ def _prepare_graph(
     optimization: Literal["exact", "fast"] = "exact",
     fast_config: FastConfig | None = None,
     generation: _GenerationSpec | None = None,
-    frontend: Frontend = "fx",
     _registry: OperatorRegistry | None = None,
     dynamic_inputs: dict[int, tuple[str, int, int]] | None = None,
     example_kwargs: dict | None = None,
@@ -2575,7 +2573,7 @@ def _prepare_graph(
     from cattorch.experts import _expert_family_context
     with _expert_family_context(registry.expert_families):
         captured = _captured or capture_model(
-            model, example_inputs, frontend=frontend, example_kwargs=example_kwargs,
+            model, example_inputs, example_kwargs=example_kwargs,
         )
     protected = registry.replaced_targets(fast=fast, config=fast_config)
     _normalize_graph(captured.graph, protected, _dynamic_placeholders(captured, dynamic_inputs))
@@ -2591,7 +2589,7 @@ def _prepare_graph(
     runtime_axes = _propagate_runtime_axes(
         captured, list(captured.graph.nodes), dynamic_inputs or {},
         model=model, example_inputs=example_inputs, example_kwargs=example_kwargs,
-        frontend=frontend, registry=registry, fast=fast, fast_config=fast_config,
+        registry=registry, fast=fast, fast_config=fast_config,
     )
     nodes = list(captured.graph.nodes)
     node_order = {node.name: index for index, node in enumerate(nodes)}

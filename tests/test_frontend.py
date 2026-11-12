@@ -31,29 +31,16 @@ class StatefulModel(nn.Module):
         return torch.relu(value @ self.weight + self.bias + self.constant + residual)
 
 
-@pytest.mark.parametrize("frontend", ["fx", "export"])
-def test_frontends_lower_parameters_buffers_constants_and_multiple_inputs(tmp_path, frontend):
+def test_parameters_buffers_constants_and_multiple_inputs_are_lowered(tmp_path):
     torch.manual_seed(123)
     model = StatefulModel().eval()
     inputs = (torch.randn(2, 4), torch.randn(2, 4))
-    result = transpile(model, inputs, tmp_path / frontend, frontend=frontend)
+    result = transpile(model, inputs, tmp_path / "model")
 
     comparison = verify(model, inputs, result, atol=2e-4)
     assert comparison.passed, comparison
     assert tuple(item.list_name for item in result.inputs) == ("input", "input_1")
     assert result.output.shape == (2, 4)
-
-
-def test_frontends_have_equivalent_public_interfaces(tmp_path):
-    model = StatefulModel().eval()
-    inputs = (torch.randn(2, 4), torch.randn(2, 4))
-    fx = transpile(model, inputs, tmp_path / "fx", frontend="fx")
-    with pytest.warns(DeprecationWarning, match="frontend='export' is deprecated"):
-        exported = transpile(model, inputs, tmp_path / "export", frontend="export")
-
-    assert fx.inputs == exported.inputs
-    assert fx.output == exported.output
-    assert set(fx.procedures) == set(exported.procedures)
 
 
 class NestedLinear(nn.Module):
@@ -66,7 +53,7 @@ class NestedLinear(nn.Module):
 
 
 def test_fx_capture_preserves_nested_module_context():
-    captured = capture_model(NestedLinear().eval(), (torch.randn(1, 3),), frontend="fx")
+    captured = capture_model(NestedLinear().eval(), (torch.randn(1, 3),))
     linear = next(node for node in captured.graph.nodes if str(node.target) == "aten.linear.default")
     paths = [entry[0] for entry in linear.meta["nn_module_stack"].values()]
     assert "stack.0" in paths
@@ -90,7 +77,7 @@ def test_public_capture_serializes_process_global_tracing_state(monkeypatch):
     monkeypatch.setattr(frontend_module, "_capture_fx", fake_capture)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(
-            lambda index: capture_model(index, (index,), frontend="fx"),
+            lambda index: capture_model(index, (index,)),
             range(8),
         ))
 
@@ -98,15 +85,14 @@ def test_public_capture_serializes_process_global_tracing_state(monkeypatch):
     assert maximum == 1
 
 
-@pytest.mark.parametrize("frontend", ["fx", "export"])
-def test_frontends_preserve_multiple_tensor_outputs(tmp_path, frontend):
+def test_multiple_tensor_outputs_are_preserved(tmp_path):
     class Multiple(nn.Module):
         def forward(self, value):
             return value, -value
 
     value = torch.ones(2)
     result = transpile(
-        Multiple().eval(), value, tmp_path / f"multiple-{frontend}", frontend=frontend,
+        Multiple().eval(), value, tmp_path / "multiple",
     )
     assert tuple(output.list_name for output in result.outputs) == ("output", "output_1")
     assert all(output.shape == (2,) for output in result.outputs)
@@ -225,11 +211,6 @@ def test_positive_strided_slice_lowers_without_an_index_map(tmp_path):
     value = torch.randn(3, 7)
     result = transpile(model, value, tmp_path / "strided")
     assert verify(model, value, result).passed
-
-
-def test_frontend_argument_is_validated(tmp_path):
-    with pytest.raises(ValueError, match="frontend must be"):
-        transpile(nn.Identity(), torch.ones(1), tmp_path / "bad", frontend="other")
 
 
 class RouterUpdate(nn.Module):
@@ -463,15 +444,14 @@ class TwoInputsAndBuffer(nn.Module):
         return 2 * value + residual * scale + self.offset
 
 
-@pytest.mark.parametrize("frontend", ["fx", "export"])
-def test_one_tensor_passed_as_several_arguments_traces_one_input_each(tmp_path, frontend):
+def test_one_tensor_passed_as_several_arguments_traces_one_input_each(tmp_path):
     # The tracer knows tensors by identity: the same object as two inputs,
     # or a buffer of the model as an input, must still give each argument
     # its own input list.
     model = TwoInputsAndBuffer().eval()
     shared = model.offset
     result = transpile(
-        model, (shared, shared), tmp_path / frontend, frontend=frontend,
+        model, (shared, shared), tmp_path / "model",
         example_kwargs={"scale": shared},
     )
     distinct = (torch.tensor([0.5, 1.0, 2.0]), torch.tensor([-1.0, 4.0, 0.0]))

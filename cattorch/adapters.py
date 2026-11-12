@@ -1,4 +1,4 @@
-"""Scoped public module adaptation for the experimental FX frontend."""
+"""Scoped public module adaptation, applied to an export-owned copy of the model."""
 
 from __future__ import annotations
 
