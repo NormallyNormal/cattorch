@@ -29,17 +29,17 @@ class Tally(nn.Module):
         self.register_buffer("total", torch.zeros(3))
         self.register_buffer("seen", torch.zeros(0, 3))
 
-    @entrypoint(example=lambda: (torch.ones(3),))
+    @entrypoint(example_inputs=lambda: (torch.ones(3),))
     def add(self, value):
         self.total += value
         return self.total.sum()
 
-    @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 8})
+    @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 8})
     def remember(self, row):
         self.seen = torch.cat([self.seen, row.reshape(1, 3)])
         return row.max()
 
-    @entrypoint(outputs=("scores",), example=lambda: (torch.ones(3),))
+    @entrypoint(output_names=("scores",), example_inputs=lambda: (torch.ones(3),))
     def score(self, weights):
         return torch.relu(self.seen @ weights)
 
@@ -92,7 +92,7 @@ command line can export it without being told its shapes:
 ```python
 from cattorch import example
 
-@example(lambda: (torch.zeros(1, 1, 28, 28),))
+@example_inputs(lambda: (torch.zeros(1, 1, 28, 28),))
 class Digits(nn.Module):
     ...
 

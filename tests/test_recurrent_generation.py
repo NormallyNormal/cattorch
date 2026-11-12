@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from cattorch import (
-    CharTokenizer, CodegenConfig, QuantizationConfig, RecurrentGenerationProgram, State,
+    CharTokenizer, CodegenConfig, ProgramCall, QuantizationConfig, RecurrentGenerationProgram,
+    State,
     UnsupportedModelError, build_project, transpile, verify,
 )
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
@@ -181,7 +182,7 @@ def load_sprite(path):
         return json.loads(archive.read("sprite.json"))
 
 
-PROGRAM_FIELDS = {"step", "max_tokens", "hidden_prefill", "top_k", "reference"}
+PROGRAM_FIELDS = {"step", "max_context", "hidden_prefill", "top_k", "reference"}
 
 
 def export(model, path, **options):
@@ -245,8 +246,8 @@ def test_prefill_then_decode_matches_the_stateless_forward(exported):
         "cattorch prepare for save",
     )
     assert result.inputs[0].list_name == TOKEN_IDS
-    assert result.output.list_name == "cattorch logits"
-    assert result.output.numel == expected.shape[1]
+    assert result.outputs[0].list_name == "cattorch logits"
+    assert result.outputs[0].numel == expected.shape[1]
 
 
 def test_prefill_equals_the_same_tokens_decoded_one_by_one(exported):
@@ -279,7 +280,7 @@ def test_reset_restores_the_initial_states(exported):
 
 def test_invalid_tokens_leave_every_state_untouched(exported):
     model, emulator, result = exported
-    vocabulary = result.output.numel
+    vocabulary = result.vocabulary_size
     run(emulator, "cattorch prefill", [1, 2])
     before = states(emulator, model)
     for tokens, status in (
@@ -352,9 +353,9 @@ def test_decode_in_a_freshly_loaded_sprite_fills_constant_states(tmp_path):
     )
 
 
-def test_max_tokens_limits_decode_and_prefill(tmp_path):
+def test_max_context_limits_decode_and_prefill(tmp_path):
     model = make("gru")
-    emulator, _ = export(model, tmp_path / "bounded", max_tokens=3, top_k=2)
+    emulator, _ = export(model, tmp_path / "bounded", max_context=3, top_k=2)
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
     assert run(emulator, "cattorch decode", [3]) == "ok"
@@ -373,12 +374,12 @@ def test_max_tokens_limits_decode_and_prefill(tmp_path):
     )
 
 
-def test_a_max_tokens_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_list_limit):
+def test_a_max_context_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_list_limit):
     # A prompt arrives in the one `cattorch token ids` list, so the buffer that
     # copies it never needs more than a list holds.
     limit = small_list_limit(400)
     model = make("gru")
-    emulator, result = export(model, tmp_path / "long", max_tokens=50 * limit)
+    emulator, result = export(model, tmp_path / "long", max_context=50 * limit)
     assert not [name for name in result.sharded_lists if "prefill" in name]
     assert run(emulator, "cattorch prefill", [1, 2, 3]) == "ok"
 
@@ -562,7 +563,7 @@ def test_reference_must_return_one_row_per_token(tmp_path):
 def test_program_validation():
     state = State("h", torch.zeros(2))
     program = RecurrentGenerationProgram((state,))
-    assert (program.step, program.max_tokens, program.hidden_prefill, program.top_k,
+    assert (program.step, program.max_context, program.hidden_prefill, program.top_k,
             program.reference) == ("step", None, True, None, None)
     assert RecurrentGenerationProgram([state]).states == (state,)
     with pytest.raises(TypeError, match="must be a tuple of State values"):
@@ -575,9 +576,9 @@ def test_program_validation():
          "recurrent state 'log' must be a replace state"),
         ((state,), {"step": " "}, ValueError, "recurrent step must be a non-empty string"),
         ((state,), {"reference": ""}, ValueError, "reference method must be a non-empty string"),
-        ((state,), {"max_tokens": 0}, ValueError, "max_tokens must be positive"),
-        ((state,), {"max_tokens": 2.0}, TypeError, "max_tokens must be an integer or None"),
-        ((state,), {"max_tokens": True}, TypeError, "max_tokens must be an integer or None"),
+        ((state,), {"max_context": 0}, ValueError, "max_context must be positive"),
+        ((state,), {"max_context": 2.0}, TypeError, "max_context must be an integer or None"),
+        ((state,), {"max_context": True}, TypeError, "max_context must be an integer or None"),
         ((state,), {"hidden_prefill": 1}, TypeError, "hidden_prefill must be a boolean"),
         ((state,), {"top_k": 0}, ValueError, "top_k must be between 1 and 64"),
         ((state,), {"top_k": 65}, ValueError, "top_k must be between 1 and 64"),
@@ -663,8 +664,10 @@ class Broken(GRULM):
 
 
 @pytest.mark.parametrize(("options", "error", "message"), [
-    ({"step": "missing"}, ValueError, "model has no callable recurrent step 'missing'"),
-    ({"reference": "missing"}, ValueError, "model has no callable reference 'missing'"),
+    ({"step": "missing"}, ValueError, "model has no callable method 'missing', which "
+     r"RecurrentGenerationProgram\(step=...\) names"),
+    ({"reference": "missing"}, ValueError, "model has no callable method 'missing', which "
+     r"RecurrentGenerationProgram\(reference=...\) names"),
     ({"step": "only_logits"}, UnsupportedModelError,
      r"step returned 1 tensors, expected 1 \+ number of states \(2\)"),
     ({"step": "reshaped"}, UnsupportedModelError,
@@ -674,26 +677,24 @@ class Broken(GRULM):
     ({"step": "one_hot"}, UnsupportedModelError, "token must index an embedding table"),
     ({"top_k": 17}, ValueError, r"top_k \(17\) exceeds output size \(16\)"),
     ({"dynamic": {0: (1, 4)}}, ValueError, "dynamic= can't be used with a RecurrentGenerationProgram"),
-    ({"example_kwargs": {}}, ValueError, "example_kwargs cannot be used with a RecurrentGenerationProgram"),
-    ({"calibration_inputs": [torch.zeros(1, 2)]}, ValueError,
-     "RecurrentGenerationProgram uses calibration_sequences instead of calibration_inputs"),
-    ({"calibration_calls": ()}, ValueError, "calibration_calls require an ExportProgram"),
-    ({"calibration_sequences": [torch.zeros(1, 2, dtype=torch.long)]}, ValueError,
-     "calibration_sequences can only be used with GPTQ quantization"),
-    ({"calibration_sequences": [torch.zeros(3, dtype=torch.long)],
+    ({"example_kwargs": {}}, ValueError, "example_kwargs can't be used with a RecurrentGenerationProgram"),
+    ({"calibration": [torch.zeros(1, 2, dtype=torch.long)]}, ValueError,
+     "calibration= is only used by GPTQ"),
+    ({"calibration": [torch.zeros(3, dtype=torch.long)],
       "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
-     r"calibration_sequences must be \[1, length\] token tensors"),
+     r"calibration= takes \[1, length\] token tensors"),
     ({"quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
-     "GPTQ requires nonempty calibration_sequences"),
-    ({"calibration_sequences": [], "quantization": QuantizationConfig(bits=8, method="gptq")},
-     ValueError, "GPTQ requires nonempty calibration_sequences"),
-    ({"calibration_sequences": [torch.tensor([[3, 16]])],
+     r"GPTQ needs calibration=, an iterable of \[1, length\] token tensors for a "
+     "RecurrentGenerationProgram"),
+    ({"calibration": [], "quantization": QuantizationConfig(bits=8, method="gptq")},
+     ValueError, "GPTQ requires nonempty calibration"),
+    ({"calibration": [torch.tensor([[3, 16]])],
       "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
-     r"calibration_sequences\[0\] has token 16 at position 1; token IDs must be whole "
+     r"calibration\[0\] has token 16 at position 1; token IDs must be whole "
      "numbers from 0 to 15"),
-    ({"calibration_sequences": [torch.tensor([[1, 2]]), torch.tensor([[3.0, 4.5]])],
+    ({"calibration": [torch.tensor([[1, 2]]), torch.tensor([[3.0, 4.5]])],
       "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
-     r"calibration_sequences\[1\] has token 4.5 at position 1"),
+     r"calibration\[1\] has token 4.5 at position 1"),
 ])
 def test_export_validation(tmp_path, options, error, message):
     torch.manual_seed(0)
@@ -729,7 +730,7 @@ def test_gptq_calibrates_over_token_sequences(tmp_path):
     emulator, result = export(
         model, tmp_path / "gptq",
         quantization=QuantizationConfig(bits=8, method="gptq", min_quantized_values=16),
-        calibration_sequences=sequences,
+        calibration=sequences,
     )
     methods = {item.method for item in result.quantization.tensors}
     assert "gptq" in methods
@@ -753,7 +754,7 @@ def test_gptq_resets_the_states_between_sequences(monkeypatch, tmp_path):
     export(
         model, tmp_path / "gptq",
         quantization=QuantizationConfig(bits=8, method="gptq", min_quantized_values=16),
-        calibration_sequences=sequences,
+        calibration=sequences,
     )
     # When the replay is created, and before each sequence.
     assert len(resets) == 1 + len(sequences)
@@ -897,7 +898,7 @@ def test_build_project_runs_the_generation_demo(tmp_path):
     _, result = export(model, tmp_path / "lm")
     tokenizer = CharTokenizer(char_tokenizer()).save(tmp_path / "chars", name="chars")
     project = build_project(
-        tmp_path / "demo", result, tokenizer=tokenizer, max_new_tokens=4, temperature=0,
+        result, tmp_path / "demo", tokenizer=tokenizer, max_new_tokens=4, temperature=0,
     )
     emulator = ProjectEmulator(project.path, answers=["hi", ""])
     emulator.green_flag()
@@ -909,9 +910,19 @@ def test_build_project_runs_the_generation_demo(tmp_path):
     assert text in emulator.sprites["Demo"].said
 
 
-def test_verify_rejects_the_program_as_for_generation(tmp_path):
+def test_verify_runs_prefill_and_decode_against_the_step(tmp_path):
     model = make("gru")
-    program = RecurrentGenerationProgram(model.states())
+    program = RecurrentGenerationProgram(model.states(), max_context=5, top_k=2)
     result = transpile(model, program, tmp_path / "gru")
-    with pytest.raises(TypeError):
-        verify(model, program, result)
+    report = verify(model, program, result, calls=[
+        ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),)),
+        ProgramCall("decode", (torch.tensor([[4]]),)),
+        ProgramCall("decode", (torch.tensor([[5]]),)),
+        ProgramCall("decode", (torch.tensor([[6]]),)),
+        ProgramCall("reset", ()),
+        ProgramCall("decode", (torch.tensor([[16]]),)),
+    ])
+    assert [call.status for call in report.calls] == [
+        "ok", "ok", "ok", "context full", "ok", "invalid item: cattorch token ids",
+    ]
+    assert report.passed, report

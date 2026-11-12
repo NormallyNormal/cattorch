@@ -376,6 +376,8 @@ def _analyze(args) -> int:
 
     from cattorch.benchmark import analyze_benchmark
 
+    if not Path(args.project).is_file():
+        raise CommandError(f"no such file: {args.project}")
     try:
         analysis = analyze_benchmark(args.project)
     except (zipfile.BadZipFile, KeyError, StopIteration):

@@ -130,7 +130,7 @@ def test_prefill_and_decode_match_the_stateless_forward(exported):
     assert emulator.lists["cattorch top k ids"] == expected[-1].topk(3).indices.tolist()
     assert emulator.variables["cattorch cache length"] == len(TOKENS)
     assert emulator.variables["cattorch max context"] == "Infinity"
-    assert result.output.numel == VOCAB
+    assert result.outputs[0].numel == result.vocabulary_size == VOCAB
     assert result.procedures == (
         "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
         "cattorch prepare for save",
@@ -205,9 +205,9 @@ def test_hidden_prefill_gives_the_same_logits(tmp_path, name):
     assert results[True][1] == results[False][1]
 
 
-def test_max_tokens_limits_the_tokens_between_resets(tmp_path):
+def test_max_context_limits_the_tokens_between_resets(tmp_path):
     model = mamba2()
-    emulator = load(transpile(model, RecurrentGenerationProgram(max_tokens=3), tmp_path / "m"))
+    emulator = load(transpile(model, RecurrentGenerationProgram(max_context=3), tmp_path / "m"))
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", TOKENS[:3]) == "ok"
     assert run(emulator, "cattorch decode", [TOKENS[3]]) == interface.CONTEXT_FULL
@@ -357,13 +357,20 @@ def test_a_wrapped_model_points_to_the_model_inside(tmp_path):
 
 def test_explicit_states_bypass_the_adapter(tmp_path):
     program = RecurrentGenerationProgram((State("h", torch.zeros(2)),))
-    with pytest.raises(ValueError, match="model has no callable recurrent step 'step'"):
+    with pytest.raises(ValueError, match=r"has no callable method 'step', which RecurrentGenerationProgram\(step=...\) names"):
         transpile(mamba(), program, tmp_path / "explicit")
 
 
-def test_the_generation_benchmark_rejects_recurrent_models(tmp_path):
+def test_the_generation_benchmark_takes_the_program_transpile_takes(tmp_path):
     from cattorch.benchmark import build_generation_benchmark_suite
 
     tokens = torch.tensor([TOKENS[:4]])
-    with pytest.raises(ValueError, match="'ssm' is a Mamba model"):
-        build_generation_benchmark_suite([("ssm", mamba(), tokens, tokens)], tmp_path / "b")
+    with pytest.raises(UnsupportedModelError, match="RecurrentGenerationProgram"):
+        build_generation_benchmark_suite(
+            [("ssm", mamba(), GenerationProgram(32), tokens)], tmp_path / "b",
+        )
+    with pytest.raises(ValueError, match="max_context=3 can't hold the 4-token prompt"):
+        build_generation_benchmark_suite(
+            [("ssm", mamba(), RecurrentGenerationProgram(max_context=3), tokens)],
+            tmp_path / "c",
+        )

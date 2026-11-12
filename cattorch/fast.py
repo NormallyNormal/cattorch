@@ -437,7 +437,7 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
         for name in config.overrides for prefix in expert_prefixes
     ):
         raise ValueError(
-            "fast weight overrides cannot change topology inside a generic "
+            "fast weight overrides can't change topology inside a generic "
             "ExpertFamily; approximate kernels remain available"
         )
 

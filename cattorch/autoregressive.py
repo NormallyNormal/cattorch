@@ -31,7 +31,7 @@ from cattorch.errors import UnsupportedModelError
 from cattorch.frontend import (
     FALLBACK_META, CapturedGraph, capture_model, tensor_output_leaves,
 )
-from cattorch.graph import _unsupported_operation, fold_static_values
+from cattorch.graph import fold_static_values
 from cattorch.program_runtime import MethodModule
 
 __all__ = [
@@ -333,7 +333,7 @@ def _require_same_structure(long_nodes, short_nodes) -> None:
                 f"{position} is {a.op} {a.target} at the longest length and "
                 f"{b.op} {b.target} at one token fewer ({_where(a)}); "
                 "length-dependent Python branches (such as an `if` on "
-                "tokens.shape[1]) cannot be cached"
+                "tokens.shape[1]) can't be cached"
             )
     if len(long_nodes) != len(short_nodes):
         extra = (long_nodes if len(long_nodes) > len(short_nodes) else short_nodes)[
@@ -344,7 +344,7 @@ def _require_same_structure(long_nodes, short_nodes) -> None:
             f"{len(long_nodes)} nodes at the longest length against "
             f"{len(short_nodes)} at one token fewer, first extra node "
             f"{extra.target} ({_where(extra)}); length-dependent Python "
-            "branches cannot be cached"
+            "branches can't be cached"
         )
 
 
@@ -496,7 +496,7 @@ def _pair_arguments(node, short_node, pair, static, short_static, out) -> None:
                 raise UnsupportedModelError(
                     f"{_where(node)}: argument {location} has a different "
                     "length at one token fewer; length-dependent Python "
-                    "branches cannot be cached"
+                    "branches can't be cached"
                 )
             for i, (x, y) in enumerate(zip(a, b)):
                 walk(x, y, (*location, i))
@@ -619,7 +619,21 @@ _RECURRENT_OPERATIONS = frozenset({
 })
 
 
-def _mixing(node, detail: str):
+def _requirement(node, detail: str) -> UnsupportedModelError:
+    """A ``GenerationProgram`` requirement ``node`` doesn't meet.
+
+    The operation itself is supported; what it does to the sequence isn't
+    something a one-token step can reproduce.
+    """
+    path = _module_path(node)
+    where = f" in module {path!r}" if path else ""
+    return UnsupportedModelError(
+        f"GenerationProgram can't generate this model one token at a time: "
+        f"`{_op_name(node)}`{where}: {detail}"
+    )
+
+
+def _mixing(node, detail: str) -> UnsupportedModelError:
     detail = f"{detail}; automatic generation allows mixing tokens only in causal attention"
     if _op_name(node) in _RECURRENT_OPERATIONS:
         # A GRU, LSTM or RNN carries a state from one token to the next.
@@ -629,7 +643,7 @@ def _mixing(node, detail: str):
             "its state (see https://github.com/NormallyNormal/cattorch/blob/main/"
             "docs/recurrent-generation.md)"
         )
-    return _unsupported_operation(node, detail)
+    return _requirement(node, detail)
 
 
 def _check_row_wise(nodes, live, static, infos, internal) -> None:
@@ -826,11 +840,12 @@ def _scalar(value):
 
 def _match_attention(index, softmax, infos, values, short_values, pair) -> AttentionBlock:
     path = _module_path(softmax)
+    where = repr(path) if path else "the model's top level"
 
     def reject(detail):
-        return _unsupported_operation(
+        return _requirement(
             softmax,
-            f"softmax over the sequence is not a recognised attention pattern "
+            f"softmax over the sequence isn't a recognised attention pattern "
             f"({detail}); expected matmul(q, k^T) -> [scale] -> causal mask -> "
             "softmax -> matmul(p, v)",
         )
@@ -959,14 +974,14 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
 
     if not masks:
         raise UnsupportedModelError(
-            f"attention over the sequence isn't causal at {path}: the softmax node "
-            f"{softmax.name} has no mask, so every token attends to later "
-            "tokens (a bidirectional model such as BERT)"
+            f"attention over the sequence isn't causal at {where}: its softmax has "
+            "no mask, so every token attends to later tokens (a bidirectional "
+            "model such as BERT)"
         )
     if sink_node is not None and not sink_dropped:
         raise reject("the sink column is not dropped before matmul(p, v)")
     window, slopes = _check_causal(
-        masks, values, short_values, pair, path, int(n_heads),
+        masks, values, short_values, pair, where, int(n_heads),
     )
     sinks = None
     if sink_node is not None:
@@ -1150,7 +1165,7 @@ def _check_causal(masks, values, short_values, pair, path, heads) -> tuple[int, 
         wrong = (allowed != expected).nonzero()
         if len(wrong):
             r, c = (int(v) for v in wrong[0])
-            what = "attends to" if bool(allowed[r, c]) else "cannot attend to"
+            what = "attends to" if bool(allowed[r, c]) else "can't attend to"
             raise UnsupportedModelError(
                 f"attention over the sequence isn't causal at {path}: {label}"
                 f"token {r} {what} token {c} (each token may attend to itself and "
@@ -1219,7 +1234,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
         if not info.sequence_axes or not consumers:
             continue
         if len(info.sequence_axes) != 1 or info.sequence_axes[0].stride != 1:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
                 f"a static tensor of shape {info.shape} is used outside attention "
                 "and has more than one growing axis or merges the sequence "
@@ -1228,9 +1243,9 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
         value = values.get(node.name)
         short_value = short_values.get(pair[node.name].name)
         if value is None or short_value is None:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
-                "a sequence-length-dependent constant could not be evaluated at "
+                "a constant that depends on the sequence length couldn't be evaluated at "
                 "export time",
             )
         axis = info.sequence_axes[0].axis
@@ -1240,7 +1255,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
             if prefix.dtype.is_floating_point else torch.equal(prefix, short_value)
         )
         if prefix.shape != short_value.shape or not close:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
                 f"the table's first {length - 1} rows at {length} tokens differ "
                 f"from the table at {length - 1} tokens (axis {axis}); rows must "
@@ -1343,7 +1358,7 @@ def build_step_module(
             owner = removed.get(node.name)
             raise UnsupportedModelError(
                 f"{_where(node)}: the value is used outside the attention block "
-                f"{owner} it belongs to, so the block cannot be replaced by a cached step"
+                f"{owner} it belongs to, so the block can't be replaced by a cached step"
             ) if owner else UnsupportedModelError(
                 f"{_where(node)}: the node was not carried into the step graph"
             )
@@ -1509,7 +1524,7 @@ def _vocabulary_size(plan: SequencePlan) -> int:
         ):
             frontier.add(node.name)
     raise UnsupportedModelError(
-        "cannot find the vocabulary size: the token input is not looked up in an "
+        "can't find the vocabulary size: the token input is not looked up in an "
         "embedding table; automatic generation needs token ids"
     )
 

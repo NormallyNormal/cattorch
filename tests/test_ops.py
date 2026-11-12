@@ -46,7 +46,7 @@ def test_rotary_embedding_is_preserved_as_a_semantic_fx_operation():
         torch.randn(1, 1, 1, 14),
         torch.randn(1, 1, 1, 14),
     )
-    captured = capture_model(RotaryModel(), inputs, frontend="fx")
+    captured = capture_model(RotaryModel(), inputs)
     assert sum(
         str(node.target) == "cattorch.rotary_embedding.default"
         for node in captured.graph.nodes
@@ -91,7 +91,7 @@ def _half_inputs():
 def test_rotate_half_is_recognized_as_one_operation():
     from cattorch.graph import _fuse_rotate_half
 
-    captured = capture_model(HalfRotaryModel(), _half_inputs(), frontend="fx")
+    captured = capture_model(HalfRotaryModel(), _half_inputs())
     _fuse_rotate_half(captured.graph)
     targets = [str(node.target) for node in captured.graph.nodes if node.op == "call_function"]
     assert targets == ["aten.transpose.int", "cattorch.rotary_half.default"]
@@ -113,7 +113,7 @@ def test_rotate_half_lookalikes_are_left_alone():
         (Swapped(), (torch.randn(2, 8), torch.randn(8), torch.randn(8))),
         (Expanding(), (torch.randn(1, 5, 1, 8), torch.randn(3, 5, 8), torch.randn(5, 8))),
     ):
-        captured = capture_model(model, inputs, frontend="fx")
+        captured = capture_model(model, inputs)
         _fuse_rotate_half(captured.graph)
         assert not any(
             str(node.target) == "cattorch.rotary_half.default" for node in captured.graph.nodes

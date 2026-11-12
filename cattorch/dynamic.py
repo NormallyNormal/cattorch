@@ -267,11 +267,11 @@ def check_entry_lengths(
                 tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
                 outcome = verify(
                     model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
-                    adapters=adapters, quantization=quantization, _storage=storage,
-                    _sig_figs=sig_figs, **tolerance,
+                    adapters=adapters, quantization=quantization, storage=storage,
+                    sig_figs=sig_figs, **tolerance,
                 )
                 (call,) = outcome.calls
-                reports = [*call.outputs, *(report for _, report in call.states)]
+                reports = [*call.outputs, *call.states.values()]
                 if call.status != "ok" or any(
                     report.values_compared != report.actual_values for report in reports
                 ):

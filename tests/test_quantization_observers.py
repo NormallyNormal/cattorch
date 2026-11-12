@@ -159,7 +159,7 @@ def test_observed_weights_are_stored_as_integers_and_reported_so(tmp_path, targe
     )
     result = transpile(
         model, torch.randn(2, width), tmp_path / "model", quantization=config,
-        calibration_inputs=[torch.randn(2, width) for _ in range(4)],
+        calibration=[torch.randn(2, width) for _ in range(4)],
     )
     report = result.quantization
     assert any(item.method == "gptq" for item in report.tensors), report

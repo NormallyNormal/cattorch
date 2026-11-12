@@ -376,7 +376,7 @@ def test_multi_entrypoint_quantization_is_owned_once(tmp_path):
             bits=8, method="gptq", min_quantized_values=1,
             min_calibration_rows=1,
         ),
-        calibration_calls=(
+        calibration=(
             ProgramCall("first", (example,)),
             ProgramCall("second", (example,)),
         ),

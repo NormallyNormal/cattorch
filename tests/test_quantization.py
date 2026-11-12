@@ -148,7 +148,7 @@ def test_a_weight_read_in_two_layouts_is_quantized_once_and_its_float16_copy_rep
     assert [(item.name, item.method) for item in report.tensors] == [("weight", "gptq")]
     result = transpile(
         model, torch.randn(4, 8), tmp_path / "both", quantization=config,
-        calibration_inputs=[torch.randn(4, 8)],
+        calibration=[torch.randn(4, 8)],
     )
     assert [
         (item.name, item.method, item.values) for item in result.quantization.tensors
@@ -208,7 +208,7 @@ def test_transpile_gptq_reconstructs_expected_weights_in_scratch(tmp_path, bits)
         value,
         tmp_path / f"gptq-{bits}",
         quantization=config,
-        calibration_inputs=calibration,
+        calibration=calibration,
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
     emulator = ScratchEmulator(_load(result.path))
@@ -234,7 +234,7 @@ def test_transpile_quantization_validation(tmp_path):
     gptq = QuantizationConfig(
         bits=4, method="gptq", min_quantized_values=1,
     )
-    with pytest.raises(ValueError, match="nonempty calibration_inputs"):
+    with pytest.raises(ValueError, match="GPTQ needs calibration="):
         transpile(model, value, tmp_path / "missing", quantization=gptq)
     with pytest.raises(ValueError, match=r"QuantizationConfig\(bits=4\)"):
         StorageConfig(precision="int4")
@@ -376,7 +376,7 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
     result = transpile(
         model, example, tmp_path / f"{model_type.__name__}-{method}",
         quantization=config,
-        calibration_inputs=calibration if method == "gptq" else None,
+        calibration=calibration if method == "gptq" else None,
     )
     assert precisions and set(precisions) == {"int4"}
     names = [tensor.name for tensor in result.quantization.tensors]
@@ -518,7 +518,7 @@ def test_addmm_weights_are_stored_as_integers_grouped_over_their_inputs(
     precisions = _record_matrix_precisions(monkeypatch)
     result = transpile(
         model, example, tmp_path / f"conv1d-{bits}-{method}",
-        quantization=config, calibration_inputs=calibration,
+        quantization=config, calibration=calibration,
     )
     assert {shape for shape, _ in precisions} == {(96, 64), (48, 96)}
     assert {precision for _, precision in precisions} == {f"int{bits}"}
@@ -565,7 +565,7 @@ def test_gpt2_conv1d_weights_are_stored_as_integers_in_generation(
     precisions = _record_matrix_precisions(monkeypatch)
     result = transpile(
         model, GenerationProgram(max_context=8), tmp_path / f"gpt2-{method}",
-        quantization=config, calibration_sequences=calibration,
+        quantization=config, calibration=calibration,
     )
     # c_attn, c_proj, c_fc and the MLP's c_proj, the tied table and positions.
     assert {precision for _, precision in precisions} == {"int8"}, precisions
@@ -712,7 +712,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
     monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
     result = transpile(
         model, example, tmp_path / "product", quantization=config,
-        calibration_inputs=calibration,
+        calibration=calibration,
     )
     assert precisions
     assert {precision for _, precision in precisions} == {f"int{bits}"}, precisions
@@ -919,7 +919,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
     monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
     result = transpile(
         model, example, tmp_path / "convolutions", quantization=config,
-        calibration_inputs=calibration,
+        calibration=calibration,
     )
     # The transposed kernel is stored flipped, as a plain convolution's.
     kernels = {(8, 2, 3, 3), (4, 8, 3)}
@@ -962,7 +962,7 @@ def test_weights_copied_into_another_layout_are_stored_as_integers(tmp_path, mon
     precisions = _record_matrix_precisions(monkeypatch)
     result = transpile(
         model, example, tmp_path / "copies", quantization=config,
-        calibration_inputs=calibration,
+        calibration=calibration,
     )
     assert sorted(set(precisions)) == [((16, 24), "int4"), ((24, 32), "int4")]
     assert not [warning for warning in result.warnings if "quantized weight" in warning]

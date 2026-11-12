@@ -22,7 +22,7 @@ import cattorch
 LABELS = ["top right", "top left", "bottom left", "bottom right"]
 
 
-@cattorch.example(lambda: (torch.tensor([[0.5, -0.25]]),))
+@cattorch.example_inputs(lambda: (torch.tensor([[0.5, -0.25]]),))
 class Quadrants(nn.Module):
     def __init__(self):
         super().__init__()
@@ -52,12 +52,12 @@ def trained(steps: int = 300) -> Quadrants:
 
 def main(output: Path = Path("build"), steps: int = 300) -> cattorch.ProjectResult:
     model = trained(steps)
-    # The @example marker supplies the inputs.
+    # The @example_inputs marker supplies the inputs.
     result = cattorch.transpile(model, None, output / "quadrants")
     assert cattorch.verify(model, None, result).passed
     example = torch.tensor([[0.5, -0.25]])
     return cattorch.build_project(
-        output / "quadrants", result, example_inputs=example, labels=LABELS,
+        result, output / "quadrants", example_inputs=example, labels=LABELS,
     )
 
 

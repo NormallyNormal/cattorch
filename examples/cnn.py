@@ -65,7 +65,7 @@ def main(output: Path = Path("build"), steps: int = 200) -> cattorch.ProjectResu
     result = cattorch.transpile(model, example, output / "lines")
     assert cattorch.verify(model, example, result).passed
     return cattorch.build_project(
-        output / "lines", result, example_inputs=example, labels=LABELS,
+        result, output / "lines", example_inputs=example, labels=LABELS,
     )
 
 

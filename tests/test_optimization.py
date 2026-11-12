@@ -652,9 +652,13 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(project_path)
-    assert report["runs"] == 3
-    assert report["speedup"] == pytest.approx(2.0)
-    assert report["output_max_abs_error"] is None  # Project was built, not run.
+    assert (report.kind, report.baseline, report.candidate) == ("paired", "exact", "fast")
+    assert (report.repeats, report.warmups) == (3, 1)
+    (case,) = report.cases
+    assert case.baseline_timings == (2.0, 2.2, 1.8)
+    assert case.baseline_seconds == pytest.approx(2.0)
+    assert case.speedup == pytest.approx(2.0)
+    assert case.output_max_abs_error is None  # Project was built, not run.
 
     for entry in stage["lists"].values():
         if entry[0] == EXACT_TIMINGS:
@@ -671,12 +675,12 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
         for name, data in assets.items():
             archive.writestr(name, data)
 
-    below_resolution = analyze_benchmark(project_path)
-    assert below_resolution["speedup"] is None
-    assert below_resolution["speedup_95_percent_interval"] is None
-    assert below_resolution["output_length_match"] is False
-    assert below_resolution["exact_output_values"] == 1
-    assert below_resolution["fast_output_values"] == 0
+    (below_resolution,) = analyze_benchmark(project_path).cases
+    assert below_resolution.speedup is None
+    assert below_resolution.speedup_95_percent_interval is None
+    assert below_resolution.output_length_match is False
+    assert below_resolution.baseline_output_values == 1
+    assert below_resolution.candidate_output_values == 0
 
 
 def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
@@ -686,7 +690,7 @@ def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
             ("second", LinearActivation().eval(), torch.randn(2, 3)),
         ],
         tmp_path / "suite.sb3",
-        iterations=3,
+        repeats=3,
     )
     with zipfile.ZipFile(suite_path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -745,9 +749,11 @@ def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(suite_path)
-    assert report["kind"] == "suite"
-    assert report["iterations_per_result"] == 3
-    assert [item["speedup"] for item in report["benchmarks"]] == [1.5, 2.0]
+    assert report.kind == "suite"
+    assert report.repeats == 3
+    assert [item.speedup for item in report.cases] == [1.5, 2.0]
+    # Seconds per call: the timed total over the repeats.
+    assert [item.baseline_seconds for item in report.cases] == [1.0, pytest.approx(8 / 3)]
 
 
 def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
@@ -758,7 +764,7 @@ def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
     suite_path = build_benchmark_suite(
         [("linear", nn.Linear(16, 12).eval(), torch.randn(2, 16), case_config)],
         tmp_path / "fast_suite.sb3",
-        iterations=10,
+        repeats=10,
     )
     with zipfile.ZipFile(suite_path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -783,10 +789,10 @@ def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(suite_path)
-    assert report["comparison"] == "exact_vs_fast"
-    assert report["benchmarks"][0]["exact_seconds"] == 2.0
-    assert report["benchmarks"][0]["fast_seconds"] == 1.0
-    assert report["benchmarks"][0]["speedup"] == 2.0
+    assert (report.baseline, report.candidate) == ("exact", "fast")
+    (case,) = report.cases
+    assert (case.baseline_seconds, case.candidate_seconds) == (0.2, 0.1)
+    assert case.speedup == 2.0
 
 
 def test_nonfinite_values_are_valid_json_and_keep_scratch_semantics(tmp_path):
@@ -971,7 +977,7 @@ def test_fast_weight_transforms_match_the_transformed_pytorch_model(tmp_path, po
     model = NamedLinear().eval()
     original_weight = model.projection.weight.detach().clone()
     x = torch.randn(3, 16)
-    config = FastConfig(weights=policy, activations=False, layer_norm=False, softmax=False)
+    config = FastConfig(layers=policy, activations=False, layer_norm=False, softmax=False)
     transformed = prepare_fast_model(model, config)
     expected = transformed(x)
 
@@ -1039,7 +1045,7 @@ def test_fast_static_matmul_matches_export_time_weight_transform(tmp_path, polic
         activations=False,
         layer_norm=False,
         softmax=False,
-        weights=policy,
+        layers=policy,
     )
     path = tmp_path / "static_matmul"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
@@ -1056,7 +1062,7 @@ def test_fast_static_matmul_pruning_preserves_remainder(tmp_path):
     x = torch.randn(3, 10)
     policy = FastLayerConfig(block_pruning=0.5)
     expected = x @ prepare_fast_matmul_weights(model.weight, policy)[0]
-    config = FastConfig(weights=policy)
+    config = FastConfig(layers=policy)
     path = tmp_path / "static_matmul_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
@@ -1075,7 +1081,7 @@ def test_fast_transposed_static_matmul_is_transformed(tmp_path):
     path = tmp_path / "transposed_static_matmul"
     transpile(
         model, x, str(path), optimization="fast",
-        fast_config=FastConfig(weights=policy),
+        fast_config=FastConfig(layers=policy),
     )
     actual = torch.tensor(
         _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
@@ -1119,7 +1125,7 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
 def test_fast_convolution_transforms_match_transformed_model(tmp_path, model, x, policy):
     torch.manual_seed(37)
     model.eval()
-    config = FastConfig(weights=policy)
+    config = FastConfig(layers=policy)
     expected = prepare_fast_model(model, config)(x)
     path = tmp_path / "fast_conv"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
@@ -1480,9 +1486,9 @@ def test_generation_benchmark_suite_bundles_stateless_and_cached(tmp_path):
     model = CachedLM(context=4, layers=1).eval()
     tokens = torch.tensor([[1, 2, 3, 4]])
     path = build_generation_benchmark_suite(
-        [("cached_lm", model, tokens, tokens[:, :2])],
+        [("cached_lm", model, GenerationProgram(4), tokens[:, :2])],
         tmp_path / "generation_suite.sb3",
-        iterations=2,
+        repeats=2,
     )
     with zipfile.ZipFile(path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -1733,7 +1739,7 @@ def test_verify_reports_exact_and_lossy_export_error(tmp_path):
     assert lossy_report.worst_index in {0, 1}
 
 
-def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
+def test_unsupported_operation_error_names_the_operation_and_module(tmp_path):
     class DigammaBlock(nn.Module):
         def forward(self, value):
             return torch.digamma(value)
@@ -1750,5 +1756,5 @@ def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
         transpile(Model().eval(), torch.ones(2), tmp_path / "digamma")
     message = str(caught.value)
     assert "aten.digamma.default" in message
-    assert "module: features" in message
-    assert "exported node: digamma" in message
+    assert "in module 'features'" in message
+    assert "node" not in message

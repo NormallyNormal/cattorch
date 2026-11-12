@@ -1410,7 +1410,7 @@ def _follow_runtime_axis(
             if input_shape[value % len(input_shape)] == 1
         }
         if axis in removed:
-            raise UnsupportedModelError("cannot squeeze the runtime extent")
+            raise UnsupportedModelError("can't squeeze the runtime extent")
         axis -= sum(value < axis for value in removed)
     elif _user_kernel(registry, target, fast, fast_config):
         # A user's kernel may handle only the traced item: it runs once per
@@ -1460,13 +1460,13 @@ def _follow_runtime_axis(
         }
         if axis in dims or axis > min(dims):
             raise UnsupportedModelError(
-                "mean cannot reduce or move a runtime extent into its reduction geometry"
+                "mean can't reduce or move a runtime extent into its reduction geometry"
             )
         axis -= sum(value < axis for value in dims)
     elif target in {"aten.layer_norm.default", "aten.native_layer_norm.default"}:
         normalized_rank = len(node.args[1])
         if axis >= len(input_shape) - normalized_rank:
-            raise UnsupportedModelError("layer normalization cannot normalize the runtime extent")
+            raise UnsupportedModelError("layer normalization can't normalize the runtime extent")
     elif target in MATMUL_OPS:
         if len(dynamic_parents) > 1:
             raise UnsupportedModelError(
@@ -1475,7 +1475,7 @@ def _follow_runtime_axis(
                 "aren't supported"
             )
         if parent is not node.args[0] or axis == len(input_shape) - 1:
-            raise UnsupportedModelError("matmul cannot use the runtime extent as a contraction dimension")
+            raise UnsupportedModelError("matmul can't use the runtime extent as a contraction dimension")
         if len(_get_shape(node.args[1])) > 2:
             # The batched kernel takes its batches and rows from the traced
             # shapes.
@@ -1815,7 +1815,7 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
             if training:
                 raise _unsupported_operation(
                     node,
-                    "training-mode dropout is nondeterministic and cannot be removed; "
+                    "training-mode dropout is nondeterministic and can't be removed; "
                     "call model.eval() before exporting",
                 )
             source = node.args[0].name
@@ -2291,6 +2291,10 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
         ):
             continue
         length = output_shape[-1]
+        if length < 2:
+            # A one-token causal mask masks nothing; the generic lowering is
+            # exact, while the causal kernels assume a triangle to skip.
+            continue
         expected_mask = torch.triu(
             torch.ones((length, length), dtype=torch.bool, device=mask.device),
             diagonal=1,

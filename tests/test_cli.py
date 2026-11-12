@@ -18,7 +18,7 @@ from torch import nn
 import cattorch
 
 
-@cattorch.example(lambda: (torch.randn(2, 3),))
+@cattorch.example_inputs(lambda: (torch.randn(2, 3),))
 class Marked(nn.Module):
     def __init__(self):
         super().__init__()
@@ -33,7 +33,7 @@ def unmarked():
     return nn.Sequential(nn.Embedding(10, 4), nn.Flatten(), nn.Linear(12, 2))
 
 
-@cattorch.example(lambda: (torch.randn(3, 3),))
+@cattorch.example_inputs(lambda: (torch.randn(3, 3),))
 class Determinant(nn.Module):
     def forward(self, value):
         return torch.linalg.det(value)
@@ -68,45 +68,101 @@ def run(capsys, *argv):
 
 def test_export_reads_the_example_marker(models, capsys):
     code, report = run(capsys, "export", "models.py:Marked", "--project")
-    assert code == 0 and report["verified"]
-    assert report["sprite"].endswith("marked.sprite3")
-    with zipfile.ZipFile(report["project"]) as archive:
+    assert code == 0 and report["verify"]["passed"]
+    assert report["path"].endswith("marked.sprite3")
+    with zipfile.ZipFile(report["project"]["path"]) as archive:
         assert "project.json" in archive.namelist()
 
 
 def test_export_with_shapes_from_a_module_path(models, capsys):
     code, report = run(
         capsys, "export", "models:unmarked", "--tokens", "1,3", "--vocab", "10",
-        "-o", "out/net", "--precision", "float16",
+        "-o", "out/net", "--precision", "float16", "--name", "Net",
     )
-    assert code == 0 and report["verified"]
-    assert report["sprite"] == "out/net.sprite3"
+    assert code == 0 and report["verify"]["passed"]
+    assert report["path"] == "out/net.sprite3" and report["sprite_name"] == "Net"
+
+
+def test_quantized_exports_are_verified_against_the_stored_weights(models, capsys):
+    code, report = run(capsys, "export", "models.py:Marked", "--quantize", "8", "--sig-figs", "4")
+    assert code == 0 and report["verify"]["passed"]
+    assert report["verify"]["max_abs_error"] < 1e-4
+    torch.save([torch.randn(2, 3) for _ in range(4)], models / "calibration.pt")
+    code, report = run(
+        capsys, "export", "models.py:Marked", "--quantize", "4", "--quantize-method", "gptq",
+        "--calibration", "calibration.pt", "-o", "gptq",
+    )
+    assert code == 0 and report["verify"]["passed"]
 
 
 def test_fast_exports_verify_and_dotted_names_keep_their_project(models, capsys):
     code, report = run(
-        capsys, "export", "models.py:Marked", "--fast", "-o", "out/net.v2", "--project",
+        capsys, "export", "models.py:Marked", "--optimization", "fast", "-o", "out/net.v2",
+        "--project",
     )
-    assert code == 0 and report["verified"]
-    assert report["sprite"] == "out/net.v2.sprite3"
-    assert report["project"] == "out/net.v2.sb3"
+    assert code == 0 and report["verify"]["passed"]
+    assert report["path"] == "out/net.v2.sprite3"
+    assert report["project"]["path"] == "out/net.v2.sb3"
 
 
 def test_export_a_saved_module_with_a_dynamic_batch(models, capsys):
     torch.save(nn.Sequential(nn.Linear(4, 2), nn.Sigmoid()), models / "saved.pt")
     code, report = run(capsys, "export", "saved.pt", "--shape", "3,4", "--dynamic", "0=1:8")
-    assert code == 0 and report["verified"]
+    assert code == 0 and report["verify"]["passed"]
 
 
-def test_errors_are_reported_without_a_traceback(models, capsys):
+def test_exit_statuses(models, capsys, monkeypatch):
+    from cattorch import cli
+
+    # 2: invalid arguments, from argparse or from cattorch's own checks.
+    assert main([]) == cli.EXIT_USAGE == 2
+    assert main(["export", "models.py:Marked", "--dynamic", "zero"]) == 2
     code, message = run(capsys, "export", "models.py:unmarked")
-    assert code == 1 and "--shape" in message
+    assert code == 2 and "--shape" in message
     code, message = run(capsys, "export", "models.py:missing", "--shape", "1,2")
-    assert code == 1 and "no attribute 'missing'" in message
+    assert code == 2 and "no attribute 'missing'" in message
+    code, message = run(capsys, "generate", "models.py:Language", "--top-k", "100")
+    assert code == 2 and "top_k" in message
+    code, message = run(capsys, "export", "models.py:Marked", "--quantize-method", "gptq")
+    assert code == 2 and "needs --quantize" in message
+    # 1: the export failed.
     code, message = run(capsys, "export", "models.py:Determinant")
-    assert code == 1 and "Unsupported operation" in message
-    with pytest.raises(SystemExit):
-        main(["export", "models.py:Marked", "--dynamic", "zero"])
+    assert code == cli.EXIT_EXPORT_FAILED == 1 and "unsupported operation" in message
+    # 3: the sprite didn't match PyTorch.
+    monkeypatch.setattr(cli, "_summary", lambda result: {})
+    import sys
+
+    verify_module = sys.modules["cattorch.verify"]
+    original = verify_module.verify
+
+    def failing(*args, **kwargs):
+        import dataclasses
+
+        return dataclasses.replace(original(*args, **kwargs), passed=False)
+
+    monkeypatch.setattr(verify_module, "verify", failing)
+    code = main(["export", "models.py:Marked"])
+    assert code == cli.EXIT_VERIFY_FAILED == 3
+    assert json.loads(capsys.readouterr().out)["verify"]["passed"] is False
+
+
+def test_every_option_has_help_and_shows_its_default(capsys):
+    import argparse
+
+    from cattorch.cli import _parser
+
+    commands = next(
+        action for action in _parser()._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    for command, parser in commands.choices.items():
+        for action in parser._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            assert action.help, (command, action.dest)
+            if action.option_strings and not isinstance(action, argparse._StoreTrueAction):
+                text = parser._get_formatter()._expand_help(action)
+                assert "default" in text, (command, action.option_strings, text)
 
 
 def test_version_and_help(capsys):
@@ -115,15 +171,16 @@ def test_version_and_help(capsys):
     import cattorch
 
     assert cattorch.__version__ == version("cattorch")
-    with pytest.raises(SystemExit):
-        main(["--version"])
+    assert main(["--version"]) == 0
     assert capsys.readouterr().out.strip() == f"cattorch {cattorch.__version__}"
     for command, expected in (
-        ("generate", ("--top-k K", "(default: 40)", "(default: 0.8)", "(default: float32)")),
+        ("generate", (
+            "--top-k K", "(default: 40)", "(default: 0.8)", "(default: float32)",
+            "--eos-token-id ID", "--quantize BITS",
+        )),
         ("analyze-benchmark", ("saved from Scratch",)),
     ):
-        with pytest.raises(SystemExit):
-            main([command, "--help"])
+        assert main([command, "--help"]) == 0
         text = " ".join(capsys.readouterr().out.split())
         assert all(part in text for part in expected), text
 
@@ -133,22 +190,23 @@ def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path
     import sys
 
     for argv in (["--shape", "1,x"], ["--tokens", "1,2", "--vocab", "0"]):
-        with pytest.raises(SystemExit):
-            main(["export", "models.py:Marked", *argv])
+        assert main(["export", "models.py:Marked", *argv]) == 2
     code, message = run(
         capsys, "export", "models.py:Marked", "--shape", "3,3",
         "--dynamic", "0=1:4", "--dynamic", "0.0=1:8",
     )
-    assert code == 1 and "dimension 0 twice" in message
-    # The export's own explanation of a wrongly shaped input reaches the user.
+    assert code == 2 and "dimension 0 twice" in message
+    # A wrongly shaped input: the model's own error, with the shapes it got.
     code, message = run(capsys, "export", "models.py:Marked", "--shape", "2,5")
     assert code == 1 and message.startswith("cattorch: error: ")
     assert "mat1 and mat2 shapes cannot be multiplied" in message
+    assert "the model raised RuntimeError when called with inputs of shape (2, 5)" in message
+    assert "control flow" not in message
     code, message = run(capsys, "export", "no_such_module:Net", "--shape", "1,2")
-    assert code == 1 and "no module named 'no_such_module'" in message
+    assert code == 2 and "no module named 'no_such_module'" in message
     for path in ("missing.sb3", "models.py"):
         code, message = run(capsys, "analyze-benchmark", path)
-        assert code == 1 and path in message
+        assert code == 2 and path in message
 
     # A model's class must be importable to unpickle it. Its module beside
     # the .pt file is found from any directory.
@@ -160,7 +218,7 @@ def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path
     )
     subprocess.run([sys.executable, "-c", script, str(saved)], check=True)
     code, report = run(capsys, "export", str(saved / "beside.pt"), "--shape", "2,3")
-    assert code == 0 and report["verified"]
+    assert code == 0 and report["verify"]["passed"]
     # A class defined in the script that saved the model can't be found.
     script = (
         "import sys, torch\nclass Net(torch.nn.Linear): pass\n"
@@ -168,7 +226,7 @@ def test_user_mistakes_are_reported_without_a_traceback(models, capsys, tmp_path
     )
     subprocess.run([sys.executable, "-c", script, str(saved)], check=True)
     code, message = run(capsys, "export", str(saved / "main.pt"), "--shape", "1,2")
-    assert code == 1 and "must be importable" in message and "script that saved" in message
+    assert code == 2 and "must be importable" in message and "script that saved" in message
 
 
 CHARACTERS = "?abcdefghij "
@@ -193,11 +251,13 @@ def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
         "--max-context", "8", "--project",
     )
     assert code == 0
-    assert report["tokenizer"].endswith("language_tokenizer.sprite3")
-    assert report["project"].endswith("language.sb3")
+    assert report["tokenizer"]["path"].endswith("language_tokenizer.sprite3")
+    assert report["tokenizer"]["tokenizer_type"] == "char"
+    assert report["project"]["path"].endswith("language.sb3")
+    assert (report["max_context"], report["vocabulary_size"], report["top_k"]) == (8, 12, None)
 
     code, message = run(capsys, "generate", "models.py:Language", "--project")
-    assert code == 1 and "needs a tokenizer" in message
+    assert code == 2 and "needs a tokenizer" in message
 
 
 @pytest.mark.parametrize("output", ["build/demo", "build/demo.sprite3", "build/demo.sb3"])
@@ -208,7 +268,7 @@ def test_every_output_is_named_after_the_output_option(models, capsys, output):
         "--max-context", "4", "--project", "-o", output,
     )
     assert code == 0
-    assert (report["sprite"], report["tokenizer"], report["project"]) == (
+    assert (report["path"], report["tokenizer"]["path"], report["project"]["path"]) == (
         "build/demo.sprite3", "build/demo_tokenizer.sprite3", "build/demo.sb3",
     )
     assert sorted(path.name for path in (models / "build").iterdir()) == [
@@ -241,10 +301,10 @@ def test_generate_detects_a_recurrent_hugging_face_model(models, capsys):
         "--temperature", "0", "--max-new-tokens", "6",
     )
     assert code == 0 and report["max_context"] is None
-    assert max_context(report["sprite"]) == "Infinity"
+    assert max_context(report["path"]) == "Infinity"
 
     # The demo runs past any context limit until its token budget is spent.
-    emulator = ProjectEmulator(report["project"], answers=["badge", ""])
+    emulator = ProjectEmulator(report["project"]["path"], answers=["badge", ""])
     emulator.green_flag()
     ids = [CHARACTERS.index(character) for character in "badge"]
     with torch.no_grad():
@@ -255,4 +315,4 @@ def test_generate_detects_a_recurrent_hugging_face_model(models, capsys):
 
     code, report = run(capsys, "generate", "--hf", "ssm", "--max-context", "5", "-o", "bounded")
     assert code == 0 and report["max_context"] == 5
-    assert max_context(report["sprite"]) == 5
+    assert max_context(report["path"]) == 5

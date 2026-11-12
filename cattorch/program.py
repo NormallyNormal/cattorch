@@ -173,7 +173,7 @@ class EntryPoint:
         if self.name in {"init", "reset", "prepare for save"}:
             raise ValueError(f"entrypoint name {self.name!r} is reserved for lifecycle procedures")
         if re.search(r"%[snb]", self.name):
-            raise ValueError("entrypoint names cannot contain Scratch argument placeholders")
+            raise ValueError("entrypoint names can't contain Scratch argument placeholders")
         object.__setattr__(self, "method", _name(self.method, "entrypoint method"))
         object.__setattr__(self, "arguments", tuple(self.arguments))
         object.__setattr__(self, "returns", tuple(self.returns))

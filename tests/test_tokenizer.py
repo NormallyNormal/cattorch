@@ -597,7 +597,7 @@ class TestSentencePieceBPE:
             tmp_path / "sentencepiece",
             scratch_casefold=True,
         )
-        assert result.tokenizer_type == "SentencePieceBPETokenizer"
+        assert result.tokenizer_type == "sentencepiece-bpe"
 
     def test_encode_casefold_ascii_fallback_and_merges(self, tmp_path):
         result = SentencePieceBPETokenizer(
@@ -681,7 +681,7 @@ def test_tokenizer_export_returns_metadata_and_separates_name(tmp_path):
     assert isinstance(result, TokenizerResult)
     assert result.path == tmp_path / "nested" / "tokenizer.sprite3"
     assert result.sprite_name == "Friendly tokenizer"
-    assert result.tokenizer_type == "CharTokenizer"
+    assert result.tokenizer_type == "char"
     assert result.token_count == 4
     assert result.archive_bytes == result.path.stat().st_size
     with zipfile.ZipFile(result.path) as archive:

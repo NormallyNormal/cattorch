@@ -392,7 +392,7 @@ def test_a_user_kernel_on_growing_state_is_rejected(tmp_path):
             super().__init__()
             self.register_buffer("seen", torch.zeros(0, 3))
 
-        @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 8})
+        @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 8})
         def add(self, row):
             self.seen = torch.cat([self.seen, row.reshape(1, 3)])
             return torch.relu(self.seen).sum(0)

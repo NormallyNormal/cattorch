@@ -62,7 +62,7 @@ def check_kernel(
 
         operator = resolve_operator(operator)
         if operator is None:
-            raise ValueError(f"cannot call kernel target {kernel.target_name!r}")
+            raise ValueError(f"can't call kernel target {kernel.target_name!r}")
     names = [argument.name for argument in operator._schema.arguments]
     optimization: Literal["exact", "fast"] = "fast" if kernel.approximate else "exact"
     emitted = []

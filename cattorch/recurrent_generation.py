@@ -309,9 +309,12 @@ def transpile_recurrent_generation(
         )
         hint = version_hint()
     assert program.states is not None
-    for method, role in ((program.step, "recurrent step"), (program.reference, "reference")):
+    for method, field in ((program.step, "step"), (program.reference, "reference")):
         if method is not None and not callable(getattr(model, method, None)):
-            raise ValueError(f"model has no callable {role} {method!r}")
+            raise ValueError(
+                f"model has no callable method {method!r}, which "
+                f"RecurrentGenerationProgram({field}=...) names"
+            )
     if not owned:
         # The checks below run the step, which may change module state (an
         # embedding with max_norm renormalizes its rows): they run on the

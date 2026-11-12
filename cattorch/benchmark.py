@@ -663,6 +663,12 @@ def build_generation_benchmark_suite(
             token = int(prompt[0, -1])
             tokens = torch.cat((prompt, prompt[:, -1:]), dim=1)
             controller = {"name": name}
+            # The program first: a model it can't export fails with the
+            # export's own message.
+            cached, cached_assets = _export_variant(
+                model, program, temp / f"generation_{index}_cached",
+                optimization=optimization, options=options,
+            )
             stateless, stateless_assets = _export_variant(
                 _generation_baseline(model, program, tokens), (tokens,),
                 temp / f"generation_{index}_stateless", optimization=optimization,
@@ -678,10 +684,6 @@ def build_generation_benchmark_suite(
             sprites.append(stateless)
             assets.update(stateless_assets)
 
-            cached, cached_assets = _export_variant(
-                model, program, temp / f"generation_{index}_cached",
-                optimization=optimization, options=options,
-            )
             write_sprite_list(cached, TOKEN_IDS, prompt.flatten().tolist())
             _add_cached_decode_procedure(cached, token)
             cached["name"] = f"{name} cached"

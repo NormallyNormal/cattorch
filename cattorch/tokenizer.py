@@ -619,7 +619,7 @@ class BPETokenizer(_TokenizerBase):
                 f"BPETokenizer requires a BPE model, not {model.get('type', 'unknown')}"
             )
         if model.get("dropout") is not None:
-            raise ValueError("BPE dropout is nondeterministic and cannot be exported")
+            raise ValueError("BPE dropout is nondeterministic and can't be exported")
         if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):
             raise ValueError(
                 "raw-text BPETokenizer does not support subword prefixes or suffixes"
@@ -921,7 +921,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         self._decode_has_non_ascii_bytes = False
 
     def _validate_processor_configuration(self) -> None:
-        """Reject SentencePiece preprocessing Scratch cannot reproduce."""
+        """Reject SentencePiece preprocessing Scratch can't reproduce."""
         serialized = getattr(self.processor, "serialized_model_proto", None)
         if callable(serialized):
             try:
@@ -954,12 +954,12 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                 normalizer = model.normalizer_spec
                 if normalizer.add_dummy_prefix:
                     raise ValueError(
-                        "SentencePiece models with add_dummy_prefix=True cannot be "
+                        "SentencePiece models with add_dummy_prefix=True can't be "
                         "reproduced by the Scratch tokenizer"
                     )
                 if normalizer.remove_extra_whitespaces:
                     raise ValueError(
-                        "SentencePiece models with remove_extra_whitespaces=True cannot "
+                        "SentencePiece models with remove_extra_whitespaces=True can't "
                         "be reproduced by the Scratch tokenizer"
                     )
                 if normalizer.name not in {"identity", "nfkc_cf"}:
@@ -974,7 +974,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         if callable(normalize):
             if str(normalize("cattorch")).startswith("▁"):
                 raise ValueError(
-                    "SentencePiece models with add_dummy_prefix=True cannot be "
+                    "SentencePiece models with add_dummy_prefix=True can't be "
                     "reproduced by the Scratch tokenizer"
                 )
             whitespace_probe = "  a  b "
@@ -1319,7 +1319,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         if not self._decode_has_non_ascii_bytes:
             return result
         warning = (
-            "Vanilla Scratch cannot convert between characters and arbitrary "
+            "Vanilla Scratch can't convert between characters and arbitrary "
             "UTF-8 byte-fallback sequences. ASCII bytes encode and decode "
             "exactly; a non-ASCII character outside the vocabulary encodes as "
             "the unknown token rather than its UTF-8 bytes, and sampled "

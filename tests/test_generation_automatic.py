@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from cattorch import (
-    CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
+    CattorchWarning, CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
     UnsupportedModelError, transpile,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
@@ -311,18 +311,16 @@ GPTQ = QuantizationConfig(bits=8, method="gptq", min_quantized_values=16)
 
 
 @pytest.mark.parametrize(("options", "message"), [
-    ({"quantization": GPTQ}, "GPTQ requires nonempty calibration_sequences"),
-    ({"quantization": GPTQ, "calibration_sequences": []},
-     "GPTQ requires nonempty calibration_sequences"),
-    ({"calibration_sequences": [torch.tensor([[1, 2]])]},
-     "calibration_sequences can only be used with GPTQ quantization"),
-    ({"quantization": GPTQ, "calibration_sequences": [torch.tensor([[1, 2, VOCAB]])]},
-     rf"calibration_sequences\[0\] has token {VOCAB} at position 2; token IDs must be "
+    ({"quantization": GPTQ}, r"GPTQ needs calibration=, an iterable of \[1, length\] token"),
+    ({"quantization": GPTQ, "calibration": []}, "GPTQ requires nonempty calibration"),
+    ({"calibration": [torch.tensor([[1, 2]])]}, "calibration= is only used by GPTQ"),
+    ({"quantization": GPTQ, "calibration": [torch.tensor([[1, 2, VOCAB]])]},
+     rf"calibration\[0\] has token {VOCAB} at position 2; token IDs must be "
      rf"whole numbers from 0 to {VOCAB - 1}"),
-    ({"quantization": GPTQ, "calibration_sequences": [torch.tensor([[1, 2]]), torch.tensor([[2.5]])]},
-     r"calibration_sequences\[1\] has token 2.5 at position 0"),
+    ({"quantization": GPTQ, "calibration": [torch.tensor([[1, 2]]), torch.tensor([[2.5]])]},
+     r"calibration\[1\] has token 2.5 at position 0"),
 ])
-def test_calibration_errors_name_calibration_sequences(tmp_path, options, message):
+def test_calibration_errors_name_calibration(tmp_path, options, message):
     with pytest.raises(ValueError, match=message):
         transpile(nano(), GenerationProgram(max_context=8), tmp_path / "gptq", **options)
 
@@ -491,18 +489,18 @@ def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
 
 
-def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
+def test_unfactorable_layers_retry_without_layer_sharing(tmp_path):
     model = nano()
     # A different MLP width in the second layer defeats the shared procedure.
     model.blocks[1].mlp = torch.nn.Sequential(
         torch.nn.Linear(16, 24), torch.nn.GELU(), torch.nn.Linear(24, 16),
     )
     model.eval()
-    with caplog.at_level("WARNING", logger="cattorch"):
-        emulator, _ = emulator_for(
+    with pytest.warns(CattorchWarning, match="exported without layer sharing"):
+        emulator, result = emulator_for(
             model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=True),
         )
-    assert "exporting without layer sharing" in caplog.text
+    assert any("exported without layer sharing" in item for item in result.warnings)
     assert "_cattorch shared transformer layer" not in emulator._procedures
     # Per-layer caches again: the retry does not bank them.
     assert "_cattorch K cache 1" in emulator.lists and "_cattorch K cache" not in emulator.lists
@@ -596,7 +594,7 @@ def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
 
 def test_generation_program_signature_and_validation():
     program = GenerationProgram(64)
-    assert (program.method, program.max_context) == ("forward", 64)
+    assert (program.method, program.max_context) == (None, 64)
     assert GenerationProgram(max_context=32, method="decode").method == "decode"
     with pytest.raises(TypeError):
         GenerationProgram()

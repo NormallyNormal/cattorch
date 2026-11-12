@@ -313,7 +313,7 @@ def test_gptq_replays_state_updates_before_later_calls(tmp_path, monkeypatch):
         quantization=QuantizationConfig(
             bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1
         ),
-        calibration_calls=(ProgramCall("step", (torch.ones(1, 2),)),) * 2,
+        calibration=(ProgramCall("step", (torch.ones(1, 2),)),) * 2,
     )
     torch.testing.assert_close(observed[0], torch.ones(1, 2))
     torch.testing.assert_close(observed[1], torch.full((1, 2), 2.0))
@@ -370,7 +370,7 @@ def test_gptq_replays_append_state_across_different_methods(tmp_path, monkeypatc
         quantization=QuantizationConfig(
             bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1
         ),
-        calibration_calls=(
+        calibration=(
             ProgramCall("write", (torch.ones(1, 2),)),
             ProgramCall("read", ()),
             ProgramCall("write", (torch.full((1, 2), 3.0),)),
@@ -454,14 +454,14 @@ def test_lifecycle_names_are_reserved(name):
 
 
 def test_generated_interface_names_cannot_collide():
-    with pytest.raises(ValueError, match="collision"):
+    with pytest.raises(ValueError, match="two lists would both be named"):
         ExportProgram(
             entrypoints=(
                 EntryPoint("a b", arguments=(Input("c", torch.ones(1)),), returns=(Output("x"),)),
                 EntryPoint("a", arguments=(Input("b c", torch.ones(1)),), returns=(Output("y"),)),
             )
         )
-    with pytest.raises(ValueError, match="collision"):
+    with pytest.raises(ValueError, match="two lists would both be named"):
         ExportProgram(
             states=(State("s", torch.ones(1)),),
             entrypoints=(
@@ -612,7 +612,7 @@ def test_benchmark_input_restore_and_output_read_are_shard_aware():
     em = ScratchEmulator(sprite)
     em.lists["input"] = []
     em.lists["input shard 2"] = []
-    em.run_procedure("cattorch restore benchmark input")
+    em.run_procedure("_cattorch restore benchmark input")
     assert read_logical_list(em.lists, "input") == x.tolist()
     assert _target_output({"lists": {"a": ["output", [1.0]], "b": ["output shard 2", [2.0]]}}) == [
         1.0,
@@ -768,7 +768,7 @@ class MarkedCounting(Counting):
         super().__init__(broken)
         self.register_buffer("hidden", torch.zeros(4))
 
-    @entrypoint(example=lambda: (torch.tensor([[1]]),))
+    @entrypoint(example_inputs=lambda: (torch.tensor([[1]]),))
     def advance(self, token):
         logits, self.hidden = self.step(token, self.hidden)
         return logits

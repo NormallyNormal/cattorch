@@ -70,7 +70,7 @@ def main():
     path = build_benchmark_suite(
         build_cases(),
         OUTPUT,
-        iterations=100,
+        repeats=100,
     )
     print(f"Static-matmul/SwiGLU suite written: {path}")
 

@@ -176,7 +176,7 @@ def test_entry_points_take_dynamic_inputs(tmp_path):
             self.linear = nn.Linear(3, 2)
             self.register_buffer("calls", torch.zeros(1))
 
-        @entrypoint(example=lambda: (torch.ones(4, 3),), dynamic={"rows": (1, 10)})
+        @entrypoint(example_inputs=lambda: (torch.ones(4, 3),), dynamic={"rows": (1, 10)})
         def score(self, rows):
             self.calls += 1
             return torch.softmax(self.linear(rows), -1) * self.calls
@@ -195,7 +195,7 @@ def test_an_entry_point_that_cant_follow_the_length_runs_per_item(tmp_path):
             super().__init__()
             self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
 
-        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
         def encode(self, sequences):
             return self.layer(sequences)
 
@@ -221,7 +221,7 @@ def test_a_per_item_output_list_holding_a_longer_intermediate_is_sharded(
             self.weight = nn.Parameter(torch.randn(1, 1, 20))
             self.bias = nn.Parameter(torch.randn(32))
 
-        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
         def encode(self, sequences):
             return (self.layer(sequences).reshape(-1, 32, 1) * self.weight).sum(-1) + self.bias
 
@@ -240,7 +240,7 @@ def test_an_entry_point_that_updates_state_doesnt_run_per_item(tmp_path):
             self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
             self.register_buffer("calls", torch.zeros(1))
 
-        @entrypoint(example=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
         def encode(self, sequences):
             self.calls += 1
             return self.layer(sequences) * self.calls
@@ -255,7 +255,7 @@ def test_an_entry_point_using_the_length_itself_is_rejected(tmp_path):
             super().__init__()
             self.table = nn.Parameter(torch.randn(10, 3))
 
-        @entrypoint(example=lambda: (torch.randn(4, 3),), dynamic={"rows": (1, 8)})
+        @entrypoint(example_inputs=lambda: (torch.randn(4, 3),), dynamic={"rows": (1, 8)})
         def add(self, rows):
             return rows + self.table[torch.arange(rows.shape[0])]
 
@@ -269,7 +269,7 @@ def test_dynamic_is_rejected_for_programs(tmp_path):
             super().__init__()
             self.register_buffer("total", torch.zeros(3))
 
-        @entrypoint(example=lambda: (torch.ones(3),))
+        @entrypoint(example_inputs=lambda: (torch.ones(3),))
         def add(self, value):
             self.total += value
             return self.total.sum()

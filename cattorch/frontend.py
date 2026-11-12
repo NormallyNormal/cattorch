@@ -868,10 +868,21 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     except UnsupportedModelError:
         raise
     except Exception as exc:
+        raised = _eager_failure(model, example_inputs, example_kwargs)
+        if raised is not None:
+            # Not a tracing problem: the model fails on these inputs.
+            shapes = ", ".join(
+                str(tuple(value.shape)) for value in flat_example_inputs(example_inputs, example_kwargs)
+            )
+            raise UnsupportedModelError(
+                f"the model raised {type(raised).__name__} when called with inputs of shape "
+                f"{shapes}: {_first_line(raised)}; check that example_inputs match what "
+                "the model takes"
+            ) from exc
         raise UnsupportedModelError(
-            "the FX frontend could not trace this model "
-            f"({type(exc).__name__}: {exc}); a common cause is control flow that "
-            "depends on tensor values or converting tensors to Python numbers, see "
+            f"PyTorch couldn't trace this model ({type(exc).__name__}: {_first_line(exc)}); "
+            "a common cause is control flow that depends on tensor values or "
+            "converting tensors to Python numbers, see "
             "https://github.com/NormallyNormal/cattorch/blob/main/docs/"
             "troubleshooting.md#keep-one-inference-return-path"
         ) from exc
@@ -923,6 +934,28 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     )
     _check_input_count(captured, example_inputs, example_kwargs)
     return captured
+
+
+def _first_line(error: BaseException) -> str:
+    return str(error).strip().splitlines()[0] if str(error).strip() else ""
+
+
+def _eager_failure(model, example_inputs, example_kwargs) -> Exception | None:
+    """What running ``model`` on the inputs raises, outside tracing, if anything.
+
+    It runs on copies, so a model that changes its state when called is
+    left as it was.
+    """
+    import copy
+
+    try:
+        with torch.no_grad():
+            copy.deepcopy(model)(
+                *copy.deepcopy(tuple(example_inputs)), **copy.deepcopy(dict(example_kwargs or {})),
+            )
+    except Exception as error:  # noqa: BLE001 - reported to the user
+        return error
+    return None
 
 
 def _own_tensor(value):

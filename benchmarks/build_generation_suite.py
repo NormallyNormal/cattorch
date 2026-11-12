@@ -23,7 +23,7 @@ def main():
         model = TinyGPT(width, heads, hidden, context).eval()
         full = torch.randint(0, 29, (1, context))
         cases.append((name, model, full, full[:, :prompt_length]))
-    path = build_generation_benchmark_suite(cases, OUTPUT, iterations=16)
+    path = build_generation_benchmark_suite(cases, OUTPUT, repeats=16)
     print(f"Generation suite written: {path}")
 
 

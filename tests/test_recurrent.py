@@ -121,7 +121,7 @@ class Streaming(nn.Module):
         self.register_buffer("hidden", torch.zeros(1, 5))
         self.register_buffer("memory", torch.zeros(1, 5))
 
-    @entrypoint(example=lambda: (torch.randn(1, 3),))
+    @entrypoint(example_inputs=lambda: (torch.randn(1, 3),))
     def step(self, value):
         if isinstance(self.cell, nn.LSTMCell):
             hidden, memory = self.cell(value, (self.hidden, self.memory))

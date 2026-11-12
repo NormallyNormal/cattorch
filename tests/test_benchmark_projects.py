@@ -27,7 +27,7 @@ def test_a_paired_benchmark_records_each_repeat(tmp_path):
 def test_a_suite_records_each_case_and_variant(tmp_path):
     path = build_benchmark_suite(
         [("first", nn.Linear(3, 2).eval(), torch.randn(2, 3))], tmp_path / "suite.sb3",
-        iterations=2,
+        repeats=2,
     )
     emulator = ProjectEmulator(path)
     emulator.green_flag()
@@ -39,7 +39,7 @@ def test_a_suite_records_each_case_and_variant(tmp_path):
 def test_a_storage_suite_records_init_and_forward(tmp_path):
     path = build_storage_benchmark_suite(
         [("tiny", nn.Linear(3, 2).eval(), torch.randn(1, 3))], tmp_path / "storage",
-        iterations=1,
+        repeats=1,
     )
     emulator = ProjectEmulator(path)
     emulator.green_flag()

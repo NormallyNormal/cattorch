@@ -86,7 +86,7 @@ def main(
         output / "rhyme_tokenizer", name="tokenizer",
     )
     return cattorch.build_project(
-        output / "rhyme", result, tokenizer=words, max_new_tokens=max_new_tokens,
+        result, output / "rhyme", tokenizer=words, max_new_tokens=max_new_tokens,
         temperature=0.5,
     )
 

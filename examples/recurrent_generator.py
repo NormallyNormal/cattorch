@@ -82,7 +82,7 @@ def main(
     result = cattorch.transpile(model, program, output / "gru")
     words = cattorch.CharTokenizer(tokenizer()).save(output / "gru_tokenizer", name="tokenizer")
     return cattorch.build_project(
-        output / "gru", result, tokenizer=words, max_new_tokens=max_new_tokens,
+        result, output / "gru", tokenizer=words, max_new_tokens=max_new_tokens,
         temperature=0.5,
     )
 

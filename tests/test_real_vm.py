@@ -107,7 +107,7 @@ def test_models_match_pytorch(tmp_path, name):
     torch.manual_seed(0)
     model, value = build().eval(), example()
     result = transpile(model, value, tmp_path / name)
-    project = build_project(tmp_path / name, result, example_inputs=value)
+    project = build_project(result, tmp_path / name, example_inputs=value)
     stage = run_vm(project, tmp_path)["stage"]
     torch.testing.assert_close(
         values(stage, f"{name} output"), model(value).detach().flatten(), atol=1e-4, rtol=1e-4,
@@ -127,7 +127,7 @@ def test_stored_weights_decode_as_in_the_emulator(tmp_path, storage, quantizatio
     result = transpile(
         model, value, tmp_path / "stored", storage=storage, quantization=quantization,
     )
-    project = build_project(tmp_path / "stored", result, example_inputs=value)
+    project = build_project(result, tmp_path / "stored", example_inputs=value)
     stage = run_vm(project, tmp_path)["stage"]
     emulator = ProjectEmulator(project.path)
     emulator.green_flag()
@@ -153,7 +153,7 @@ def test_variable_lengths_match_pytorch(tmp_path):
     torch.manual_seed(2)
     model = Pool().eval()
     result = transpile(model, torch.randn(1, 3, 8), tmp_path / "pool", dynamic={0: {1: (1, 12)}})
-    project = build_project(tmp_path / "pool", result)
+    project = build_project(result, tmp_path / "pool")
     for length in (1, 9):
         memory = torch.randn(1, length, 8)
         stage = run_vm(
@@ -170,7 +170,7 @@ class Tally(nn.Module):
         self.register_buffer("seen", torch.zeros(0, 3))
         self.weights = nn.Parameter(torch.randn(3))
 
-    @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 6})
+    @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 6})
     def add(self, row):
         self.seen = torch.cat([self.seen, row.reshape(1, 3)])
         return (self.seen @ self.weights).softmax(0) @ self.seen
@@ -180,7 +180,7 @@ def test_program_state_carries_between_calls(tmp_path):
     torch.manual_seed(3)
     model = Tally().eval()
     result = transpile(model, None, tmp_path / "tally")
-    project = build_project(tmp_path / "tally", result)
+    project = build_project(result, tmp_path / "tally")
     rows = torch.randn(3, 3)
     stage = run_vm(project, tmp_path, flag=False, calls=[
         ("tally add", {"tally add row": row.tolist()}) for row in rows
@@ -217,7 +217,7 @@ def test_an_output_list_holding_a_longer_intermediate_is_sharded(tmp_path):
     )
     model = Readout().eval()
     result = transpile(model, program, tmp_path / "readout")
-    project = build_project(tmp_path / "readout", result)
+    project = build_project(result, tmp_path / "readout")
     stage = run_vm(project, tmp_path, flag=False, calls=[("readout read", {})])["stage"]
     expected = model.read(torch.ones(200_005)).detach()
     torch.testing.assert_close(values(stage, "readout read value"), expected, atol=1e-6, rtol=1e-6)
@@ -263,7 +263,7 @@ def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
             assert b"_cattorch shared transformer layer" in archive.read("sprite.json")
     tokenizer = CharTokenizer(char_tokenizer()).save(tmp_path / "chars", name="chars")
     project = build_project(
-        tmp_path / "demo", result, tokenizer=tokenizer, max_new_tokens=6, temperature=0,
+        result, tmp_path / "demo", tokenizer=tokenizer, max_new_tokens=6, temperature=0,
     )
     said = [entry["text"] for entry in run_vm(project, tmp_path, answers=["the cat", ""])["said"]]
     text = "".join(CHARACTERS[index] for index in greedy(model, "the cat", 6))
@@ -278,7 +278,7 @@ def test_non_finite_example_values_load_and_round_trip(tmp_path):
 
     value = torch.tensor([1.5, math.inf, -math.inf, math.nan])
     result = transpile(Scale().eval(), value, tmp_path / "scale")
-    project = build_project(tmp_path / "scale", result, example_inputs=value)
+    project = build_project(result, tmp_path / "scale", example_inputs=value)
     with zipfile.ZipFile(project.path) as archive:
         stored = json.loads(archive.read("project.json"), parse_constant=pytest.fail)
     assert [1.5, "Infinity", "-Infinity", "NaN"] in [
@@ -347,7 +347,7 @@ def test_a_benchmark_suite_runs(tmp_path):
 
     path = build_benchmark_suite(
         [("first", nn.Linear(3, 2).eval(), torch.randn(2, 3))], tmp_path / "suite.sb3",
-        iterations=2,
+        repeats=2,
     )
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
     results = stage["cattorch benchmark results"]
@@ -719,7 +719,7 @@ def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
 
     model = Lookup().eval()
     result = transpile(model, torch.tensor([[1, 3]]), tmp_path / "lookup")
-    project = build_project(tmp_path / "lookup", result)
+    project = build_project(result, tmp_path / "lookup")
     calls = [
         ("lookup run", {"lookup input": [1, 3]}),
         ("lookup run", {"lookup input": [1]}),

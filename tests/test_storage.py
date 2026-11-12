@@ -739,7 +739,7 @@ def test_storage_benchmark_bundles_all_variants(tmp_path):
     project_path = build_storage_benchmark_suite(
         [("tiny", TinyLinear().eval(), torch.randn(1, 3))],
         tmp_path / "storage_suite",
-        iterations=2,
+        repeats=2,
     )
     with zipfile.ZipFile(project_path) as archive:
         project = json.loads(archive.read("project.json"))

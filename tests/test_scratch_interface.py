@@ -221,12 +221,12 @@ class Memory(nn.Module):
         super().__init__()
         self.register_buffer("seen", torch.zeros(1, 3))
 
-    @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 8})
+    @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 8})
     def add(self, row):
         self.seen = torch.cat([self.seen, row.reshape(1, 3)])
         return self.seen.sum(0)
 
-    @entrypoint(example=lambda: (torch.ones(2, 3),), dynamic={"rows": (1, 4)})
+    @entrypoint(example_inputs=lambda: (torch.ones(2, 3),), dynamic={"rows": (1, 4)})
     def latest(self, rows):
         return rows @ self.seen[-1]
 
@@ -348,9 +348,9 @@ def test_project_names(tmp_path):
     lm = transpile(Language().eval(), GenerationProgram(max_context=16), tmp_path / "story")
     words = CharTokenizer(char_tokenizer()).save(tmp_path / "words")
     projects = {
-        "points": build_project(tmp_path / "a", plain, labels=["x", "y", "z"]),
-        "memory": build_project(tmp_path / "b", program),
-        "story": build_project(tmp_path / "c", lm, tokenizer=words),
+        "points": build_project(plain, tmp_path / "a", labels=["x", "y", "z"]),
+        "memory": build_project(program, tmp_path / "b"),
+        "story": build_project(lm, tmp_path / "c", tokenizer=words),
     }
     patterns = documented("Projects")
     used: set[str] = set()
@@ -371,7 +371,7 @@ def test_project_names(tmp_path):
                 used.update(matches)
         # The project's result names what it adds.
         found = project_names(project)
-        assert set(project.messages) <= found["broadcasts"]
+        assert set(project.broadcasts) <= found["broadcasts"]
         assert set(project.lists) | set(project.variables) == found["data"]
     assert used == set().union(*patterns.values())
 

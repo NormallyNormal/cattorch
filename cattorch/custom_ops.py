@@ -120,7 +120,7 @@ def op(function: Callable | None = None, *, name: str | None = None, fake: Calla
         try:
             hints = typing.get_type_hints(function)
         except NameError as error:
-            raise TypeError(f"cannot resolve the annotations of {qualified}: {error}") from error
+            raise TypeError(f"can't resolve the annotations of {qualified}: {error}") from error
         signature = inspect.signature(function)
         eager.__signature__ = signature.replace(  # type: ignore[attr-defined]
             parameters=[
@@ -135,7 +135,7 @@ def op(function: Callable | None = None, *, name: str | None = None, fake: Calla
             definition = torch.library.custom_op(qualified, mutates_args=())(eager)
         except (ValueError, TypeError) as error:
             raise TypeError(
-                f"cannot declare {qualified}: {error}; annotate every argument and "
+                f"can't declare {qualified}: {error}; annotate every argument and "
                 "the return type"
             ) from error
         shape = fake or eager

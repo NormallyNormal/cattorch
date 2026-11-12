@@ -112,7 +112,7 @@ def main():
     path = build_benchmark_suite(
         build_cases(),
         OUTPUT / "cattorch_suite.sb3",
-        iterations=100,
+        repeats=100,
     )
     print(f"Suite written: {path}")
 

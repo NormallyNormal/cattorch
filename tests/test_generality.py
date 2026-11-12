@@ -530,10 +530,10 @@ def test_example_kwargs_rejections(tmp_path):
     program = ExportProgram(entrypoints=(
         EntryPoint("run", arguments=(Input("x", x),), returns=(Output("y"),)),
     ))
-    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+    with pytest.raises(ValueError, match="example_kwargs can't be used with an ExportProgram"):
         transpile(model, program, tmp_path / "a", example_kwargs={"mask": mask})
     generation = GenerationProgram(max_context=4)
-    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+    with pytest.raises(ValueError, match="example_kwargs can't be used with a GenerationProgram"):
         transpile(model, generation, tmp_path / "b", example_kwargs={"mask": mask})
     with pytest.raises(TypeError, match="dict with string keys"):
         transpile(model, (x,), tmp_path / "c", example_kwargs=[("mask", mask)])
@@ -543,7 +543,7 @@ def test_example_kwargs_rejections(tmp_path):
         transpile(
             WithDropout().eval(), (VECTOR,), tmp_path / "d",
             quantization=QuantizationConfig(bits=4, method="gptq"),
-            calibration_inputs=[VECTOR],
+            calibration=[VECTOR],
             example_kwargs={"mask": mask},
         )
     result = transpile(model, (x,), tmp_path / "e", example_kwargs={"mask": mask})
