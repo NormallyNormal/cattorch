@@ -283,6 +283,31 @@
   outputs back only when it is `ok`, and end with a `NAME OPERATION complete`
   broadcast, such as `points run complete`; the bridge blocks
   (`cattorch bridge NAME OPERATION`) are part of the documented interface.
+- `QuantizationConfig(overrides=...)` gives some weights other quantization
+  settings: a module path or parameter name maps to bits (4, 6 or 8), `None`
+  for float16, or a new `QuantizationOverride(bits, method, group_size)`.
+  The longest matching key wins, a key that matches no parameter is an
+  error, and a weight read under several names, such as a token embedding
+  tied to the output head, takes the highest precision they select. One
+  sprite holds several integer formats side by side; each
+  `TensorQuantizationReport` names the `override` it used. On the trained
+  GPT-2 (124M), where int4 GPTQ gives perplexity 70.0 against 40.0 in float,
+  `QuantizationConfig(bits=4, method="gptq", overrides={"lm_head": 8})`
+  gives 42.1, since nearly all the int4 loss is in the tied table used as
+  the output head; int8 GPTQ gives 40.2. Its sprite holds 109 MB of JSON,
+  against about 89 MB in int4 and 176 MB in int8, and the second integer
+  format adds a few dozen decoder blocks.
+- With `quantization`, a weight computed from parameters before any input
+  arrives is quantized as computed: a `weight_norm` or `spectral_norm`
+  weight (`torch.nn.utils.parametrizations`, or the older `spectral_norm`),
+  `F.linear(x, w * g)`, a LoRA sum `w + b @ a`, a clamped, masked or scaled
+  weight, or an average with a buffer. It is grouped as the matrix product
+  reads it and GPTQ calibrates it; its parameters stay unrounded. The
+  module that computes it then computes with the quantized weight in its
+  place, so the sprite and every PyTorch comparison cattorch makes use the
+  same values. The report names such a weight by its attribute
+  (`fc.weight`) or as `weight computed from <parameters>`, and the new
+  `TensorQuantizationReport.sources` lists its parameters.
 
 ## Performance
 
@@ -324,6 +349,16 @@
   export wasn't repeated before the change, where the smaller ones
   extrapolate to about 11 GB. A 2-layer, 768-wide GPT-2
   `GenerationProgram` in int8 peaked at 0.7 GB instead of 1.3 GB.
+- GPTQ applies its error feedback to the columns after each block of
+  `block_size` columns at once (the paper's lazy batch update), works on a
+  few thousand rows at a time, runs its per-column steps in NumPy and its
+  factorizations on one thread, which a busy machine slows far less than
+  torch's thread pool; the weights it chooses are the same up to
+  floating-point rounding. On a busy 4-core machine, int8 GPTQ of the
+  trained GPT-2 took 151 s instead of 703 s, its matrix work 57 s instead
+  of 609 s. A matrix with more than 8,192 inputs, whose statistics would
+  take over 512 MiB, uses symmetric quantization instead, and the report
+  says so.
 
 ## Fixes
 
@@ -362,9 +397,8 @@
 - GPTQ now calibrates convolution kernels (`nn.Conv1d`, `nn.Conv2d`,
   `nn.Conv3d`, grouped and depthwise ones, and their transposed forms) over
   the input windows each group of kernels reads, instead of falling back to
-  symmetric quantization with a warning. Its groups run along the kernel's
-  last dimension, as storage reads them, so the kernels stay in int8 or
-  int4. In small CNNs trained briefly on synthetic images, int4 GPTQ instead
+  symmetric quantization with a warning. The kernels stay in int8 or int4.
+  In small CNNs trained briefly on synthetic images, int4 GPTQ instead
   of int4 symmetric lowers the output error relative to the float model from
   1.4% to 0.8% for plain 3x3 convolutions, 4.5% to 1.2% with grouped ones,
   3.5% to 1.1% with depthwise ones, 4.0% to 0.6% for a 1D network and 10.7%
@@ -793,8 +827,10 @@
   as `weight_norm`, `spectral_norm` or `F.linear(x, w * g)`, were rounded to
   integers, and the weight export computed from them was stored in float16
   without a warning, about 7% off the float model in int4. The parameters
-  are no longer rounded; the weight is stored in float16 as computed, with a
-  warning and a report entry named after its parameters.
+  are no longer rounded, and the weight is quantized as computed (see New
+  features). One computed where cattorch can't compute it from quantized
+  values instead, as in an `ExportProgram` entry point method, is stored in
+  float16 with a warning and a report entry.
 - With `quantization`, parameters that are vectors, such as
   `nn.MultiheadAttention`'s `(1, 1, E)` `bias_k` and `bias_v` and `(N, 1)`
   gains, were quantized like matrices. A matrix is now a parameter read as
@@ -966,6 +1002,27 @@
   the token list either: no block changes its input lists.
 - A variable-length program input with fewer rows than its minimum ran;
   it now reports `too few items`, as a plain sprite does.
+- With `quantization`, a matrix whose integer storage isn't smaller than
+  float16, such as one quantized in groups of one value (`group_size=1`, or
+  a prime input width such as 97), was stored in integers with a float16
+  scale per value, 24 bits instead of 16. Such a matrix now stays float16,
+  unrounded, and the report says so and why; the cost is the storage
+  codec's own for the tensor, Huffman coding included. A 97-wide int8
+  Linear's sprite went from 30.8 KB to 27.3 KB and its error from 3.8e-4 to
+  2.8e-4.
+- With `quantization`, convolution kernels were grouped along the kernel
+  width, a scale for every 3 values of a 3x3 kernel and for every value of
+  a 1x1 one, so int8 kernels took 13 to 24 bits per value. A 1D or 2D
+  convolution is now grouped like the linear map it is, over each output
+  channel's fan-in up to `group_size`, symmetric and GPTQ alike. A 3D or
+  transposed convolution, which export lowers to 2D convolutions per kernel
+  depth or to flipped kernels, is grouped within its last two kernel
+  dimensions (9 values of a 3x3x3 kernel). A small CNN with 3x3, 1x1 and
+  depthwise convolutions went from 70.4 KB to 51.6 KB in int8 at the same
+  error, and from 60.3 KB to 40.6 KB in int4 GPTQ with its error 6.6e-3
+  instead of 8.5e-3 relative to the output; int4 without GPTQ loses some
+  accuracy with the larger groups (4.1% to 4.6% here), which a smaller
+  `group_size`, also per layer through `overrides`, recovers.
 
 ## Deprecations
 
