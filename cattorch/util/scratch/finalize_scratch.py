@@ -20,7 +20,6 @@ import re
 import shutil
 import tempfile
 import uuid
-import warnings
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from pathlib import Path
 
 from cattorch import interface
 from cattorch.codegen import CodegenConfig
+from cattorch.errors import warn
 from cattorch.storage import BASE92_ALPHABET
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.scratch.ids import compact_sprite_ids
@@ -381,7 +381,7 @@ def finalize_sprite(
     file_size = output_path.stat().st_size
 
     for message in warning_messages:
-        warnings.warn(message, stacklevel=2)
+        warn(message)
     log.info("Written: %s (asset_id: %s)", output_path, asset_id)
     return FinalizedSprite(
         path=output_path,

@@ -137,7 +137,7 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
             )
         except ValueError as error:
             generic_expert_errors.append(
-                f"ExpertFamily at {path or '<root>'}: {error}"
+                f"ExpertFamily at {path!r}: {error}" if path else f"the top-level ExpertFamily: {error}"
             )
     entries = []
     for entrypoint in program.entrypoints:

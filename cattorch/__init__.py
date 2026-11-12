@@ -26,17 +26,21 @@ from cattorch.ops import rotary_embedding
 from cattorch.adapters import AdapterContext, ModuleAdapter
 from cattorch.moe_detection import CustomMoEWarning
 from cattorch.markers import (
-    adapter, entrypoint, example, export_forward, generate, marked_program, moe,
+    MarkedProgram, adapter, entrypoint, example_inputs, export_forward, generate, marked_program,
+    moe,
 )
 from cattorch.program import (
     EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall,
     RecurrentGenerationProgram, State, StateInput, StateUpdate,
 )
-from cattorch.errors import CattorchError, UnsupportedModelError, UnsupportedOperationError
+from cattorch.errors import (
+    CattorchError, CattorchWarning, UnsupportedModelError, UnsupportedOperationError,
+)
+from cattorch.interface import INTERFACE_VERSION
 from cattorch.results import (
-    ArtifactResult, BoundedDimension, EntryPointResult, ProgramCallVerifyResult, ProgramResult,
-    ProgramVerifyResult, ProjectResult, StateResult, TensorSpec, TokenizerResult,
-    TranspileResult, VerifyResult, MultiOutputVerifyResult,
+    ArtifactResult, BoundedDimension, EntryPointResult, GenerationResult,
+    ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult, ProjectResult, StateResult,
+    TensorSpec, TokenizerResult, TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
 from cattorch.verify import verify
 from cattorch.project import build_project
@@ -65,13 +69,15 @@ __all__ = [
     "StorageConfig", "QuantizationConfig", "QuantizationOverride", "QuantizationReport",
     "TensorQuantizationReport",
     "CodegenConfig", "rotary_embedding",
-    "adapter", "entrypoint", "example", "export_forward", "generate", "marked_program", "moe",
+    "adapter", "entrypoint", "example_inputs", "export_forward", "generate", "marked_program",
+    "MarkedProgram", "moe",
     "EntryPoint", "ExportProgram", "Input", "Output", "ProgramCall", "State", "StateInput",
     "StateUpdate", "AdapterContext", "ModuleAdapter", "CustomMoEWarning",
-    "CattorchError", "UnsupportedModelError", "UnsupportedOperationError",
+    "CattorchError", "CattorchWarning", "UnsupportedModelError", "UnsupportedOperationError",
+    "INTERFACE_VERSION",
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",
-    "TensorSpec", "TokenizerResult", "TranspileResult",
+    "TensorSpec", "TokenizerResult", "TranspileResult", "GenerationResult",
     "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project", "ProjectResult",
     "build_paired_benchmark", "build_benchmark_suite", "analyze_benchmark",
     "build_generation_benchmark_suite",

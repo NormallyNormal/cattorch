@@ -9,6 +9,7 @@ writing an artifact.
 from __future__ import annotations
 
 from dataclasses import KW_ONLY, dataclass
+import math
 import re
 from typing import Literal
 
@@ -21,34 +22,69 @@ def _name(value: str, field: str) -> str:
     return value.strip()
 
 
+def dynamic_dimension(value, example: torch.Tensor, where: str) -> dict[int, tuple[int, int]]:
+    """One input's ``dynamic`` bounds in their canonical form, ``{dimension: (minimum, maximum)}``.
+
+    ``value`` is that form, or ``(minimum, maximum)`` for the first
+    dimension. Every API that takes variable-length bounds (``transpile``,
+    ``@entrypoint``, ``Input`` and the command line) accepts both. Only one
+    dimension of an input can vary, and the dimensions before it must have
+    size 1, so its items are whole rows of the flattened list.
+    """
+    if isinstance(value, dict):
+        if len(value) != 1:
+            raise ValueError(f"{where} can vary in one dimension, not {len(value)}")
+        ((dimension, bounds),) = value.items()
+    else:
+        dimension, bounds = 0, value
+    if (
+        not isinstance(bounds, (tuple, list)) or len(bounds) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds)
+        or not 1 <= bounds[0] <= bounds[1]
+    ):
+        raise ValueError(
+            f"dynamic bounds for {where} must be (minimum, maximum), or "
+            "{dimension: (minimum, maximum)}, with 1 <= minimum <= maximum"
+        )
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or not (
+        0 <= dimension < example.ndim
+    ):
+        raise ValueError(f"{where} has no dimension {dimension!r}")
+    if math.prod(example.shape[:dimension]) != 1:
+        raise ValueError(
+            f"the dynamic dimension {dimension} of {where} must come after dimensions of size 1"
+        )
+    if example.shape[dimension] < 1:
+        raise ValueError(f"{where} needs an example with an item along dimension {dimension}")
+    return {dimension: (int(bounds[0]), int(bounds[1]))}
+
+
 @dataclass(frozen=True)
 class Input:
     """One tensor argument supplied through a public Scratch list.
 
-    ``dynamic=(minimum, maximum)`` lets the first dimension's length vary
-    between those bounds at run time.
+    ``dynamic={dimension: (minimum, maximum)}`` lets that dimension's length
+    vary between those bounds at run time; ``dynamic=(minimum, maximum)`` is
+    short for the first dimension. The field holds the long form.
     """
 
     name: str
     example: torch.Tensor
     _: KW_ONLY
-    dynamic: tuple[int, int] | None = None
+    dynamic: dict[int, tuple[int, int]] | tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "input name"))
         if not isinstance(self.example, torch.Tensor):
             raise TypeError("Input.example must be a torch.Tensor")
         if self.dynamic is not None:
-            bounds = tuple(self.dynamic)
-            if (
-                len(bounds) != 2
-                or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds)
-                or not 1 <= bounds[0] <= bounds[1]
-            ):
-                raise ValueError("Input.dynamic must be (minimum, maximum) with 1 <= minimum <= maximum")
-            if self.example.ndim < 1 or self.example.shape[0] < 1:
-                raise ValueError("a dynamic Input needs an example with a first dimension")
-            object.__setattr__(self, "dynamic", bounds)
+            object.__setattr__(
+                self, "dynamic",
+                dynamic_dimension(self.dynamic, self.example, f"input {self.name!r}"),
+            )
+
+    def __hash__(self) -> int:
+        return hash((self.name, id(self.example)))
 
 
 @dataclass(frozen=True)
@@ -79,11 +115,11 @@ class State:
                 or self.capacity < self.initial.shape[0]
             ):
                 raise ValueError(
-                    "append state capacity must be an integer no smaller than "
-                    "its initial leading dimension"
+                    f"append state {self.name!r} needs capacity=, a whole number of rows "
+                    f"no smaller than its initial {self.initial.shape[0]}"
                 )
         elif self.capacity is not None:
-            raise ValueError("capacity is only valid for append state")
+            raise ValueError(f"capacity= is only valid for append state, and {self.name!r} is a replace state")
 
 
 @dataclass(frozen=True)
@@ -142,7 +178,10 @@ class EntryPoint:
         object.__setattr__(self, "arguments", tuple(self.arguments))
         object.__setattr__(self, "returns", tuple(self.returns))
         if not self.returns:
-            raise ValueError("an entrypoint must declare at least one return binding")
+            raise ValueError(
+                f"entry point {self.name!r} needs at least one value in returns=, an "
+                "Output or a StateUpdate"
+            )
         if any(not isinstance(value, (Input, StateInput)) for value in self.arguments):
             raise TypeError("entrypoint arguments must be Input or StateInput values")
         if any(not isinstance(value, (Output, StateUpdate)) for value in self.returns):
@@ -189,7 +228,10 @@ class ExportProgram:
                 name = f"cattorch {entrypoint.name} {binding.name}"
                 owner = ("entrypoint", entrypoint.name)
                 if name in public_names and public_names[name] != owner:
-                    raise ValueError(f"public list name collision: {name!r}")
+                    raise ValueError(
+                        f"two lists would both be named {name!r}; rename an entry "
+                        "point, input, output or state"
+                    )
                 public_names[name] = owner
             for argument in entrypoint.arguments:
                 if isinstance(argument, StateInput) and argument.name not in states:
@@ -225,13 +267,16 @@ class GenerationProgram:
     causal language model). cattorch traces it at ``max_context`` tokens,
     derives the one-token step with a K/V cache per attention layer, checks it
     against the original model, and creates init, reset, prefill, and decode
-    blocks. ``method`` names the method to export. A Hugging Face model's
-    first tensor output (the logits) is the interface.
+    blocks. ``method`` names the method to export; ``None`` (the default)
+    means the model's ``@generate`` method if it has one, else ``forward``.
+    A Hugging Face model's first tensor output (the logits) is the interface.
+    ``hidden_prefill`` skips the output layer for every prompt token but the
+    last; ``top_k`` also lists the largest logits and their token IDs.
     """
 
     max_context: int
     _: KW_ONLY
-    method: str = "forward"
+    method: str | None = None
     hidden_prefill: bool = True
     top_k: int | None = None
 
@@ -243,7 +288,8 @@ class GenerationProgram:
             )
         if self.max_context < 1:
             raise ValueError("GenerationProgram.max_context must be positive")
-        object.__setattr__(self, "method", _name(self.method, "generation method"))
+        if self.method is not None:
+            object.__setattr__(self, "method", _name(self.method, "generation method"))
         if not isinstance(self.hidden_prefill, bool):
             raise TypeError("GenerationProgram.hidden_prefill must be a boolean")
         if self.top_k is not None:
@@ -263,8 +309,8 @@ class RecurrentGenerationProgram:
     the order of ``states``, and the logits flatten to one vocabulary row.
     It suits GRU and LSTM language models, Mamba and RWKV. The sprite has the
     same init, reset, prefill and decode blocks as a ``GenerationProgram``;
-    reset restores each state's initial value. ``max_tokens`` limits how many
-    tokens it consumes between resets (None: no limit), and ``reference``
+    reset restores each state's initial value. ``max_context`` limits how many
+    tokens it reads between resets (None: no limit), and ``reference``
     names a stateless ``method(tokens) -> logits`` the step is checked
     against at export.
 
@@ -276,7 +322,7 @@ class RecurrentGenerationProgram:
     states: tuple[State, ...] | None = None
     _: KW_ONLY
     step: str = "step"
-    max_tokens: int | None = None
+    max_context: int | None = None
     hidden_prefill: bool = True
     top_k: int | None = None
     reference: str | None = None
@@ -292,11 +338,11 @@ class RecurrentGenerationProgram:
                 "RecurrentGenerationProgram step= and reference= need states=; without "
                 "states, the Hugging Face model's adapter supplies all three"
             )
-        if self.max_tokens is not None:
-            if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
-                raise TypeError("RecurrentGenerationProgram.max_tokens must be an integer or None")
-            if self.max_tokens < 1:
-                raise ValueError("RecurrentGenerationProgram.max_tokens must be positive")
+        if self.max_context is not None:
+            if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
+                raise TypeError("RecurrentGenerationProgram.max_context must be an integer or None")
+            if self.max_context < 1:
+                raise ValueError("RecurrentGenerationProgram.max_context must be positive")
         if not isinstance(self.hidden_prefill, bool):
             raise TypeError("RecurrentGenerationProgram.hidden_prefill must be a boolean")
         if self.top_k is not None:

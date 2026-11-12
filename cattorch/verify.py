@@ -8,7 +8,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence, overload
 
 import torch
 
@@ -22,17 +22,19 @@ from cattorch.quantization import (
     QuantizationConfig, expert_bank_effective_ndims, quantize_model,
 )
 from cattorch.storage import StorageConfig, quantized_storage
-from cattorch.program import ExportProgram, Input, Output, ProgramCall
+from cattorch.program import (
+    ExportProgram, GenerationProgram, Input, Output, ProgramCall, RecurrentGenerationProgram, State,
+)
 from cattorch.program_runtime import ProgramReplay
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
-    ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult, TranspileResult,
-    VerifyResult, MultiOutputVerifyResult,
+    GenerationResult, ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult,
+    TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
 from cattorch.util.scratch.archive import read_json
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list, write_logical_list
-from cattorch.interface import STATUS_VARIABLE, input_name, output_name
+from cattorch.interface import OK, STATUS_VARIABLE, input_name, output_name
 
 
 def _normalise_inputs(example_inputs):
@@ -155,40 +157,49 @@ def round_as_stored(
             value.copy_(stored if layout is value else stored.transpose(-1, -2))
 
 
-def _verify_program(
+def _check_reproducible(quantization: QuantizationConfig | None) -> None:
+    if quantization is not None and quantization.method != "symmetric":
+        raise ValueError(
+            "verify reproduces symmetric quantization only: GPTQ depends on the "
+            "export's calibration data. Verify a GPTQ export against the float model "
+            "instead, without quantization= and with a looser tolerance such as atol=0.05"
+        )
+
+
+def _lossy(quantization, storage, sig_figs) -> bool:
+    return (
+        quantization is not None or sig_figs is not None
+        or (storage is not None and storage.precision != "float32")
+    )
+
+
+def _program_reference(
     model: torch.nn.Module,
     program: ExportProgram,
-    sprite: str | Path | ProgramResult,
+    registry,
     *,
-    calls: tuple[ProgramCall, ...] | None,
-    adapters: tuple[ModuleAdapter, ...],
     quantization: QuantizationConfig | None,
-    atol: float,
-    rtol: float,
-    _storage: StorageConfig | None = None,
-    _sig_figs: int | None = None,
-) -> ProgramVerifyResult:
-    path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
-    project = read_json(path)
-    emulator = ScratchEmulator(project)
-    registry = default_registry().for_export(adapters=adapters)
+    storage: StorageConfig | None,
+    sig_figs: int | None,
+) -> torch.nn.Module:
+    """A copy of ``model`` prepared as a program export prepares its own.
+
+    Adapters, folded batch norms, quantized weights, and the rounding of
+    storage and ``sig_figs``, so it holds the values the sprite stores.
+    """
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )
-    if quantization is not None and quantization.method != "symmetric":
-        raise ValueError(
-            "program verification currently reconstructs symmetric quantization; "
-            "GPTQ requires the exact export calibration sequence"
-        )
-    lossy = quantization is not None or _storage is not None or _sig_figs is not None
-    if lossy:
-        # Stored values are those of the folded model.
-        owned = fold_eval_batch_norms(
-            owned, methods=tuple(entry.method for entry in program.entrypoints),
-        )
+    if not _lossy(quantization, storage, sig_figs):
+        return owned
+    # Stored values are those of the folded model.
+    owned = fold_eval_batch_norms(
+        owned, methods=tuple(entry.method for entry in program.entrypoints),
+    )
     if quantization is not None:
         from cattorch.program_export import _ProgramCalibrationModule
         from cattorch.program_runtime import default_program_calls
+
         observed_calls = default_program_calls(program)
         quantize_model(
             _ProgramCalibrationModule(owned, program, observed_calls),
@@ -198,16 +209,42 @@ def _verify_program(
             _registry=registry,
             _names_from=owned,
         )
-    if lossy:
-        round_as_stored(
-            owned, _storage or StorageConfig(), quantization=quantization, sig_figs=_sig_figs,
+    round_as_stored(owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs)
+    return owned
+
+
+def _verify_program(
+    model: torch.nn.Module,
+    program: ExportProgram,
+    sprite: str | Path | ProgramResult,
+    *,
+    calls: tuple[ProgramCall, ...] | None,
+    adapters: tuple[ModuleAdapter, ...],
+    quantization: QuantizationConfig | None,
+    storage: StorageConfig | None,
+    sig_figs: int | None,
+    atol: float,
+    rtol: float,
+) -> ProgramVerifyResult:
+    if isinstance(sprite, (TranspileResult, GenerationResult)):
+        raise TypeError(
+            f"an ExportProgram's sprite is a ProgramResult or a path, not a "
+            f"{type(sprite).__name__}"
         )
+    path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
+    emulator = ScratchEmulator(read_json(path))
+    registry = default_registry().for_export(adapters=adapters)
+    owned = _program_reference(
+        model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
+    )
     replay = ProgramReplay(owned, program)
     if calls is None:
         from cattorch.program_runtime import default_program_calls
         calls = default_program_calls(program)
     call_results = []
     for invocation in calls:
+        if not isinstance(invocation, ProgramCall):
+            raise TypeError(f"calls must contain ProgramCall values, not {type(invocation).__name__}")
         entry = replay.entry(invocation)
         for binding, value in zip(
             (binding for binding in entry.arguments if isinstance(binding, Input)),
@@ -220,7 +257,7 @@ def _verify_program(
         emulator.run_procedure(f"cattorch {entry.name}")
         status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
         output_results = []
-        if status == "ok":
+        if status == OK:
             from cattorch.experts import _expert_family_context
             with _expert_family_context(registry.expert_families):
                 leaves = replay.run(invocation)
@@ -231,21 +268,18 @@ def _verify_program(
                         _get_logical_list(emulator, f"cattorch {entry.name} {binding.name}"),
                         atol=atol, rtol=rtol,
                     ))
-        state_results = tuple(
-            (
-                state.name,
-                _compare_values(
-                    replay.states[state.name],
-                    _get_logical_list(emulator, f"cattorch state {state.name}"),
-                    atol=atol, rtol=rtol,
-                ),
+        state_results = {
+            state.name: _compare_values(
+                replay.states[state.name],
+                _get_logical_list(emulator, f"cattorch state {state.name}"),
+                atol=atol, rtol=rtol,
             )
             for state in program.states
-        )
+        }
         passed = (
-            status == "ok"
+            status == OK
             and all(value.passed for value in output_results)
-            and all(value.passed for _, value in state_results)
+            and all(value.passed for value in state_results.values())
         )
         call_results.append(ProgramCallVerifyResult(
             entrypoint=entry.name,
@@ -260,68 +294,312 @@ def _verify_program(
     )
 
 
-def verify(
-    model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | None,
-    sprite: str | Path | TranspileResult | ProgramResult,
-    *,
-    atol: float = 1e-4,
-    rtol: float = 1e-5,
-    calls: tuple[ProgramCall, ...] | None = None,
-    adapters: tuple[ModuleAdapter, ...] = (),
-    quantization: QuantizationConfig | None = None,
-    example_kwargs: dict[str, Any] | None = None,
-    _storage: StorageConfig | None = None,
-    _sig_figs: int | None = None,
-):
-    """Run one generated forward in the emulator and compare it with PyTorch.
+class _GenerationReference:
+    """What a generation sprite should compute, run in PyTorch.
 
-    Use it to check the conversion and the effect of lossy export settings.
-    It says nothing about speed in browser Scratch.
-
-    ``sprite`` may be a path or ``TranspileResult``. ``example_inputs`` must
-    match the exported fixed interface. The returned ``VerifyResult`` reports
-    output length, aggregate errors, and the worst flattened index for one
-    tensor output; a length mismatch is a failed result with infinite error
-    metrics. Multiple tensor leaves return ``MultiOutputVerifyResult``, with
-    one comparison per leaf in export order and an overall ``passed`` flag.
-
-    For an ``ExportProgram``, ``calls`` runs a sequence of ``ProgramCall``s
-    with state carried between them, ``adapters`` must match the export, and a
-    symmetric ``quantization`` config makes PyTorch use the quantized weights.
-    The result is a ``ProgramVerifyResult``.
-
-    ``example_kwargs`` must match the export: tensor values are written to the
-    inputs after the positional ones, and all of them are passed to the model.
-    A model in training mode is run as an evaluation-mode copy, with a warning.
-    Non-tensor output leaves are ignored, as in ``transpile``.
+    ``logits(tokens)`` gives the next token's logits after reading
+    ``tokens``, all the tokens since the last reset, as one row.
     """
-    if atol < 0 or rtol < 0:
-        raise ValueError("atol and rtol must be non-negative")
-    if example_inputs is None:
-        # As in ``transpile``: the interface comes from the model's markers.
-        from cattorch.markers import example_inputs as marked_example, has_entrypoints, marked_program
-        if has_entrypoints(model):
-            model, example_inputs = marked_program(model)
+
+    def __init__(self, model, program, registry, *, quantization, storage, sig_figs):
+        lossy = _lossy(quantization, storage, sig_figs)
+        if isinstance(program, GenerationProgram):
+            from cattorch.autoregressive import MethodLeaves
+            from cattorch.markers import generation_method
+
+            method = program.method or generation_method(model) or "forward"
+            if not callable(getattr(model, method, None)):
+                raise ValueError(
+                    f"model has no callable method {method!r}, which "
+                    "GenerationProgram(method=...) names"
+                )
+            owned = copy.deepcopy(model).float()
+            module = owned if method == "forward" else MethodLeaves(owned, method)
+            prepared = registry.adapt_model(module, _copy=False)
+            if lossy:
+                prepared = fold_eval_batch_norms(prepared)
+                if quantization is not None:
+                    quantize_model(
+                        prepared, quantization, None,
+                        orientation_inputs=[
+                            (torch.zeros(1, program.max_context, dtype=torch.long),),
+                        ],
+                        _registry=registry,
+                    )
+                round_as_stored(
+                    prepared, storage or StorageConfig(), quantization=quantization,
+                    sig_figs=sig_figs,
+                )
+            self.model = prepared
+            self.max_context: int | None = program.max_context
+            self.states = None
+            return
+        from cattorch.huggingface_recurrent import adapt_recurrent_model
+        from cattorch.recurrent_generation import step_program
+
+        states, step = program.states, program.step
+        owned = model
+        if states is None:
+            adapted = adapt_recurrent_model(model)
+            if adapted is None:
+                raise UnsupportedModelError(
+                    "RecurrentGenerationProgram needs states=... unless the model is a "
+                    "supported Hugging Face recurrent model (Mamba, Mamba-2, RWKV)"
+                )
+            owned, states, step = adapted.module, adapted.states, adapted.step
         else:
-            example_inputs = marked_example(model)
-            if example_inputs is None:
-                raise ValueError("example_inputs is None, but the model has no marker for them")
-    validate_export_options(example_kwargs=example_kwargs)
-    if example_kwargs is not None and isinstance(example_inputs, ExportProgram):
-        raise ValueError("example_kwargs cannot be used with an ExportProgram")
-    if isinstance(example_inputs, ExportProgram):
-        if isinstance(sprite, TranspileResult):
-            raise TypeError("an ExportProgram must be verified with a ProgramResult or path")
-        return _verify_program(
-            model, example_inputs, sprite,
-            calls=calls, adapters=adapters, quantization=quantization,
-            atol=atol, rtol=rtol, _storage=_storage, _sig_figs=_sig_figs,
+            owned = copy.deepcopy(model).float()
+        states = tuple(
+            State(state.name, state.initial.float()) if state.initial.is_floating_point()
+            else state for state in states
         )
-    if calls is not None or adapters or quantization is not None:
-        raise ValueError("calls, adapters, and quantization require an ExportProgram")
-    if isinstance(sprite, ProgramResult):
-        raise TypeError("ordinary tensor verification cannot use a ProgramResult")
+        export = step_program(states, step)
+        self.model = _program_reference(
+            owned, export, registry, quantization=quantization, storage=storage,
+            sig_figs=sig_figs,
+        )
+        self.step = step
+        self.initial = tuple(state.initial for state in states)
+        self.max_context = program.max_context
+        self.states = self.initial
+        self.read = 0
+
+    def logits(self, tokens: list[int]) -> torch.Tensor:
+        with torch.no_grad():
+            if self.states is None:
+                value = torch.tensor([tokens], dtype=torch.long)
+                output = tensor_output_leaves(self.model(value), warn=False)[0]
+                return output.reshape(len(tokens), -1)[-1]
+            if len(tokens) < self.read:
+                self.states, self.read = self.initial, 0
+            logits = None
+            for token in tokens[self.read:]:
+                returned = getattr(self.model, self.step)(
+                    torch.tensor([[token]], dtype=torch.long), *self.states,
+                )
+                logits, *updates = tensor_output_leaves(returned, warn=False)
+                self.states = tuple(updates)
+            self.read = len(tokens)
+            assert logits is not None
+            return logits.reshape(-1)
+
+
+def _generation_calls(vocabulary: int, max_context: int | None) -> tuple[ProgramCall, ...]:
+    """A prefill and decodes over a fixed token sequence, as default ``calls``."""
+    length = min(max_context or 8, 8)
+    generator = torch.Generator().manual_seed(0)
+    tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
+    prompt = max(1, length // 2)
+    return (
+        ProgramCall("prefill", (tokens[:, :prompt],)),
+        *(
+            ProgramCall("decode", (tokens[:, position:position + 1],))
+            for position in range(prompt, length)
+        ),
+    )
+
+
+def _verify_generation(
+    model: torch.nn.Module,
+    program: GenerationProgram | RecurrentGenerationProgram,
+    sprite: str | Path | GenerationResult,
+    *,
+    calls: tuple[ProgramCall, ...] | None,
+    adapters: tuple[ModuleAdapter, ...],
+    quantization: QuantizationConfig | None,
+    storage: StorageConfig | None,
+    sig_figs: int | None,
+    atol: float,
+    rtol: float,
+) -> ProgramVerifyResult:
+    """Run generation block calls in the emulator and compare each with PyTorch."""
+    from cattorch import interface
+
+    if isinstance(sprite, (TranspileResult, ProgramResult)):
+        raise TypeError(
+            f"a generation sprite is a GenerationResult or a path, not a "
+            f"{type(sprite).__name__}"
+        )
+    path = sprite.path if isinstance(sprite, GenerationResult) else Path(sprite)
+    project = read_json(path)
+    emulator = ScratchEmulator(project)
+    names = {entry[0] for entry in project.get("lists", {}).values()}
+    if interface.LOGITS not in names:
+        raise ValueError(f"{path} is not a generation sprite: it has no {interface.LOGITS!r} list")
+    top_k = interface.TOP_K_VALUES in names
+    registry = default_registry().for_export(adapters=adapters)
+    reference = _GenerationReference(
+        model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
+    )
+    # The token IDs the sprite accepts.
+    from cattorch.autoregressive import EmbeddingLookup, lookup_vocabulary
+
+    vocabulary = sprite.vocabulary_size if isinstance(sprite, GenerationResult) else None
+    if vocabulary is None:
+        token = torch.zeros(1, 1, dtype=torch.long)
+        lookup = EmbeddingLookup(token)
+        run = (
+            reference.model if reference.states is None
+            else lambda value: getattr(reference.model, reference.step)(value, *reference.initial)
+        )
+        with torch.no_grad(), lookup:
+            run(token)
+        vocabulary = lookup_vocabulary(run, lookup) or int(reference.logits([0]).numel())
+    if calls is None:
+        calls = _generation_calls(vocabulary, reference.max_context)
+    tokens: list[int] = []
+    results = []
+    for invocation in calls:
+        if not isinstance(invocation, ProgramCall):
+            raise TypeError(f"calls must contain ProgramCall values, not {type(invocation).__name__}")
+        block = invocation.entrypoint
+        if block not in {"prefill", "decode", "reset"}:
+            raise ValueError(
+                f"a generation sprite's calls name 'prefill', 'decode' or 'reset', not {block!r}"
+            )
+        if block == "reset":
+            if invocation.inputs:
+                raise ValueError("ProgramCall('reset') takes no inputs")
+            values: list = []
+        else:
+            if len(invocation.inputs) != 1:
+                raise ValueError(f"ProgramCall({block!r}, ...) takes one tensor of token IDs")
+            values = invocation.inputs[0].detach().cpu().flatten().tolist()
+            _set_logical_list(emulator, interface.TOKEN_IDS, values)
+        emulator.run_procedure(f"cattorch {block}")
+        status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
+        expected_status = _expected_generation_status(
+            block, values, len(tokens), vocabulary, reference.max_context,
+        )
+        if expected_status == OK:
+            tokens = (
+                [] if block == "reset"
+                else [int(value) for value in values] if block == "prefill"
+                else [*tokens, int(values[0])]
+            )
+        outputs: list[VerifyResult] = []
+        if block != "reset" and status == OK == expected_status:
+            expected = reference.logits(tokens)
+            outputs.append(_compare_values(
+                expected, _get_logical_list(emulator, interface.LOGITS), atol=atol, rtol=rtol,
+            ))
+            if top_k:
+                values_found = _get_logical_list(emulator, interface.TOP_K_VALUES)
+                ids_found = _get_logical_list(emulator, interface.TOP_K_IDS)
+                largest = torch.topk(expected, len(values_found)).values
+                outputs.append(_compare_values(largest, values_found, atol=atol, rtol=rtol))
+                # Ties may list either ID, so the IDs are checked by the
+                # logits they point at.
+                try:
+                    pointed = expected[[int(float(value)) for value in ids_found]]
+                except (ValueError, IndexError):
+                    pointed = torch.full((len(ids_found),), math.nan)
+                outputs.append(_compare_values(largest, pointed.tolist(), atol=atol, rtol=rtol))
+        results.append(ProgramCallVerifyResult(
+            entrypoint=block,
+            passed=status == expected_status and all(value.passed for value in outputs),
+            outputs=tuple(outputs),
+            states={},
+            status=status,
+            expected_status=expected_status,
+        ))
+    return ProgramVerifyResult(
+        passed=all(value.passed for value in results), calls=tuple(results),
+    )
+
+
+def _expected_generation_status(
+    block: str, values: list, cached: int, vocabulary: int, max_context: int | None,
+) -> str:
+    """The ``cattorch status`` a generation block should end with."""
+    from cattorch import interface
+
+    if block == "reset":
+        return OK
+    tokens = interface.TOKEN_IDS
+    if block == "decode" and len(values) != 1:
+        return interface.wrong_number_of_items(tokens)
+    if block == "prefill":
+        if not values:
+            return interface.too_few_items(tokens)
+        if max_context is not None and len(values) > max_context:
+            return interface.too_many_items(tokens)
+    for value in values:
+        number = float(value)
+        if not number.is_integer() or not 0 <= number < vocabulary:
+            return interface.invalid_item(tokens)
+    if block == "decode" and max_context is not None and cached >= max_context:
+        return interface.CONTEXT_FULL
+    return OK
+
+
+def _tensor_reference(
+    model: torch.nn.Module,
+    inputs: tuple[torch.Tensor, ...],
+    example_kwargs: dict[str, Any] | None,
+    *,
+    adapters: tuple[ModuleAdapter, ...],
+    quantization: QuantizationConfig | None,
+    storage: StorageConfig | None,
+    sig_figs: int | None,
+) -> torch.nn.Module:
+    """The model a tensor-input sprite is compared with.
+
+    An evaluation-mode copy with the Hugging Face defaults ``transpile``
+    uses, when needed; with export options, a copy prepared as the export
+    prepares its own: adapters, folded batch norms, quantized weights, and
+    the rounding of storage and ``sig_figs``.
+    """
+    if adapters or _lossy(quantization, storage, sig_figs):
+        registry = default_registry().for_export(adapters=adapters)
+        owned = registry.adapt_model(model)
+        if not _lossy(quantization, storage, sig_figs):
+            return owned
+        owned = fold_eval_batch_norms(owned)
+        if quantization is not None:
+            quantize_model(
+                owned, quantization, None, orientation_inputs=[inputs],
+                call_kwargs=example_kwargs, _registry=registry,
+            )
+        round_as_stored(
+            owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs,
+        )
+        return owned
+    transformers = sys.modules.get("transformers")
+    huggingface = transformers is not None and any(
+        isinstance(module, transformers.PreTrainedModel) for module in model.modules()
+    )
+    training = any(module.training for module in model.modules())
+    if training or huggingface:
+        # Compare against the model transpile exported: an evaluation-mode
+        # copy, with the same Hugging Face defaults (no cache or extra outputs).
+        model = copy.deepcopy(model)
+        if training:
+            eval_mode_copy_warning(model)
+            model.eval()
+        if huggingface:
+            prepare_huggingface_models(model)
+    return model
+
+
+def _verify_tensors(
+    model: torch.nn.Module,
+    example_inputs,
+    sprite: str | Path | TranspileResult,
+    *,
+    adapters: tuple[ModuleAdapter, ...],
+    quantization: QuantizationConfig | None,
+    storage: StorageConfig | None,
+    sig_figs: int | None,
+    example_kwargs: dict[str, Any] | None,
+    atol: float,
+    rtol: float,
+) -> VerifyResult | MultiOutputVerifyResult:
+    if isinstance(sprite, (ProgramResult, GenerationResult)):
+        raise TypeError(
+            f"a sprite from tensor inputs is a TranspileResult or a path, not a "
+            f"{type(sprite).__name__}"
+        )
     inputs = _normalise_inputs(example_inputs)
     if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs):
         raise TypeError("example_inputs must be a tensor or tuple of tensors")
@@ -334,34 +612,21 @@ def verify(
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
     emulator.run_procedure("cattorch forward")
 
-    training = any(module.training for module in model.modules())
-    transformers = sys.modules.get("transformers")
-    huggingface = transformers is not None and any(
-        isinstance(module, transformers.PreTrainedModel) for module in model.modules()
+    reference = _tensor_reference(
+        model, inputs, example_kwargs, adapters=adapters, quantization=quantization,
+        storage=storage, sig_figs=sig_figs,
     )
-    if training or huggingface:
-        # Compare against the model transpile exported: an evaluation-mode
-        # copy, with the same Hugging Face defaults (no cache or extra outputs).
-        model = copy.deepcopy(model)
-        if training:
-            model.eval()
-            eval_mode_copy_warning()
-        if huggingface:
-            prepare_huggingface_models(model)
     with torch.no_grad():
-        expected = model(*inputs, **(example_kwargs or {}))
+        expected = reference(*inputs, **(example_kwargs or {}))
     leaves = tensor_output_leaves(expected, warn=False)
-    output_names = tuple(
-        output_name(index)
-        for index in range(len(leaves))
-    )
+    output_names = tuple(output_name(index) for index in range(len(leaves)))
     actual_names = {
         entry[0] for entry in project.get("lists", {}).values()
         if re.fullmatch(r"output(?:_[1-9][0-9]*)?", entry[0])
     }
     if actual_names != set(output_names):
         raise UnsupportedModelError(
-            "generated output lists do not match the model's tensor output leaves: "
+            "the sprite's output lists don't match the model's tensor outputs: "
             f"expected {output_names}, found {tuple(sorted(actual_names))}"
         )
     comparisons = tuple(
@@ -377,4 +642,129 @@ def verify(
         passed=all(result.passed for result in comparisons),
         outputs=comparisons,
         approximate_operations=approximate,
+    )
+
+
+Sprite = str | Path | TranspileResult | ProgramResult | GenerationResult
+
+
+@overload
+def verify(
+    model: torch.nn.Module,
+    example_inputs: ExportProgram | GenerationProgram | RecurrentGenerationProgram,
+    sprite: Sprite,
+    *,
+    atol: float = ...,
+    rtol: float = ...,
+    calls: Sequence[ProgramCall] | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    quantization: QuantizationConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    sig_figs: int | None = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+) -> ProgramVerifyResult: ...
+
+
+@overload
+def verify(
+    model: torch.nn.Module,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | None,
+    sprite: Sprite,
+    *,
+    atol: float = ...,
+    rtol: float = ...,
+    calls: Sequence[ProgramCall] | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    quantization: QuantizationConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    sig_figs: int | None = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+) -> VerifyResult | MultiOutputVerifyResult | ProgramVerifyResult: ...
+
+
+def verify(
+    model: torch.nn.Module,
+    example_inputs: (
+        torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram
+        | RecurrentGenerationProgram | None
+    ),
+    sprite: Sprite,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-5,
+    calls: Sequence[ProgramCall] | None = None,
+    adapters: Sequence[ModuleAdapter] = (),
+    quantization: QuantizationConfig | None = None,
+    storage: StorageConfig | None = None,
+    sig_figs: int | None = None,
+    example_kwargs: dict[str, Any] | None = None,
+) -> VerifyResult | MultiOutputVerifyResult | ProgramVerifyResult:
+    """Run an exported sprite in the emulator and compare it with PyTorch.
+
+    Use it to check the conversion and the effect of lossy export settings.
+    It says nothing about speed in browser Scratch. ``model`` and
+    ``example_inputs`` are what was passed to ``transpile``, and ``sprite``
+    is the export's result or its path; ``None`` takes the interface from
+    the model's markers, as ``transpile`` does.
+
+    For tensor inputs, the sprite runs ``cattorch forward`` on
+    ``example_inputs`` (and the tensors in ``example_kwargs``, which must
+    match the export's), and the result is a ``VerifyResult``, or a
+    ``MultiOutputVerifyResult`` with one comparison per output. A length
+    mismatch is a failed result with infinite error metrics.
+
+    For an ``ExportProgram`` (or ``@entrypoint`` markers), ``calls`` runs a
+    sequence of ``ProgramCall``s with state carried between them, each entry
+    point once with its example inputs by default. For a ``GenerationProgram``
+    or ``RecurrentGenerationProgram``, ``calls`` names the blocks
+    ``"prefill"``, ``"decode"`` and ``"reset"`` with their token IDs, such as
+    ``ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))``; by default a
+    prefill and a few decodes. Each call's logits and top-k lists are
+    compared with the model's next-token logits, and its ``cattorch status``
+    with the status its input should give, such as ``context full``. Both
+    return a ``ProgramVerifyResult``.
+
+    ``adapters``, ``quantization``, ``storage`` and ``sig_figs`` are the
+    export's options: given, PyTorch runs a copy of the model prepared as the
+    export prepared its own, holding the values the sprite stores, so the
+    comparison isolates the conversion from lossy storage and can use tight
+    tolerances. Without them a lossy export needs a looser tolerance. Only
+    symmetric quantization can be reproduced. A model in training mode is
+    run as an evaluation-mode copy, with a warning. Non-tensor output leaves
+    are ignored, as in ``transpile``.
+    """
+    if atol < 0 or rtol < 0:
+        raise ValueError("atol and rtol must be non-negative")
+    validate_export_options(
+        storage=storage, quantization=quantization, sig_figs=sig_figs, adapters=adapters,
+        example_kwargs=example_kwargs,
+    )
+    adapters = tuple(adapters)
+    _check_reproducible(quantization)
+    if example_inputs is None:
+        from cattorch.transpiler import interface_from_markers
+
+        model, example_inputs = interface_from_markers(model)
+    options: dict[str, Any] = dict(
+        adapters=adapters, quantization=quantization, storage=storage, sig_figs=sig_figs,
+        atol=atol, rtol=rtol,
+    )
+    stateful = (ExportProgram, GenerationProgram, RecurrentGenerationProgram)
+    if isinstance(example_inputs, stateful):
+        if example_kwargs is not None:
+            raise ValueError(
+                f"example_kwargs can't be used with a {type(example_inputs).__name__}, "
+                "whose calls take their inputs from calls="
+            )
+        calls = None if calls is None else tuple(calls)
+        if isinstance(example_inputs, ExportProgram):
+            return _verify_program(model, example_inputs, sprite, calls=calls, **options)
+        return _verify_generation(model, example_inputs, sprite, calls=calls, **options)
+    if calls is not None:
+        raise ValueError(
+            "calls= applies to programs and generation programs; for tensor inputs, "
+            "verify runs example_inputs once"
+        )
+    return _verify_tensors(
+        model, example_inputs, sprite, example_kwargs=example_kwargs, **options,
     )

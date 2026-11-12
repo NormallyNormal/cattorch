@@ -32,8 +32,9 @@ def entry_examples(program, entrypoint):
         if isinstance(binding, Input):
             if binding.dynamic is not None:
                 # Traced with one row, like append state.
-                dynamic_inputs[len(args)] = (binding.name, *binding.dynamic)
-                args.append(binding.example[:1])
+                ((axis, (minimum, maximum)),) = binding.dynamic.items()
+                dynamic_inputs[len(args)] = (binding.name, minimum, maximum, axis)
+                args.append(binding.example.narrow(axis, 0, 1))
             else:
                 args.append(binding.example)
         else:
@@ -43,6 +44,7 @@ def entry_examples(program, entrypoint):
                     state.name,
                     int(state.initial.shape[0]),
                     int(state.capacity),
+                    0,
                 )
                 args.append(state.initial.new_zeros((1, *state.initial.shape[1:])))
             else:
@@ -137,10 +139,14 @@ class ProgramReplay:
                 value = next(public)
                 expected = binding.example.shape
                 if binding.dynamic is not None:
-                    minimum, maximum = binding.dynamic
+                    ((axis, (minimum, maximum)),) = binding.dynamic.items()
                     matches = (
-                        value.ndim == len(expected) and value.shape[1:] == expected[1:]
-                        and minimum <= value.shape[0] <= maximum
+                        value.ndim == len(expected)
+                        and all(
+                            size == wanted for dimension, (size, wanted)
+                            in enumerate(zip(value.shape, expected)) if dimension != axis
+                        )
+                        and minimum <= value.shape[axis] <= maximum
                     )
                 else:
                     matches = value.shape == expected

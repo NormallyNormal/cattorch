@@ -367,11 +367,11 @@ def _build_entry_wrapper(
         )
         lists.add(name)
         if spec.numel is None:
-            trailing = math.prod(
-                extent for extent in spec.shape[1:] if isinstance(extent, int)
-            )
-            rows = spec.shape[0]
-            minimum = rows.minimum if isinstance(rows, BoundedDimension) else 1
+            # The dimensions before the variable one have size 1, so its
+            # items are rows of the other dimensions' values.
+            trailing = math.prod(extent for extent in spec.shape if isinstance(extent, int))
+            rows = next(extent for extent in spec.shape if isinstance(extent, BoundedDimension))
+            minimum = rows.minimum
             # An append state can be empty.
             minimum = max(minimum, 1) if isinstance(binding, Input) else 0
             checks = interface.length_checks(
@@ -412,9 +412,7 @@ def _build_entry_wrapper(
         if isinstance(binding, Output):
             shown = display(_input_list(entrypoint.name, binding.name))
             if spec.numel is None:
-                trailing = math.prod(
-                    extent for extent in spec.shape[1:] if isinstance(extent, int)
-                )
+                trailing = math.prod(extent for extent in spec.shape if isinstance(extent, int))
                 checks = interface.length_checks(
                     shown, width=trailing, min_items=0, max_items=spec.max_numel,
                     lists=(temporary,),
@@ -651,10 +649,14 @@ def transpile_program(
     any_filled = bool(empty_on_load)
     calls = tuple(calibration_calls or ())
     known_entries = {entry.name for entry in program.entrypoints}
-    if any(call_value.entrypoint not in known_entries for call_value in calls):
-        raise ValueError("calibration_calls contains an unknown entrypoint")
+    for call_value in calls:
+        if call_value.entrypoint not in known_entries:
+            raise ValueError(
+                f"{_calibration_name} calls entry point {call_value.entrypoint!r}, which the "
+                f"program doesn't have; its entry points are {sorted(known_entries)}"
+            )
     if calibration_calls is not None and (quantization is None or quantization.method != "gptq"):
-        raise ValueError("calibration_calls can only be used with GPTQ quantization")
+        raise ValueError(f"{_calibration_name}= is only used by GPTQ quantization")
 
     # Model ownership, transforms, and calibration belong to the whole
     # program. Every entrypoint below captures the same prepared module.
@@ -1238,10 +1240,10 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
         isinstance(binding, StateUpdate) for binding in entrypoint.returns
     ):
         raise error
-    ((index, (name, minimum, maximum)),) = dynamic_inputs.items()
+    ((index, (name, minimum, maximum, axis)),) = dynamic_inputs.items()
     if not isinstance(entrypoint.arguments[index], Input):
         raise error
-    spec = {index: (name, minimum, maximum, 0)}
+    spec = {index: (name, minimum, maximum, axis)}
     # The full example, whose items differ, shows mixing across them.
     examples = list(args)
     examples[index] = entrypoint.arguments[index].example

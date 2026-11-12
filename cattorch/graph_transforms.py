@@ -141,3 +141,36 @@ class _LinearThenBatchNorm(torch.nn.Module):
 
 
 __all__ = ["fold_eval_batch_norms"]
+
+
+def mode_dependent_modules(model: torch.nn.Module) -> list[str]:
+    """Paths of the modules in training mode whose output depends on it.
+
+    These are dropout and batch norm, a recurrent layer or attention with
+    dropout, an instance norm tracking running statistics, and any module
+    whose ``forward`` reads ``self.training``. Other modules give the same
+    output in either mode, so exporting them in evaluation mode changes
+    nothing.
+    """
+    nn = torch.nn
+    found = []
+    for path, module in model.named_modules():
+        if not module.training:
+            continue
+        dependent = (
+            isinstance(module, (nn.modules.dropout._DropoutNd, nn.modules.batchnorm._BatchNorm))
+            or (
+                isinstance(module, nn.modules.instancenorm._InstanceNorm)
+                and module.track_running_stats
+            )
+            or (
+                isinstance(module, (nn.RNNBase, nn.MultiheadAttention))
+                and getattr(module, "dropout", 0)
+            )
+        )
+        if not dependent:
+            code = getattr(getattr(type(module), "forward", None), "__code__", None)
+            dependent = code is not None and "training" in code.co_names
+        if dependent:
+            found.append(path or type(module).__name__)
+    return found

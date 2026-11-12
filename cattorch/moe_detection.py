@@ -14,12 +14,11 @@ import copy
 import itertools
 import math
 import logging
-import warnings
 
 import torch
 from torch import nn
 
-from cattorch.errors import UnsupportedModelError
+from cattorch.errors import CattorchWarning, UnsupportedModelError, warn
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ _DATA_DEPENDENT_OPS = frozenset({
 })
 
 
-class CustomMoEWarning(UserWarning):
+class CustomMoEWarning(CattorchWarning):
     """A hand-written MoE block was exported as a sparse mixture of experts."""
 
 
@@ -133,7 +132,7 @@ def detect_custom_moe(module: nn.Module, path: str) -> nn.Module | None:
         return None
     family.train(module.training)
     inputs, expected = probes
-    where = path or "<root>"
+    where = repr(path) if path else "the top level"
     name = type(module).__name__
     count = len(expert_list)
     for top_k, scoring, normalize in itertools.product(
@@ -152,13 +151,12 @@ def detect_custom_moe(module: nn.Module, path: str) -> nn.Module | None:
             continue
         if matches:
             description = _describe(top_k, scoring, normalize)
-            warnings.warn(
+            warn(
                 f"{name} at {where} is exported as a sparse mixture of {count} "
                 f"experts ({description}), which matched it on probe inputs; "
                 "run verify on real inputs, or declare the block with "
                 "ExpertFamily and SparseMoE",
                 CustomMoEWarning,
-                stacklevel=2,
             )
             log.info("custom MoE %s at %s: %s", name, where, description)
             return candidate

@@ -274,9 +274,15 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
 
         tracer = _FastTransformTracer()
         traced = GraphModule(model, tracer.trace(model))
-    except Exception:
-        log.warning("Skipping whole-neuron pruning because FX tracing was not available")
-        return
+    except Exception as error:
+        from cattorch.errors import UnsupportedModelError
+
+        reason = str(error).splitlines()[0] if str(error) else ""
+        raise UnsupportedModelError(
+            "FastConfig(neuron_pruning=...) finds Linear, activation, Linear chains "
+            "with torch.fx symbolic tracing, which can't trace this model "
+            f"({type(error).__name__}: {reason}); export it with neuron_pruning=0"
+        ) from None
 
     modules = dict(model.named_modules())
     calls_by_target: dict[str, list] = {}
@@ -443,6 +449,13 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
                 if isinstance(transformed, nn.Linear)
                 else _factor_conv(transformed, rank)
             )
+            if replacement is None:
+                from cattorch.errors import warn
+
+                warn(
+                    f"the model was exported without its low-rank factorization at rank "
+                    f"{rank}, which would not make it smaller or faster"
+                )
         target = replacement if replacement is not None else transformed
         _apply_pruning(target, policy.pruning)
         return target
@@ -469,7 +482,12 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
             else:
                 replacement = _factor_conv(module, rank)
             if replacement is None:
-                log.warning("Skipping non-beneficial low-rank transform for %s", name)
+                from cattorch.errors import warn
+
+                warn(
+                    f"{name!r} was exported without its low-rank factorization at rank "
+                    f"{rank}, which would not make it smaller or faster"
+                )
             else:
                 parent_name, _, child_name = name.rpartition(".")
                 parent = transformed.get_submodule(parent_name) if parent_name else transformed

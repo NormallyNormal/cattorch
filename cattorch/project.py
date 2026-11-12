@@ -14,14 +14,16 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from cattorch.errors import warn
 from cattorch.results import (
-    BoundedDimension, ProgramResult, ProjectResult, TokenizerResult, TranspileResult,
+    BoundedDimension, GenerationResult, ProgramResult, ProjectResult, TokenizerResult,
+    TranspileResult,
 )
 from cattorch.sprite import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
@@ -584,12 +586,12 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
 
 
 def build_project(
+    model: TranspileResult | ProgramResult | GenerationResult,
     output_path: str | Path,
-    model: TranspileResult | ProgramResult,
     *,
     tokenizer: TokenizerResult | None = None,
     example_inputs: torch.Tensor | tuple[torch.Tensor, ...] = (),
-    labels=None,
+    labels: Sequence[str] | None = None,
     max_new_tokens: int = 40,
     temperature: float = 0.8,
     eos_token_id: int | None = None,
@@ -597,8 +599,8 @@ def build_project(
 ) -> ProjectResult:
     """Write a runnable Scratch project around exported sprites.
 
-    ``model`` is a ``transpile`` result. For a ``GenerationProgram`` export,
-    pass the ``tokenizer`` result too: the project asks for a prompt and
+    ``model`` is a ``transpile`` result. For a text generator (a
+    ``GenerationResult``), pass the ``tokenizer`` result too: the project asks for a prompt and
     continues it, sampling at ``temperature`` (0 picks the likeliest token)
     for up to ``max_new_tokens`` tokens or until ``eos_token_id``. ``prompt``
     replaces the question it asks. For any other model, the project shows the
@@ -609,7 +611,7 @@ def build_project(
 
     In every case each operation is also bridged to global lists, so other
     sprites can run it with ``broadcast and wait``; ``ProjectResult`` lists
-    the messages and data.
+    the broadcasts and data. Warnings are also emitted as ``CattorchWarning``.
     """
     output_path = Path(output_path)
     if output_path.suffix.lower() != ".sb3":
@@ -618,29 +620,37 @@ def build_project(
         example_inputs = (example_inputs,)
     builder = _Builder()
     if isinstance(model, ProgramResult):
+        if tokenizer is not None:
+            raise ValueError("tokenizer= applies only to a text generator, a GenerationResult")
         _program_project(builder, model)
-    elif not isinstance(model, TranspileResult):
-        raise TypeError("model must be the result of cattorch.transpile")
-    elif "cattorch prefill" in model.procedures:
+    elif isinstance(model, GenerationResult):
         if tokenizer is None:
             raise ValueError("a text generator's project needs its tokenizer= result")
+        if not isinstance(tokenizer, TokenizerResult):
+            raise TypeError("tokenizer must be the result of cattorch.transpile_tokenizer")
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive")
         _generation_project(
             builder, model, tokenizer, max_new_tokens=max_new_tokens,
             temperature=temperature, eos_token_id=eos_token_id, prompt=prompt,
         )
-    else:
+    elif isinstance(model, TranspileResult):
         if tokenizer is not None:
-            raise ValueError("tokenizer= applies only to a GenerationProgram export")
+            raise ValueError("tokenizer= applies only to a text generator, a GenerationResult")
         _forward_project(builder, model, tuple(example_inputs), labels)
+    else:
+        raise TypeError(
+            f"model must be the result of cattorch.transpile, not a {type(model).__name__}"
+        )
     project_warnings = builder.write(output_path)
     for message in project_warnings:
-        warnings.warn(message, stacklevel=2)
+        warn(message)
     return ProjectResult(
         path=output_path,
         sprites=tuple(sprite["name"] for sprite in builder.sprites),
-        messages=tuple(builder.messages),
+        broadcasts=tuple(
+            name for message in builder.messages for name in (message, completion(message))
+        ),
         lists=tuple(builder.global_lists),
         variables=tuple(builder.global_variables),
         warnings=tuple(project_warnings),

@@ -142,7 +142,7 @@ def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFa
 
     from cattorch.errors import UnsupportedModelError
 
-    where = path or "<root>"
+    where = repr(path) if path else "the top level"
     name = type(module).__name__
 
     def matrix(stack):

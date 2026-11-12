@@ -422,8 +422,8 @@ def _short_reason(detail: str) -> str:
     """A failure message without the error class and documentation links."""
     text = re.sub(r";? *(supported operations:|see) https?://\S+", "", detail)
     unsupported = re.match(
-        r"UnsupportedOperationError: Unsupported operation: ([\w.]+); "
-        r"exported node: [\w.]+(?:; (.*))?", text,
+        r"UnsupportedOperationError: unsupported operation ([\w.]+)"
+        r"(?: in module '[^']*')?(?:; (.*))?", text,
     )
     if unsupported:
         operation, reason = unsupported.groups()
@@ -433,7 +433,7 @@ def _short_reason(detail: str) -> str:
         text = f"needs an input's value at export (`{operation}`)"
     else:
         text = re.sub(r"^\w+Error: ", "", text)
-        text = text.replace("the FX frontend could not trace this model ", "tracing failed ")
+        text = text.replace("PyTorch couldn't trace this model ", "tracing failed ")
     text = text.split("; a common cause")[0]
     return text.replace("|", "\\|").replace("\n", " ")[:160]
 

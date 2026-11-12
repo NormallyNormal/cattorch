@@ -39,7 +39,7 @@ from cattorch.program import (
 from cattorch.program_export import ProgramAssembly, transpile_program
 from cattorch.program_runtime import MethodModule
 from cattorch.quantization import QuantizationConfig
-from cattorch.results import TranspileResult
+from cattorch.results import GenerationResult, generation_result
 from cattorch.sprite import (
     _STEP_LOGITS, _STEP_TOKEN, _TOP_K_IDS, _TOP_K_VALUES, _add_generation_blocks,
     _add_warp_procedure, _finish_generation_prepare, _guard_generation_init,
@@ -109,7 +109,7 @@ def _check_reference(
     ``hint`` ends a mismatch's message.
     """
     assert program.reference is not None and program.states is not None
-    length = min(program.max_tokens or 32, 32)
+    length = min(program.max_context or 32, 32)
     generator = torch.Generator().manual_seed(0)
     tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
     states = [state.initial for state in program.states]
@@ -150,6 +150,22 @@ def _check_reference(
             )
 
 
+def step_program(states: tuple[State, ...], step: str) -> ExportProgram:
+    """The one-entry-point ``ExportProgram`` a recurrent generator is lowered as."""
+    return ExportProgram(
+        states=states,
+        entrypoints=(EntryPoint(
+            _ENTRY,
+            method=step,
+            arguments=(
+                Input("token", torch.zeros(1, 1, dtype=torch.long)),
+                *(StateInput(state.name) for state in states),
+            ),
+            returns=(Output("logits"), *(StateUpdate(state.name) for state in states)),
+        ),),
+    )
+
+
 def _calibration_calls(
     sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]], vocabulary: int,
 ) -> tuple[tuple[ProgramCall, ...], frozenset[int]]:
@@ -161,8 +177,8 @@ def _calibration_calls(
             sequence = sequence[0]
         if not isinstance(sequence, torch.Tensor) or sequence.ndim != 2 or sequence.shape[0] != 1:
             raise ValueError(
-                "RecurrentGenerationProgram calibration_sequences must be [1, length] "
-                "token tensors"
+                f"a RecurrentGenerationProgram's calibration= takes [1, length] token "
+                f"tensors, and item {len(starts)} isn't one"
             )
         starts.add(len(calls))
         calls.extend(
@@ -221,13 +237,13 @@ def _generation_interface(
             step_tokens=_STEP_TOKEN,
             logits=interface.LOGITS,
             step_logits=_STEP_LOGITS,
-            capacity=program.max_tokens,
+            capacity=program.max_context,
             hidden_prefill=program.hidden_prefill,
             top_k=program.top_k,
             compact_top_k=compact_top_k,
             vocabulary=vocabulary,
         )
-        if program.max_tokens is None:
+        if program.max_context is None:
             # The documented loop stops when the cache length reaches the
             # maximum context, which an unbounded generator never does.
             sprite["variables"]["cattorch_recurrent_max_context"] = [
@@ -235,9 +251,9 @@ def _generation_interface(
             ]
         rename_list(sprite, "cattorch prefill buffer", "_cattorch prefill buffer")
         # The prompt arrives in the one `cattorch token ids` list: no more
-        # than a Scratch list holds, however large max_tokens is.
+        # than a Scratch list holds, however large max_context is.
         assembly.capacities["_cattorch prefill buffer"] = min(
-            program.max_tokens or SCRATCH_LIST_LIMIT, SCRATCH_LIST_LIMIT,
+            program.max_context or SCRATCH_LIST_LIMIT, SCRATCH_LIST_LIMIT,
         )
         logits = assembly.capacities.get(_STEP_LOGITS, 0)
         assembly.capacities[interface.LOGITS] = logits
@@ -264,7 +280,7 @@ def transpile_recurrent_generation(
     codegen: CodegenConfig | None,
     adapters: tuple[ModuleAdapter, ...],
     kernels=(),
-) -> TranspileResult:
+) -> GenerationResult:
     """Export ``program.step`` with the init, reset, prefill and decode blocks."""
     hint = ""
     # Whether ``model`` is a copy this export made, which the export can then
@@ -296,19 +312,14 @@ def transpile_recurrent_generation(
     for method, role in ((program.step, "recurrent step"), (program.reference, "reference")):
         if method is not None and not callable(getattr(model, method, None)):
             raise ValueError(f"model has no callable {role} {method!r}")
-    if calibration_sequences is not None and (
-        quantization is None or quantization.method != "gptq"
-    ):
-        raise ValueError("calibration_sequences can only be used with GPTQ quantization")
     if not owned:
         # The checks below run the step, which may change module state (an
         # embedding with max_norm renormalizes its rows): they run on the
         # export's copy, never on the caller's model.
         model = copy.deepcopy(model)
         owned = True
-    if any(module.training for module in model.modules()):
-        eval_mode_copy_warning()
-        model.eval()
+    eval_mode_copy_warning(model)
+    model.eval()
     if any(
         value.is_floating_point() and value.dtype != torch.float32
         for value in (*model.parameters(), *model.buffers())
@@ -324,7 +335,7 @@ def transpile_recurrent_generation(
     program = RecurrentGenerationProgram(
         states,
         step=program.step,
-        max_tokens=program.max_tokens,
+        max_context=program.max_context,
         hidden_prefill=program.hidden_prefill,
         top_k=program.top_k,
         reference=program.reference,
@@ -339,18 +350,7 @@ def transpile_recurrent_generation(
         _calibration_calls(calibration_sequences, vocabulary)
         if calibration_sequences is not None else (None, frozenset())
     )
-    export = ExportProgram(
-        states=program.states,
-        entrypoints=(EntryPoint(
-            _ENTRY,
-            method=program.step,
-            arguments=(
-                Input("token", torch.zeros(1, 1, dtype=torch.long)),
-                *(StateInput(state.name) for state in program.states),
-            ),
-            returns=(Output("logits"), *(StateUpdate(state.name) for state in program.states)),
-        ),),
-    )
+    export = step_program(program.states, program.step)
     codegen = codegen or CodegenConfig()
     result = transpile_program(
         model, export, output_path, sig_figs,
@@ -370,7 +370,7 @@ def transpile_recurrent_generation(
             frozenset({f"cattorch {_ENTRY} logits"}) if program.hidden_prefill else frozenset()
         ),
         _calibration_resets=resets,
-        _calibration_name="calibration_sequences",
+        _calibration_name="calibration",
         # The generation blocks guard the step and reset, and check the tokens.
         _guard_overlaps=False,
         _initialized_flag=False,
@@ -378,25 +378,13 @@ def transpile_recurrent_generation(
         _owned_model=owned,
     )
     (entry,) = result.entrypoints
-    return TranspileResult(
-        path=result.path,
-        sprite_name=result.sprite_name,
-        archive_bytes=result.archive_bytes,
-        expanded_json_bytes=result.expanded_json_bytes,
-        block_count=result.block_count,
-        list_count=result.list_count,
-        sharded_lists=result.sharded_lists,
-        warnings=result.warnings,
-        inputs=tuple(replace(spec, list_name=interface.TOKEN_IDS) for spec in entry.inputs),
-        output=replace(entry.outputs[0], list_name=interface.LOGITS),
-        procedures=(
-            interface.INIT, interface.RESET, interface.PREFILL, interface.DECODE,
-            interface.PREPARE_FOR_SAVE,
-        ),
-        quantization=result.quantization,
-        fallback_operations=result.fallback_operations,
-        approximate_operations=result.approximate_operations,
+    return generation_result(
+        result,
+        max_context=program.max_context,
+        top_k=program.top_k,
+        vocabulary_size=vocabulary,
+        logits=logit_count,
     )
 
 
-__all__ = ["transpile_recurrent_generation"]
+__all__ = ["step_program", "transpile_recurrent_generation"]

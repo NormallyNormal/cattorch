@@ -1602,7 +1602,7 @@ def lookup_vocabulary(
 
 
 def check_calibration_tokens(sequences: Iterable, vocabulary: int | None) -> list:
-    """``calibration_sequences`` as a list, each token checked against ``vocabulary``."""
+    """Generation ``calibration=`` as a list, each token checked against ``vocabulary``."""
     checked = list(sequences)
     allowed = (
         f"from 0 to {vocabulary - 1}" if vocabulary is not None else "of 0 or more"
@@ -1619,7 +1619,7 @@ def check_calibration_tokens(sequences: Iterable, vocabulary: int | None) -> lis
             position = int(wrong.nonzero()[0])
             value = tokens.flatten()[position].item()
             raise ValueError(
-                f"calibration_sequences[{index}] has token {value} at position {position}; "
+                f"calibration[{index}] has token {value} at position {position}; "
                 f"token IDs must be whole numbers {allowed}"
             )
     return checked

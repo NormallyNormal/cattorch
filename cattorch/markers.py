@@ -14,7 +14,7 @@ import copy
 import inspect
 import types
 import warnings
-from typing import Callable
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 from torch import nn
@@ -22,6 +22,9 @@ from torch import nn
 from cattorch.adapters import AdapterContext, ModuleAdapter
 from cattorch.errors import UnsupportedModelError
 from cattorch.interface import output_name
+
+if TYPE_CHECKING:
+    from cattorch.program import ExportProgram
 
 MARKER = "__cattorch__"
 
@@ -58,20 +61,20 @@ def entrypoint(
     method: Callable | None = None,
     *,
     name: str | None = None,
-    inputs: tuple[str, ...] | None = None,
-    outputs: tuple[str, ...] | None = None,
+    input_names: tuple[str, ...] | None = None,
+    output_names: tuple[str, ...] | None = None,
     capacity: dict[str, int] | None = None,
-    example=None,
-    dynamic: dict[str, tuple[int, int]] | None = None,
-):
+    example_inputs=None,
+    dynamic: dict[str, tuple[int, int] | dict[int, tuple[int, int]]] | None = None,
+) -> Callable:
     """Export this method as a Scratch block; usable bare or with options.
 
     ``name`` names the block (``cattorch <name>``), the method name by
-    default. ``inputs`` and ``outputs`` name its Scratch lists; inputs default
-    to the method's parameter names and outputs to ``output``, ``output_1``,
-    and so on. ``example`` gives example arguments: a tuple, a tensor, or a
-    function returning one. ``forward`` can take them from ``@example``
-    instead.
+    default. ``input_names`` and ``output_names`` name its Scratch lists;
+    inputs default to the method's parameter names and outputs to
+    ``output``, ``output_1``, and so on. ``example_inputs`` gives the
+    arguments to export it with: a tuple, a tensor, or a function returning
+    one. ``forward`` can take them from ``@example_inputs`` instead.
 
     A buffer the method updates in place (``self.total += value``) or
     reassigns becomes persistent state, starting from the buffer's value. A
@@ -79,13 +82,14 @@ def entrypoint(
     ``self.history = torch.cat([self.history, row])``, needs its largest
     length in ``capacity={"history": 64}``.
 
-    ``dynamic={"rows": (1, 64)}`` lets an input's first dimension vary
-    between those bounds at run time; keys are input names.
+    ``dynamic={"rows": {0: (1, 64)}}`` lets an input's dimension vary
+    between those bounds at run time, as ``transpile(dynamic=...)`` does;
+    keys are input names, and ``(1, 64)`` is short for the first dimension.
     """
     options = {
-        "name": name, "inputs": None if inputs is None else tuple(inputs),
-        "outputs": None if outputs is None else tuple(outputs),
-        "capacity": dict(capacity or {}), "example": example,
+        "name": name, "input_names": None if input_names is None else tuple(input_names),
+        "output_names": None if output_names is None else tuple(output_names),
+        "capacity": dict(capacity or {}), "example_inputs": example_inputs,
         "dynamic": dict(dynamic or {}),
     }
 
@@ -116,11 +120,11 @@ def export_forward(method: Callable) -> Callable:
 
 # ── Class markers ───────────────────────────────────────────────────────────
 
-def example(inputs):
+def example_inputs(inputs) -> Callable[[type], type]:
     """Give a model class example inputs for ``forward``.
 
     ``inputs`` is a tuple, a tensor, or a function returning one, such as
-    ``@example(lambda: (torch.zeros(1, 1, 28, 28),))``. With it,
+    ``@example_inputs(lambda: (torch.zeros(1, 1, 28, 28),))``. With it,
     ``transpile(model, None, path)`` needs no example of its own.
     """
     def apply(module_type: type) -> type:
@@ -167,7 +171,9 @@ def moe(
     return apply
 
 
-def adapter(module_type: type[nn.Module]):
+def adapter(
+    module_type: type[nn.Module],
+) -> Callable[[Callable[[nn.Module, AdapterContext], nn.Module]], ModuleAdapter]:
     """Build a ``ModuleAdapter`` from a function, for classes you don't own.
 
     ``@adapter(ThirdPartyBlock)`` on ``def replace(module, context)`` returns
@@ -181,8 +187,8 @@ def adapter(module_type: type[nn.Module]):
 
 # ── Reading markers at export ───────────────────────────────────────────────
 
-def example_inputs(model: nn.Module) -> tuple[torch.Tensor, ...] | None:
-    """``forward``'s example from an ``@example`` marker, or ``None``."""
+def marked_example_inputs(model: nn.Module) -> tuple[torch.Tensor, ...] | None:
+    """``forward``'s example inputs from an ``@example_inputs`` marker, or ``None``."""
     options = marker(type(model), "example")
     return None if options is None else _arguments(options["inputs"])
 
@@ -246,7 +252,7 @@ def marked_moe(module: nn.Module, path: str):
     from cattorch.experts import ExpertFamily, SparseMoE
     from cattorch.moe_detection import _probe_outputs, _router
 
-    where = f"{type(module).__name__} at {path or '<root>'}"
+    where = f"{type(module).__name__} at {path!r}" if path else f"the top-level {type(module).__name__}"
 
     def part(name):
         value = getattr(module, name, None)
@@ -265,7 +271,7 @@ def marked_moe(module: nn.Module, path: str):
         None,
     )
     if width is None:
-        raise UnsupportedModelError(f"cannot tell the input width of {where}")
+        raise UnsupportedModelError(f"can't tell the input width of {where}")
     dtype = next(module.parameters()).dtype
     family = ExpertFamily.from_modules(
         list(expert_list), example_input=torch.zeros(1, width, dtype=dtype),
@@ -370,14 +376,28 @@ def has_entrypoints(model: nn.Module) -> bool:
     return bool(marked_methods(type(model), "entrypoint"))
 
 
-def marked_program(model: nn.Module):
-    """Build ``(export model, ExportProgram)`` from ``@entrypoint`` markers.
+class MarkedProgram(NamedTuple):
+    """What :func:`marked_program` builds from a model's ``@entrypoint`` markers.
+
+    ``model`` is a copy of the model whose class gains one generated method
+    per entry point, and ``program`` the ``ExportProgram`` that calls those
+    methods. Pass both on together, as ``transpile(*marked, path)``, or
+    unpack them: ``model, program = marked``.
+    """
+
+    model: nn.Module
+    program: ExportProgram
+
+
+def marked_program(model: nn.Module) -> MarkedProgram:
+    """Build the export model and ``ExportProgram`` from ``@entrypoint`` markers.
 
     The export model is a copy whose class gains one generated method per
     entry point. Each takes the entry point's inputs and every state's value,
     installs the values as buffers, calls the marked method, and returns its
     outputs and the updated states, which is how ``ExportProgram`` threads
-    state.
+    state. ``transpile``, ``verify`` and ``analyze`` do this themselves when
+    given the model and ``None``; call it to inspect the program.
     """
     from cattorch.program import EntryPoint, ExportProgram, Input, Output, State, StateInput, StateUpdate
 
@@ -394,12 +414,13 @@ def marked_program(model: nn.Module):
     modes: dict[str, str] = {}
     capacities: dict[str, int] = {}
     for method_name, function, options in methods:
-        source = options["example"]
+        source = options["example_inputs"]
         if source is None and method_name == "forward":
             source = marker(type(model), "example") and marker(type(model), "example")["inputs"]
         if source is None:
             raise UnsupportedModelError(
-                f"@entrypoint {method_name} needs example=, the arguments to export it with"
+                f"@entrypoint {method_name} needs example_inputs=, the arguments to "
+                "export it with"
             )
         arguments = _arguments(source)
         if any(not isinstance(value, torch.Tensor) for value in arguments):
@@ -407,11 +428,11 @@ def marked_program(model: nn.Module):
         parameters = [
             parameter.name for parameter in inspect.signature(function).parameters.values()
         ][1:]
-        input_names = options["inputs"] or tuple(parameters[:len(arguments)])
+        input_names = options["input_names"] or tuple(parameters[:len(arguments)])
         if len(input_names) != len(arguments):
             raise UnsupportedModelError(
-                f"@entrypoint {method_name} names {len(input_names)} inputs for "
-                f"{len(arguments)} example arguments"
+                f"@entrypoint {method_name} has {len(input_names)} input_names for "
+                f"{len(arguments)} example inputs"
             )
         changed, result = _changed_buffers(model, method_name, arguments)
         for name in options["capacity"]:
@@ -463,18 +484,19 @@ def marked_program(model: nn.Module):
                     UserWarning,
                     stacklevel=3,
                 )
-        output_names = options["outputs"] or tuple(
+        output_names = options["output_names"] or tuple(
             output_name(index) for index in range(len(outputs))
         )
         if len(output_names) != len(outputs):
             raise UnsupportedModelError(
-                f"@entrypoint {method_name} names {len(output_names)} outputs, but returns "
-                f"{len(outputs)} tensors"
+                f"@entrypoint {method_name} has {len(output_names)} output_names, but "
+                f"returns {len(outputs)} tensors"
             )
         unknown = set(options["dynamic"]) - set(input_names)
         if unknown:
             raise UnsupportedModelError(
-                f"@entrypoint {method_name} makes unknown inputs dynamic: {sorted(unknown)}"
+                f"@entrypoint {method_name}'s dynamic= names inputs it doesn't have: "
+                f"{sorted(unknown)}; its inputs are {list(input_names)}"
             )
         plans.append((method_name, options["name"] or method_name, input_names, arguments,
                       output_names, set(changed) & set(buffers), options["dynamic"]))
@@ -508,7 +530,7 @@ def marked_program(model: nn.Module):
         ))
     exported = copy.deepcopy(model)
     exported.__class__ = type(type(model).__name__, (type(model),), generated)
-    return exported, ExportProgram(entrypoints=tuple(entrypoints), states=states)
+    return MarkedProgram(exported, ExportProgram(entrypoints=tuple(entrypoints), states=states))
 
 
 def _entry_method(method_name: str, inputs: int, states, changed, aliases):

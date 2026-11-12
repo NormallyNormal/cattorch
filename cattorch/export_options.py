@@ -18,6 +18,7 @@ def validate_export_options(
     sig_figs=None,
     adapters=(),
     example_kwargs=None,
+    calibration=None,
 ) -> None:
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise ValueError("name must be a non-empty string")
@@ -37,8 +38,14 @@ def validate_export_options(
         isinstance(sig_figs, bool) or not isinstance(sig_figs, int) or sig_figs < 1
     ):
         raise ValueError("sig_figs must be a positive integer or None")
+    if isinstance(adapters, ModuleAdapter) or not isinstance(adapters, (tuple, list)):
+        raise TypeError("adapters must be a tuple or list of ModuleAdapter values")
     if any(not isinstance(adapter, ModuleAdapter) for adapter in adapters):
         raise TypeError("adapters must contain ModuleAdapter values")
+    if calibration is not None and (
+        isinstance(calibration, (str, bytes)) or not hasattr(calibration, "__iter__")
+    ):
+        raise TypeError("calibration must be an iterable of calibration items, such as a list")
     if example_kwargs is not None and (
         not isinstance(example_kwargs, dict)
         or any(not isinstance(key, str) for key in example_kwargs)

@@ -16,6 +16,7 @@ Usage
     BPETokenizer(tokenizer).save("my_tokenizer")
 """
 
+import itertools
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Sequence
 
 from cattorch import interface
 from cattorch.codegen import CodegenConfig
+from cattorch.errors import collect_warnings, with_warnings
 from cattorch.results import TokenizerResult
 from cattorch.sprite import (
     _EPOCH,
@@ -280,8 +282,11 @@ def _sentencepiece_model_summary(serialized: bytes) -> tuple[str, list[str]]:
 class _TokenizerBase(ABC):
     """Base class for tokenizer transpilers.
 
-    Subclasses construct their Scratch program with the typed DSL.
+    Subclasses construct their Scratch program with the typed DSL. ``kind``
+    is the ``TokenizerResult.tokenizer_type`` of the sprites they write.
     """
+
+    kind: str
     def __init__(self, tokenizer) -> None:
         """
         Parameters
@@ -356,7 +361,16 @@ class _TokenizerBase(ABC):
             Display name inside Scratch. Defaults to the output path stem.
         codegen : CodegenConfig, optional
             JSON-size, loop-unrolling, and compact-ID controls.
+
+        Its warnings are also emitted as ``CattorchWarning``.
         """
+        with collect_warnings() as collected:
+            result = self._save(output_path, name=name, codegen=codegen)
+        return with_warnings(result, collected)
+
+    def _save(
+        self, output_path: str | Path, *, name: str | None, codegen: CodegenConfig | None,
+    ) -> TokenizerResult:
         tokens = self._build_tokens_list()
 
         sprite = self._build_sprite(tokens)
@@ -385,7 +399,7 @@ class _TokenizerBase(ABC):
             list_count=len(sprite.get("lists", {})),
             sharded_lists=(),
             warnings=finalized.warnings,
-            tokenizer_type=self.__class__.__name__,
+            tokenizer_type=self.kind,
             token_count=len(tokens),
         )
 
@@ -488,8 +502,10 @@ def _check_encodes_characters(
     for token_id, token in enumerate(tokens):
         if len(token) == 1 and token not in special:
             ids.setdefault(token, token_id)
+    # A character outside the vocabulary; any character not in it will do,
+    # so the search ends within len(ids) + 1 code points.
     unknown = next(
-        character for character in "☃¤�⁂〓" if character not in ids
+        character for character in map(chr, itertools.count(0x2603)) if character not in ids
     )
     other_cases = [
         swapped for character in ids
@@ -533,6 +549,8 @@ class CharTokenizer(_TokenizerBase):
 
         CharTokenizer(tokenizer).save("my_char_tok")
     """
+
+    kind = "char"
     def _build_sprite(self, tokens: list[str]) -> dict:
         unknown_id = self._unknown_id()
         if unknown_id is None:
@@ -581,6 +599,9 @@ class BPETokenizer(_TokenizerBase):
 
         BPETokenizer(tokenizer).save("my_bpe_tok")
     """
+
+    kind = "bpe"
+
     def _build_sprite(self, tokens: list[str]) -> dict:
         # Merges combine token IDs, so tokens are never compared as text and
         # may differ only in case.
@@ -871,6 +892,8 @@ class SentencePieceBPETokenizer(_TokenizerBase):
     scratch_casefold:
         Whether the model was trained with case-folding normalization.
     """
+
+    kind = "sentencepiece-bpe"
 
     def __init__(self, tokenizer, *, scratch_casefold: bool = False):
         super().__init__(tokenizer)
@@ -1289,14 +1312,10 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         _add_top_level_call(sprite, "cattorch detokenize", x=0, y=100)
         return sprite
 
-    def save(
-        self,
-        output_path: str | Path,
-        *,
-        name: str | None = None,
-        codegen: CodegenConfig | None = None,
+    def _save(
+        self, output_path: str | Path, *, name: str | None, codegen: CodegenConfig | None,
     ) -> TokenizerResult:
-        result = super().save(output_path, name=name, codegen=codegen)
+        result = super()._save(output_path, name=name, codegen=codegen)
         if not self._decode_has_non_ascii_bytes:
             return result
         warning = (
@@ -1328,12 +1347,13 @@ def transpile_tokenizer(
     scratch_casefold: bool = False,
     codegen: CodegenConfig | None = None,
 ) -> TokenizerResult:
-    """Transpile a HuggingFace tokenizer into a Scratch .sprite3 file.
+    """Transpile a tokenizer into a Scratch .sprite3 file.
 
-    Auto-detects SentencePiece BPE, Hugging Face BPE, or character-level from
-    the tokenizer. Every other kind, such as WordPiece, Unigram, or a
-    SentencePiece Unigram model, raises ``ValueError``. For explicit control,
-    use ``CharTokenizer``, ``BPETokenizer`` or ``SentencePieceBPETokenizer``.
+    Detects a SentencePiece BPE model, a Hugging Face BPE tokenizer, or a
+    character-level tokenizer, and exports it with ``SentencePieceBPETokenizer``,
+    ``BPETokenizer`` or ``CharTokenizer``; use one of those to choose the
+    kind yourself. Every other kind, such as WordPiece, Unigram, or a
+    SentencePiece Unigram model, raises ``ValueError``.
 
     Parameters
     ----------
@@ -1344,11 +1364,23 @@ def transpile_tokenizer(
     name : str, optional
         Display name inside Scratch. Defaults to the output path stem.
     scratch_casefold : bool, optional
-        Set for a SentencePiece model trained with case-folding normalization.
+        Set for a SentencePiece model trained with case-folding normalization,
+        as ``SentencePieceBPETokenizer(scratch_casefold=True)``. Other kinds
+        of tokenizer raise ``ValueError`` when it is set.
     codegen : CodegenConfig, optional
         JSON-size, loop-unrolling, and compact-ID controls.
+
+    Returns
+    -------
+    TokenizerResult
+        Its ``tokenizer_type`` says which kind was exported.
     """
     processor = getattr(tokenizer, "processor", tokenizer)
+    if scratch_casefold and not _is_sentencepiece(processor):
+        raise ValueError(
+            "scratch_casefold applies to a SentencePiece model trained with case "
+            "folding, and this tokenizer isn't a SentencePiece model"
+        )
     if _is_sentencepiece(processor):
         # The constructor rejects SentencePiece models other than BPE.
         return SentencePieceBPETokenizer(

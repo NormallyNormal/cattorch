@@ -7,12 +7,12 @@ import weakref
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, NamedTuple
+from typing import Any, Callable, Iterable, Literal, NamedTuple, Sequence, overload
 
 import torch
 
 from cattorch.codegen import CodegenConfig
-from cattorch.errors import UnsupportedModelError
+from cattorch.errors import UnsupportedModelError, collect_warnings, warn, with_warnings
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.frontend import flat_example_inputs, keep_operations
@@ -27,7 +27,10 @@ from cattorch.graph import (
 )
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
+    GenerationResult,
+    ProgramResult,
     TranspileResult,
+    generation_result,
     _tensor_spec as boundary_spec,
     fallback_warning,
 )
@@ -2011,54 +2014,133 @@ def _select_unroll_factor(
     return 1
 
 
+ExampleInputs = torch.Tensor | tuple[torch.Tensor, ...]
+
+
+@overload
+def transpile(
+    model: torch.nn.Module,
+    example_inputs: GenerationProgram | RecurrentGenerationProgram,
+    output_path: str | Path,
+    *,
+    name: str | None = ...,
+    optimization: Literal["exact", "fast"] = ...,
+    fast_config: FastConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    quantization: QuantizationConfig | None = ...,
+    calibration: Iterable[Any] | None = ...,
+    sig_figs: int | None = ...,
+    codegen: CodegenConfig | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    kernels: Sequence[Kernel] = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+    dynamic: dict | None = ...,
+) -> GenerationResult: ...
+
+
+@overload
+def transpile(
+    model: torch.nn.Module,
+    example_inputs: ExportProgram,
+    output_path: str | Path,
+    *,
+    name: str | None = ...,
+    optimization: Literal["exact", "fast"] = ...,
+    fast_config: FastConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    quantization: QuantizationConfig | None = ...,
+    calibration: Iterable[Any] | None = ...,
+    sig_figs: int | None = ...,
+    codegen: CodegenConfig | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    kernels: Sequence[Kernel] = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+    dynamic: dict | None = ...,
+) -> ProgramResult: ...
+
+
+@overload
+def transpile(
+    model: torch.nn.Module,
+    example_inputs: ExampleInputs,
+    output_path: str | Path,
+    *,
+    name: str | None = ...,
+    optimization: Literal["exact", "fast"] = ...,
+    fast_config: FastConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    quantization: QuantizationConfig | None = ...,
+    calibration: Iterable[Any] | None = ...,
+    sig_figs: int | None = ...,
+    codegen: CodegenConfig | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    kernels: Sequence[Kernel] = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+    dynamic: dict | None = ...,
+) -> TranspileResult: ...
+
+
+@overload
+def transpile(
+    model: torch.nn.Module,
+    example_inputs: None,
+    output_path: str | Path,
+    *,
+    name: str | None = ...,
+    optimization: Literal["exact", "fast"] = ...,
+    fast_config: FastConfig | None = ...,
+    storage: StorageConfig | None = ...,
+    quantization: QuantizationConfig | None = ...,
+    calibration: Iterable[Any] | None = ...,
+    sig_figs: int | None = ...,
+    codegen: CodegenConfig | None = ...,
+    adapters: Sequence[ModuleAdapter] = ...,
+    kernels: Sequence[Kernel] = ...,
+    example_kwargs: dict[str, Any] | None = ...,
+    dynamic: dict | None = ...,
+) -> TranspileResult | ProgramResult: ...
+
+
 def transpile(
     model: torch.nn.Module,
     example_inputs: (
-        torch.Tensor
-        | tuple[torch.Tensor, ...]
-        | ExportProgram
-        | GenerationProgram
-        | RecurrentGenerationProgram
-        | None
+        ExampleInputs | ExportProgram | GenerationProgram | RecurrentGenerationProgram | None
     ),
     output_path: str | Path,
-    sig_figs: int | None = None,
     *,
     name: str | None = None,
     optimization: Literal["exact", "fast"] = "exact",
     fast_config: FastConfig | None = None,
     storage: StorageConfig | None = None,
     quantization: QuantizationConfig | None = None,
-    calibration_inputs: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
+    calibration: Iterable[Any] | None = None,
+    sig_figs: int | None = None,
     codegen: CodegenConfig | None = None,
-    adapters: tuple[ModuleAdapter, ...] = (),
-    calibration_calls: tuple[ProgramCall, ...] | None = None,
-    calibration_sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
+    adapters: Sequence[ModuleAdapter] = (),
+    kernels: Sequence[Kernel] = (),
     example_kwargs: dict[str, Any] | None = None,
-    kernels: tuple[Kernel, ...] = (),
     dynamic: dict | None = None,
-):
+) -> TranspileResult | ProgramResult | GenerationResult:
     """Export a PyTorch module as a Scratch ``.sprite3`` file.
 
     Parameters
     ----------
     model:
         Module to trace. Export-time weight transforms operate on an
-        evaluation-mode copy and do not mutate this object; modules left in
-        training mode are exported in evaluation mode with a warning.
+        evaluation-mode copy and do not mutate this object; a model with
+        modules whose behavior depends on training mode (dropout, batch
+        norm) left in training mode is exported in evaluation mode, with a
+        warning.
     example_inputs:
-        One tensor or a tuple defining a fixed interface, an ``ExportProgram``
-        defining named methods and state, a ``GenerationProgram`` defining
-        the cached decoder interface, or a ``RecurrentGenerationProgram``
-        defining the same interface for a recurrent step. ``None`` takes the interface from the
-        model's experimental markers: its ``@entrypoint`` methods, or the
-        ``@example`` inputs of ``forward``.
+        What the sprite is called with. One tensor or a tuple defines a
+        fixed interface for ``forward``; an ``ExportProgram`` defines named
+        methods and state; a ``GenerationProgram`` or
+        ``RecurrentGenerationProgram`` defines a text generator. ``None``
+        takes the interface from the model's markers: its ``@entrypoint``
+        methods, or the ``@example_inputs`` of ``forward``.
     output_path:
         Destination path. ``.sprite3`` is appended when absent and missing
         parent directories are created.
-    sig_figs:
-        Optional positive significant-figure limit for static values. This is
-        an independent lossy control.
     name:
         Scratch sprite display name. Defaults to the output filename stem.
     optimization:
@@ -2070,50 +2152,56 @@ def transpile(
         Serialized static-tensor compression policy.
     quantization:
         Symmetric or GPTQ integer matrix-weight policy.
-    calibration_inputs:
-        One-pass iterable of eager-model input tensors or tuples. Required by
-        GPTQ fixed-interface exports and invalid for other exports.
-    calibration_calls:
-        Named whole-program GPTQ calls for an ``ExportProgram``.
-    calibration_sequences:
-        Token sequences used to calibrate a ``GenerationProgram`` or
-        ``RecurrentGenerationProgram`` with GPTQ.
+    calibration:
+        GPTQ calibration data, in the form the export is called with: an
+        iterable of input tensors or tuples for tensor inputs, of
+        ``ProgramCall`` values for an ``ExportProgram``, and of ``[1, length]``
+        token tensors for a ``GenerationProgram`` or
+        ``RecurrentGenerationProgram``. Read once. Required by GPTQ and
+        invalid without it.
+    sig_figs:
+        Optional positive significant-figure limit for stored values. This
+        is an independent lossy control.
     codegen:
         Expanded-JSON budget, loop-unrolling, compact-ID, and optional
         structural-compaction policy.
     adapters:
-        Scoped module adapters for an ``ExportProgram``,
-        ``GenerationProgram`` or ``RecurrentGenerationProgram``. They apply to
-        an export-owned model copy.
-    example_kwargs:
-        Keyword arguments for the traced call, like ``torch.export``'s
-        ``kwargs``. Tensor values become inputs after the positional ones
-        (``input_k`` in order); other values, such as ``use_cache=False``, are
-        constants of the trace. Not valid for programs, and tensor values
-        cannot be combined with GPTQ ``calibration_inputs``.
+        Scoped ``ModuleAdapter`` values that replace module types in the
+        export's own copy of the model.
     kernels:
         Experimental ``cattorch.experimental.Kernel`` lowerings for this
         export. A kernel for an operation cattorch already lowers replaces the
         built-in one; an approximate kernel applies only in fast mode.
+    example_kwargs:
+        Keyword arguments for the traced call of ``forward``, like
+        ``torch.export``'s ``kwargs``. Tensor values become inputs after the
+        positional ones (``input_k`` in order); other values, such as
+        ``use_cache=False``, are constants of the trace. Only for tensor
+        ``example_inputs``, and tensor values can't be combined with GPTQ.
     dynamic:
-        Bounded variable-length inputs, as ``{input: (minimum, maximum)}`` for
-        an input's first dimension or ``{input: {dimension: (minimum,
-        maximum)}}``; an input is its position or tensor keyword name. The
+        A variable-length input, as ``{input: {dimension: (minimum,
+        maximum)}}``, or ``{input: (minimum, maximum)}`` for its first
+        dimension; an input is its position or tensor keyword name. The
         sprite then accepts any length in the bounds. The export is checked
         against the model at several lengths and fails if the model uses the
-        length in a way the sprite can't follow. Not valid for programs.
+        length in a way the sprite can't follow. Only for tensor
+        ``example_inputs``: a program's entry points take
+        ``Input(dynamic=...)``, and generation prompts vary by themselves.
 
     Returns
     -------
-    TranspileResult or ProgramResult
-        Artifact path, size/count metadata, warnings, tensor interface,
-        procedures, and any quantization report.
+    TranspileResult, ProgramResult or GenerationResult
+        For tensor inputs, an ``ExportProgram`` (or ``@entrypoint``
+        markers), and a generation program respectively: the artifact's
+        path, size and count metadata, warnings, interface, procedures, and
+        any quantization report.
 
     Notes
     -----
     Operations without a fast implementation use the exact kernel. Unsupported
     operations raise an error instead of silently changing the model's
-    behavior. See ``docs/api-reference.md`` and ``docs/supported-models.md``.
+    behavior. Every warning is also emitted as a ``CattorchWarning``. See
+    ``docs/api-reference.md`` and ``docs/supported-models.md``.
     """
     validate_export_options(
         name=name,
@@ -2125,15 +2213,21 @@ def transpile(
         sig_figs=sig_figs,
         adapters=adapters,
         example_kwargs=example_kwargs,
+        calibration=calibration,
     )
-    kernels = validate_kernels(kernels)
+    adapters = tuple(adapters)
+    kernels = validate_kernels(tuple(kernels))
     kept = active_kernel_targets(
         kernels,
         fast=optimization == "fast",
         config=fast_config or FastConfig(),
     )
-    with keep_operations(kept), warn_unused_kernels(kernels, fast=optimization == "fast"):
-        return _transpile_any(
+    with (
+        collect_warnings() as collected,
+        keep_operations(kept),
+        warn_unused_kernels(kernels, fast=optimization == "fast"),
+    ):
+        result = _transpile_any(
             model,
             example_inputs,
             output_path,
@@ -2143,15 +2237,14 @@ def transpile(
             fast_config=fast_config,
             storage=storage,
             quantization=quantization,
-            calibration_inputs=calibration_inputs,
+            calibration=calibration,
             codegen=codegen,
             adapters=adapters,
-            calibration_calls=calibration_calls,
-            calibration_sequences=calibration_sequences,
             example_kwargs=example_kwargs,
             kernels=kernels,
             dynamic=dynamic,
         )
+    return with_warnings(result, collected)
 
 
 def _transpile_dynamic(
@@ -2256,6 +2349,118 @@ def _registry_with(kernels, adapters=()) -> OperatorRegistry:
     return default_registry().for_export(adapters=adapters, kernels=kernels)
 
 
+def _kind(example_inputs) -> str:
+    """The export kind's name, for messages."""
+    if isinstance(example_inputs, (ExportProgram, GenerationProgram, RecurrentGenerationProgram)):
+        return f"a {type(example_inputs).__name__}"
+    return "tensor inputs"
+
+
+def _only_for_tensor_inputs(example_inputs, *, dynamic, example_kwargs) -> None:
+    """Reject the options that only a tensor-input export takes."""
+    if isinstance(example_inputs, ExportProgram):
+        if dynamic is not None:
+            raise ValueError(
+                "dynamic= applies to tensor inputs; give an entry point's bounds with "
+                "Input(..., dynamic=...) or @entrypoint(dynamic=...)"
+            )
+        if example_kwargs is not None:
+            raise ValueError(
+                "example_kwargs can't be used with an ExportProgram, whose entry points "
+                "take their inputs from Input values"
+            )
+    elif isinstance(example_inputs, GenerationProgram):
+        if dynamic is not None:
+            raise ValueError(
+                "dynamic= can't be used with a GenerationProgram, whose prompts already "
+                "vary up to max_context"
+            )
+        if example_kwargs is not None:
+            raise ValueError(
+                "example_kwargs can't be used with a GenerationProgram, whose method "
+                "takes only the token IDs"
+            )
+    elif isinstance(example_inputs, RecurrentGenerationProgram):
+        if dynamic is not None:
+            raise ValueError(
+                "dynamic= can't be used with a RecurrentGenerationProgram, which takes "
+                "prompts of any length"
+            )
+        if example_kwargs is not None:
+            raise ValueError(
+                "example_kwargs can't be used with a RecurrentGenerationProgram, whose "
+                "step takes only a token and the states"
+            )
+
+
+def check_calibration(example_inputs, quantization, calibration) -> None:
+    """Check ``calibration=`` against the quantization and the export kind.
+
+    The items themselves are checked as they are read, since an iterable
+    can be read only once.
+    """
+    gptq = quantization is not None and quantization.method == "gptq"
+    if calibration is not None and not gptq:
+        raise ValueError(
+            "calibration= is only used by GPTQ, "
+            "quantization=QuantizationConfig(..., method='gptq')"
+        )
+    if gptq and calibration is None:
+        form = (
+            "ProgramCall values" if isinstance(example_inputs, ExportProgram)
+            else "[1, length] token tensors"
+            if isinstance(example_inputs, (GenerationProgram, RecurrentGenerationProgram))
+            else "input tensors or tuples of them"
+        )
+        raise ValueError(
+            f"GPTQ needs calibration=, an iterable of {form} for {_kind(example_inputs)}"
+        )
+    if calibration is not None and isinstance(calibration, (torch.Tensor, ProgramCall)):
+        raise TypeError(
+            "calibration= takes an iterable of calibration items, such as a list; "
+            f"wrap one {type(calibration).__name__} in a list"
+        )
+
+
+def _program_calls(calibration):
+    """``calibration=`` of an ``ExportProgram``: every item a ``ProgramCall``."""
+    calls = tuple(calibration)
+    for index, call_value in enumerate(calls):
+        if not isinstance(call_value, ProgramCall):
+            raise TypeError(
+                f"calibration[{index}] is a {type(call_value).__name__}; an ExportProgram's "
+                "calibration= takes ProgramCall values"
+            )
+    return calls
+
+
+class _CheckedCalibration:
+    """``calibration=`` of tensor inputs, each item checked as it is read.
+
+    Iterating reads the caller's iterable again, so a list can be read by
+    several attempts at the export and a generator only once, as given.
+    """
+
+    def __init__(self, items):
+        self.items = items
+
+    def __iter__(self):
+        return (_calibration_item(index, item) for index, item in enumerate(self.items))
+
+
+def _calibration_item(index, item):
+    """One ``calibration=`` item of tensor inputs: a tensor or a tuple of tensors."""
+    if isinstance(item, torch.Tensor) or (
+        isinstance(item, tuple) and item
+        and all(isinstance(value, torch.Tensor) for value in item)
+    ):
+        return item
+    raise TypeError(
+        f"calibration[{index}] is a {type(item).__name__}; for tensor inputs, each "
+        "calibration= item is a tensor or a tuple of tensors, like example_inputs"
+    )
+
+
 def _transpile_any(
     model,
     example_inputs,
@@ -2267,67 +2472,25 @@ def _transpile_any(
     fast_config,
     storage,
     quantization,
-    calibration_inputs,
+    calibration,
     codegen,
     adapters,
-    calibration_calls,
-    calibration_sequences,
     example_kwargs,
     kernels,
     dynamic=None,
 ):
     if example_inputs is None:
         # The model describes its own interface with markers.
-        from cattorch.markers import (
-            example_inputs as marked_example,
-            has_entrypoints,
-            marked_program,
-        )
-
-        if has_entrypoints(model):
-            model, example_inputs = marked_program(model)
-        else:
-            example_inputs = marked_example(model)
-            if example_inputs is None:
-                raise ValueError(
-                    "example_inputs is None, but the model has no @example or "
-                    "@entrypoint marker to take them from"
-                )
-    if isinstance(example_inputs, GenerationProgram) and example_inputs.method == "forward":
+        model, example_inputs = interface_from_markers(model)
+    if isinstance(example_inputs, GenerationProgram) and example_inputs.method is None:
         from cattorch.markers import generation_method
 
-        method = generation_method(model)
-        if method is not None:
-            example_inputs = dataclasses.replace(example_inputs, method=method)
-    if dynamic is not None and isinstance(example_inputs, ExportProgram):
-        raise ValueError(
-            "dynamic= applies to forward; give an entry point's bounds with "
-            "Input(..., dynamic=...) or @entrypoint(dynamic=...)"
+        example_inputs = dataclasses.replace(
+            example_inputs, method=generation_method(model) or "forward",
         )
-    if dynamic is not None and isinstance(example_inputs, GenerationProgram):
-        raise ValueError(
-            "dynamic= can't be used with a GenerationProgram, whose prompts already "
-            "vary up to max_context"
-        )
-    if dynamic is not None and isinstance(example_inputs, RecurrentGenerationProgram):
-        raise ValueError(
-            "dynamic= can't be used with a RecurrentGenerationProgram, which takes "
-            "prompts of any length"
-        )
-    if example_kwargs is not None and isinstance(
-        example_inputs,
-        (ExportProgram, GenerationProgram),
-    ):
-        raise ValueError("example_kwargs cannot be used with an ExportProgram or GenerationProgram")
-    if example_kwargs is not None and isinstance(example_inputs, RecurrentGenerationProgram):
-        raise ValueError("example_kwargs cannot be used with a RecurrentGenerationProgram")
+    _only_for_tensor_inputs(example_inputs, dynamic=dynamic, example_kwargs=example_kwargs)
+    check_calibration(example_inputs, quantization, calibration)
     if isinstance(example_inputs, ExportProgram):
-        if calibration_inputs is not None:
-            raise ValueError("ExportProgram uses calibration_calls instead of calibration_inputs")
-        if calibration_sequences is not None:
-            raise ValueError(
-                "calibration_sequences require a GenerationProgram or RecurrentGenerationProgram"
-            )
         from cattorch.program_export import transpile_program
 
         return transpile_program(
@@ -2340,22 +2503,18 @@ def _transpile_any(
             fast_config=fast_config,
             storage=storage,
             quantization=quantization,
-            calibration_calls=calibration_calls,
+            calibration_calls=None if calibration is None else _program_calls(calibration),
             codegen=codegen,
             adapters=adapters,
             kernels=kernels,
+            _calibration_name="calibration",
         )
     if isinstance(example_inputs, GenerationProgram):
-        if calibration_calls is not None:
-            raise ValueError("calibration_calls require an ExportProgram")
-        if calibration_inputs is not None:
+        if not callable(getattr(model, example_inputs.method, None)):
             raise ValueError(
-                "GenerationProgram uses calibration_sequences instead of calibration_inputs"
+                f"model has no callable method {example_inputs.method!r}, which "
+                "GenerationProgram(method=...) names"
             )
-        if not hasattr(model, example_inputs.method) or not callable(
-            getattr(model, example_inputs.method)
-        ):
-            raise ValueError(f"model has no callable generation method {example_inputs.method!r}")
         from cattorch.huggingface_recurrent import contains_recurrent_model
 
         family = contains_recurrent_model(model)
@@ -2364,11 +2523,10 @@ def _transpile_any(
                 f"GenerationProgram caches attention keys and values, and this {family} "
                 "model has no attention; export it with RecurrentGenerationProgram() instead"
             )
-        generation_program = example_inputs
         registry = _registry_with(kernels, adapters)
         return _transpile_automatic_generation(
             model,
-            generation_program,
+            example_inputs,
             output_path,
             sig_figs,
             name=name,
@@ -2376,18 +2534,11 @@ def _transpile_any(
             fast_config=fast_config,
             storage=storage,
             quantization=quantization,
-            calibration_sequences=calibration_sequences,
+            calibration_sequences=calibration,
             codegen=codegen,
             registry=registry,
         )
     if isinstance(example_inputs, RecurrentGenerationProgram):
-        if calibration_calls is not None:
-            raise ValueError("calibration_calls require an ExportProgram")
-        if calibration_inputs is not None:
-            raise ValueError(
-                "RecurrentGenerationProgram uses calibration_sequences instead of "
-                "calibration_inputs"
-            )
         from cattorch.recurrent_generation import transpile_recurrent_generation
 
         return transpile_recurrent_generation(
@@ -2400,17 +2551,12 @@ def _transpile_any(
             fast_config=fast_config,
             storage=storage,
             quantization=quantization,
-            calibration_sequences=calibration_sequences,
+            calibration_sequences=calibration,
             codegen=codegen,
             adapters=adapters,
             kernels=kernels,
         )
-    if calibration_calls is not None:
-        raise ValueError("calibration_calls require an ExportProgram")
-    if calibration_sequences is not None:
-        raise ValueError(
-            "calibration_sequences require a GenerationProgram or RecurrentGenerationProgram"
-        )
+    calibration_inputs = None if calibration is None else _CheckedCalibration(calibration)
     if dynamic is not None:
         return _transpile_dynamic(
             model,
@@ -2447,6 +2593,26 @@ def _transpile_any(
     )
 
 
+def interface_from_markers(model):
+    """``(model, example_inputs)`` from the model's markers, for ``example_inputs=None``.
+
+    With ``@entrypoint`` methods the model becomes ``marked_program``'s copy
+    and the inputs its ``ExportProgram``; otherwise the inputs are
+    ``forward``'s ``@example_inputs``.
+    """
+    from cattorch.markers import has_entrypoints, marked_example_inputs, marked_program
+
+    if has_entrypoints(model):
+        return tuple(marked_program(model))
+    example_inputs = marked_example_inputs(model)
+    if example_inputs is None:
+        raise ValueError(
+            f"example_inputs is None, but {type(model).__name__} has no @example_inputs "
+            "or @entrypoint marker to take them from"
+        )
+    return model, example_inputs
+
+
 def _transpile_automatic_generation(
     model: torch.nn.Module,
     program: GenerationProgram,
@@ -2461,7 +2627,7 @@ def _transpile_automatic_generation(
     calibration_sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None,
     codegen: CodegenConfig | None,
     registry: OperatorRegistry,
-) -> TranspileResult:
+) -> GenerationResult:
     """Export a stateless ``forward(tokens)`` model as a cached decoder.
 
     The model is prepared exactly like an ordinary export (adapters, fast
@@ -2483,10 +2649,6 @@ def _transpile_automatic_generation(
     config = fast_config or FastConfig()
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
-    if calibration_sequences is not None and (
-        quantization is None or quantization.method != "gptq"
-    ):
-        raise ValueError("calibration_sequences can only be used with GPTQ quantization")
     max_context = program.max_context
     owned = False
     if any(
@@ -2504,23 +2666,24 @@ def _transpile_automatic_generation(
         prepared = prepare_fast_model(prepared, config)
     prepared = fold_eval_batch_norms(prepared)
     report = None
+    token = torch.zeros(1, 1, dtype=torch.long)
+    lookup = EmbeddingLookup(token)
+    try:
+        with torch.no_grad(), lookup:
+            prepared(token)
+        vocabulary = lookup_vocabulary(prepared, lookup)
+    except Exception:  # noqa: BLE001 - the step export reports what the model can't do
+        vocabulary = None
     if quantization is not None:
         if calibration_sequences is not None:
-            token = torch.zeros(1, 1, dtype=torch.long)
-            lookup = EmbeddingLookup(token)
-            with torch.no_grad(), lookup:
-                prepared(token)
-            calibration_sequences = check_calibration_tokens(
-                calibration_sequences,
-                lookup_vocabulary(prepared, lookup),
-            )
+            calibration_sequences = check_calibration_tokens(calibration_sequences, vocabulary)
         report = quantize_model(
             prepared,
             quantization,
             calibration_sequences,
             orientation_inputs=[(torch.zeros(1, max_context, dtype=torch.long),)],
             _registry=registry,
-            _calibration_name="calibration_sequences",
+            _calibration_name="calibration",
         )
     step = GenerationStepModule(
         build_generation_step(
@@ -2550,7 +2713,7 @@ def _transpile_automatic_generation(
     try:
         # Tracing runs the step, so every attempt gets its own copy. Without
         # layer sharing there is no second attempt.
-        return _transpile(
+        result = _transpile(
             copy.deepcopy(step) if codegen.layer_sharing == "auto" else step,
             (example,),
             output_path,
@@ -2559,11 +2722,11 @@ def _transpile_automatic_generation(
             **options,
         )
     except _LayerSharingUnavailable:
-        log.warning(
-            "layer_sharing='auto' could not factor this model's layers; "
-            "exporting without layer sharing"
+        warn(
+            "layer_sharing='auto' couldn't share this model's layers; it was "
+            "exported without layer sharing"
         )
-        return _transpile(
+        result = _transpile(
             copy.deepcopy(step),
             (example,),
             output_path,
@@ -2571,6 +2734,12 @@ def _transpile_automatic_generation(
             codegen=replace(codegen, layer_sharing="off"),
             **options,
         )
+    return generation_result(
+        result,
+        max_context=max_context,
+        top_k=program.top_k,
+        vocabulary_size=vocabulary or math.prod(result.outputs[0].shape),
+    )
 
 
 def _transpile(
@@ -2629,15 +2798,15 @@ def _transpile(
     codegen = codegen or CodegenConfig()
     registry = _registry or default_registry().clone()
     if calibration_inputs is not None and (quantization is None or quantization.method != "gptq"):
-        raise ValueError("calibration_inputs can only be used with GPTQ quantization")
+        raise ValueError("calibration= is only used by GPTQ quantization")
     if (
         quantization is not None
         and quantization.method == "gptq"
         and any(isinstance(value, torch.Tensor) for value in (example_kwargs or {}).values())
     ):
         raise ValueError(
-            "tensor-valued example_kwargs cannot be combined with GPTQ "
-            "calibration_inputs; pass those tensors positionally"
+            "tensor-valued example_kwargs can't be combined with GPTQ, whose "
+            "calibration= items are positional inputs; pass those tensors positionally"
         )
     quantization_report = _prepared_quantization_report
     if not _prepared_model:
@@ -2653,6 +2822,7 @@ def _transpile(
                 orientation_inputs=[tuple(example_inputs)],
                 call_kwargs=example_kwargs,
                 _registry=registry,
+                _calibration_name="calibration",
             )
     elif calibration_inputs is not None:
         raise ValueError("prepared model calibration has already been consumed")
@@ -3054,19 +3224,9 @@ def _transpile(
             if len(layout.shards) > 1
         ),
         inputs=input_specs,
-        output=boundary_spec(
-            interface.LOGITS if generation is not None else "output",
-            tuple(graph.output_shape),
-            graph.output_dtype,
-            (
-                (graph.dynamic_axes[graph.output_name], graph._public_bounds(graph.output_name))
-                if graph.output_name in graph.dynamic_axes
-                else None
-            ),
-        ),
-        additional_outputs=tuple(
+        outputs=tuple(
             boundary_spec(
-                f"output_{index}",
+                (interface.LOGITS if generation is not None else output_name(index)),
                 tuple(shape),
                 dtype,
                 (
@@ -3075,7 +3235,7 @@ def _transpile(
                     else None
                 ),
             )
-            for index, (node_name, shape, dtype) in enumerate(graph.outputs[1:], 1)
+            for index, (node_name, shape, dtype) in enumerate(graph.outputs)
         ),
         procedures=tuple(procedures),
         warnings=finalized.warnings

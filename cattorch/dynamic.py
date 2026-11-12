@@ -259,11 +259,11 @@ def check_entry_lengths(
         for position, binding in enumerate(inputs):
             if binding.dynamic is None:
                 continue
-            minimum, maximum = binding.dynamic
+            ((axis, (minimum, maximum)),) = binding.dynamic.items()
 
             def error(length):
                 values = [value.example for value in inputs]
-                values[position] = varied_at_length(binding.example, 0, length)
+                values[position] = varied_at_length(binding.example, axis, length)
                 tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
                 outcome = verify(
                     model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
@@ -279,7 +279,7 @@ def check_entry_lengths(
                 found = max((report.max_abs_error for report in reports), default=0.0)
                 return found, outcome.passed
 
-            lengths = _lengths(minimum, binding.example.shape[0], maximum)
+            lengths = _lengths(minimum, binding.example.shape[axis], maximum)
             baseline, matches = error(lengths[0])
             where = f"input {binding.name!r} of entry point {entry.name!r}"
             if not matches:
@@ -458,8 +458,7 @@ def per_unit_result(result, spec, output_axes, input_shapes, output_shapes):
     return dataclasses.replace(
         result,
         inputs=inputs,
-        output=specs[0],
-        additional_outputs=tuple(specs[1:]),
+        outputs=tuple(specs),
         warnings=result.warnings + (
             "the dynamic dimension runs the model once per item, because its "
             "operations can't take a variable length directly",

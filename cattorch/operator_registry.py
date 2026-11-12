@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import itertools
 import math
-import warnings
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Literal, cast
 
@@ -70,13 +69,20 @@ class OperationRule:
         return self.exact_kernel
 
 
-def eval_mode_copy_warning() -> None:
-    warnings.warn(
-        "the model has modules in training mode; it was exported in evaluation "
-        "mode (dropout disabled, batch norm using running statistics)",
-        UserWarning,
-        stacklevel=3,
-    )
+def eval_mode_copy_warning(model: torch.nn.Module) -> None:
+    """Warn when exporting ``model`` in evaluation mode changes what it computes."""
+    from cattorch.errors import warn
+    from cattorch.graph_transforms import mode_dependent_modules
+
+    modules = mode_dependent_modules(model)
+    if modules:
+        shown = ", ".join(repr(path) for path in modules[:3])
+        more = f" and {len(modules) - 3} more" if len(modules) > 3 else ""
+        warn(
+            f"the model has modules in training mode ({shown}{more}); it was exported "
+            "in evaluation mode (dropout disabled, batch norm using running statistics)",
+            stacklevel=3,
+        )
 
 
 class OperatorRegistry:
@@ -238,9 +244,8 @@ class OperatorRegistry:
         """
         if _copy:
             model = copy.deepcopy(model)
-        if any(module.training for module in model.modules()):
-            model.eval()
-            eval_mode_copy_warning()
+        eval_mode_copy_warning(model)
+        model.eval()
         prepare_huggingface_models(model)
         replacements: dict[int, torch.nn.Module] = {}
 
