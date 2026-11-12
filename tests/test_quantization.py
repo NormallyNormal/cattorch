@@ -1353,3 +1353,131 @@ def test_blocked_gptq_matches_column_by_column_error_feedback(monkeypatch):
     assert (item.method, item.fallback_reason) == (
         "symmetric", "input width 32 is above 16; its GPTQ Hessian would take 0.0 GiB",
     )
+
+
+class _UntiedLM(torch.nn.Module):
+    """A hand-written language model: untied head with a bias, then a scale."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(96, 32)
+        self.mix = torch.nn.Linear(32, 48)
+        self.head = torch.nn.Linear(48, 96)
+
+    def forward(self, tokens):
+        return self.head(torch.tanh(self.mix(self.embedding(tokens)))) * 0.5
+
+
+class _RecurrentLM(_UntiedLM):
+    def __init__(self):
+        super().__init__()
+        self.mix = torch.nn.GRU(32, 48, batch_first=True)
+
+    def forward(self, tokens):
+        return self.head(self.mix(self.embedding(tokens))[0]) * 0.5
+
+    def step(self, token, hidden):
+        output, hidden = self.mix(self.embedding(token), hidden)
+        return self.head(output) * 0.5, hidden
+
+
+def _gpt2_lm(tied=True):
+    transformers = pytest.importorskip("transformers")
+    return transformers.GPT2LMHeadModel(transformers.GPT2Config(
+        vocab_size=80, n_positions=8, n_embd=32, n_layer=1, n_head=2,
+        bos_token_id=0, eos_token_id=0, tie_word_embeddings=tied,
+    ))
+
+
+@pytest.mark.parametrize("kind", ["tied", "untied", "recurrent"])
+@torch.no_grad()
+def test_generation_output_head_is_int8_by_default_at_4_bits(tmp_path, monkeypatch, kind):
+    # The head is the weight of the last matrix product before the logits:
+    # GPT-2's tied table or its untied head, or a hand-written head followed
+    # by a bias and a scale in a recurrent generation export. The default
+    # stores exactly what an explicit int8 override would.
+    from cattorch import GenerationProgram, RecurrentGenerationProgram, State
+
+    torch.manual_seed(31)
+    model = {
+        "tied": _gpt2_lm, "untied": lambda: _gpt2_lm(tied=False), "recurrent": _RecurrentLM,
+    }[kind]().eval()
+    head, shape = {
+        "tied": ("transformer.wte.weight", (80, 32)),
+        "untied": ("lm_head.weight", (80, 32)), "recurrent": ("head.weight", (96, 48)),
+    }[kind]
+    program = (
+        RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 48)),))
+        if kind == "recurrent" else GenerationProgram(max_context=8)
+    )
+    config = QuantizationConfig(bits=4, min_quantized_values=512)
+    precisions = _record_matrix_precisions(monkeypatch)
+    result = transpile(model, program, tmp_path / kind, quantization=config)
+    report = {item.name: item for item in result.quantization.tensors}
+    assert (report[head].bits, report[head].override) == (8, "head_bits")
+    assert {
+        item.bits for name, item in report.items() if name != head and item.bits
+    } == {4}
+    # GPT-2's untied embedding has the head's shape, and stays int4.
+    assert {precision for found, precision in precisions if found == shape} == (
+        {"int4", "int8"} if kind == "untied" else {"int8"}
+    )
+    assert "int4" in {precision for _, precision in precisions}
+
+    tokens = [3, 1, 79]
+    explicit = QuantizationConfig(
+        bits=4, min_quantized_values=512, overrides={head.rsplit(".", 1)[0]: 8},
+    )
+    emulator = ScratchEmulator(_load(result.path))
+    emulator.run_procedure("cattorch init")
+    emulator.lists[TOKEN_IDS] = tokens
+    emulator.run_procedure("cattorch prefill")
+    assert emulator.variables["cattorch status"] == "ok"
+    logits = torch.tensor([float(value) for value in emulator.lists["cattorch logits"]])
+    expected_model = copy.deepcopy(model)
+    quantize_model(
+        expected_model, explicit, None,
+        orientation_inputs=[(torch.zeros(1, 8, dtype=torch.long),)],
+    )
+    round_as_stored(expected_model, StorageConfig(), quantization=explicit)
+    expected = expected_model(torch.tensor([tokens]))
+    expected = getattr(expected, "logits", expected)[0, -1]
+    torch.testing.assert_close(logits, expected.float(), atol=1e-4, rtol=0)
+
+
+@torch.no_grad()
+def test_explicit_settings_take_precedence_over_the_output_head_default():
+    from cattorch import QuantizationOverride
+
+    torch.manual_seed(32)
+    model = _UntiedLM().eval()
+    example = (torch.tensor([[3, 7, 95]]),)
+
+    def head(config, logits=True):
+        report = quantize_model(
+            copy.deepcopy(model), QuantizationConfig(min_quantized_values=512, **config), None,
+            orientation_inputs=[example], _logits_of=(lambda output: output) if logits else None,
+        )
+        found = {item.name: item for item in report.tensors}
+        assert found["mix.weight"].bits == config["bits"]
+        item = found["head.weight"]
+        return item.bits, item.override, item.effective_group_size
+
+    assert head(dict(bits=4)) == (8, "head_bits", 48)
+    assert head(dict(bits=6)) == (8, "head_bits", 48)
+    assert head(dict(bits=8)) == (8, None, 48)
+    assert head(dict(bits=4, head_bits=6)) == (6, "head_bits", 48)
+    assert head(dict(bits=4, head_bits=4)) == (4, None, 48)
+    assert head(dict(bits=4, head_bits=None)) == (None, "head_bits", None)
+    # An override that selects the head, lowering or raising it, decides.
+    assert head(dict(bits=4, overrides={"head": 4})) == (4, "head", 48)
+    assert head(dict(bits=4, overrides={"head.weight": None})) == (None, "head.weight", None)
+    assert head(dict(bits=6, overrides={"head": QuantizationOverride(bits=8, group_size=16)})) == (
+        8, "head", 16,
+    )
+    assert head(dict(bits=8, overrides={"head": 4})) == (4, "head", 48)
+    # Exports that aren't generation exports have no output head.
+    assert head(dict(bits=4), logits=False) == (4, None, 48)
+    for value in (True, 5, "int8"):
+        with pytest.raises(ValueError, match="head_bits"):
+            QuantizationConfig(bits=4, head_bits=value)
