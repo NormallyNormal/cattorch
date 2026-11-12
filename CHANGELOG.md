@@ -1239,6 +1239,20 @@
   → `block_count`, `verified` → `verify.passed`, `max_abs_error` →
   `verify.max_abs_error`, `project` and `tokenizer` → objects with `path`;
   `tokenizer_error` → `tokenizer.error`.
+- A generation export (`GenerationProgram`, `RecurrentGenerationProgram`)
+  with `QuantizationConfig(bits=4)` or `bits=6` stores the output head in
+  int8: the weight of the last matrix product that computes the logits,
+  found by following the model's computation, such as `lm_head` or GPT-2's
+  tied embedding table. On the trained GPT-2, int4 GPTQ goes from
+  perplexity 70.0 to 42.1 (float: 40.0), symmetric int4 from 1,220 to
+  45.9 and symmetric int6 from 58.3 to 41.4; its int4 sprite grows from
+  89 MB to 109 MB. A model whose vocabulary table is most of its weights
+  grows more: a two-layer Mamba-2 from 34 MB to 60 MB (int8: 65 MB). The
+  new `QuantizationConfig.head_bits` (`"auto"`, 4, 6, 8 or `None` for
+  float16) sets it, and an override that selects the head wins;
+  `head_bits=4` restores the previous int4 export.
+  The head's report entry has `override="head_bits"`. See
+  [the output head](docs/storage.md#the-output-head-of-a-language-model).
 
 # 0.5.0 - 2026-09-14
 

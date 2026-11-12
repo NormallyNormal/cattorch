@@ -352,6 +352,7 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
 | `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. |
 | `overrides` | `{}` | Other settings for some weights: a module path or parameter name mapped to bits (`4`, `6`, `8`), `None` for float16, or a `QuantizationOverride`. See [per-weight settings](storage.md#per-weight-settings). |
+| `head_bits` | `"auto"` | The output head of a generation export: `"auto"` for int8 when `bits` is 4 or 6 and `bits` otherwise, `4`, `6` or `8`, or `None` for float16. An override that selects the head wins. Other exports ignore it. See [the output head](storage.md#the-output-head-of-a-language-model). |
 
 ### `QuantizationOverride`
 
@@ -532,12 +533,13 @@ number of `values`, `calibration_rows` seen, `effective_group_size`,
 `fallback_reason` if GPTQ wasn't used, `sources`, the parameters a weight
 computed from parameters is computed from (empty otherwise), and
 `override`, the `QuantizationConfig.overrides` key whose settings it used,
-if any. A weight computed from parameters is named by its attribute, such
+if any, or `"head_bits"` for a generation export's output head whose
+settings `QuantizationConfig.head_bits` chose. A weight computed from parameters is named by its attribute, such
 as a parametrized `fc.weight`, or `weight computed from <parameters>`. A
 `method` of `"float16"` means the values are stored in float16, and
 `fallback_reason` says why: the tensor was smaller than
 `min_quantized_values`, integer storage wouldn't be smaller, an override
-keeps it float16, storage reads it grouped along a different axis than it
+or `head_bits=None` keeps it float16, storage reads it grouped along a different axis than it
 was quantized in, or it is a weight computed from parameters where
 quantization couldn't compute it from quantized values instead.
 Values of a quantized entry that are also, or only, stored in float16, such

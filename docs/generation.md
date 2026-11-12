@@ -110,7 +110,10 @@ cattorch exports again without sharing, with a warning in
 The model is prepared the way an ordinary export is, before the step is built.
 `QuantizationConfig`, including GPTQ with token sequences as `calibration`,
 `optimization="fast"`, `adapters`, and the [storage options](storage.md) work
-as they do for any model.
+as they do for any model. With `bits=4` or `bits=6`, the output head, the
+weight that computes the logits (GPT-2's tied embedding table), is stored
+in int8 unless `QuantizationConfig.head_bits` or an override says
+otherwise; see [the output head](storage.md#the-output-head-of-a-language-model).
 
 ## Verify a generator
 

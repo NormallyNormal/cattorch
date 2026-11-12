@@ -169,6 +169,9 @@ it to `False` only for debugging or measurement.
 [storage options](storage.md) work as for any export. GPTQ takes
 `calibration=` as `[1, length]` token tensors. Calibration runs the step
 over each sequence token by token and resets the states between sequences.
+With `bits=4` or `bits=6`, the output head is stored in int8 unless
+`QuantizationConfig.head_bits` or an override says otherwise; see
+[the output head](storage.md#the-output-head-of-a-language-model).
 
 An int8 Mamba-2 stays within 4% of the largest logit in the tests. Fast mode
 approximates GELU, LayerNorm and softmax in the step as it does anywhere else,

@@ -163,7 +163,7 @@ QuantizationConfig(
     bits=4,
     method="gptq",
     overrides={
-        "lm_head": 8,                      # the output head in int8
+        "transformer.h.11.mlp": 8,         # the last MLP in int8
         "transformer.h.0": QuantizationOverride(bits=6, group_size=32),
         "transformer.h.11.mlp.c_proj": None,  # float16
     },
@@ -182,6 +182,68 @@ calibration for those weights. Each `TensorQuantizationReport` names the
 `override` it used. One sprite can hold several integer formats: each is
 decoded by its own bank, and the int4 Huffman decoder is added only when
 some weight uses int4.
+
+## The output head of a language model
+
+In a generation export (`GenerationProgram`, `RecurrentGenerationProgram`),
+the output head is stored in int8 when `bits` is 4 or 6. The output head is
+the weight of the last matrix product that computes the logits: cattorch
+follows the model's computation while it observes it, and takes the
+weights of the matrix products that no other matrix product follows on the
+way to the logits. A bias, a scale or a softcap after the head doesn't
+change which weight it is, and a sum of two products, such as a head and a
+low-rank adapter on it, makes both weights part of the head. That is
+`lm_head` in Llama or Qwen2, `head` in RWKV, a hand-written model's final
+`nn.Linear`, and GPT-2's or Mamba's token embedding, which is tied to the
+head, so the shared table is int8. An untied input embedding stays at
+`bits`. A model whose logits no matrix product computes, such as a bigram
+table looked up by token, has no output head.
+
+The head turns a few hundred hidden values into tens of thousands of
+logits, and int4 rounding errors in it shift every logit at once. On the
+trained 124M-parameter GPT-2, measured on 510 next-token predictions of
+held-out text (float perplexity 40.0):
+
+| `QuantizationConfig` | Head in `bits` | Head in int8 (default) | Matrix payload |
+|---|---:|---:|---|
+| `bits=4` | perplexity 1,220 | 45.9 | 57.7 MB → 79.4 MB |
+| `bits=4, method="gptq"` | 70.0 | 42.1 | 57.7 MB → 79.4 MB |
+| `bits=6` | 58.3 | 41.4 | 96.5 MB → 106.2 MB |
+| `bits=6, method="gptq"` | 41.1 | 40.3 | 96.5 MB → 106.2 MB |
+| `bits=8` | 41.1 | 41.1 | 127.4 MB |
+
+The full int4 export grows from 89 MB to 109 MB of sprite JSON. Quantizing
+only GPT-2's embedding side to int4, with the rest in float, leaves the
+perplexity at 39.9, which is why an untied input embedding keeps `bits`.
+A small trained two-layer transformer with a tied 4,096-token table shows
+the same (perplexity 166 in float, 291 in int4, 169 with the int8 head); a
+small LSTM language model loses less (134, 139, 137).
+
+The cost is the head's share of the weights. In a model whose vocabulary
+table is most of its weights, an int4 export with the int8 head is nearly
+as large as an int8 one: a two-layer Mamba-2 with the full 50,288-token
+tied table takes 34 MB of sprite JSON in int4, 60 MB with the int8 head,
+and 65 MB in int8. Set `head_bits=4` where size matters more.
+
+`QuantizationConfig.head_bits` sets it: `"auto"` (the default) means int8
+for `bits=4` and `bits=6` and `bits` otherwise; `4`, `6` or `8` store the
+head in that many bits, and `None` keeps it float16. The head uses the
+config's `method` and `group_size`. An override that selects the head
+under any of its names takes precedence over `head_bits`, raising or
+lowering it, so for GPT-2 `overrides={"lm_head": 4}` stores the shared
+table in int4. The precedence is: an override for the weight, then
+`head_bits`, then `bits`.
+
+```python
+QuantizationConfig(bits=4)                  # int4, the output head int8
+QuantizationConfig(bits=4, head_bits=4)     # int4 everywhere
+QuantizationConfig(bits=4, overrides={"lm_head": 6})  # the head int6
+```
+
+The head's `TensorQuantizationReport` has `override="head_bits"` when
+`head_bits` chose its settings. Other exports, a plain `transpile` or an
+`ExportProgram`, have no output head and ignore `head_bits`: name the last
+layer in `overrides` to keep it in int8 there.
 
 ## GPTQ calibration
 

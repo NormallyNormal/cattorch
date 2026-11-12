@@ -717,7 +717,10 @@ def transpile_program(
             _registry=registry,
             _calibration_name=_calibration_name,
             _names_from=prepared_model,
-            _logits_of=None if _logits is None else _program_output(program, observed_calls, _logits),
+            _logits_of=(
+                None if _logits is None
+                else _program_output(program, observed_calls, _logits)
+            ),
         )
         prepared_model = calibration_model.model
         resolved_storage = quantized_storage(
