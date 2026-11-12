@@ -85,6 +85,29 @@ class _ProgramCalibrationModule(nn.Module):
                 module._buffers.update(saved)
 
 
+def _program_output(
+    program: ExportProgram, calls: tuple[ProgramCall, ...], name: str,
+) -> Callable[[list[torch.Tensor]], torch.Tensor | None]:
+    """Pick the output ``name`` from what each of ``calls`` returns, in turn."""
+    positions = {
+        entry.name: next(
+            (
+                index for index, binding in enumerate(entry.returns)
+                if isinstance(binding, Output) and binding.name == name
+            ),
+            None,
+        )
+        for entry in program.entrypoints
+    }
+    remaining = iter(calls)
+
+    def pick(leaves: list[torch.Tensor]) -> torch.Tensor | None:
+        position = positions[next(remaining).entrypoint]
+        return None if position is None else leaves[position]
+
+    return pick
+
+
 def _merge_sprite_targets(left: dict, right: dict) -> dict:
     """Merge independent lifecycle/procedure roots without chaining them."""
     result = left
@@ -553,6 +576,7 @@ def transpile_program(
     _owned_model: bool = False,
     _initialized_flag: bool = True,
     _check_items: bool = True,
+    _logits: str | None = None,
 ) -> ProgramResult:
     """Compile all explicit program entrypoints into one sprite artifact.
 
@@ -594,6 +618,9 @@ def transpile_program(
       longer needs, so it is adapted and quantized in place instead of
       copied again. Variable-length entry points still copy it: their
       check runs the original model afterwards.
+    - ``_logits`` names the output binding that holds a generation export's
+      logits, whose output head quantization stores with
+      ``QuantizationConfig.head_bits``.
 
     The renaming and hidden-output hooks can't be combined with
     variable-length inputs, whose export check runs the entry points through
@@ -690,9 +717,12 @@ def transpile_program(
             _registry=registry,
             _calibration_name=_calibration_name,
             _names_from=prepared_model,
+            _logits_of=None if _logits is None else _program_output(program, observed_calls, _logits),
         )
         prepared_model = calibration_model.model
-        resolved_storage = quantized_storage(resolved_storage, quantization)
+        resolved_storage = quantized_storage(
+            resolved_storage, quantization, quantization_report,
+        )
 
     combined = None
     entry_results = []

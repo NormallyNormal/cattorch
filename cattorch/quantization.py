@@ -6,7 +6,7 @@ import itertools
 import math
 import weakref
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Literal, Mapping, cast
+from typing import Any, Callable, Iterable, Literal, Mapping, cast
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree as pytree
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.weak import WeakIdKeyDictionary
 
 from cattorch.storage import _quantize_arrays, group_scales, integer_storage_bytes
 from cattorch.operator_registry import OperatorRegistry, default_registry
@@ -72,6 +73,15 @@ class QuantizationConfig:
     under several names, such as an embedding tied to the output head,
     takes the highest precision any of its names selects, and a weight
     computed from parameters the highest precision of its parameters.
+
+    ``head_bits`` sets the output head of a generation export
+    (``GenerationProgram``, ``RecurrentGenerationProgram``): the weights of
+    the last matrix products that compute the logits, found by following
+    the model's computation. ``"auto"`` stores it in int8 when ``bits`` is
+    4 or 6, and in ``bits`` otherwise; 4, 6 or 8 store it in that many
+    bits, and ``None`` keeps it float16. An override that selects the head
+    under any of its names takes precedence. Other exports have no output
+    head, and ignore ``head_bits``.
     """
 
     bits: Literal[4, 6, 8]
@@ -83,6 +93,7 @@ class QuantizationConfig:
     block_size: int = 128
     min_calibration_rows: int = 128
     overrides: Mapping[str, int | QuantizationOverride | None] = field(default_factory=dict)
+    head_bits: Literal["auto", 4, 6, 8] | None = "auto"
 
     def __post_init__(self) -> None:
         if isinstance(self.bits, bool) or self.bits not in {4, 6, 8}:
@@ -108,6 +119,10 @@ class QuantizationConfig:
             or self.damp_percent <= 0
         ):
             raise ValueError("damp_percent must be a positive finite number")
+        if self.head_bits is not None and (
+            isinstance(self.head_bits, bool) or self.head_bits not in {"auto", 4, 6, 8}
+        ):
+            raise ValueError("head_bits must be 'auto', 4, 6, 8, or None for float16")
         if not isinstance(self.overrides, Mapping):
             raise TypeError("overrides must be a mapping of names to settings")
         normalized: dict[str, QuantizationOverride] = {}
@@ -156,6 +171,27 @@ class QuantizationConfig:
                     formats.append(item)
         return tuple(formats)
 
+    def _head_settings(
+        self, names: Iterable[str], *, every_name: bool = True,
+    ) -> _WeightSettings:
+        """The settings for the output head, read under ``names``.
+
+        An override that selects any of its names decides, as for any
+        weight; otherwise ``head_bits`` does.
+        """
+        names = list(names)
+        if any(
+            name == key or name.startswith(f"{key}.")
+            for name in names for key in cast(dict, self.overrides)
+        ):
+            return self._settings(names, every_name=every_name)
+        bits = self.head_bits
+        if bits == "auto":
+            bits = 8 if self.bits < 8 else self.bits
+        if bits == self.bits:
+            return _WeightSettings(self.bits, self.method, self.group_size, None)
+        return _WeightSettings(bits, self.method, self.group_size, HEAD_BITS)
+
     def _settings(self, names: Iterable[str], *, every_name: bool = True) -> _WeightSettings:
         """The settings for a weight read under ``names``.
 
@@ -189,9 +225,14 @@ class QuantizationConfig:
             found,
             key=lambda item: (
                 16 if item.bits is None else item.bits, -item.group_size,
-                item.method == "gptq",
+                item.method == "gptq", item.key is not None,
             ),
         )
+
+
+# The ``TensorQuantizationReport.override`` of an output head whose settings
+# ``QuantizationConfig.head_bits`` chose.
+HEAD_BITS = "head_bits"
 
 
 @dataclass(frozen=True)
@@ -203,6 +244,11 @@ class _WeightSettings:
     method: str
     group_size: int
     key: str | None
+
+    def float16_reason(self) -> str:
+        if self.key == HEAD_BITS:
+            return "head_bits=None keeps the output head in float16"
+        return f"override {self.key!r} keeps it in float16"
 
     def config(self, base: QuantizationConfig) -> QuantizationConfig:
         """``base`` with these settings, for one weight's quantization."""
@@ -221,7 +267,8 @@ class TensorQuantizationReport:
     """Quantization decision for one parameter or parameter view.
 
     A weight computed from parameters names them in ``sources``; ``override``
-    is the ``QuantizationConfig.overrides`` key whose settings it used.
+    is the ``QuantizationConfig.overrides`` key whose settings it used, or
+    ``"head_bits"`` for an output head whose settings ``head_bits`` chose.
     """
 
     name: str
@@ -254,6 +301,8 @@ class QuantizationReport:
     _stored: dict = field(default_factory=dict, repr=False, compare=False)
     # Weights computed from parameters, by storage, which regions may sit in.
     _computed: dict = field(default_factory=dict, repr=False, compare=False)
+    # Every (precision, maximum group size) the quantized weights use.
+    _integer_formats: tuple = field(default=(), repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -435,6 +484,7 @@ class _GPTQCaptureMode(TorchDispatchMode):
         *,
         collect_hessian: bool = True,
         static_storages: Iterable[int] = (),
+        follow_products: bool = False,
     ):
         super().__init__()
         # Parameters, and weights computed from them (see
@@ -458,6 +508,13 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # known at export, such as ``weight_norm``'s weight.
         self.direct_reads: set[int] = set()
         self.derivations: set[int] = set()
+        # With ``follow_products``: each tensor computed at run time -> the
+        # storages of the weights whose matrix products last computed it.
+        # A product with a weight replaces its inputs' weights with its own;
+        # every other operation passes on all its inputs' weights.
+        self.products: WeakIdKeyDictionary | None = (
+            WeakIdKeyDictionary() if follow_products else None
+        )
 
     def _static_entry(
         self, tensor: torch.Tensor,
@@ -632,7 +689,35 @@ class _GPTQCaptureMode(TorchDispatchMode):
         for value, view, orientation in views:
             if view is not None:
                 self._record(value, view, orientation)
+        if self.products is not None:
+            self._follow_products(args, kwargs, result, views)
         return result
+
+    def _follow_products(self, args, kwargs, result, views) -> None:
+        products = self.products
+        assert products is not None
+        weights = frozenset(
+            view.untyped_storage().data_ptr() for _, view, _ in views if view is not None
+        )
+        if not weights:
+            weights = frozenset().union(*(
+                products.get(item, frozenset())
+                for item in pytree.tree_leaves((args, kwargs))
+                if isinstance(item, torch.Tensor)
+            ))
+        if not weights:
+            return
+        for item in pytree.tree_leaves(result):
+            if isinstance(item, torch.Tensor):
+                products[item] = weights
+
+    def last_products(self, output) -> frozenset[int]:
+        """The storages of the weights whose matrix products last computed
+        ``output``: of the output head, when ``output`` is the logits."""
+        assert self.products is not None
+        if not isinstance(output, torch.Tensor):
+            return frozenset()
+        return self.products.get(output, frozenset())
 
 
 # Operations, besides views, whose results only rearrange, repeat or convert
@@ -1506,6 +1591,7 @@ def quantize_model(
     _registry: OperatorRegistry | None = None,
     _calibration_name: str = "calibration_inputs",
     _names_from: torch.nn.Module | None = None,
+    _logits_of: Callable[[Any], torch.Tensor] | None = None,
 ) -> QuantizationReport:
     """Quantize eligible weights in-place and return a structured report.
 
@@ -1523,6 +1609,11 @@ def quantize_model(
     ``_calibration_name`` is the caller's name for ``calibration_inputs``,
     for its errors. ``_names_from`` is the module whose parameter names the
     report uses, when ``model`` wraps it.
+
+    A generation export passes ``_logits_of``, which picks the logits from
+    the model's output. The weights of the last matrix products that
+    compute them on every observed call form the output head, which takes
+    ``config.head_bits``.
     """
     effective_ndims = expert_bank_effective_ndims(model)
 
@@ -1561,7 +1652,10 @@ def quantize_model(
         static_storages=[
             buffer.untyped_storage().data_ptr() for buffer in model.buffers()
         ],
+        follow_products=_logits_of is not None and observing,
     )
+    # The storages of the output head's weights.
+    head: set[int] = set()
     # Weights computed from parameters, by storage, with their name and the
     # names of the parameters they are computed from.
     computed: dict[int, tuple[_DerivedWeight, str, tuple[str, ...]]] = {}
@@ -1602,7 +1696,7 @@ def quantize_model(
             for raw_batch in observed_inputs:
                 batch = _normalize_batch(raw_batch)
                 try:
-                    model(*batch, **(call_kwargs or {}))
+                    output = model(*batch, **(call_kwargs or {}))
                 except RuntimeError as error:
                     if config.method != "gptq":
                         raise
@@ -1614,6 +1708,9 @@ def quantize_model(
                         f"the model failed on {_calibration_name}[{batches}] "
                         f"(inputs {shapes}): {error}"
                     ) from error
+                if capture.products is not None:
+                    assert _logits_of is not None
+                    head |= capture.last_products(_logits_of(output))
                 batches += 1
         if config.method == "gptq" and batches == 0:
             raise ValueError(f"GPTQ requires nonempty {_calibration_name}")
@@ -1625,7 +1722,10 @@ def quantize_model(
     gptq = config.method == "gptq"
     total_rows = sum(stat.rows for stat in capture.stats.values()) if gptq else 0
     settings_by_storage = {
-        pointer: config._settings(all_names[pointer]) for pointer in base_parameters
+        pointer: (config._head_settings if pointer in head else config._settings)(
+            all_names[pointer],
+        )
+        for pointer in base_parameters
     }
     # A computed weight read as a matrix is quantized like a parameter, and
     # takes the settings of the parameters it is computed from.
@@ -1638,7 +1738,9 @@ def quantize_model(
     for pointer, (weight, name, sources) in computed.items():
         base_parameters[pointer] = (name, weight.tensor)
         sources_by_storage[pointer] = sources
-        settings_by_storage[pointer] = config._settings([
+        settings_by_storage[pointer] = (
+            config._head_settings if pointer in head else config._settings
+        )([
             name, *(alias for source in weight.sources for alias in all_names.get(source, ())),
         ], every_name=False)
 
@@ -1713,7 +1815,7 @@ def quantize_model(
                 if settings.bits is None:
                     report(replace(kept_float16(
                         stat.name, stat.weight.numel(),
-                        f"override {settings.key!r} keeps it in float16", rows,
+                        settings.float16_reason(), rows,
                     ), sources=sources, override=settings.key), pointer, views)
                     continue
                 weight_config = settings.config(config)
@@ -1790,7 +1892,7 @@ def quantize_model(
                     matrix_name = f"{matrix_name}[remaining]"
                 if settings.bits is None:
                     report(replace(kept_float16(
-                        matrix_name, count, f"override {settings.key!r} keeps it in float16",
+                        matrix_name, count, settings.float16_reason(),
                     ), override=settings.key), pointer, (spec,), remaining=remaining)
                     continue
                 weight_config = settings.config(config)
@@ -1847,6 +1949,12 @@ def quantize_model(
                     f"below min_quantized_values={config.min_quantized_values}",
                 ))
 
+    formats = list(config._integer_formats())
+    for settings in settings_by_storage.values():
+        if settings.key == HEAD_BITS and settings.bits is not None:
+            item = (f"int{settings.bits}", settings.group_size)
+            if item not in formats:
+                formats.append(item)
     gptq_values = sum(item.values for item in reports if item.method == "gptq")
     symmetric_values = sum(item.values for item in reports if item.method == "symmetric")
     return QuantizationReport(
@@ -1860,6 +1968,7 @@ def quantize_model(
         tensors=tuple(reports),
         _regions=tuple(regions),
         _computed={pointer: weight.tensor for pointer, (weight, _, _) in computed.items()},
+        _integer_formats=tuple(formats),
     )
 
 

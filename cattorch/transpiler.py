@@ -15,7 +15,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError, collect_warnings, warn, with_warnings
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
-from cattorch.frontend import flat_example_inputs, keep_operations
+from cattorch.frontend import flat_example_inputs, keep_operations, tensor_output_leaves
 from cattorch.graph import (
     _NOOP_OPS,
     _GenerationSpec,
@@ -2598,6 +2598,8 @@ def _transpile_automatic_generation(
             orientation_inputs=[(torch.zeros(1, max_context, dtype=torch.long),)],
             _registry=registry,
             _calibration_name="calibration",
+            # The logits are the output's first tensor, as the step's.
+            _logits_of=lambda output: tensor_output_leaves(output, warn=False)[0],
         )
     step = GenerationStepModule(
         build_generation_step(
@@ -2741,7 +2743,7 @@ def _transpile(
     elif calibration_inputs is not None:
         raise ValueError("prepared model calibration has already been consumed")
     if quantization is not None:
-        storage = quantized_storage(storage, quantization)
+        storage = quantized_storage(storage, quantization, quantization_report)
 
     # 1. Analyse the PyTorch graph
     graph = _prepare_graph(

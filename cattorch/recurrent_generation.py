@@ -379,6 +379,7 @@ def transpile_recurrent_generation(
         _initialized_flag=False,
         _check_items=False,
         _owned_model=owned,
+        _logits="logits",
     )
     (entry,) = result.entrypoints
     return generation_result(

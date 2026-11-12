@@ -90,8 +90,12 @@ class StorageConfig:
             raise ValueError("precision must be 'float32' or 'float16'")
 
 
-def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
-    """The storage a ``QuantizationConfig`` implies: its integer format and groups."""
+def quantized_storage(storage: StorageConfig, quantization, report=None) -> StorageConfig:
+    """The storage a ``QuantizationConfig`` implies: its integer format and groups.
+
+    ``report``, the ``QuantizationReport`` of the export's quantization, adds
+    the formats only it knows of, such as an output head's.
+    """
     result = StorageConfig(compression=storage.compression)
     # Integer formats aren't a public StorageConfig option, so set them past
     # the frozen dataclass's validation.
@@ -100,7 +104,10 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
         ("group_size", quantization.group_size),
         ("min_quantized_values", quantization.min_quantized_values),
         ("scale_precision", quantization.scale_precision),
-        ("integer_formats", quantization._integer_formats()),
+        (
+            "integer_formats",
+            getattr(report, "_integer_formats", ()) or quantization._integer_formats(),
+        ),
     ):
         object.__setattr__(result, name, value)
     return result
