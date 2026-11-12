@@ -171,7 +171,7 @@ def _calibration_calls(
 ) -> tuple[tuple[ProgramCall, ...], frozenset[int]]:
     """One step call per token, and the calls that start a sequence."""
     calls: list[ProgramCall] = []
-    starts = set()
+    starts: set[int] = set()
     for sequence in check_calibration_tokens(sequences, vocabulary):
         if isinstance(sequence, tuple) and len(sequence) == 1:
             sequence = sequence[0]

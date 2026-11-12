@@ -17,7 +17,7 @@ def _weight_only(policy: FastLayerConfig) -> FastConfig:
         activations=False,
         layer_norm=False,
         softmax=False,
-        weights=policy,
+        layers=policy,
     )
 
 

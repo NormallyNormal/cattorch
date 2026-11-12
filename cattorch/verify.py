@@ -8,7 +8,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Sequence, overload
+from typing import Any, Sequence
 
 import torch
 
@@ -216,7 +216,7 @@ def _program_reference(
 def _verify_program(
     model: torch.nn.Module,
     program: ExportProgram,
-    sprite: str | Path | ProgramResult,
+    sprite: Sprite,
     *,
     calls: tuple[ProgramCall, ...] | None,
     adapters: tuple[ModuleAdapter, ...],
@@ -402,7 +402,7 @@ def _generation_calls(vocabulary: int, max_context: int | None) -> tuple[Program
 def _verify_generation(
     model: torch.nn.Module,
     program: GenerationProgram | RecurrentGenerationProgram,
-    sprite: str | Path | GenerationResult,
+    sprite: Sprite,
     *,
     calls: tuple[ProgramCall, ...] | None,
     adapters: tuple[ModuleAdapter, ...],
@@ -585,7 +585,7 @@ def _tensor_reference(
 def _verify_tensors(
     model: torch.nn.Module,
     example_inputs,
-    sprite: str | Path | TranspileResult,
+    sprite: Sprite,
     *,
     adapters: tuple[ModuleAdapter, ...],
     quantization: QuantizationConfig | None,
@@ -646,40 +646,6 @@ def _verify_tensors(
 
 
 Sprite = str | Path | TranspileResult | ProgramResult | GenerationResult
-
-
-@overload
-def verify(
-    model: torch.nn.Module,
-    example_inputs: ExportProgram | GenerationProgram | RecurrentGenerationProgram,
-    sprite: Sprite,
-    *,
-    atol: float = ...,
-    rtol: float = ...,
-    calls: Sequence[ProgramCall] | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    quantization: QuantizationConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    sig_figs: int | None = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-) -> ProgramVerifyResult: ...
-
-
-@overload
-def verify(
-    model: torch.nn.Module,
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...] | None,
-    sprite: Sprite,
-    *,
-    atol: float = ...,
-    rtol: float = ...,
-    calls: Sequence[ProgramCall] | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    quantization: QuantizationConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    sig_figs: int | None = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-) -> VerifyResult | MultiOutputVerifyResult | ProgramVerifyResult: ...
 
 
 def verify(

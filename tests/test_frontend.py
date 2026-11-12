@@ -105,7 +105,7 @@ def test_fx_rejects_data_dependent_python_control_flow(tmp_path):
                 return value + 1
             return value - 1
 
-    with pytest.raises(UnsupportedModelError, match="FX frontend could not trace"):
+    with pytest.raises(UnsupportedModelError, match="PyTorch couldn't trace this model"):
         transpile(DataDependent().eval(), torch.ones(2), tmp_path / "data-dependent")
 
 

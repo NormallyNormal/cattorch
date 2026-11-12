@@ -7,7 +7,7 @@ import weakref
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, NamedTuple, Sequence, overload
+from typing import Any, Callable, Iterable, Literal, NamedTuple, Sequence
 
 import torch
 
@@ -2014,97 +2014,11 @@ def _select_unroll_factor(
     return 1
 
 
-ExampleInputs = torch.Tensor | tuple[torch.Tensor, ...]
-
-
-@overload
-def transpile(
-    model: torch.nn.Module,
-    example_inputs: GenerationProgram | RecurrentGenerationProgram,
-    output_path: str | Path,
-    *,
-    name: str | None = ...,
-    optimization: Literal["exact", "fast"] = ...,
-    fast_config: FastConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    quantization: QuantizationConfig | None = ...,
-    calibration: Iterable[Any] | None = ...,
-    sig_figs: int | None = ...,
-    codegen: CodegenConfig | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    kernels: Sequence[Kernel] = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-    dynamic: dict | None = ...,
-) -> GenerationResult: ...
-
-
-@overload
-def transpile(
-    model: torch.nn.Module,
-    example_inputs: ExportProgram,
-    output_path: str | Path,
-    *,
-    name: str | None = ...,
-    optimization: Literal["exact", "fast"] = ...,
-    fast_config: FastConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    quantization: QuantizationConfig | None = ...,
-    calibration: Iterable[Any] | None = ...,
-    sig_figs: int | None = ...,
-    codegen: CodegenConfig | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    kernels: Sequence[Kernel] = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-    dynamic: dict | None = ...,
-) -> ProgramResult: ...
-
-
-@overload
-def transpile(
-    model: torch.nn.Module,
-    example_inputs: ExampleInputs,
-    output_path: str | Path,
-    *,
-    name: str | None = ...,
-    optimization: Literal["exact", "fast"] = ...,
-    fast_config: FastConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    quantization: QuantizationConfig | None = ...,
-    calibration: Iterable[Any] | None = ...,
-    sig_figs: int | None = ...,
-    codegen: CodegenConfig | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    kernels: Sequence[Kernel] = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-    dynamic: dict | None = ...,
-) -> TranspileResult: ...
-
-
-@overload
-def transpile(
-    model: torch.nn.Module,
-    example_inputs: None,
-    output_path: str | Path,
-    *,
-    name: str | None = ...,
-    optimization: Literal["exact", "fast"] = ...,
-    fast_config: FastConfig | None = ...,
-    storage: StorageConfig | None = ...,
-    quantization: QuantizationConfig | None = ...,
-    calibration: Iterable[Any] | None = ...,
-    sig_figs: int | None = ...,
-    codegen: CodegenConfig | None = ...,
-    adapters: Sequence[ModuleAdapter] = ...,
-    kernels: Sequence[Kernel] = ...,
-    example_kwargs: dict[str, Any] | None = ...,
-    dynamic: dict | None = ...,
-) -> TranspileResult | ProgramResult: ...
-
-
 def transpile(
     model: torch.nn.Module,
     example_inputs: (
-        ExampleInputs | ExportProgram | GenerationProgram | RecurrentGenerationProgram | None
+        torch.Tensor | tuple[torch.Tensor, ...] | ExportProgram | GenerationProgram
+        | RecurrentGenerationProgram | None
     ),
     output_path: str | Path,
     *,

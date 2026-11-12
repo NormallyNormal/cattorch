@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from cattorch import build_generation_benchmark_suite
+from cattorch import GenerationProgram, build_generation_benchmark_suite
 from build_suite import TinyGPT
 
 
@@ -21,8 +21,8 @@ def main():
         ("catgpt1_generation", 32, 2, 64),
     ):
         model = TinyGPT(width, heads, hidden, context).eval()
-        full = torch.randint(0, 29, (1, context))
-        cases.append((name, model, full, full[:, :prompt_length]))
+        prompt = torch.randint(0, 29, (1, prompt_length))
+        cases.append((name, model, GenerationProgram(max_context=context), prompt))
     path = build_generation_benchmark_suite(cases, OUTPUT, repeats=16)
     print(f"Generation suite written: {path}")
 

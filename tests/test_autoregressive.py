@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch import UnsupportedModelError, UnsupportedOperationError
+from cattorch import UnsupportedModelError
 from cattorch.autoregressive import (
     analyze_sequence, build_generation_step, build_step_module,
     check_step_equivalence, prepare_sequence_model,
@@ -302,12 +302,13 @@ class Roll(nn.Module):
 
 @pytest.mark.parametrize("mixer", [CumSum(), SequenceMean(), Roll()], ids=["cumsum", "mean", "roll"])
 def test_token_mixing_outside_attention_is_rejected(mixer):
-    with pytest.raises(UnsupportedOperationError) as raised:
+    with pytest.raises(UnsupportedModelError) as raised:
         analyze(NanoGPT(layers=1, mix=mixer))
     message = str(raised.value)
     assert "over the sequence" in message
     assert "blocks.0.mix" in message
     assert "mixing tokens only in causal attention" in message
+    assert "aten." not in message
 
 
 def test_bert_is_rejected_as_non_causal():
@@ -343,7 +344,7 @@ def test_sliding_window_mask_becomes_a_window():
 
 
 def test_window_without_the_current_token_is_rejected():
-    with pytest.raises(UnsupportedModelError, match="isn't causal.*cannot attend to token 1"):
+    with pytest.raises(UnsupportedModelError, match="isn't causal.*can.t attend to token 1"):
         analyze(_windowed(3, offset=1), 12)
 
 
@@ -387,7 +388,7 @@ def test_length_dependent_table_is_rejected():
             scale = (torch.arange(tokens.shape[1]) / tokens.shape[1])[None, :, None]
             return self.inner(tokens) + scale
 
-    with pytest.raises(UnsupportedOperationError, match="rows must not depend on the sequence length"):
+    with pytest.raises(UnsupportedModelError, match="rows must not depend on the sequence length"):
         analyze(Normalised())
 
 

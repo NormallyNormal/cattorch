@@ -285,13 +285,13 @@ def _export(args) -> int:
             quantization=quantization, storage=options["storage"], sig_figs=options["sig_figs"],
         )
         if args.optimization == "fast" or gptq:
-            tolerance = {"atol": 0.05, "rtol": 0.05}
+            atol, rtol = 0.05, 0.05
         elif quantization is not None or args.precision != "float32" or args.sig_figs:
             # Long sums over stored values accumulate float32 rounding.
-            tolerance = {"atol": 1e-3, "rtol": 1e-4}
+            atol, rtol = 1e-3, 1e-4
         else:
-            tolerance = {"atol": 1e-4, "rtol": 1e-5}
-        check = verify(model, example, result, **tolerance, **stored)
+            atol, rtol = 1e-4, 1e-5
+        check = verify(model, example, result, atol=atol, rtol=rtol, **stored)
         passed = check.passed
         report["verify"] = {"passed": check.passed}
         if hasattr(check, "max_abs_error"):
