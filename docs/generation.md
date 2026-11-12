@@ -19,8 +19,10 @@ whose tokens mix through a recurrence (GRU and LSTM language models, Mamba,
 RWKV), use a [`RecurrentGenerationProgram`](recurrent-generation.md) instead. It must be in evaluation
 mode. `max_context` is fixed at export. Other fields are `hidden_prefill`,
 `top_k`, and `method`, which names the method to export when it isn't
-`forward`. See [`GenerationProgram`](api-reference.md#generationprogram) for
-all fields.
+`forward` (by default the method marked [`@generate`](markers.md), if any).
+See [`GenerationProgram`](api-reference.md#generationprogram) for all fields.
+The export returns a `GenerationResult`, which describes the token list, the
+logits and top-k lists, `max_context`, and the blocks.
 
 ## How it works
 
@@ -93,22 +95,63 @@ shared code checks whether it is running as the final layer. Set it to
 
 ## Layer sharing
 
-`CodegenConfig(layer_sharing="auto")` shares one block of code across repeated
+`CodegenConfig(layer_sharing=True)` shares one block of code across repeated
 layers when the attention blocks sit in consecutive modules named `blocks.0`,
 `blocks.1`, and so on. The caches are then banked into one list per K and V
 (`_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
 Hugging Face's `model.layers.N`, export without sharing and with one list per
 layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
 repeated but can't be factored, for example because the MLP widths differ,
-cattorch logs a warning and exports again without sharing. Sharing makes
-sprites smaller.
+cattorch exports again without sharing, with a warning in
+`result.warnings`. Sharing makes sprites smaller.
 
 ## Quantization
 
 The model is prepared the way an ordinary export is, before the step is built.
-`QuantizationConfig`, including GPTQ with `calibration_sequences`,
+`QuantizationConfig`, including GPTQ with token sequences as `calibration`,
 `optimization="fast"`, `adapters`, and the [storage options](storage.md) work
 as they do for any model.
+
+## Verify a generator
+
+`verify` runs prefill, decode and reset calls in the emulator and compares
+each with PyTorch: the logits, the top-k lists, and `cattorch status`,
+including the statuses an invalid call should give:
+
+```python
+import torch
+from torch import nn
+
+from cattorch import GenerationProgram, ProgramCall, transpile, verify
+
+class Decoder(nn.Module):
+    def __init__(self, vocabulary=16, width=8):
+        super().__init__()
+        self.embed = nn.Embedding(vocabulary, width)
+        self.head = nn.Linear(width, vocabulary)
+
+    def forward(self, tokens):
+        hidden = self.embed(tokens)
+        attended = nn.functional.scaled_dot_product_attention(
+            hidden, hidden, hidden, is_causal=True,
+        )
+        return self.head(hidden + attended)
+
+decoder = Decoder().eval()
+program = GenerationProgram(max_context=4, top_k=3)
+result = transpile(decoder, program, "decoder")
+report = verify(decoder, program, result, calls=[
+    ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),)),
+    ProgramCall("decode", (torch.tensor([[4]]),)),
+    ProgramCall("decode", (torch.tensor([[5]]),)),  # the cache is full
+])
+assert report.passed
+print([call.status for call in report.calls])  # ['ok', 'ok', 'context full']
+```
+
+Without `calls`, `verify` prefills a few tokens and decodes a few more. Pass
+the export's `quantization`, `storage` and `sig_figs` too, and PyTorch uses
+the values the sprite stores.
 
 ## Scratch interface
 

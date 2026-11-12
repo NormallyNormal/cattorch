@@ -17,8 +17,9 @@ projects are written to `benchmarks/artifacts/`, which is not committed.
 5. Click the green flag and wait until the results list on the stage has every
    expected entry. Each entry is added after its timed section ends.
 6. Save the finished project to your computer.
-7. Run `cattorch-benchmark downloaded-project.sb3`, or
-   `python -m cattorch.benchmark downloaded-project.sb3` from a checkout.
+7. Run `cattorch analyze-benchmark downloaded-project.sb3`, or
+   `python -m cattorch.cli analyze-benchmark downloaded-project.sb3` from a
+   checkout.
 
 The report lists each named timing, the speedup for each case, output error,
 block counts, file size, and the project's SHA-256. Save the report together

@@ -155,7 +155,7 @@ A sprite from a [`GenerationProgram`](generation.md#scratch-interface):
 A sprite from a [`RecurrentGenerationProgram`](recurrent-generation.md#scratch-interface)
 has the same names. It has no cache: `cattorch reset` restores the model's
 initial state, `cattorch cache length` counts the tokens read since then, and
-`cattorch max context` is `max_tokens`, or `Infinity` when it has no limit.
+`cattorch max context` is `max_context`, or `Infinity` when it has no limit.
 
 ## Program sprites
 

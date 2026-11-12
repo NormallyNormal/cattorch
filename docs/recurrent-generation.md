@@ -15,7 +15,7 @@ logits. The sprite has the same blocks and lists as a
 | Model | A transformer whose tokens mix only in causal attention. | A model whose tokens mix through a recurrence. |
 | What you give | The stateless `forward(tokens)`. cattorch derives the step. | A one-token `step` and its states, or a Hugging Face Mamba, Mamba-2 or RWKV model as it is. |
 | Memory per token | Grows: every token adds a row to each layer's K/V cache. | Fixed: the states have the same size after any number of tokens. |
-| Context limit | `max_context`, required. | `max_tokens`, optional. Without it the sprite takes any number of tokens. |
+| Context limit | `max_context`, required. | `max_context`, optional. Without it the sprite takes any number of tokens. |
 
 ## Quick start
 
@@ -111,7 +111,7 @@ value replaces it. `RecurrentGenerationProgram` rejects append states.
 ## The reference check
 
 With `reference="forward"`, or another method name, export traces the step as
-it is exported and runs the traced graph from the initial states over up to 32 random tokens (fewer if `max_tokens` is
+it is exported and runs the traced graph from the initial states over up to 32 random tokens (fewer if `max_context` is
 smaller) and compares each logits row with
 `reference(tokens)`, which must return `[1, n, V]` or `[n, V]` logits. Every
 row must agree within `1e-4` of its largest value, or export stops with an
@@ -167,12 +167,12 @@ it to `False` only for debugging or measurement.
 
 `QuantizationConfig`, `optimization="fast"`, `adapters` and the
 [storage options](storage.md) work as for any export. GPTQ takes
-`calibration_sequences`: `[1, length]` token tensors. Calibration runs the step
+`calibration=` as `[1, length]` token tensors. Calibration runs the step
 over each sequence token by token and resets the states between sequences.
 
 An int8 Mamba-2 stays within 4% of the largest logit in the tests. Fast mode
 approximates GELU, LayerNorm and softmax in the step as it does anywhere else,
-and `TranspileResult.approximate_operations` lists what it approximated;
+and `GenerationResult.approximate_operations` lists what it approximated;
 `fallback_operations` lists operations that ran as decompositions. See
 [optimization modes](optimization.md).
 
@@ -186,7 +186,7 @@ differences:
 - There is no K/V cache. The states live in internal lists.
 - `cattorch cache length` counts the tokens consumed since the last reset or
   prefill.
-- `cattorch max context` is `max_tokens`, or `Infinity` when `max_tokens` is
+- `cattorch max context` is `max_context`, or `Infinity` when `max_context` is
   `None`. The loop's stop condition `(cattorch cache length) = (cattorch max
   context)` then never ends generation; stop on a token count or an end token
   instead.
@@ -213,14 +213,14 @@ every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
 
 Prefill and decode check `cattorch token ids` before they change anything, and
 a block that fails writes no logits and leaves the states as they were. The
-statuses are those of a K/V cache, with `max_tokens` as the context:
+statuses are those of a K/V cache, with `max_context` as the context:
 
 | Situation | `cattorch status` |
 |---|---|
 | Decode with zero or several tokens | `wrong number of items: cattorch token ids` |
-| Decode after `max_tokens` tokens | `context full` |
+| Decode after `max_context` tokens | `context full` |
 | Prefill with no tokens | `too few items: cattorch token ids` |
-| Prefill longer than `max_tokens` | `too many items: cattorch token ids` |
+| Prefill longer than `max_context` | `too many items: cattorch token ids` |
 | A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: cattorch token ids` |
 | Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
 | A block that another of the sprite's blocks started during | `another call ran during this one` |
@@ -297,7 +297,7 @@ very slow; it wasn't timed in Scratch.
 
 `cattorch generate --hf REPO`, or `cattorch generate MODEL` when `MODEL` loads
 one, recognizes these models and exports them with a
-`RecurrentGenerationProgram`. `--max-context` sets `max_tokens`; without it
+`RecurrentGenerationProgram`. `--max-context` sets `max_context`; without it
 the generator takes any number of tokens. See
 [projects and the command line](projects-and-cli.md#the-command-line).
 

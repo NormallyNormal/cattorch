@@ -14,9 +14,11 @@ Problems usually happen at one of three stages:
 
 ## Put the model in evaluation mode
 
-Call `model.eval()` before export. A model with modules still in training mode
-is exported as an evaluation-mode copy with a warning: dropout is disabled
-and batch norm uses its running statistics. Your model itself is unchanged.
+Call `model.eval()` before export. A model is always exported as an
+evaluation-mode copy: dropout is disabled and batch norm uses its running
+statistics. When modules whose output depends on the mode (dropout, batch
+norm, or a `forward` that reads `self.training`) are still in training mode,
+the export warns, naming them. Your model itself is unchanged.
 
 ## Keep one inference return path
 
@@ -105,9 +107,13 @@ was tested with. See [recurrent generation](recurrent-generation.md).
 ## Read the error
 
 `UnsupportedOperationError` names the operation that failed and the module it
-came from. `UnsupportedModelError` covers other problems, such as a non-tensor
-return value. Both subclass `CattorchError`, so you can catch that one class.
-See [exceptions](api-reference.md#exceptions).
+came from. `UnsupportedModelError` covers other problems with the model, such
+as a non-tensor return value, a requirement of a `GenerationProgram` it
+doesn't meet, or an error the model raises on the example inputs (the
+message gives their shapes). Both subclass `CattorchError`, so you can catch
+that one class. A `TypeError` or `ValueError` means an argument is wrong.
+Every warning is a `CattorchWarning` and is also in `result.warnings`. See
+[exceptions](api-reference.md#exceptions).
 
 ## Report an issue
 

@@ -195,7 +195,7 @@ result = transpile(
     example,
     "model_gptq_q4",
     quantization=QuantizationConfig(bits=4, method="gptq"),
-    calibration_inputs=calibration_batches,
+    calibration=calibration_batches,
 )
 
 for tensor in result.quantization.tensors:
@@ -203,13 +203,13 @@ for tensor in result.quantization.tensors:
         print(tensor.name, tensor.fallback_reason)
 ```
 
-Choose the calibration argument to match the export interface:
+`calibration` takes items in the form the export is called with:
 
-| Export interface | Calibration argument | Items |
-|---|---|---|
-| Tensor example inputs | `calibration_inputs` | Tensors or tuples matching the eager model's inputs |
-| `ExportProgram` | `calibration_calls` | Ordered `ProgramCall` values exercising the model's methods and state |
-| `GenerationProgram` | `calibration_sequences` | Full token sequences accepted by the generation method |
+| Export interface | `calibration` items |
+|---|---|
+| Tensor example inputs | Tensors or tuples matching the eager model's inputs |
+| `ExportProgram` | Ordered `ProgramCall` values exercising the model's methods and state |
+| `GenerationProgram`, `RecurrentGenerationProgram` | Full `[1, length]` token sequences accepted by the generation method |
 
 Calibration data is read once, so a generator works. For cached generation,
 calibrate with realistic full sequences of up to `max_context` tokens.

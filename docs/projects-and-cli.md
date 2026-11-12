@@ -20,7 +20,7 @@ example = torch.tensor([[0.5, -0.25]])
 
 result = cattorch.transpile(model, example, "build/points")
 project = cattorch.build_project(
-    "build/points", result, example_inputs=example, labels=["red", "green", "blue"],
+    result, "build/points", example_inputs=example, labels=["red", "green", "blue"],
 )
 print(project.path)  # build/points.sb3
 ```
@@ -38,7 +38,7 @@ exported [tokenizer](tokenizers.md) too:
 ```python
 words = cattorch.CharTokenizer(hf_tokenizer).save("build/tokenizer", name="tokenizer")
 project = cattorch.build_project(
-    "build/story", result, tokenizer=words, max_new_tokens=40, temperature=0.8,
+    result, "build/story", tokenizer=words, max_new_tokens=40, temperature=0.8,
 )
 ```
 
@@ -48,7 +48,7 @@ shows the text so far in a speech bubble. An empty answer stops it. The
 temperature slider sets how random the choices are; 0 always picks the
 likeliest token. Generation stops after `max_new_tokens`, at `eos_token_id`
 when you give one, or when the model's context is full (never, for a recurrent
-generator without `max_tokens`). `prompt` replaces the
+generator without `max_context`). `prompt` replaces the
 question it asks.
 
 A model with [entry points](markers.md) gets a bridge for each one but no
@@ -77,8 +77,8 @@ name; the [Scratch interface](scratch-interface.md#projects) lists them all:
 `NAME prefill` takes a whole prompt and `NAME decode` one token, as the
 [generation blocks](generation.md#scratch-interface) do. Both sample the next
 token from the logits and write it to `NAME next token`, zero-based. `NAME
-status` is `ok` or an error message. `ProjectResult` lists every message, list,
-and variable a project defines.
+status` is `ok` or an error message. `ProjectResult` lists every broadcast,
+list, and variable a project defines.
 
 To use the bridges in your own project, build one with `build_project`, then
 drag its sprites into your project, or start from it and add your own sprites.
@@ -93,12 +93,12 @@ cattorch export my_models.py:Classifier --project
 cattorch export model.pt --shape 1,28,28 --labels "0,1,2,3,4,5,6,7,8,9" --project
 cattorch generate my_models.py:TinyGPT --tokenizer path/to/tokenizer --project
 cattorch generate --hf some-user/tiny-model --max-context 64 --project
-cattorch generate --hf AntonV/mamba2-130m-hf --precision int8 --project
+cattorch generate --hf AntonV/mamba2-130m-hf --quantize 8 --project
 ```
 
 `cattorch export MODEL` exports a model, checks it against PyTorch with
-[`verify`](api-reference.md#verify), and prints a JSON summary. It exits with
-status 1 if the check fails. `MODEL` is one of:
+[`verify`](api-reference.md#verify), and prints a JSON summary. `MODEL` is
+one of:
 
 - `file.py:name` or `package.module:name`, naming a module, a class to
   construct without arguments, or a function returning a module.
@@ -109,7 +109,7 @@ status 1 if the check fails. `MODEL` is one of:
   the script that saved the model can't be found; define it in a module
   instead.
 
-The inputs come from the model's [`@cattorch.example`](markers.md) marker or
+The inputs come from the model's [`@cattorch.example_inputs`](markers.md) marker or
 `@entrypoint` methods, or from `--shape 1,28,28` for random float inputs and
 `--tokens 1,8` for random token IDs below `--vocab` (default 2). Repeat them
 for several inputs, floats first. `--dynamic 0=1:32` lets input 0's first dimension vary
@@ -120,29 +120,59 @@ from 1 to 32 at run time, and `--dynamic 0.1=1:64` its second; see
 [`GenerationProgram`](generation.md) with `--max-context` (default 64) and
 `--top-k`. A Hugging Face Mamba, Mamba-2, or RWKV model is recognized and
 exported as a [`RecurrentGenerationProgram`](recurrent-generation.md)
-instead; there `--max-context` is optional and sets `max_tokens`, and without
+instead; there `--max-context` is optional, and without
 it the generator takes any number of tokens (the summary's `max_context` is
 `null`). `--hf REPO` loads a Hugging Face causal language model and its
 tokenizer by name or directory; `--tokenizer` names a Hugging Face tokenizer
 for a model given as `MODEL`. The tokenizer is exported too when its type is
 [supported](tokenizers.md#compatibility). Generation exports aren't verified.
 
-Both commands take:
+The options are named after the Python parameters they set. Both commands
+take:
 
 | Option | Effect |
 |---|---|
 | `-o PATH` | Output path, with or without `.sprite3` or `.sb3`. The sprite is `PATH.sprite3` and `generate`'s tokenizer `PATH_tokenizer.sprite3`. Defaults to the model's name, lowercased: `name` in `file.py:name` or `module:name`, the `.pt` file's stem, or the last part of the `--hf` repo. |
+| `--name NAME` | The sprite's name in Scratch, `transpile(name=...)`. Defaults to the file's name. |
 | `--project` | Also write `PATH.sb3` with `build_project`. |
-| `--fast` | Use [approximate kernels](optimization.md). |
-| `--precision` | `float32` (the default) stores weights exactly, `float16` at half precision, and `int8` or `int4` [quantize](storage.md) matrices. `export` verifies a lossy or `--fast` export with `atol=0.05, rtol=0.05`, and any other with `atol=1e-4, rtol=1e-5`. |
+| `--optimization {exact,fast}` | `fast` uses [approximate kernels](optimization.md). |
+| `--precision {float32,float16}` | How stored weights are kept, `StorageConfig(precision=...)`: `float32` (the default) exactly, `float16` at half precision. |
+| `--quantize {4,6,8}` | [Quantize](storage.md) matrix weights to that many bits, `QuantizationConfig(bits=...)`. |
+| `--quantize-method {symmetric,gptq}` | How `--quantize` quantizes; `symmetric` by default. `gptq` needs `--calibration`. |
+| `--calibration FILE` | GPTQ calibration data: a list saved with `torch.save`, of input tensors for `export` or `[1, length]` token tensors for `generate`. |
+| `--sig-figs N` | Round stored values to `N` significant figures. |
 
-`export` also takes `--labels` for its project and `--no-verify`, and
-`generate` takes `--max-new-tokens`, `--temperature`, and `--eos` (defaulting
-to the tokenizer's end token). `cattorch analyze-benchmark PROJECT` prints a
-saved [benchmark project's](verification-and-benchmarking.md) timings, like
-`cattorch-benchmark`. `cattorch --version` prints the installed version, which
-Python code can read as `cattorch.__version__`, and `--help` after a command
-lists its options with their defaults.
+`export` verifies against a copy of the model holding the values the sprite
+stores, so float16, symmetric quantization and `--sig-figs` are checked with
+`atol=1e-3, rtol=1e-4`, and an exact float32 export with `atol=1e-4,
+rtol=1e-5`; a `fast` or GPTQ export is compared with the model itself with
+`atol=0.05, rtol=0.05`. It also takes `--labels` for its project and
+`--no-verify`. `generate` takes `--max-new-tokens`, `--temperature`, and
+`--eos-token-id` (defaulting to the tokenizer's end token), as
+`build_project` does. `cattorch analyze-benchmark PROJECT` prints a saved
+[benchmark project's](verification-and-benchmarking.md) results as JSON, the
+fields of `analyze_benchmark`'s `BenchmarkAnalysis`. `cattorch --version`
+prints the installed version, which Python code can read as
+`cattorch.__version__`, and `--help` after a command lists its options with
+their defaults.
+
+The JSON summary uses the result's field names: `path`, `sprite_name`,
+`archive_bytes`, `expanded_json_bytes`, `block_count`, `list_count`,
+`sharded_lists`, `warnings`, `fallback_operations` and
+`approximate_operations`, and for `generate` also `max_context`,
+`vocabulary_size` and `top_k`. `export` adds `verify`, with `passed` and
+`max_abs_error`; `--project` adds `project`, with its `path`; `generate` adds
+`tokenizer`, with the tokenizer result's fields, or its `error` when it
+couldn't be exported.
+
+The commands exit with one of these statuses:
+
+| Status | Meaning |
+|---|---|
+| `0` | Success. |
+| `1` | The export failed: an unsupported model or operation, or a file that can't be read or written. |
+| `2` | Invalid arguments, found by the command's parser or by cattorch's checks of them. |
+| `3` | `export`'s check found that the sprite doesn't match PyTorch. |
 
 ## Examples
 

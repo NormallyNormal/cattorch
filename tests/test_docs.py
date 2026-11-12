@@ -66,7 +66,7 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
     guide = (ROOT / "docs" / "verification-and-benchmarking.md").read_text(
         encoding="utf-8"
     )
-    assert '("decoder", decoder, stateless_input, prompt)' in guide
+    assert '("decoder", decoder, GenerationProgram(max_context=16), prompt)' in guide
 
 
 @pytest.mark.parametrize(
@@ -81,10 +81,13 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
         ("docs/markers.md", (0,)),
         ("docs/projects-and-cli.md", (0,)),
         ("docs/recurrent-generation.md", (0,)),
+        ("docs/verification-and-benchmarking.md", (0, 1, 2, 3, 4, 5)),
+        ("docs/generation.md", (1,)),
     ],
     ids=(
         "quick-start", "getting-started", "stateful-program", "sparse-moe",
         "routed-experts", "custom-kernels", "markers", "projects", "recurrent-generation",
+        "verification-and-benchmarking", "verify-generation",
     ),
 )
 def test_documented_export_examples_run(

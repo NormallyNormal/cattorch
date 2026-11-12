@@ -48,7 +48,7 @@ All three options are off by default.
   lists, and custom blocks. The documented input, output, and lifecycle names
   don't change.
 - `compact_schema=True` leaves redundant fields out of the saved block data.
-- `layer_sharing="auto"` generates one copy of the code for repeated
+- `layer_sharing=True` generates one copy of the code for repeated
   transformer layers named `blocks.N` and shares it across them. For cached
   generation, every layer must also have the same cache width. Layers that
   don't fit keep their own code.

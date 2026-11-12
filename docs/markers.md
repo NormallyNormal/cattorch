@@ -59,15 +59,18 @@ interface from the markers. Each entry point becomes a block named
 `cattorch <name>`, with a list per input named after its parameter
 (`cattorch add value`) and a list per output (`cattorch score scores`).
 
-- `example=` gives the arguments to export with: a tuple, a tensor, or a
-  function returning one. They must be tensors. `example=()` exports a
-  method with no arguments, computed from the weights and the state.
-- `name=` names the block, `inputs=` and `outputs=` name its lists. Outputs
-  default to `output`, `output_1`, and so on. Only the method's tensor
-  results become outputs, as with `forward`; other results, such as `None`,
-  are skipped with a warning.
-- `dynamic={"rows": (1, 32)}` lets an input's first dimension vary between
-  those bounds at run time, checked at several lengths during export (see
+- `example_inputs=` gives the arguments to export with: a tuple, a tensor,
+  or a function returning one. They must be tensors. `example_inputs=()`
+  exports a method with no arguments, computed from the weights and the
+  state.
+- `name=` names the block, `input_names=` and `output_names=` name its
+  lists. Outputs default to `output`, `output_1`, and so on. Only the
+  method's tensor results become outputs, as with `forward`; other results,
+  such as `None`, are skipped with a warning.
+- `dynamic={"rows": {0: (1, 32)}}` lets an input's dimension vary between
+  those bounds at run time, checked at several lengths during export, in the
+  same form as `transpile(dynamic=...)`: keys are input names, and
+  `(1, 32)` is short for the first dimension (see
   [variable-length inputs](supported-models.md#variable-length-inputs)).
 - cattorch runs each entry point once on a copy of the model to find the
   buffers it changes. Each one becomes a state list, `cattorch state total`,
@@ -80,17 +83,19 @@ interface from the markers. Each entry point becomes a block named
 - A buffer that changes shape without a capacity, or a capacity for a buffer
   that never grows, fails the export.
 
-`marked_program(model)` returns the export copy and the
+`marked_program(model)` returns a `MarkedProgram`: the export copy of the
+model and the
 [`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state) the markers
-describe, if you want to inspect or extend it.
+describe, if you want to inspect or extend them. `model, program =
+marked_program(model)` unpacks it.
 
 ## Example inputs
 
-`@example` gives a class example inputs for `forward`, so tools such as the
-command line can export it without being told its shapes:
+`@example_inputs` gives a class example inputs for `forward`, so tools such
+as the command line can export it without being told its shapes:
 
 ```python
-from cattorch import example
+from cattorch import example_inputs
 
 @example_inputs(lambda: (torch.zeros(1, 1, 28, 28),))
 class Digits(nn.Module):

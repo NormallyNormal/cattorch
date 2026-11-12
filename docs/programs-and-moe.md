@@ -114,7 +114,7 @@ rejects fails verification even if its outputs happen to match. Later calls
 continue from the state after the last successful call.
 
 To check support and estimated size without writing a sprite, call
-`analyze(model, program)` from `cattorch.experimental`.
+`analyze(model, program)` from `cattorch.experimental`; `analyze(model, None)` reads a marked model's program from its markers.
 
 ## Scoped module adapters
 

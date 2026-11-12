@@ -3,7 +3,9 @@
 [Documentation home](index.md)
 
 Functions, configuration classes, and result types are imported from
-`cattorch`. Paths can be strings or `pathlib.Path` objects.
+`cattorch`. Paths can be strings or `pathlib.Path` objects. Every function
+takes its leading arguments (the model, what it's called with, the output
+path) by position and everything after them by keyword.
 
 Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
 `StateInput`, `StateUpdate`, `ProgramCall`), markers, and `ModuleAdapter` are
@@ -23,71 +25,63 @@ transpile(
     model,
     example_inputs,
     output_path,
-    sig_figs=None,
     *,
     name=None,
     optimization="exact",
     fast_config=None,
     storage=None,
     quantization=None,
-    calibration_inputs=None,
+    calibration=None,
+    sig_figs=None,
     codegen=None,
     adapters=(),
-    calibration_calls=None,
-    calibration_sequences=None,
+    kernels=(),
     example_kwargs=None,
-) -> TranspileResult
+    dynamic=None,
+) -> TranspileResult | ProgramResult | GenerationResult
 ```
 
 Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 
 | Parameter | Meaning |
 |---|---|
-| `model` | Module to export. Export works on a copy; a model with modules in training mode is exported in evaluation mode, with a warning. |
-| `example_inputs` | A tensor or tuple of tensors, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. Programs carry their own examples. |
+| `model` | Module to export. Export works on a copy. A model left in training mode with modules that behave differently in it (dropout, batch norm) is exported in evaluation mode, with a warning. |
+| `example_inputs` | What the sprite is called with: a tensor or tuple of tensors for `forward`, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. `None` takes it from the model's [markers](markers.md). |
 | `output_path` | Destination. `.sprite3` is appended when absent and missing parent directories are created. |
-| `sig_figs` | Round stored values to this many significant figures. Lossy. |
 | `name` | Scratch sprite display name. Defaults to the destination filename stem. |
 | `optimization` | `"exact"` (default) or `"fast"`. See [optimization modes](optimization.md). |
 | `fast_config` | A `FastConfig`; valid only with `optimization="fast"`. |
 | `storage` | A `StorageConfig` for weight compression and float precision. |
-| `quantization` | A `QuantizationConfig` for symmetric or GPTQ integer weights. Don't combine with an integer `StorageConfig.precision`. |
-| `calibration_inputs` | Iterable of tensors or tensor tuples for GPTQ with tensor inputs. Read once. Only valid with `method="gptq"`. |
+| `quantization` | A `QuantizationConfig` for symmetric or GPTQ integer weights. |
+| `calibration` | GPTQ calibration data, read once, in the form the export is called with: an iterable of tensors or tensor tuples for tensor inputs, of `ProgramCall`s for an `ExportProgram`, and of `[1, length]` token tensors for a generation program. Required with `method="gptq"` and invalid without it. |
+| `sig_figs` | Round stored values to this many significant figures. Lossy. |
 | `codegen` | A `CodegenConfig` for JSON size target, loop unrolling, IDs, and compaction. |
-| `adapters` | `ModuleAdapter`s that replace module types for this export. |
-| `calibration_calls` | `ProgramCall`s for GPTQ with an `ExportProgram`. |
-| `calibration_sequences` | Token sequences for GPTQ with a `GenerationProgram` or `RecurrentGenerationProgram` (`[1, length]` tensors for the latter). |
-| `dynamic` | One variable-length input, as `{input: (minimum, maximum)}` for its first dimension or `{input: {dimension: (minimum, maximum)}}`; see [variable-length inputs](supported-models.md#variable-length-inputs). Not valid with programs. |
+| `adapters` | `ModuleAdapter`s that replace module types in the export's copy of the model. |
 | `kernels` | Experimental `Kernel`s for this export; see [custom kernels](custom-kernels.md). Each replaces the built-in lowering of its operation for this export. |
-| `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Not valid with programs, or with GPTQ when a value is a tensor. |
+| `example_kwargs` | Keyword arguments for the model call, as a dict. Tensor values become input lists after the positional ones, in dict order. Other values, such as `use_cache=False`, are fixed for the export. Only for tensor inputs, and not with GPTQ when a value is a tensor. |
+| `dynamic` | One variable-length input, as `{input: {dimension: (minimum, maximum)}}`, or `{input: (minimum, maximum)}` for its first dimension; `input` is its position or tensor keyword name. See [variable-length inputs](supported-models.md#variable-length-inputs). Only for tensor inputs: a program's entry points take `Input(dynamic=...)`, in the same form. |
 
-Tensor-input and generation exports return a `TranspileResult`. An
-`ExportProgram` export returns a `ProgramResult`. Export raises
-`UnsupportedOperationError` for an operation cattorch can't convert,
-`UnsupportedModelError` for other unsupported models, and `ValueError` or
-`TypeError` for invalid options. See [troubleshooting](troubleshooting.md).
+Tensor inputs return a `TranspileResult`, an `ExportProgram` (or
+`@entrypoint` markers) a `ProgramResult`, and a `GenerationProgram` or
+`RecurrentGenerationProgram` a `GenerationResult`. Every option works with
+every kind of export except where the table says otherwise; an option a kind
+doesn't take raises `ValueError`.
 
-With an `ExportProgram`, the call looks like this and returns a
-`ProgramResult`:
+Errors follow one rule. Invalid arguments raise `TypeError` (the wrong type)
+or `ValueError` (an invalid value or combination), before the model runs.
+`UnsupportedOperationError` means the traced model uses an operation
+cattorch can't convert. `UnsupportedModelError` means the model can't be
+exported as it is: something about its structure, a requirement of the
+export kind it doesn't meet (such as a `GenerationProgram`'s causal
+attention), a marker that doesn't match what it does, or a failure when it
+runs on the example inputs. See [troubleshooting](troubleshooting.md).
 
-```text
-transpile(
-    model,
-    program,
-    output_path,
-    *,
-    adapters=(),
-    calibration_calls=None,
-    ...
-) -> ProgramResult
-```
+Every warning an export gives is in its result's `warnings`, and is also
+emitted as a `CattorchWarning`.
 
-See [programs and sparse MoE](programs-and-moe.md) for interface names,
-state updates, and calibration.
-
-A `GenerationProgram` or `RecurrentGenerationProgram` export also accepts
-`adapters`, for example to convert your MoE module to `SparseMoE` or
-`StackedSwiGLUMoE`.
+For GPTQ, use calibration data that routes tokens the way real use does.
+Experts that receive too little data fall back to symmetric quantization; see
+[GPTQ calibration](storage.md#gptq-calibration).
 
 ### `rotary_embedding`
 
@@ -106,25 +100,27 @@ model runs unchanged in PyTorch; see [markers](markers.md).
 
 | Name | Use |
 |---|---|
-| `entrypoint` | On a method: export it as a Scratch block. Buffers it updates become state; `capacity=` for a buffer that grows; `name=`, `inputs=`, `outputs=`, `example=`. |
-| `example` | On a class: example inputs for `forward`, so `transpile(model, None, path)` needs none. |
+| `entrypoint` | On a method: export it as a Scratch block. Buffers it updates become state; `capacity=` for a buffer that grows; `name=`, `input_names=`, `output_names=`, `example_inputs=`, `dynamic=`. |
+| `example_inputs` | On a class: example inputs for `forward`, so `transpile(model, None, path)` needs none. |
 | `export_forward` | On a method: trace it instead of `forward` for every instance of the class. |
 | `moe` | On a class: export it as a sparse mixture of experts with the given `router`, `experts`, `top_k`, `scoring`, `normalize`, `shared`, and `scale`, checked against `forward`. |
-| `generate` | On a method: the method a `GenerationProgram` exports. |
+| `generate` | On a method: the method a `GenerationProgram` exports when its `method` isn't set. |
 | `adapter` | On a function: build a `ModuleAdapter` for a class you don't own. |
-| `marked_program` | `marked_program(model)` returns the export copy and the `ExportProgram` a model's `entrypoint` markers describe. |
+| `marked_program` | `marked_program(model)` returns a `MarkedProgram`: the export copy of the model (`model`) and the `ExportProgram` (`program`) its `entrypoint` markers describe. |
 
-Pass `None` as `example_inputs` to `transpile` and `verify` to take the
-interface from `entrypoint` or `example` markers.
+Pass `None` as `example_inputs` to `transpile`, `verify` and `analyze` to take
+the interface from `entrypoint` or `example_inputs` markers.
 
 The classes markers compile to can also be used directly:
 
 | Name | Use |
 |---|---|
 | `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entrypoints-and-state). |
-| `ProgramCall` | One call in `verify(model, program, result, calls=...)`. |
-| `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
-| `CustomMoEWarning` | Warned when a hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
+| `ProgramCall` | One block call: in `verify(..., calls=...)`, and in an `ExportProgram`'s `calibration=`. |
+| `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path` and the program's `state_names`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
+| `CattorchWarning` | Base class of every warning cattorch emits. |
+| `CustomMoEWarning` | A `CattorchWarning` warned when a hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
+| `INTERFACE_VERSION` | The version of the [Scratch interface](scratch-interface.md) exported sprites implement, `1`. |
 
 `op`, for declaring a new operation, is [experimental](stability.md); see
 [custom kernels and operations](custom-kernels.md).
@@ -145,38 +141,32 @@ transpile_tokenizer(
 ```
 
 Detect the tokenizer type (character, raw-text Hugging Face BPE, or
-SentencePiece BPE) and export it. Any other type, such as WordPiece, Unigram,
-or a SentencePiece Unigram model, raises `ValueError`; see
-[tokenizers](tokenizers.md). Use `scratch_casefold=True` only for a
-SentencePiece model trained with case-folding normalization.
+SentencePiece BPE) and export it with `CharTokenizer`, `BPETokenizer` or
+`SentencePieceBPETokenizer`. Any other type, such as WordPiece, Unigram, or a
+SentencePiece Unigram model, raises `ValueError`; see
+[tokenizers](tokenizers.md). `scratch_casefold=True` is for a SentencePiece
+model trained with case-folding normalization; with any other tokenizer it
+raises `ValueError`.
 
-### `CharTokenizer` and `BPETokenizer`
+### `CharTokenizer`, `BPETokenizer` and `SentencePieceBPETokenizer`
 
 ```text
 CharTokenizer(tokenizer).save(output_path, *, name=None, codegen=None)
 BPETokenizer(tokenizer).save(output_path, *, name=None, codegen=None)
+SentencePieceBPETokenizer(tokenizer, *, scratch_casefold=False).save(
+    output_path, *, name=None, codegen=None,
+)
 ```
 
-Export a Hugging Face tokenizer as a character or BPE tokenizer, without
-auto-detection. The tokenizer must have `get_vocab()`; anything else raises
-`TypeError`. `BPETokenizer` also needs a fast (Rust-backed) BPE tokenizer so
-cattorch can read its merges. `CharTokenizer` checks that the tokenizer's
-tokens are single characters and that it encodes text one character at a
-time, and raises `ValueError` otherwise.
-
-### `SentencePieceBPETokenizer`
-
-```text
-SentencePieceBPETokenizer(
-    tokenizer,
-    *,
-    scratch_casefold=False,
-).save(output_path, *, name=None, codegen=None)
-```
-
-`tokenizer` can be a `SentencePieceProcessor` or an object with one in its
-`.processor` attribute. The model must be trained with `model_type="bpe"`;
-Unigram, word and char models raise `ValueError`. See
+Export a tokenizer as the kind you choose, without detection; each returns a
+`TokenizerResult`. `CharTokenizer` and `BPETokenizer` take a Hugging Face
+tokenizer, which must have `get_vocab()`; anything else raises `TypeError`.
+`BPETokenizer` also needs a fast (Rust-backed) BPE tokenizer so cattorch can
+read its merges. `CharTokenizer` checks that the tokenizer's tokens are
+single characters and that it encodes text one character at a time, and
+raises `ValueError` otherwise. `SentencePieceBPETokenizer` takes a
+`SentencePieceProcessor` or an object with one in its `.processor`
+attribute; the model must be trained with `model_type="bpe"`. See
 [tokenizers](tokenizers.md) for normalization, case, Unicode, and byte
 fallback limits.
 
@@ -195,32 +185,47 @@ verify(
     calls=None,
     adapters=(),
     quantization=None,
+    storage=None,
+    sig_figs=None,
     example_kwargs=None,
 ) -> VerifyResult | MultiOutputVerifyResult | ProgramVerifyResult
 ```
 
-Run `cattorch forward` once in cattorch's Python emulator and compare the
-result with PyTorch. `sprite` can be a path or a `TranspileResult`. Tolerances
-must be non-negative. `verify` checks correctness, not speed.
+Run an exported sprite in cattorch's Python emulator and compare it with
+PyTorch. `model` and `example_inputs` are what was passed to `transpile`
+(`None` takes them from the markers), and `sprite` is the export's result or
+its path. Tolerances must be non-negative. `verify` checks correctness, not
+speed. It works for every kind of export:
 
-A model with one tensor output returns a `VerifyResult`, even if the tensor is
-inside a container. A model with several returns a `MultiOutputVerifyResult`,
-whose `outputs` are in the same order as `TranspileResult.outputs` and whose
-`passed` requires all of them to pass. Non-tensor outputs are ignored, as in
-`transpile`. Outputs that don't match the sprite's lists raise
-`UnsupportedModelError`.
+- **Tensor inputs**: the sprite runs `cattorch forward` on `example_inputs`.
+  A model with one tensor output returns a `VerifyResult`, even if the tensor
+  is inside a container; a model with several returns a
+  `MultiOutputVerifyResult`, whose `outputs` are in the same order as
+  `TranspileResult.outputs`. Pass the same `example_kwargs` used at export.
+  Non-tensor outputs are ignored, as in `transpile`. Outputs that don't match
+  the sprite's lists raise `UnsupportedModelError`.
+- **Programs** (`ExportProgram` or `@entrypoint` markers): `calls` is a
+  sequence of `ProgramCall`s run in order, keeping state between them in both
+  PyTorch and Scratch; by default each entry point once with its example
+  inputs.
+- **Generation** (`GenerationProgram` or `RecurrentGenerationProgram`):
+  `calls` names the blocks `"prefill"`, `"decode"` and `"reset"` with their
+  token IDs, such as `ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))`;
+  by default a prefill and a few decodes. Each call's `cattorch logits` and
+  top-k lists are compared with the model's next-token logits, and its
+  `cattorch status` with the status its input should give, such as
+  `context full` or `too many items: cattorch token ids`.
 
-Pass the same `example_kwargs` used at export. A model in training mode is
-compared as an evaluation-mode copy, with a warning.
+Programs and generation return a `ProgramVerifyResult`.
 
-The remaining arguments apply only to an `ExportProgram`:
-
-- `calls`: a tuple of `ProgramCall`s run in order, keeping state between them
-  in both PyTorch and Scratch. The result is a `ProgramVerifyResult`.
-- `adapters`: the same adapters used at export.
-- `quantization`: a symmetric `QuantizationConfig`. PyTorch then runs with the
-  quantized weights, so the comparison shows conversion error separately from
-  quantization error. GPTQ isn't supported here.
+`adapters`, `quantization`, `storage` and `sig_figs` are the export's
+options. Given them, PyTorch runs a copy of the model prepared as the export
+prepared its own (adapted, batch norms folded, weights quantized and rounded
+as stored), so the comparison isolates the conversion from lossy storage and
+can use tight tolerances. Without them, compare a lossy export with a looser
+tolerance. Only symmetric quantization can be reproduced; for GPTQ, verify
+against the float model with a tolerance such as `atol=0.05`. A model in
+training mode is compared as an evaluation-mode copy, with a warning.
 
 ## Projects
 
@@ -228,8 +233,8 @@ The remaining arguments apply only to an `ExportProgram`:
 
 ```text
 build_project(
-    output_path,
     model,
+    output_path,
     *,
     tokenizer=None,
     example_inputs=(),
@@ -243,17 +248,24 @@ build_project(
 
 Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
 missing. Every operation gets a bridge to global lists that other sprites can
-run with `broadcast and wait`. A plain model gets list monitors starting from
-`example_inputs` (or zeros) and runs on the green flag or space key; `labels`
-names a classifier's outputs. A `GenerationProgram` export needs `tokenizer`, a
-`TokenizerResult`, and gets a Demo sprite that continues typed prompts. A model
-with entry points gets bridges only. See
+run with `broadcast and wait`. A `TranspileResult` gets list monitors starting
+from `example_inputs` (or zeros) and runs on the green flag or space key;
+`labels` names a classifier's outputs. A `GenerationResult` needs `tokenizer`,
+a `TokenizerResult`, and gets a Demo sprite that continues typed prompts. A
+`ProgramResult` gets bridges only. See
 [projects and the command line](projects-and-cli.md).
 
 ### `ProjectResult`
 
-`path`, the `sprites` in the project, and the bridges' `messages`, global
-`lists`, and global `variables`, all by Scratch name, plus `warnings`.
+| Field | Meaning |
+|---|---|
+| `path` | Path of the written `.sb3`. |
+| `sprites` | Names of the project's sprites. |
+| `broadcasts` | The project's public broadcasts: each bridge's message followed by its completion broadcast, such as `points run`, `points run complete`. |
+| `lists`, `variables` | The global lists and variables the bridges read and write. |
+| `warnings` | Size warnings; each is also emitted as a `CattorchWarning`. |
+
+All names are Scratch names.
 
 ## Configuration objects
 
@@ -267,27 +279,28 @@ error when the object is created.
 | `activations` | `True` | Use fast activation approximations (currently QuickGELU for exact and tanh GELU). |
 | `layer_norm` | `True` | Compute LayerNorm variance in one pass. |
 | `softmax` | `True` | Skip max subtraction in softmax. |
-| `neuron_pruning` | `0.0` | Fraction in `[0, 1)` of hidden units to remove from Linear → activation → Linear paths and `StackedSwiGLUMoE` experts. |
-| `weights` | `FastLayerConfig()` | Weight transforms applied to every eligible layer. |
-| `overrides` | `{}` | Per-module `FastLayerConfig`s, keyed by module name, that replace `weights` for that module. |
+| `neuron_pruning` | `0.0` | Fraction in `[0, 1)` of hidden units to remove from Linear → activation → Linear paths and `StackedSwiGLUMoE` experts. Finding the paths needs a model `torch.fx` can trace symbolically; one it can't raises `UnsupportedModelError`. |
+| `layers` | `FastLayerConfig()` | Weight transforms applied to every eligible layer. |
+| `overrides` | `{}` | Per-module `FastLayerConfig`s, keyed by module name, that replace `layers` for that module. |
 
 ### `FastLayerConfig`
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `pruning` | `0.0` | Fraction in `[0, 1)` of weight groups to remove, smallest magnitude first. |
+| `block_pruning` | `0.0` | Fraction in `[0, 1)` of weight blocks to remove, smallest magnitude first. |
 | `rank` | `None` | Truncated-SVD rank. Can't be combined with `rank_ratio`. |
 | `rank_ratio` | `None` | Rank as a fraction in `(0, 1]` of the matrix's full rank. Can't be combined with `rank`. |
 
-A transform is skipped for a layer when it wouldn't reduce the number of
-multiplications. See [optimization modes](optimization.md#weight-transforms).
+A low-rank transform is skipped for a layer when it wouldn't reduce the
+number of multiplications, with a warning. See
+[optimization modes](optimization.md#weight-transforms).
 
 ### `GenerationProgram`
 
 | Field | Default | Meaning |
 |---|---:|---|
 | `max_context` | required | Maximum number of tokens the cache holds. The only positional field; the others are keyword-only. |
-| `method` | `"forward"` | Name of the model method that takes token IDs and returns next-token logits for every position. |
+| `method` | `None` | Name of the model method that takes token IDs and returns next-token logits for every position. `None` means the method marked `@generate`, or `forward`. |
 | `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. The final layer's query, attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 
@@ -300,21 +313,19 @@ Scratch blocks.
 |---|---:|---|
 | `states` | `None` | A tuple of replace-mode `State`s with their initial values, in the order the step takes and returns them. The only positional field; the others are keyword-only. `None` exports a Hugging Face Mamba, Mamba-2 or RWKV causal LM through cattorch's own step, states and reference check; `step` and `reference` must then keep their defaults. Any other model needs `states`. |
 | `step` | `"step"` | Name of the model method `step(token, *states) -> (logits, *new_states)`. `token` is a `[1, 1]` tensor of one token ID, looked up in an embedding; the logits flatten to one vocabulary row; each new state keeps its shape. |
-| `max_tokens` | `None` | Maximum number of tokens consumed between resets, like `max_context`. `None` sets no limit, and `cattorch max context` is `Infinity`. |
+| `max_context` | `None` | Maximum number of tokens read between resets, as for a `GenerationProgram`. `None` sets no limit, and `cattorch max context` is `Infinity`. |
 | `hidden_prefill` | `True` | During prefill, skip the operations that only compute the logits for every prompt token but the last. State updates still run. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |
 | `reference` | `None` | Name of a stateless model method `reference(tokens) -> logits` (`[1, n, V]` or `[n, V]`). At export, the step runs over up to 32 random tokens from the initial states and each logits row must match it within `1e-4` of the row's largest value. |
 
 For models whose tokens mix through a recurrence rather than attention: GRU
 and LSTM language models, Mamba, RWKV. The sprite has the same blocks, lists,
-statuses and notifications as a `GenerationProgram`'s, with
-`cattorch cache length` counting the tokens consumed; `cattorch reset` and
+statuses and broadcasts as a `GenerationProgram`'s, with
+`cattorch cache length` counting the tokens read; `cattorch reset` and
 prefill restore every state's initial value. A decode with a token that
 isn't valid, or whose step fails, leaves the states unchanged; a prefill that
 fails restores the initial states, as a `GenerationProgram`'s empties its
-cache. `quantization`,
-`calibration_sequences`, `optimization="fast"`, `adapters` and the storage
-options work as for a `GenerationProgram`. See
+cache. Every `transpile` option works as for a `GenerationProgram`. See
 [recurrent generation](recurrent-generation.md) for the step contract, the
 supported Hugging Face models and the Scratch interface.
 
@@ -339,8 +350,7 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `min_quantized_values` | `16384` | Matrices with fewer values stay float16. |
 | `damp_percent` | `0.01` | GPTQ damping added to the Hessian diagonal, as a fraction of its mean. GPTQ only. |
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
-| `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses `fallback`. |
-| `fallback` | `"symmetric"` | Method for matrices without enough calibration data. Only `"symmetric"` is supported, so the field has no effect yet. |
+| `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. |
 | `overrides` | `{}` | Other settings for some weights: a module path or parameter name mapped to bits (`4`, `6`, `8`), `None` for float16, or a `QuantizationOverride`. See [per-weight settings](storage.md#per-weight-settings). |
 
 ### `QuantizationOverride`
@@ -355,9 +365,8 @@ The longest key that matches a parameter's name wins; a weight read under
 several names, such as a tied embedding and output head, takes the highest
 precision they select. A key that matches no parameter is an error.
 
-GPTQ needs a model in evaluation mode and at least one calibration example,
-passed as `calibration_inputs`, `calibration_calls`, or `calibration_sequences`
-depending on the export. See [GPTQ calibration](storage.md#gptq-calibration).
+GPTQ needs at least one calibration example, passed as `transpile`'s
+`calibration`. See [GPTQ calibration](storage.md#gptq-calibration).
 
 ### `CodegenConfig`
 
@@ -368,24 +377,12 @@ depending on the export. See [GPTQ calibration](storage.md#gptq-calibration).
 | `id_namespace` | `None` | Three characters from `A-Z a-z 0-9 - _` included in block IDs. `None` picks a random one. `""` gives shorter IDs for a sprite that is the only generated sprite in its project. |
 | `compact_internal_names` | `False` | Shorten internal variable, list, and custom block names. |
 | `compact_schema` | `False` | Leave redundant fields out of the saved block data. |
-| `layer_sharing` | `"off"` | `"auto"` shares one copy of the code across repeated transformer layers. |
+| `layer_sharing` | `False` | Share one copy of the code across repeated transformer layers where the layout allows it, falling back with a warning where it doesn't. |
 
 See [code generation](code-generation.md) before turning on `compact_schema` or
 `layer_sharing`.
 
 ## Result types
-
-An `ExportProgram` export returns a `ProgramResult`: the `ArtifactResult`
-fields plus `EntryPointResult` and `StateResult` records, and
-`fallback_operations` and `approximate_operations` as for a `TranspileResult`,
-summed over the entry points. Verifying a program
-returns a `ProgramVerifyResult`, with one `ProgramCallVerifyResult` per call.
-These result types, and the classes that define programs and calls, are
-imported from `cattorch`.
-
-Each `ProgramCallVerifyResult` has `entrypoint`, `passed`, `outputs`, `states`,
-and the Scratch `status`. A call whose status isn't `"ok"` fails, and doesn't
-change the state used for later calls.
 
 ### `TensorSpec`
 
@@ -409,7 +406,7 @@ length can change at runtime. See
 
 ### `ArtifactResult`
 
-Fields shared by model and tokenizer results:
+Fields shared by every sprite result:
 
 | Field | Meaning |
 |---|---|
@@ -419,28 +416,67 @@ Fields shared by model and tokenizer results:
 | `expanded_json_bytes` | Size of the uncompressed `sprite.json`. |
 | `block_count`, `list_count` | Number of generated blocks and lists. |
 | `sharded_lists` | Names of lists split into [shards](storage.md#list-sharding). |
-| `warnings` | Size, compatibility, and fallback warnings. Check these before sharing the sprite. |
+| `warnings` | Every warning of the export: size, compatibility, fallbacks, and anything that changed what was exported. Each is also emitted as a `CattorchWarning`. Check these before sharing the sprite. |
 
 ### `TranspileResult`
 
-`ArtifactResult` plus `inputs`, `output`, `additional_outputs`, `procedures`
-(the custom block names), `quantization` (a `QuantizationReport`, or
-`None`), `fallback_operations`, and `approximate_operations`. The `outputs`
-property lists every
-output's `TensorSpec` in order.
+`ArtifactResult` plus:
 
-`approximate_operations` lists, the same way, the operations that used an
-approximate kernel in fast mode.
+| Field | Meaning |
+|---|---|
+| `inputs` | A `TensorSpec` per input list, in argument order. |
+| `outputs` | A `TensorSpec` per output list, in output order. The `output` property is `outputs[0]`. |
+| `procedures` | The public blocks. |
+| `quantization` | A `QuantizationReport`, or `None`. |
+| `fallback_operations` | Operations that have no kernel of their own and ran as PyTorch's decomposition into simpler operations, as `(operation, calls)` pairs such as `("aten.mish.default", 2)`. These usually run slower than a dedicated kernel would, and `warnings` names them too. Calls that depend only on weights are computed at export and aren't listed. |
+| `approximate_operations` | The operations that used an approximate kernel in fast mode, the same way. |
 
-`fallback_operations` lists the operations that have no kernel of their own
-and ran as PyTorch's decomposition into simpler operations, as
-`(operation, calls)` pairs such as `("aten.mish.default", 2)`. These usually
-run slower than a dedicated kernel would, and `warnings` names them too.
-Calls that depend only on weights are computed at export and aren't listed.
+### `GenerationResult`
+
+`ArtifactResult` plus, the same for a `GenerationProgram` and a
+`RecurrentGenerationProgram`:
+
+| Field | Meaning |
+|---|---|
+| `inputs` | The `cattorch token ids` list: a prompt of 1 to `max_context` tokens for `cattorch prefill` (to 200,000 without a limit), or the one token `cattorch decode` reads. |
+| `outputs` | `cattorch logits`, one value per token ID, then, with `top_k`, `cattorch top k values` and `cattorch top k ids`. |
+| `max_context` | The most tokens read between resets; `None` for no limit. |
+| `vocabulary_size` | The number of token IDs the sprite accepts. |
+| `top_k` | The number of largest logits listed, or `None`. |
+| `procedures` | `cattorch init`, `cattorch reset`, `cattorch prefill`, `cattorch decode` and `cattorch prepare for save`. |
+| `quantization`, `fallback_operations`, `approximate_operations` | As for `TranspileResult`. |
+
+### `ProgramResult`
+
+`ArtifactResult` plus `entrypoints` (an `EntryPointResult` per entry point),
+`states` (a `StateResult` per state), `procedures` (the public blocks), and
+`quantization`, `fallback_operations` and `approximate_operations` as for a
+`TranspileResult`, summed over the entry points.
+
+### `EntryPointResult`
+
+| Field | Meaning |
+|---|---|
+| `name` | The entry point's name. |
+| `procedure` | Its block, `cattorch ENTRY`. |
+| `completion_broadcast` | The broadcast the block sends when it ends, `cattorch ENTRY complete`. |
+| `inputs`, `outputs` | A `TensorSpec` per input and output list, in declaration order. |
+| `state_inputs`, `state_updates` | The names of the states it reads and writes. |
+
+### `StateResult`
+
+| Field | Meaning |
+|---|---|
+| `name` | The state's name. |
+| `list_name` | Its list, `cattorch state STATE`. |
+| `mode` | `"replace"` or `"append"`. |
+| `shape`, `dtype` | Its initial tensor's shape and dtype. |
+| `capacity` | The most rows an append state holds; `None` for a replace state. |
 
 ### `TokenizerResult`
 
-`ArtifactResult` plus `tokenizer_type` and `token_count`.
+`ArtifactResult` plus `tokenizer_type`, the kind exported (`"char"`,
+`"bpe"` or `"sentencepiece-bpe"`), and `token_count`, its vocabulary size.
 
 ### `VerifyResult`
 
@@ -454,15 +490,30 @@ Calls that depend only on weights are computed at export and aren't listed.
 | `max_rel_error` | Largest relative difference. |
 | `mean_abs_error` | Mean absolute difference. |
 | `worst_index` | Zero-based flattened index of the largest absolute error, or `None` for an empty result. |
-| `approximate_operations` | The export's `approximate_operations`, when `verify` was given its `TranspileResult`. Approximate kernels explain small differences. |
+| `approximate_operations` | The export's `approximate_operations`, when `verify` was given its result. Approximate kernels explain small differences. |
 
 If the sprite returns the wrong number of values, `passed` is `False` and the
 error fields are infinite; no exception is raised.
 
 ### `MultiOutputVerifyResult`
 
-`passed`, true only if every output passes, and `outputs`, a tuple with one
-`VerifyResult` per output in export order.
+`passed`, true only if every output passes; `outputs`, a tuple with one
+`VerifyResult` per output in export order; and `approximate_operations`, as
+for `VerifyResult`.
+
+### `ProgramVerifyResult` and `ProgramCallVerifyResult`
+
+A `ProgramVerifyResult` has `passed`, true only if every call passes, and
+`calls`, one `ProgramCallVerifyResult` per call, with:
+
+| Field | Meaning |
+|---|---|
+| `entrypoint` | The block called: an entry point, or `prefill`, `decode` or `reset`. |
+| `passed` | Whether `status` is `expected_status` and every comparison passed. |
+| `outputs` | A `VerifyResult` per output list, when the call succeeded. For generation: `cattorch logits`, then the top-k values, then the logits at the top-k IDs compared with the top-k values (ties may list either ID). |
+| `states` | A `VerifyResult` per state list, by state name. |
+| `status` | The `cattorch status` the call ended with. |
+| `expected_status` | The status its input should give: `ok`, or for generation the failure an invalid call reports. A call that fails doesn't change the state used for later calls. |
 
 ### `QuantizationReport`
 
@@ -497,96 +548,110 @@ use reads as a matrix when the rest is quantized for its uses.
 ## Benchmark API
 
 Each builder writes an `.sb3` project (adding the suffix if needed) and returns
-its `Path`. Timing happens when you run the project in Scratch.
+its `Path`. Timing happens when you run the project in Scratch; read the
+results with `analyze_benchmark`. Every builder takes `repeats` (the timed
+calls per variant), `warmups` (untimed calls first), and the export options
+of `transpile`: `fast_config`, `storage`, `quantization`, `calibration` (a
+list, since every variant is exported), `sig_figs`, `codegen`, `adapters` and
+`kernels`. A project's public names are its results lists, such as
+`cattorch benchmark results`, and the stage variables
+`cattorch benchmark repeats`, `cattorch benchmark warmups` and
+`cattorch benchmark comparison`; everything else is internal.
 
 ### `build_paired_benchmark`
 
 ```text
 build_paired_benchmark(
-    model,
-    example_inputs,
-    output_path,
-    *,
-    sig_figs=None,
-    warmups=2,
-    repeats=7,
-    fast_config=None,
+    model, example_inputs, output_path, *,
+    repeats=7, warmups=2, fast_config=None, storage=None, quantization=None,
+    calibration=None, sig_figs=None, codegen=None, adapters=(), kernels=(),
 ) -> Path
 ```
 
-Build a project that times one model in exact and fast mode.
+Time one model in exact and fast mode, alternating, recording each call in
+the `cattorch exact timings` and `cattorch fast timings` lists.
 
 ### `build_benchmark_suite`
 
 ```text
 build_benchmark_suite(
-    cases,
-    output_path,
-    *,
-    iterations=100,
-    warmups=0,
-    sig_figs=None,
-    fast_config=None,
-    storage=None,
+    cases, output_path, *,
+    repeats=100, warmups=0, fast_config=None, storage=None, quantization=None,
+    calibration=None, sig_figs=None, codegen=None, adapters=(), kernels=(),
 ) -> Path
 ```
 
 Each case is `(name, model, example_inputs)`, or
 `(name, model, example_inputs, fast_config)` to set fast mode options for that
-case. Names must be unique.
+case, timed in exact and fast mode. Names must be unique.
 
 ### `build_generation_benchmark_suite`
 
 ```text
 build_generation_benchmark_suite(
-    cases,
-    output_path,
-    *,
-    iterations=16,
-    sig_figs=None,
+    cases, output_path, *,
+    repeats=16, warmups=0, fast_config=None, storage=None, quantization=None,
+    calibration=None, sig_figs=None, codegen=None, adapters=(), kernels=(),
 ) -> Path
 ```
 
-Each case is `(name, model, stateless_input, prompt)`. `prompt` must be a
-`[1, T]` tensor. Prefill isn't timed; only the decode loop is.
+Each case is `(name, model, program, prompt)`: `program` a `GenerationProgram`
+or `RecurrentGenerationProgram`, and `prompt` a `[1, length]` token tensor.
+The `cached` variant prefills the prompt outside the timer, then times
+decodes; `max_context` must hold the prompt and every decode. The
+`stateless` variant times the model's method (a recurrent program's
+`reference`) on the prompt plus one token, the work each token costs without
+a cache.
 
 ### `build_storage_benchmark_suite`
 
 ```text
 build_storage_benchmark_suite(
-    cases,
-    output_path,
-    *,
-    iterations=10,
-    sig_figs=None,
+    cases, output_path, *,
+    repeats=10, warmups=0, fast_config=None, sig_figs=None, codegen=None,
+    adapters=(), kernels=(),
 ) -> Path
 ```
 
-Each case is `(name, model, example_inputs)`. The project times initialization
-and forward calls for uncompressed float32, compressed float32 and float16, and
-symmetric 8-, 6-, and 4-bit quantization.
+Each case is `(name, model, example_inputs)`. The project times weight
+decoding and forward calls for uncompressed float32, compressed float32 and
+float16, and symmetric 8-, 6-, and 4-bit quantization, so it takes no
+`storage` or `quantization`.
 
 ### `analyze_benchmark`
 
 ```text
-analyze_benchmark(path) -> dict
+analyze_benchmark(path) -> BenchmarkAnalysis
 ```
 
 Read the results from a benchmark project saved after running in Scratch.
-Returns a dictionary with the project's size and SHA-256, benchmark type, the
-comparison, the raw result list, and parsed per-case timings. Storage suites also include sprite sizes, and
-generation suites include output comparisons. Raises `ValueError` if the
-project hasn't been run or can't be parsed. The `cattorch-benchmark` command
-does the same from the shell; see
+Raises `ValueError` if the project hasn't run, or ran only part of the way.
+`cattorch analyze-benchmark PROJECT` prints the same as JSON; see
 [verification and benchmarking](verification-and-benchmarking.md).
+
+`BenchmarkAnalysis` has `kind` (`"paired"`, `"suite"` or `"storage"`), the
+compared variants' names `baseline` and `candidate` (such as `"exact"` and
+`"fast"`), `repeats` and `warmups`, `cases`, `storage`, the `raw_results`
+list, and the file's `project_bytes` and `project_sha256`. Each
+`BenchmarkCase` in `cases` has its `name`, `baseline_seconds` and
+`candidate_seconds` (the seconds one call took), `speedup`, each sprite's
+`baseline_blocks` and `candidate_blocks`, `baseline_output_values`,
+`candidate_output_values`, `output_length_match` and `output_max_abs_error`
+comparing their outputs, and, for a paired benchmark, every run's
+`baseline_timings` and `candidate_timings` and the bootstrap
+`speedup_95_percent_interval`. A storage suite's `storage` holds a
+`StorageBenchmarkCase` per case, with its `name` and `variants`: a
+`StorageBenchmarkVariant` (`init_seconds`, `forward_seconds`,
+`sprite_bytes`) per storage mode.
 
 ## Exceptions
 
 | Exception | Also a | Raised when |
 |---|---|---|
 | `CattorchError` | `Exception` | Base class for the errors below. |
-| `UnsupportedModelError` | `ValueError` | The model can't be exported, for example because it returns a non-tensor value. |
+| `UnsupportedModelError` | `ValueError` | The model can't be exported as it is; see [`transpile`](#transpile). |
 | `UnsupportedOperationError` | `NotImplementedError` | The model uses an operation cattorch can't convert. The message names the operation and module. |
+| `CattorchWarning` | `UserWarning` | Base class of every warning cattorch emits. |
 
-Invalid configuration values raise ordinary `TypeError` or `ValueError`. See
+Invalid arguments raise ordinary `TypeError` or `ValueError`. See
 [troubleshooting](troubleshooting.md).
