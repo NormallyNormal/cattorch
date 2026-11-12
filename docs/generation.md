@@ -77,8 +77,8 @@ that break the requirements below in ways the analysis can't see.
 |---|---|
 | `attention over the sequence isn't causal` | A bidirectional model such as BERT, or a mask that lets a token see a later one. The message names the token pair. |
 | `mixes tokens outside attention`, `allows mixing tokens only in causal attention` | An operation combines positions: `cumsum`, a mean over the sequence, `roll`, `flip`, a convolution along it. The message names the operation and its module. |
-| `the model's graph changes with the sequence length` | A length-dependent Python branch. Remove it or fix it to one path. |
-| `not a recognised attention pattern` | A softmax over the sequence that isn't matmul, scale, causal mask, softmax, matmul. The message says which part didn't match. |
+| `the model computes something else when the sequence is one token shorter` | A length-dependent Python branch. Remove it or fix it to one path. |
+| `isn't a recognised attention pattern` | A softmax over the sequence that isn't matmul, scale, causal mask, softmax, matmul. The message says which part didn't match. |
 | `the table's first N rows ... differ` | A position table whose rows depend on the sequence length. |
 | `the cached step disagrees with the model` | The export-time check failed. The message gives the first differing row and the largest error. |
 | `GenerationProgram caches attention keys and values, and this ... model has no attention` | A Hugging Face Mamba, Mamba-2, or RWKV model. Use [`RecurrentGenerationProgram()`](recurrent-generation.md). |

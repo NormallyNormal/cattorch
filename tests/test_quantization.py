@@ -817,7 +817,7 @@ def test_weights_computed_from_parameters_are_quantized_as_computed(tmp_path, mo
         original = copy.deepcopy(model.state_dict())
         precisions = _record_matrix_precisions(monkeypatch)
         result = transpile(
-            model, example, tmp_path / case, quantization=config, calibration_inputs=calibration,
+            model, example, tmp_path / case, quantization=config, calibration=calibration,
         )
         assert all(torch.equal(value, model.state_dict()[key]) for key, value in original.items())
         computed = [item for item in result.quantization.tensors if item.sources]

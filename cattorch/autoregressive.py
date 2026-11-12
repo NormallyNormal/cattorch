@@ -321,30 +321,29 @@ def _module_path(node) -> str | None:
 
 
 def _where(node) -> str:
+    """The operation a node runs and the module it came from, for messages."""
     path = _module_path(node)
-    return f"{node.target}" + (f" at {path}" if path else "")
+    return f"`{_op_name(node)}`" + (f" in module {path!r}" if path else "")
 
 
 def _require_same_structure(long_nodes, short_nodes) -> None:
     for position, (a, b) in enumerate(zip(long_nodes, short_nodes)):
         if (a.op, str(a.target)) != (b.op, str(b.target)):
             raise UnsupportedModelError(
-                "the model's graph changes with the sequence length: node "
-                f"{position} is {a.op} {a.target} at the longest length and "
-                f"{b.op} {b.target} at one token fewer ({_where(a)}); "
-                "length-dependent Python branches (such as an `if` on "
-                "tokens.shape[1]) can't be cached"
+                "the model computes something else when the sequence is one token "
+                f"shorter: operation {position + 1} is {_where(a)} at the longest "
+                f"length and {_where(b)} at one token fewer; length-dependent Python "
+                "branches (such as an `if` on tokens.shape[1]) can't be cached"
             )
     if len(long_nodes) != len(short_nodes):
         extra = (long_nodes if len(long_nodes) > len(short_nodes) else short_nodes)[
             min(len(long_nodes), len(short_nodes))
         ]
         raise UnsupportedModelError(
-            "the model's graph changes with the sequence length: "
-            f"{len(long_nodes)} nodes at the longest length against "
-            f"{len(short_nodes)} at one token fewer, first extra node "
-            f"{extra.target} ({_where(extra)}); length-dependent Python "
-            "branches can't be cached"
+            "the model computes something else when the sequence is one token "
+            f"shorter: {len(long_nodes)} operations at the longest length against "
+            f"{len(short_nodes)} at one token fewer, the first extra one "
+            f"{_where(extra)}; length-dependent Python branches can't be cached"
         )
 
 

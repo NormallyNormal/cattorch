@@ -75,6 +75,8 @@ def _fields(cls) -> tuple[tuple[str, str], ...]:
             else f"factory {field.default_factory.__name__}",
         )
         for field in dataclasses.fields(cls)
+        # Private fields, and fields set by cattorch rather than passed in.
+        if not field.name.startswith("_") and field.init
     )
 
 

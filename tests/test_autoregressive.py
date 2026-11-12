@@ -372,9 +372,12 @@ def test_length_dependent_branch_is_rejected():
                 return super().forward(tokens) * 2
             return super().forward(tokens)
 
-    with pytest.raises(UnsupportedModelError, match="changes with the sequence length") as raised:
+    with pytest.raises(
+        UnsupportedModelError, match="computes something else when the sequence is one token shorter",
+    ) as raised:
         analyze(Branching())
     assert "length-dependent Python" in str(raised.value)
+    assert "node" not in str(raised.value)
 
 
 def test_length_dependent_table_is_rejected():

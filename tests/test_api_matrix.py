@@ -94,6 +94,12 @@ def kinds():
     }
 
 
+def overrides(kind, bits=None):
+    """Symmetric int8 with another setting for each kind's output layer."""
+    layer = "second" if kind in {"tensors", "program", "markers"} else "head"
+    return QuantizationConfig(bits=8, min_quantized_values=1, overrides={layer: bits})
+
+
 GPTQ = QuantizationConfig(bits=8, method="gptq", min_quantized_values=1, min_calibration_rows=1)
 SYMMETRIC = QuantizationConfig(bits=8, min_quantized_values=1)
 
@@ -119,6 +125,7 @@ OPTIONS = {
     }),
     "storage": ({"storage": StorageConfig(precision="float16")}, {}),
     "quantization": ({"quantization": SYMMETRIC}, {}),
+    "quantization_overrides": (lambda kind: {"quantization": overrides(kind, 4)}, {}),
     "gptq": (lambda kind: {"quantization": GPTQ, "calibration": calibration(kind)}, {}),
     "gptq_without_calibration": ({"quantization": GPTQ}, {
         kind: (ValueError, "GPTQ needs calibration=")
@@ -171,12 +178,14 @@ def test_every_option_works_or_is_rejected_on_every_kind(tmp_path, option, kind)
         assert result.sprite_name == "Sprite"
 
 
+@pytest.mark.parametrize("quantization", ["symmetric", "overrides"])
 @pytest.mark.parametrize("kind", sorted(RESULTS))
-def test_verify_reproduces_the_export_options_on_every_kind(tmp_path, kind):
+def test_verify_reproduces_the_export_options_on_every_kind(tmp_path, kind, quantization):
     model, example = kinds()[kind]
     options = dict(
-        adapters=(ADAPTER,), quantization=SYMMETRIC, storage=StorageConfig(precision="float16"),
-        sig_figs=5,
+        adapters=(ADAPTER,),
+        quantization=SYMMETRIC if quantization == "symmetric" else overrides(kind, 4),
+        storage=StorageConfig(precision="float16"), sig_figs=5,
     )
     result = transpile(model, example, tmp_path / "sprite", **options)
     report = verify(model, example, result, atol=1e-3, rtol=1e-4, **options)
@@ -184,6 +193,10 @@ def test_verify_reproduces_the_export_options_on_every_kind(tmp_path, kind):
     # Without the export's options PyTorch runs another model: the adapter
     # changes the result.
     assert not verify(model, example, result, atol=1e-3, rtol=1e-4).passed
+    if quantization == "overrides":
+        # The override is reproduced too: without it, the layer is int8.
+        options["quantization"] = SYMMETRIC
+        assert not verify(model, example, result, atol=1e-3, rtol=1e-4, **options).passed
 
 
 def test_a_neuron_pruned_model_torch_fx_cant_trace_is_rejected(tmp_path):

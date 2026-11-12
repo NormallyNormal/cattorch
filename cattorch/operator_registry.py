@@ -271,7 +271,7 @@ class OperatorRegistry:
                 result = adapter(module, AdapterContext(path, state_names))
                 if not isinstance(result, torch.nn.Module):
                     raise TypeError(
-                        f"module adapter for {path or '<root>'} returned "
+                        f"the module adapter for {repr(path) if path else 'the top-level module'} returned "
                         f"{type(result).__name__}, not nn.Module"
                     )
                 replacements[identity] = result
