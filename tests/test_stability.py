@@ -17,6 +17,9 @@ import enum
 import inspect
 import warnings
 
+import sys
+from pathlib import Path
+
 import pytest
 
 import cattorch
@@ -120,9 +123,8 @@ def cli_options() -> dict:
     return snapshot
 
 
-SIGNATURES: dict = {}  # Filled in below.
-
-CLI: dict = {}  # Filled in below.
+sys.path.insert(0, str(Path(__file__).parent))
+from stable_api import CLI, SIGNATURES  # noqa: E402
 
 
 def test_every_stable_name_is_importable_from_cattorch():
