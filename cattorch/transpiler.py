@@ -2307,6 +2307,20 @@ def _only_for_tensor_inputs(example_inputs, *, dynamic, example_kwargs) -> None:
             )
 
 
+def check_head_bits(example_inputs, quantization) -> None:
+    """Reject an explicit ``head_bits`` for an export without an output head."""
+    if (
+        quantization is not None and quantization.head_bits != "auto"
+        and not isinstance(example_inputs, (GenerationProgram, RecurrentGenerationProgram))
+    ):
+        raise ValueError(
+            "QuantizationConfig.head_bits applies to generation exports "
+            "(GenerationProgram, RecurrentGenerationProgram), whose logits identify an "
+            "output head; for this export, set the last layer's bits in "
+            "QuantizationConfig.overrides instead"
+        )
+
+
 def check_calibration(example_inputs, quantization, calibration) -> None:
     """Check ``calibration=`` against the quantization and the export kind.
 
@@ -2404,6 +2418,7 @@ def _transpile_any(
         )
     _only_for_tensor_inputs(example_inputs, dynamic=dynamic, example_kwargs=example_kwargs)
     check_calibration(example_inputs, quantization, calibration)
+    check_head_bits(example_inputs, quantization)
     if isinstance(example_inputs, ExportProgram):
         from cattorch.program_export import transpile_program
 

@@ -107,6 +107,7 @@ def round_as_stored(
     *,
     quantization: QuantizationConfig | None = None,
     sig_figs: int | None = None,
+    report=None,
 ) -> None:
     """Round ``model``'s floating parameters and buffers as a sprite stores them.
 
@@ -117,13 +118,15 @@ def round_as_stored(
     would not reproduce exactly in float16. A comparison with the result
     then isolates Scratch lowering from the independently lossy storage.
     Values computed in ``forward`` rather than held by the model, such as a
-    table built there, aren't rounded.
+    table built there, aren't rounded. ``report``, the ``QuantizationReport``
+    of the model's quantization, gives the integer formats only it knows of,
+    such as an output head's.
     """
     from cattorch.sprite import _static_storage_group_size, _static_storage_precision
     from cattorch.storage import rounded_values
 
     if quantization is not None:
-        storage = quantized_storage(storage, quantization)
+        storage = quantized_storage(storage, quantization, report)
     effective_ndims = expert_bank_effective_ndims(model)
     with torch.no_grad():
         for value in (*model.parameters(), *model.buffers()):
@@ -181,11 +184,14 @@ def _program_reference(
     quantization: QuantizationConfig | None,
     storage: StorageConfig | None,
     sig_figs: int | None,
+    logits: str | None = None,
 ) -> torch.nn.Module:
     """A copy of ``model`` prepared as a program export prepares its own.
 
     Adapters, folded batch norms, quantized weights, and the rounding of
     storage and ``sig_figs``, so it holds the values the sprite stores.
+    ``logits`` names the output holding a generation export's logits, as
+    ``transpile_program`` takes it.
     """
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
@@ -197,19 +203,27 @@ def _program_reference(
         owned, methods=tuple(entry.method for entry in program.entrypoints),
     )
     if quantization is not None:
-        from cattorch.program_export import _ProgramCalibrationModule
+        from cattorch.program_export import _ProgramCalibrationModule, _program_output
         from cattorch.program_runtime import default_program_calls
 
         observed_calls = default_program_calls(program)
-        quantize_model(
+        report = quantize_model(
             _ProgramCalibrationModule(owned, program, observed_calls),
             quantization,
             None,
             orientation_inputs=[torch.zeros(1) for _ in observed_calls],
             _registry=registry,
             _names_from=owned,
+            _logits_of=(
+                None if logits is None else _program_output(program, observed_calls, logits)
+            ),
         )
-    round_as_stored(owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs)
+    else:
+        report = None
+    round_as_stored(
+        owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs,
+        report=report,
+    )
     return owned
 
 
@@ -318,17 +332,20 @@ class _GenerationReference:
             prepared = registry.adapt_model(module, _copy=False)
             if lossy:
                 prepared = fold_eval_batch_norms(prepared)
+                report = None
                 if quantization is not None:
-                    quantize_model(
+                    report = quantize_model(
                         prepared, quantization, None,
                         orientation_inputs=[
                             (torch.zeros(1, program.max_context, dtype=torch.long),),
                         ],
                         _registry=registry,
+                        # The logits are the output's first tensor, as in the export.
+                        _logits_of=lambda output: tensor_output_leaves(output, warn=False)[0],
                     )
                 round_as_stored(
                     prepared, storage or StorageConfig(), quantization=quantization,
-                    sig_figs=sig_figs,
+                    sig_figs=sig_figs, report=report,
                 )
             self.model = prepared
             self.max_context: int | None = program.max_context
@@ -356,7 +373,7 @@ class _GenerationReference:
         export = step_program(states, step)
         self.model = _program_reference(
             owned, export, registry, quantization=quantization, storage=storage,
-            sig_figs=sig_figs,
+            sig_figs=sig_figs, logits="logits",
         )
         self.step = step
         self.initial = tuple(state.initial for state in states)
@@ -711,6 +728,9 @@ def verify(
         from cattorch.transpiler import interface_from_markers
 
         model, example_inputs = interface_from_markers(model)
+    from cattorch.transpiler import check_head_bits
+
+    check_head_bits(example_inputs, quantization)
     options: dict[str, Any] = dict(
         adapters=adapters, quantization=quantization, storage=storage, sig_figs=sig_figs,
         atol=atol, rtol=rtol,

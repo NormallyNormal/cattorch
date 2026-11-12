@@ -81,7 +81,7 @@ class QuantizationConfig:
     4 or 6, and in ``bits`` otherwise; 4, 6 or 8 store it in that many
     bits, and ``None`` keeps it float16. An override that selects the head
     under any of its names takes precedence. Other exports have no output
-    head, and ignore ``head_bits``.
+    head: they take the default ``"auto"`` and raise for any other value.
     """
 
     bits: Literal[4, 6, 8]

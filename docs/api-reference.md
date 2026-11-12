@@ -352,7 +352,7 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
 | `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. |
 | `overrides` | `{}` | Other settings for some weights: a module path or parameter name mapped to bits (`4`, `6`, `8`), `None` for float16, or a `QuantizationOverride`. See [per-weight settings](storage.md#per-weight-settings). |
-| `head_bits` | `"auto"` | The output head of a generation export: `"auto"` for int8 when `bits` is 4 or 6 and `bits` otherwise, `4`, `6` or `8`, or `None` for float16. An override that selects the head wins. Other exports ignore it. See [the output head](storage.md#the-output-head-of-a-language-model). |
+| `head_bits` | `"auto"` | The output head of a generation export: `"auto"` for int8 when `bits` is 4 or 6 and `bits` otherwise, `4`, `6` or `8`, or `None` for float16. An override that selects the head wins. Other exports accept only `"auto"` and raise `ValueError` for any other value. See [the output head](storage.md#the-output-head-of-a-language-model). |
 
 ### `QuantizationOverride`
 

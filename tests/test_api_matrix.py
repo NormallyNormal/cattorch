@@ -102,6 +102,8 @@ def overrides(kind, bits=None):
 
 GPTQ = QuantizationConfig(bits=8, method="gptq", min_quantized_values=1, min_calibration_rows=1)
 SYMMETRIC = QuantizationConfig(bits=8, min_quantized_values=1)
+# int4 with an explicit int6 output head; generation exports only.
+HEAD4 = QuantizationConfig(bits=4, min_quantized_values=1, head_bits=6)
 
 
 def calibration(kind):
@@ -126,6 +128,10 @@ OPTIONS = {
     "storage": ({"storage": StorageConfig(precision="float16")}, {}),
     "quantization": ({"quantization": SYMMETRIC}, {}),
     "quantization_overrides": (lambda kind: {"quantization": overrides(kind, 4)}, {}),
+    "head_bits": ({"quantization": HEAD4}, {
+        kind: (ValueError, "head_bits applies to generation exports.*overrides")
+        for kind in ("tensors", "program", "markers")
+    }),
     "gptq": (lambda kind: {"quantization": GPTQ, "calibration": calibration(kind)}, {}),
     "gptq_without_calibration": ({"quantization": GPTQ}, {
         kind: (ValueError, "GPTQ needs calibration=")
@@ -176,6 +182,10 @@ def test_every_option_works_or_is_rejected_on_every_kind(tmp_path, option, kind)
     assert isinstance(result, RESULTS[kind])
     if option == "name":
         assert result.sprite_name == "Sprite"
+    if option == "head_bits":
+        assert [item.override for item in result.quantization.tensors if item.bits == 6] == [
+            "head_bits",
+        ]
 
 
 @pytest.mark.parametrize("quantization", ["symmetric", "overrides"])
@@ -197,6 +207,31 @@ def test_verify_reproduces_the_export_options_on_every_kind(tmp_path, kind, quan
         # The override is reproduced too: without it, the layer is int8.
         options["quantization"] = SYMMETRIC
         assert not verify(model, example, result, atol=1e-3, rtol=1e-4, **options).passed
+
+
+@pytest.mark.parametrize("head_bits", ["auto", 4, None])
+@pytest.mark.parametrize("kind", ["generation", "recurrent"])
+def test_verify_reproduces_the_output_head_of_an_int4_generation_export(
+    tmp_path, kind, head_bits,
+):
+    # The default int8 head, an int4 one, and a float16 one: each sprite
+    # passes verify with its own config, and fails it with another head.
+    model, example = kinds()[kind]
+    config = QuantizationConfig(bits=4, min_quantized_values=1, head_bits=head_bits)
+    result = transpile(model, example, tmp_path / "sprite", quantization=config)
+    head = {"auto": 8, 4: 4, None: None}[head_bits]
+    assert {
+        item.bits for item in result.quantization.tensors if item.name.startswith("head")
+    } == {head}
+    assert verify(model, example, result, atol=1e-5, rtol=1e-5, quantization=config).passed
+    other = QuantizationConfig(
+        bits=4, min_quantized_values=1, head_bits=6 if head_bits == "auto" else "auto",
+    )
+    assert not verify(model, example, result, atol=1e-5, rtol=1e-5, quantization=other).passed
+    with pytest.raises(ValueError, match="head_bits applies to generation exports"):
+        verify(
+            *kinds()["tensors"], result, quantization=QuantizationConfig(bits=4, head_bits=8),
+        )
 
 
 def test_a_neuron_pruned_model_torch_fx_cant_trace_is_rejected(tmp_path):

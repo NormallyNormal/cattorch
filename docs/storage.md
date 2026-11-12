@@ -241,9 +241,11 @@ QuantizationConfig(bits=4, overrides={"lm_head": 6})  # the head int6
 ```
 
 The head's `TensorQuantizationReport` has `override="head_bits"` when
-`head_bits` chose its settings. Other exports, a plain `transpile` or an
-`ExportProgram`, have no output head and ignore `head_bits`: name the last
-layer in `overrides` to keep it in int8 there.
+`head_bits` chose its settings. Other exports, of tensor inputs or an
+`ExportProgram`, have no output head: they accept the default `"auto"` and
+raise `ValueError` for any other `head_bits`. Name the last layer in
+`overrides` to keep it in int8 there. `verify` reproduces the head of a
+generation export from the same `QuantizationConfig`.
 
 ## GPTQ calibration
 

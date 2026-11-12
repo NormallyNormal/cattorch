@@ -1250,8 +1250,9 @@
   grows more: a two-layer Mamba-2 from 34 MB to 60 MB (int8: 65 MB). The
   new `QuantizationConfig.head_bits` (`"auto"`, 4, 6, 8 or `None` for
   float16) sets it, and an override that selects the head wins;
-  `head_bits=4` restores the previous int4 export.
-  The head's report entry has `override="head_bits"`. See
+  `head_bits=4` restores the previous int4 export; a non-generation export
+  raises `ValueError` for any `head_bits` but `"auto"`, and `verify`
+  reproduces the head. The head's report entry has `override="head_bits"`. See
   [the output head](docs/storage.md#the-output-head-of-a-language-model).
 
 # 0.5.0 - 2026-09-14
