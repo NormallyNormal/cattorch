@@ -152,6 +152,8 @@ def _dynamic(text: str) -> tuple[int, int, int, int]:
 
 
 def _example_inputs(args, model):
+    if _given(args, "vocab") and not args.tokens:
+        raise CommandError("--vocab needs --tokens")
     inputs = [torch.randn(shape) for shape in args.shape]
     inputs += [torch.randint(0, args.vocab, shape) for shape in args.tokens]
     if inputs:
@@ -220,6 +222,34 @@ def _export_options(args) -> dict:
     return options
 
 
+def _max_abs_error(check) -> float:
+    """The largest error of any comparison in a ``verify`` result.
+
+    A program call that ended with another status than expected compared
+    nothing, and counts as infinite, as an output of the wrong length does.
+    """
+    from cattorch.results import (
+        MultiOutputVerifyResult, ProgramVerifyResult, VerifyResult,
+    )
+
+    if isinstance(check, VerifyResult):
+        return check.max_abs_error
+    if isinstance(check, MultiOutputVerifyResult):
+        comparisons = list(check.outputs)
+        mismatched = False
+    else:
+        assert isinstance(check, ProgramVerifyResult)
+        comparisons = [
+            comparison for call in check.calls
+            for comparison in (*call.outputs, *call.states.values())
+        ]
+        mismatched = any(call.status != call.expected_status for call in check.calls)
+    errors = [comparison.max_abs_error for comparison in comparisons]
+    if mismatched:
+        errors.append(float("inf"))
+    return max(errors, default=0.0)
+
+
 def _summary(result) -> dict:
     """A result's fields, by their Python names, for the JSON summary."""
     fields = [
@@ -269,6 +299,8 @@ def _export(args) -> int:
     from cattorch.verify import verify
     from cattorch.project import build_project
 
+    if args.labels is not None and not args.project:
+        raise CommandError("--labels needs --project")
     options = _export_options(args)
     model, name = load_model(args.model)
     example = _example_inputs(args, model)
@@ -299,9 +331,7 @@ def _export(args) -> int:
             atol, rtol = 1e-4, 1e-5
         check = verify(model, example, result, atol=atol, rtol=rtol, **stored)
         passed = check.passed
-        report["verify"] = {"passed": check.passed}
-        if hasattr(check, "max_abs_error"):
-            report["verify"]["max_abs_error"] = check.max_abs_error
+        report["verify"] = {"passed": check.passed, "max_abs_error": _max_abs_error(check)}
     if args.project:
         labels = args.labels.split(",") if args.labels else None
         project = build_project(
@@ -312,6 +342,24 @@ def _export(args) -> int:
     return EXIT_OK if passed else EXIT_VERIFY_FAILED
 
 
+def _from_pretrained(flag: str, name: str, loader: str):
+    """Load a Hugging Face model or tokenizer that ``flag`` names.
+
+    A missing transformers, or a name that can't be loaded, is a problem
+    with the arguments, as a ``MODEL`` that can't be loaded is.
+    """
+    try:
+        import transformers
+    except ImportError:
+        raise CommandError(
+            f'{flag} needs transformers: pip install "cattorch[tokenizers]"'
+        ) from None
+    try:
+        return getattr(transformers, loader).from_pretrained(name)
+    except OSError as error:
+        raise CommandError(f"can't load {flag} {name}: {error}") from None
+
+
 def _generate(args) -> int:
     from cattorch import (
         GenerationProgram, RecurrentGenerationProgram, transpile, transpile_tokenizer,
@@ -319,24 +367,30 @@ def _generate(args) -> int:
     from cattorch.huggingface_recurrent import recurrent_family
     from cattorch.project import build_project
 
+    if args.model and args.hf:
+        raise CommandError("give MODEL or --hf REPO, not both")
+    if not args.model and not args.hf:
+        raise CommandError("give a MODEL or --hf REPO")
+    if not args.project:
+        for flag, value in (
+            ("--max-new-tokens", "max_new_tokens"), ("--temperature", "temperature"),
+            ("--eos-token-id", "eos_token_id"),
+        ):
+            if _given(args, value):
+                raise CommandError(f"{flag} sets the project's demo; it needs --project")
     options = _export_options(args)
     tokenizer = None
     if args.hf:
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError:
-            raise CommandError('--hf needs transformers: pip install "cattorch[tokenizers]"') from None
-        model = AutoModelForCausalLM.from_pretrained(args.hf).eval()
+        model = _from_pretrained("--hf", args.hf, "AutoModelForCausalLM").eval()
         name = args.hf.rstrip("/").split("/")[-1].lower()
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.hf)
-    elif args.model:
+        tokenizer = _from_pretrained(
+            "--hf" if args.tokenizer is None else "--tokenizer",
+            args.tokenizer or args.hf, "AutoTokenizer",
+        )
+    else:
         model, name = load_model(args.model)
         if args.tokenizer:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    else:
-        raise CommandError("give a MODEL or --hf REPO")
+            tokenizer = _from_pretrained("--tokenizer", args.tokenizer, "AutoTokenizer")
     outputs = _outputs(args.output, name)
     program: GenerationProgram | RecurrentGenerationProgram
     if recurrent_family(model) is not None:
@@ -392,6 +446,19 @@ def _analyze(args) -> int:
         ) from None
     print(dumps(dataclasses.asdict(analysis), indent=2))
     return EXIT_OK
+
+
+class _Given(argparse._StoreAction):
+    """Stores an option and records that it was given, for options with a default."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        setattr(namespace, f"_given_{self.dest}", True)
+
+
+def _given(args, dest: str) -> bool:
+    """Whether the command line gave the option stored in ``dest``."""
+    return getattr(args, f"_given_{dest}", False)
 
 
 class _HelpFormatter(argparse.HelpFormatter):
@@ -475,7 +542,7 @@ def _parser() -> argparse.ArgumentParser:
         help="a token-ID input of this shape, after the --shape inputs (default: none)",
     )
     export.add_argument(
-        "--vocab", type=_positive, default=2,
+        "--vocab", type=_positive, default=2, action=_Given,
         help="--tokens IDs are random, below this",
     )
     export.add_argument(
@@ -518,15 +585,16 @@ def _parser() -> argparse.ArgumentParser:
         "sprite's top k lists (default: none)",
     )
     generate.add_argument(
-        "--max-new-tokens", type=_positive, default=40, metavar="N",
+        "--max-new-tokens", type=_positive, default=40, metavar="N", action=_Given,
         help="the most tokens the project's demo adds to a prompt",
     )
     generate.add_argument(
-        "--temperature", type=float, default=0.8,
-        help="the demo's starting sampling temperature; 0 always picks the likeliest token",
+        "--temperature", type=float, default=0.8, action=_Given,
+        help="the project's demo's starting sampling temperature; 0 always picks the "
+        "likeliest token",
     )
     generate.add_argument(
-        "--eos-token-id", type=int, metavar="ID",
+        "--eos-token-id", type=int, metavar="ID", action=_Given,
         help="the token ID that ends a continuation (default: the tokenizer's end token)",
     )
     options(generate)

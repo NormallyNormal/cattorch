@@ -111,7 +111,8 @@ one of:
 
 The inputs come from the model's [`@cattorch.example_inputs`](markers.md) marker or
 `@entrypoint` methods, or from `--shape 1,28,28` for random float inputs and
-`--tokens 1,8` for random token IDs below `--vocab` (default 2). Repeat them
+`--tokens 1,8` for random token IDs below `--vocab` (default 2; it needs
+`--tokens`). Repeat them
 for several inputs, floats first. `--dynamic 0=1:32` lets input 0's first dimension vary
 from 1 to 32 at run time, and `--dynamic 0.1=1:64` its second; see
 [variable-length inputs](supported-models.md#variable-length-inputs).
@@ -123,8 +124,9 @@ exported as a [`RecurrentGenerationProgram`](recurrent-generation.md)
 instead; there `--max-context` is optional, and without
 it the generator takes any number of tokens (the summary's `max_context` is
 `null`). `--hf REPO` loads a Hugging Face causal language model and its
-tokenizer by name or directory; `--tokenizer` names a Hugging Face tokenizer
-for a model given as `MODEL`. The tokenizer is exported too when its type is
+tokenizer by name or directory, instead of `MODEL` (giving both is an
+error); `--tokenizer` names a Hugging Face tokenizer for a model given as
+`MODEL`, or replaces `--hf`'s. The tokenizer is exported too when its type is
 [supported](tokenizers.md#compatibility). Generation exports aren't verified.
 
 The options are named after the Python parameters they set. Both commands
@@ -148,9 +150,11 @@ stores, so float16, symmetric quantization and `--sig-figs` are checked with
 rtol=1e-5`. A `fast` export is checked with `atol=0.05, rtol=0.05`, and so
 is a GPTQ export, which can't be reproduced and is compared with the model
 itself. It also takes `--labels` for its project and
-`--no-verify`. `generate` takes `--max-new-tokens`, `--temperature`, and
-`--eos-token-id` (defaulting to the tokenizer's end token), as
-`build_project` does. `cattorch analyze-benchmark PROJECT` prints a saved
+`--no-verify`. `generate` takes `--max-new-tokens` (default 40),
+`--temperature` (default 0.8), and `--eos-token-id` (defaulting to the
+tokenizer's end token) for its project's demo, as `build_project` does.
+These project options, and `--labels`, need `--project`: without it they
+are an error rather than ignored. `cattorch analyze-benchmark PROJECT` prints a saved
 [benchmark project's](verification-and-benchmarking.md) results as JSON, the
 fields of `analyze_benchmark`'s `BenchmarkAnalysis`. `cattorch --version`
 prints the installed version, which Python code can read as
@@ -162,9 +166,12 @@ The JSON summary uses the result's field names: `path`, `sprite_name`,
 `sharded_lists`, `warnings`, `fallback_operations` and
 `approximate_operations`, and for `generate` also `max_context`,
 `vocabulary_size` and `top_k`. `export` adds `verify`, with `passed` and
-`max_abs_error`; `--project` adds `project`, with its `path`; `generate` adds
-`tokenizer`, with the tokenizer result's fields, or its `error` when it
-couldn't be exported.
+`max_abs_error`, the largest error over every output (and, for a model with
+entry points, every call and state; a call that ended with an unexpected
+status counts as infinite, written as the string `"Infinity"`);
+`--project` adds `project`, with its `path`; `generate` adds `tokenizer`,
+with the tokenizer result's fields, or its `error` when it couldn't be
+exported.
 
 The commands exit with one of these statuses:
 
@@ -172,7 +179,7 @@ The commands exit with one of these statuses:
 |---|---|
 | `0` | Success. |
 | `1` | The export failed: an unsupported model or operation, or a file that can't be read or written. |
-| `2` | Invalid arguments, found by the command's parser or by cattorch's checks of them, including a `MODEL` that doesn't exist or can't be loaded. |
+| `2` | Invalid arguments, found by the command's parser or by cattorch's checks of them, including a `MODEL`, `--hf` model or `--tokenizer` that doesn't exist or can't be loaded (or needs transformers, which isn't installed), and options that can't apply together. |
 | `3` | `export`'s check found that the sprite doesn't match PyTorch. |
 
 ## Examples

@@ -316,3 +316,102 @@ def test_generate_detects_a_recurrent_hugging_face_model(models, capsys):
     code, report = run(capsys, "generate", "--hf", "ssm", "--max-context", "5", "-o", "bounded")
     assert code == 0 and report["max_context"] == 5
     assert max_context(report["path"]) == 5
+
+
+MORE_MODELS = '''
+import torch
+from torch import nn
+
+import cattorch
+
+
+@cattorch.example_inputs(lambda: (torch.randn(1, 3),))
+class Two(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 2)
+
+    def forward(self, value):
+        return self.linear(value), value * 2
+
+
+class Counter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("total", torch.zeros(3))
+
+    @cattorch.entrypoint(example_inputs=(torch.ones(3),))
+    def add(self, value):
+        self.total = self.total + value
+        return self.total * 1.5
+'''
+
+
+def test_verify_summary_has_the_largest_error_for_every_kind_of_export(models, capsys):
+    (models / "more.py").write_text(MORE_MODELS)
+    for spec in ("more.py:Two", "more.py:Counter"):
+        code, report = run(capsys, "export", spec)
+        assert code == 0, report
+        assert report["verify"]["passed"] is True
+        assert 0 <= report["verify"]["max_abs_error"] < 1e-4
+
+
+def test_max_abs_error_of_program_and_multi_output_results():
+    from cattorch.cli import _max_abs_error
+    from cattorch.results import (
+        MultiOutputVerifyResult, ProgramCallVerifyResult, ProgramVerifyResult, VerifyResult,
+    )
+
+    def compared(error):
+        return VerifyResult(True, 1, (1,), 1, error, error, error, 0)
+
+    assert _max_abs_error(MultiOutputVerifyResult(True, (compared(0.5), compared(0.25)))) == 0.5
+    calls = (
+        ProgramCallVerifyResult("a", True, (compared(0.1),), {"s": compared(0.3)}),
+        ProgramCallVerifyResult("b", True, (compared(0.2),), {}),
+    )
+    assert _max_abs_error(ProgramVerifyResult(True, calls)) == 0.3
+    wrong_status = ProgramCallVerifyResult("c", False, (), {}, status="ok", expected_status="x")
+    assert _max_abs_error(ProgramVerifyResult(False, (*calls, wrong_status))) == float("inf")
+
+
+def test_options_that_cannot_apply_together_are_rejected(models, capsys):
+    save_characters(models / "chars")
+    for argv, expected in (
+        (["generate", "models.py:Language", "--hf", "chars"], "not both"),
+        (["export", "models.py:Marked", "--labels", "a,b"], "--labels needs --project"),
+        (["export", "models.py:Marked", "--vocab", "5"], "--vocab needs --tokens"),
+        (["generate", "models.py:Language", "--temperature", "0"], "needs --project"),
+        (["generate", "models.py:Language", "--max-new-tokens", "3"], "needs --project"),
+        (["generate", "models.py:Language", "--eos-token-id", "3"], "needs --project"),
+    ):
+        code, message = run(capsys, *argv)
+        assert code == 2 and expected in message, (argv, message)
+    assert not list(models.glob("*.sprite3"))
+
+
+def test_hugging_face_names_that_cannot_be_loaded_exit_with_usage(models, capsys, monkeypatch):
+    for argv in (
+        ["generate", "--hf", "./no_such_directory"],
+        ["generate", "models.py:Language", "--tokenizer", "./no_such_directory"],
+    ):
+        code, message = run(capsys, *argv)
+        assert code == 2 and "can't load" in message and "no_such_directory" in message
+    # Without transformers, both flags say how to install it.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    for argv, flag in (
+        (["generate", "--hf", "chars"], "--hf"),
+        (["generate", "models.py:Language", "--tokenizer", "chars"], "--tokenizer"),
+    ):
+        code, message = run(capsys, *argv)
+        assert code == 2 and f"{flag} needs transformers" in message, message
+
+
+def test_an_output_option_naming_a_directory_is_rejected(models, capsys):
+    (models / "build").mkdir()
+    for output in ("build/", "build", ""):
+        code, message = run(capsys, "export", "models.py:Marked", "-o", output)
+        assert code == 2 and "-o" in message, (output, message)
+    assert not list(models.rglob("*.sprite3"))
