@@ -305,26 +305,32 @@ which one causes a drop in accuracy.
 
 ## Preserve processor costumes
 
-Compressed weights are stored in lists as text. To decode them, the sprite
-switches to the costume named after each character and reads the costume
-number, so its costumes are a lookup table for the decoder. Don't rename,
-reorder, remove, or add costumes on that sprite, or the weights will load
-incorrectly. Put any visible costumes on a different sprite.
+Weights are stored in lists. Compressed weights are text, in a 92-character
+alphabet (base92), and the sprite has a costume named after each of those
+characters. To decode a character, the sprite switches to its costume and
+reads the costume number: the costumes are the decoder's lookup table, and
+hold no weights. Don't rename, reorder, remove, or add costumes on that
+sprite, or the weights will load incorrectly. Put any visible costumes on a
+different sprite. A sprite stored with `compression=False` has one costume.
 
 ## List sharding
 
-Scratch limits each list to 200,000 items. cattorch splits larger tensors
-across several lists, called shards:
+Scratch limits each list to 200,000 items, so cattorch splits a larger
+tensor across several lists, called shards. A public list, such as an input,
+an output, a state or `cattorch logits`, is split like this:
 
 - The first shard keeps the original name.
 - Later shards are named `<name> shard 2`, `<name> shard 3`, and so on.
+- The variables `cattorch <base> shard count` and
+  `cattorch <base> logical length` hold the number of shards and the total
+  number of items, where `<base>` is the list's name without the `cattorch `
+  it may start with.
 - The generated blocks read and write every shard.
-- For each split public list, the variables `cattorch <name> shard count` and
-  `cattorch <name> logical length` hold the number of shards and total items.
 
 If your own scripts copy a sharded input or output, copy every shard in order,
-not only the first. `result.sharded_lists` names the lists that were split.
-`verify` handles shards for you.
+not only the first; `verify` handles shards for you. Weights are split too,
+into internal lists: a compressed weight into smaller pieces, since each
+piece's decoded bytes must also fit in one list.
 
 A token embedding tied to the output head, as in GPT-2 and Mamba, is stored
 once even when it spans several lists: the embedding reads the head's shards.
