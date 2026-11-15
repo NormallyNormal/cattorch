@@ -247,16 +247,12 @@ token longer than others or holding part of a token. Every `cattorch decode`
 after that fails as in the table above and changes nothing, until
 `cattorch reset` or `cattorch prefill` runs; both start from empty caches.
 `cattorch init` doesn't clear the condition. `cattorch cache length` keeps
-whatever value the stopped block left.
+whatever value the stopped block left. Call the sprite's blocks from one
+script at a time; what the sprite detects when calls overlap, and how to
+recover, is in [overlapping calls](scratch-interface.md#overlapping-calls).
 
 Before saving a project that has generated, call `cattorch prepare for save`;
 see [save after running](storage.md#save-after-running).
-
-### Overlapping calls
-
-Call the sprite's blocks from one script at a time. What the sprite detects
-when calls overlap, and how to recover, is in
-[overlapping calls](scratch-interface.md#overlapping-calls).
 
 Related: [recurrent generation](recurrent-generation.md),
 [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
