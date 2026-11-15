@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from cattorch import QuantizationConfig, StorageConfig, interface, transpile
+from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, interface, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
@@ -224,7 +224,23 @@ EXPORTS = {
     "recurrent step": lambda: (
         _Cell(), {"input": torch.zeros(1, 3), "input_1": torch.zeros(1, 4)}, {},
     ),
+    # One procedure runs every layer, starting from the input list.
+    "shared layers": lambda: (
+        _Layers(), {"input": torch.zeros(1, 4)}, {"codegen": CodegenConfig(layer_sharing=True)},
+    ),
 }
+
+
+class _Layers(nn.Module):
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(2)
+        self.blocks = nn.ModuleList(nn.Sequential(nn.Linear(4, 4), nn.Tanh()) for _ in range(3))
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x, x.sum(-1)
 
 
 class _Cell(nn.Module):
@@ -364,3 +380,11 @@ def test_the_blocks_on_the_canvas_run_the_public_blocks(plain):
         and block["opcode"] == "procedures_call"
     )
     assert loose == [FORWARD, INIT]
+
+
+def test_the_shared_layers_export_runs_one_procedure_for_every_layer(tmp_path_factory):
+    sprite = _exported("shared layers", tmp_path_factory).sprite
+    assert any(
+        block.get("mutation", {}).get("proccode", "").endswith("cattorch shared transformer layer")
+        for block in sprite["blocks"].values() if isinstance(block, dict)
+    )
