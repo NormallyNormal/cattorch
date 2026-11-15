@@ -33,6 +33,35 @@ _LAYER_PATH = re.compile(r"(?:^|\.)blocks\.(\d+)(?:\.|$)")
 # The offset of the current layer's rows in the banked K/V caches, which the
 # shared layer's cached attention adds to its cache indices.
 _LAYER_CACHE_BASE = "cattorch layer cache base"
+# The list a shared layer reads its input from when that input can't be
+# overwritten between layers: a public input, or a value still read after
+# the layers.
+_LAYER_INPUT_COPY = "cattorch shared layer input"
+
+# Why a graph's layers weren't shared, when it has nothing to share. A
+# program warns about this only when none of its entry points has layers.
+_SHARED_MODULES = (
+    "(layer sharing shares submodules named `blocks.0`, `blocks.1`, ..., "
+    "such as the items of an `nn.ModuleList` attribute called `blocks`)"
+)
+NO_REPEATED_LAYERS = f"it has no repeated layers to share {_SHARED_MODULES}"
+NO_REPEATED_LAYERS_IN_PROGRAM = (
+    f"none of its entry points has repeated layers to share {_SHARED_MODULES}"
+)
+
+
+def layer_sharing_warning(reason: str, entry_point: str | None = None) -> str:
+    """The warning that ``layer_sharing=True`` didn't share layers, and why."""
+    if entry_point is None:
+        return (
+            f"layer_sharing=True didn't share the model's layers: {reason}; "
+            "it was exported without layer sharing"
+        )
+    return (
+        f"layer_sharing=True didn't share the layers of entry point "
+        f"{entry_point!r}: {reason}; that entry point was exported without "
+        "layer sharing"
+    )
 
 
 def _graph_layer(node) -> int | None:
@@ -112,7 +141,8 @@ def _program_stack(sprite: dict, program) -> tuple[str, str]:
 def _share_repeated_transformer_layers(
     sprite: dict, compiler, storage: StorageConfig, *,
     layer_tail: tuple[str, str] | None = None,
-) -> bool:
+    cache_reason: str | None = None,
+) -> str | None:
     """Factor structurally identical ``blocks.N`` slabs into one warp block.
 
     Scratch cannot pass lists to custom blocks. The shared slab therefore uses
@@ -120,11 +150,32 @@ def _share_repeated_transformer_layers(
     between calls, and selects concatenated weight banks through scalar bases.
     ``layer_tail`` is ``(gate, final)``: the gate variable is set to 1 before
     each call, and to the ``final`` variable's value before the last one.
-    """
-    def reject(reason: str) -> bool:
-        log.info("Shared transformer layer skipped: %s", reason)
-        return False
 
+    Returns ``None`` when the layers were shared, and otherwise why not, as
+    a clause for a user-facing warning (``NO_REPEATED_LAYERS`` when there is
+    nothing to share); the sprite is then unchanged. ``cache_reason`` is why
+    a generation step's K/V caches couldn't be banked.
+    """
+    def reject(reason: str) -> str:
+        log.info("Shared transformer layer skipped: %s", reason)
+        return reason
+
+    nodes = {node.name: node for node in compiler.graph.nodes}
+    # Output copies follow the roots that compute nodes, under the last
+    # node's name; they belong to no layer.
+    emitted = [
+        (name, root, _graph_layer(nodes[name]))
+        for name, root in compiler.emitted_roots[:compiler.node_roots]
+        if name in nodes
+    ]
+    layers = sorted({layer for _, _, layer in emitted if layer is not None})
+    if len(layers) < 2:
+        return reject(NO_REPEATED_LAYERS)
+    if layers != list(range(len(layers))):
+        return reject(
+            "its `blocks.N` layers aren't numbered consecutively from `blocks.0` "
+            f"(found {', '.join(f'`blocks.{layer}`' for layer in layers)})"
+        )
     if (
         compiler.graph.generation.first_cache is not None
         and not compiler.graph.generation.banked_caches
@@ -132,17 +183,8 @@ def _share_repeated_transformer_layers(
         # Cached K/V lists are statically named in Scratch. Until attention is
         # split into thin per-layer cache wrappers, sharing the whole slab
         # would incorrectly direct every call to layer zero's cache.
-        return reject("cached generation requires banked caches")
+        return reject(cache_reason or "its layers' key/value caches can't be shared")
 
-    nodes = {node.name: node for node in compiler.graph.nodes}
-    emitted = [
-        (name, root, _graph_layer(nodes[name]))
-        for name, root in compiler.emitted_roots
-        if name in nodes
-    ]
-    layers = sorted({layer for _, _, layer in emitted if layer is not None})
-    if len(layers) < 2 or layers != list(range(len(layers))):
-        return reject("layers are not a consecutive repeated stack")
     grouped = [
         [(name, root) for name, root, found in emitted if found == layer]
         for layer in layers
@@ -173,21 +215,29 @@ def _share_repeated_transformer_layers(
         ]
         for layer in layers
     ]
-    if any(signature != signatures[0] for signature in signatures[1:]):
-        return reject("emitted operation signatures differ")
+    for layer, signature in zip(layers[1:], signatures[1:]):
+        if signature != signatures[0]:
+            return reject(
+                f"layer `blocks.{layer}` doesn't compute the same operations as "
+                "`blocks.0` (its shapes, constants or operations differ)"
+            )
 
     blocks = sprite["blocks"]
     starts = [group[0][1] for group in grouped]
     emitted_roots = [root for _, root in compiler.emitted_roots]
     last_position = max(emitted_roots.index(root) for _, root in grouped[-1])
     successor = emitted_roots[last_position + 1] if last_position + 1 < len(emitted_roots) else None
-    command_groups = [
-        _chain_until(blocks, start, starts[index + 1] if index + 1 < len(starts) else successor)
-        for index, start in enumerate(starts)
-    ]
+    try:
+        command_groups = [
+            _chain_until(blocks, start, starts[index + 1] if index + 1 < len(starts) else successor)
+            for index, start in enumerate(starts)
+        ]
+    except ValueError:
+        return reject("code from outside the `blocks.N` layers runs between them")
     main_root = next(
         identifier for identifier, block in blocks.items()
         if block.get("topLevel") and block.get("parent") is None
+        and block.get("opcode") != "procedures_definition"
     )
     all_commands = set(_chain_until(blocks, main_root, None))
     owned_groups = [
@@ -207,9 +257,15 @@ def _share_repeated_transformer_layers(
             if field and field[0] in static_names and field[0] not in found:
                 found.append(field[0])
         role_names.append(found)
-    if not role_names[0] or any(len(names) != len(role_names[0]) for names in role_names):
+    if not role_names[0]:
+        return reject("its layers have no weights")
+    if any(len(names) != len(role_names[0]) for names in role_names):
         log.info("Repeated layer static roles: %s", role_names)
-        return reject("static role counts differ")
+        return reject(
+            "its layers don't read the same number of distinct weight tensors "
+            "(weights with identical values are stored once, so a layer whose "
+            "weights repeat each other or another layer's reads fewer)"
+        )
 
     bank_roles = []
     for role, names in enumerate(zip(*role_names)):
@@ -218,18 +274,21 @@ def _share_repeated_transformer_layers(
         entries = [sprite["lists"][list_ids[name]] for name in names]
         sizes = [len(entry[1]) for entry in entries]
         if len(set(sizes)) != 1:
-            return reject("a candidate weight bank is misaligned")
+            return reject("a weight tensor's stored size differs between layers")
         # Logical layer banks may exceed one physical Scratch list. The
         # ordinary precision-aware sharder runs after this transform and
         # rewrites indexed reads across row-aligned physical shards.
         bank_roles.append((role, names, sizes[0]))
     if not bank_roles:
-        return reject("no layer-varying static weights were found")
+        return reject("its layers have identical weights, so they have no per-layer weights to bank")
     banked = [name for _, names, _ in bank_roles for name in names]
     if len(set(banked)) != len(banked):
         # A deduplicated tensor read by only some layers, or in a different
         # role per layer, can't become one row of a bank.
-        return reject("a static tensor would fill more than one bank slot")
+        return reject(
+            "a weight tensor with the same values is used by some layers but "
+            "not others, or in a different place in different layers"
+        )
     log.info("Repeated layer bank roles: %s", bank_roles)
 
     layer_zero_owned = owned_groups[0]
@@ -244,7 +303,11 @@ def _share_repeated_transformer_layers(
             block = blocks.get(identifier)
             field = block.get("fields", {}).get("LIST") if block else None
             if field and field[1] == winner_id and block["opcode"] != "data_itemoflist":
-                return reject("a banked tensor uses a non-read list operation")
+                return reject(
+                    "an operation in the layers uses a weight in a way other than "
+                    "reading it item by item, so it can't read the weight from a "
+                    "per-layer bank"
+                )
 
     layer_names = [
         {node.name for node in compiler.graph.nodes if _graph_layer(node) == layer}
@@ -262,7 +325,10 @@ def _share_repeated_transformer_layers(
             if arg.name in members and arg.name in compiler.scope.assignments
         }
         if not used:
-            return reject("could not identify a carried layer output")
+            return reject(
+                f"layer `blocks.{layers[index]}`'s output isn't read by the "
+                + ("next layer" if index + 1 < len(layer_names) else "rest of the model")
+            )
         output_nodes.append(max(used, key=lambda name: next(
             i for i, node in enumerate(compiler.graph.nodes) if node.name == name
         )))
@@ -278,7 +344,7 @@ def _share_repeated_transformer_layers(
         )
     ]
     if not first_inputs:
-        return reject("could not identify the first layer input")
+        return reject("layer `blocks.0` doesn't read a tensor computed before it")
     first_input = first_inputs[-1]
     input_list = (
         f"T{compiler.scope.assignments[first_input]}"
@@ -286,12 +352,39 @@ def _share_repeated_transformer_layers(
         else compiler.graph.input_names[first_input]
     )
     output_list = output_lists[0]
+    # The calls copy each layer's output into the first layer's input list.
+    # A public input list must keep the caller's values, and a value read
+    # again after the layers must survive them: the first layer then reads
+    # a private copy instead.
+    in_layers = set().union(*layer_names)
+    first_position = min(
+        index for index, node in enumerate(compiler.graph.nodes) if node.name in in_layers
+    )
+    def root(name: str) -> str:
+        seen = set()
+        while name in compiler.graph.aliases and name not in seen:
+            seen.add(name)
+            name = compiler.graph.aliases[name]
+        return name
+
+    copy_input = (
+        first_input in compiler.graph.input_names
+        or any(root(name) == first_input for name, _, _ in compiler.graph.outputs)
+        or any(
+            root(argument.name) == first_input
+            for node in compiler.graph.nodes[first_position:]
+            if node.name not in in_layers
+            for argument in node.all_input_nodes
+        )
+    )
+    # Without a predecessor the first layer starts the script, and the calls
+    # take its place there.
     predecessor = next(
         (identifier for identifier, block in blocks.items() if block.get("next") == starts[0]),
         None,
     )
-    if predecessor is None:
-        return reject("the repeated layer has no chain predecessor")
+    if copy_input and input_list not in list_ids:
+        return reject("layer `blocks.0`'s input list wasn't found")
 
     base_variables = []
     for role, names, size in bank_roles:
@@ -373,12 +466,47 @@ def _share_repeated_transformer_layers(
                 blocks[old_index[1]]["parent"] = add_id
             block["inputs"]["INDEX"] = [3, add_id, [4, 0]]
 
+    carried = input_list
+    if copy_input:
+        carried = _LAYER_INPUT_COPY
+        source_id = list_ids[input_list]
+        carried_id = f"cattorch_shared_layer_input_{uuid.uuid4().hex[:8]}"
+        sprite["lists"][carried_id] = [carried, []]
+        input_node = nodes.get(first_input)
+        shape = tuple(input_node.meta["val"].shape) if input_node is not None else ()
+        capacity = (
+            compiler.graph.runtime_capacity(first_input, shape)
+            if first_input in compiler.graph.dynamic_axes
+            else math.prod(shape)
+        )
+        compiler.logical_sizes[carried] = max(compiler.logical_sizes.get(carried, 0), capacity)
+
+        def point_at_copy(value):
+            if isinstance(value, list):
+                if len(value) >= 3 and value[0] == 13 and value[2] == source_id:
+                    value[1:3] = [carried, carried_id]
+                for part in value:
+                    point_at_copy(part)
+
+        for identifier in layer_zero_owned:
+            block = blocks.get(identifier)
+            if block is None:
+                continue
+            for field in block.get("fields", {}).values():
+                if isinstance(field, list) and len(field) >= 2 and field[1] == source_id:
+                    field[0:2] = [carried, carried_id]
+            for value in block.get("inputs", {}).values():
+                point_at_copy(value)
+
     log.info(
-        "Repeated layer activation path: input=%s outputs=%s",
-        input_list, output_lists,
+        "Repeated layer activation path: input=%s carried=%s outputs=%s",
+        input_list, carried, output_lists,
     )
 
     first_end = command_groups[0][-1]
+    first_position_xy = {
+        key: blocks[starts[0]][key] for key in ("x", "y") if key in blocks[starts[0]]
+    }
     blocks[first_end]["next"] = None
     procedure_name = "cattorch shared transformer layer"
     definition = f"cattorch_shared_layer_definition_{uuid.uuid4().hex[:8]}"
@@ -404,6 +532,17 @@ def _share_repeated_transformer_layers(
 
     body: list = []
     copy_index = "cattorch shared layer copy index"
+
+    def copy_list(target: str, source: str) -> tuple:
+        return (
+            clear(target),
+            for_each(copy_index, length(source), (
+                append(target, item(source, var(copy_index))),
+            )),
+        )
+
+    if carried != input_list:
+        body.extend(copy_list(carried, input_list))
     cache_base = _LAYER_CACHE_BASE if compiler.graph.generation.banked_caches else None
     for layer in layers:
         body.extend(set_var(name, layer * size) for name, size in base_variables)
@@ -416,21 +555,11 @@ def _share_repeated_transformer_layers(
                 layer * compiler.graph.generation.cache_layer_width,
             ))
         body.append(call(procedure_name))
-        if layer != layers[-1] and input_list != output_list:
-            body.extend((
-                clear(input_list),
-                for_each(copy_index, length(output_list), (
-                    append(input_list, item(output_list, var(copy_index))),
-                )),
-            ))
+        if layer != layers[-1] and carried != output_list:
+            body.extend(copy_list(carried, output_list))
     final_output_list = output_lists[-1]
     if final_output_list != output_list:
-        body.extend((
-            clear(final_output_list),
-            for_each(copy_index, length(output_list), (
-                append(final_output_list, item(output_list, var(copy_index))),
-            )),
-        ))
+        body.extend(copy_list(final_output_list, output_list))
     wrapper = Program(
         "shared_layer_calls",
         variables=(
@@ -439,31 +568,38 @@ def _share_repeated_transformer_layers(
             *((cache_base,) if cache_base is not None else ()),
             *(layer_tail or ()),
         ),
-        lists=tuple(dict.fromkeys((input_list, output_list, final_output_list))),
+        lists=tuple(dict.fromkeys((input_list, carried, output_list, final_output_list))),
         body=tuple(body),
     )
     wrapper_root, wrapper_tail = _program_stack(sprite, wrapper)
     # `_program_stack` may replace its temporary block dictionary while
     # remapping data IDs; refresh the shared reference before splicing.
     blocks = sprite["blocks"]
-    blocks[predecessor]["next"] = wrapper_root
-    blocks[wrapper_root]["parent"] = predecessor
-    blocks[wrapper_root]["topLevel"] = False
-    blocks[wrapper_root].pop("x", None)
-    blocks[wrapper_root].pop("y", None)
+    if predecessor is None:
+        # The calls start the script, where the first layer was.
+        blocks[wrapper_root]["parent"] = None
+        blocks[wrapper_root]["topLevel"] = True
+        blocks[wrapper_root].pop("x", None)
+        blocks[wrapper_root].pop("y", None)
+        blocks[wrapper_root].update(first_position_xy)
+    else:
+        blocks[predecessor]["next"] = wrapper_root
+        blocks[wrapper_root]["parent"] = predecessor
+        blocks[wrapper_root]["topLevel"] = False
+        blocks[wrapper_root].pop("x", None)
+        blocks[wrapper_root].pop("y", None)
     blocks[wrapper_tail]["next"] = successor
     if successor in blocks:
         blocks[successor]["parent"] = wrapper_tail
 
     log.info(
-        "Shared wrapper splice root=%s parent=%s top=%s predecessor_next=%s",
+        "Shared wrapper splice root=%s parent=%s top=%s",
         wrapper_root,
         sprite["blocks"][wrapper_root].get("parent"),
         sprite["blocks"][wrapper_root].get("topLevel"),
-        sprite["blocks"][predecessor].get("next"),
     )
     if cache_base is not None:
         _merge_variables_by_name(sprite, {cache_base})
     if layer_tail is not None:
         _merge_variables_by_name(sprite, set(layer_tail))
-    return True
+    return None

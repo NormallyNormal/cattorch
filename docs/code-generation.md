@@ -48,16 +48,39 @@ All three options are off by default.
   lists, and custom blocks. The documented input, output, and lifecycle names
   don't change.
 - `compact_schema=True` leaves redundant fields out of the saved block data.
-- `layer_sharing=True` generates one copy of the code for repeated
-  transformer layers named `blocks.N` and shares it across them. The layers
-  must be consecutive and compile to the same code with weights of the same
-  shapes, and for cached generation every layer must also have the same
-  cache width. Sharing is all or nothing: if any layer doesn't fit, the whole
-  model is exported without sharing, with a warning.
+- `layer_sharing=True` generates one copy of the code for repeated layers
+  and calls it once per layer, with each layer's weights. See
+  [layer sharing](#layer-sharing).
 
 Schema compaction and layer sharing are tested less widely than the
 defaults. After enabling either, run `verify` and check that the project
 imports, edits, runs, and saves in your Scratch client.
+
+### Layer sharing
+
+Layer sharing looks for submodules named `blocks.0`, `blocks.1`, and so on,
+such as the items of an `nn.ModuleList` attribute called `blocks`. It shares
+them when:
+
+- they are numbered consecutively from `blocks.0`, and run one after another,
+  each reading the previous layer's output;
+- every layer computes the same operations, with the same shapes and
+  constants, and weights of the same sizes;
+- for [cached generation](generation.md#layer-sharing), every attention block
+  sits in its own layer and every layer's cache has the same width.
+
+The layers can be anywhere in the model, including at its start, where they
+read the input list; the input list keeps the values you put in it.
+
+Sharing is all or nothing: if any layer doesn't fit, the model is exported
+without sharing. Whenever `layer_sharing=True` shares nothing, the export
+warns once, in `result.warnings` and as a `CattorchWarning`, and the warning
+says why, such as which layer differs from `blocks.0`. A model with no
+`blocks.N` layers warns too, since the option had no effect. In a
+[program](programs-and-moe.md), each entry point is shared on its own: an
+entry point without repeated layers, such as one that resets state, isn't
+reported, an entry point whose layers couldn't be shared is reported by
+name, and a program in which no entry point has repeated layers warns once.
 
 ## Reproducible exports and multiple sprites
 

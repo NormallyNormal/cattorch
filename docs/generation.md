@@ -104,10 +104,11 @@ layers when the attention blocks sit in consecutive modules named `blocks.0`,
 `blocks.1`, and so on. The caches are then banked into one list per K and V
 (the internal lists `_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
 Hugging Face's `model.layers.N`, export without sharing and with one list per
-layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
-repeated but can't be factored, for example because the MLP widths differ,
-cattorch exports again without sharing, with a warning in
-`result.warnings`. Sharing makes sprites smaller.
+layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers
+can't be shared, for example because the MLP widths differ, or the model has
+no `blocks.N` layers, cattorch exports without sharing, with a warning in
+`result.warnings` that says why. Sharing makes sprites smaller. See
+[layer sharing](code-generation.md#layer-sharing) for what can be shared.
 
 ## Quantization
 

@@ -375,7 +375,7 @@ GPTQ needs at least one calibration example, passed as `transpile`'s
 | `id_namespace` | `None` | Three characters from `A-Z a-z 0-9 - _` included in block IDs. `None` picks a random one. `""` gives shorter IDs for a sprite that is the only generated sprite in its project. |
 | `compact_internal_names` | `False` | Shorten internal variable, list, and custom block names. |
 | `compact_schema` | `False` | Leave redundant fields out of the saved block data. |
-| `layer_sharing` | `False` | Share one copy of the code across repeated transformer layers. Sharing is all or nothing: if any layer doesn't fit, the whole model is exported without sharing, with a warning. |
+| `layer_sharing` | `False` | Share one copy of the code across repeated layers named `blocks.0`, `blocks.1`, ... Sharing is all or nothing: if any layer doesn't fit, or there are no such layers, the model is exported without sharing and a warning says why. |
 
 See [code generation](code-generation.md) before turning on `compact_schema` or
 `layer_sharing`.

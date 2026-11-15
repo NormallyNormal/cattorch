@@ -432,10 +432,12 @@ def test_layer_sharing_banks_the_caches(tmp_path):
 def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
     # Hugging Face layers live in `model.layers`, not `blocks.N`.
     hf = tiny_decoder("gpt2").eval()
-    result = transpile(
-        hf, GenerationProgram(max_context=8), tmp_path / "hf",
-        codegen=CodegenConfig(layer_sharing=True),
-    )
+    with pytest.warns(CattorchWarning, match="no repeated layers to share"):
+        result = transpile(
+            hf, GenerationProgram(max_context=8), tmp_path / "hf",
+            codegen=CodegenConfig(layer_sharing=True),
+        )
+    assert any("`blocks.0`" in item for item in result.warnings)
     emulator = ScratchEmulator(load_sprite(result.path))
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
@@ -452,7 +454,10 @@ def test_unfactorable_layers_retry_without_layer_sharing(tmp_path):
         emulator, result = emulator_for(
             model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=True),
         )
-    assert any("exported without layer sharing" in item for item in result.warnings)
+    assert any(
+        "exported without layer sharing" in item and "`blocks.1`" in item
+        for item in result.warnings
+    )
     assert "_cattorch shared transformer layer" not in emulator._procedures
     # Per-layer caches again: the retry does not bank them.
     assert "_cattorch K cache 1" in emulator.lists and "_cattorch K cache" not in emulator.lists

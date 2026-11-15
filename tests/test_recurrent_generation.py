@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from cattorch import (
-    CharTokenizer, CodegenConfig, ProgramCall, QuantizationConfig, RecurrentGenerationProgram,
+    CattorchWarning, CharTokenizer, CodegenConfig, ProgramCall, QuantizationConfig, RecurrentGenerationProgram,
     State,
     UnsupportedModelError, build_project, transpile, verify,
 )
@@ -281,7 +281,12 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
 
 def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
     model = recurrent_model("ssm")
-    emulator, _ = export(model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True))
+    # Its layers can't share one procedure, and the export says why.
+    with pytest.warns(CattorchWarning, match="distinct weight tensors"):
+        emulator, result = export(
+            model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True),
+        )
+    assert any("exported without layer sharing" in item for item in result.warnings)
     run(emulator, "cattorch prefill", [3, 1, 4])
     run(emulator, "cattorch decode", [1])
     torch.testing.assert_close(

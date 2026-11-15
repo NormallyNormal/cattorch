@@ -32,6 +32,9 @@ from cattorch.results import (
 from cattorch.quantization import quantize_model
 from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
+from cattorch.layer_sharing import (
+    NO_REPEATED_LAYERS, NO_REPEATED_LAYERS_IN_PROGRAM, layer_sharing_warning,
+)
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.guards import (
     _BUSY, _EPOCH, _add_epoch_procedure, _epoch_current, _init_outcome, _overtaken,
@@ -725,6 +728,8 @@ def transpile_program(
     flags = [f"_cattorch {entry.name} initialized" for entry in program.entrypoints]
     all_initialized = _all_initialized(flags) if _initialized_flag else ()
     sub_warnings: list[str] = []
+    # Why layer sharing skipped each entry point, when it was asked for.
+    unshared_layers: dict[str, str | None] = {}
     fallbacks: Counter[str] = Counter()
     approximations: Counter[str] = Counter()
     sharded_names: set[str] = set()
@@ -908,6 +913,8 @@ def transpile_program(
                 "GPTQ fallback", "tied weight", "quantized weight", "weight computed from",
             ))
         )
+        if codegen.layer_sharing:
+            unshared_layers[entrypoint.name] = sub_result.unshared_layers
         fallbacks.update(dict(sub_result.fallback_operations))
         approximations.update(dict(sub_result.approximate_operations))
         sharded_names.update(storage_names.get(name, name) for name in sub_result.sharded_lists)
@@ -1209,7 +1216,7 @@ def transpile_program(
             final_data_name(name, frozenset(public_data_names)) for name in sharded_names
         )),
         warnings=tuple(dict.fromkeys((
-            *sub_warnings, *finalized.warnings,
+            *sub_warnings, *_layer_sharing_warnings(unshared_layers), *finalized.warnings,
             *filter(None, (fallback_warning(tuple(sorted(fallbacks.items()))),)),
         ))),
         entrypoints=tuple(entry_results),
@@ -1263,6 +1270,29 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
     )
     return per_unit_result(
         result, spec, axes, input_shapes, [tuple(value.shape) for value in result.outputs],
+    )
+
+
+def _layer_sharing_warnings(unshared: dict[str, str | None]) -> tuple[str, ...]:
+    """Warnings for the entry points ``layer_sharing=True`` didn't share.
+
+    ``unshared`` maps each entry point to why its layers weren't shared
+    (``None`` if they were). An entry point without repeated layers, such as
+    a reset, isn't reported, unless no entry point has any.
+    """
+    if not unshared:
+        return ()
+    if all(reason == NO_REPEATED_LAYERS for reason in unshared.values()):
+        reason = NO_REPEATED_LAYERS if len(unshared) == 1 else NO_REPEATED_LAYERS_IN_PROGRAM
+        return (layer_sharing_warning(reason),)
+    if len(unshared) == 1:
+        return tuple(
+            layer_sharing_warning(reason) for reason in unshared.values() if reason is not None
+        )
+    return tuple(
+        layer_sharing_warning(reason, name)
+        for name, reason in unshared.items()
+        if reason is not None and reason != NO_REPEATED_LAYERS
     )
 
 

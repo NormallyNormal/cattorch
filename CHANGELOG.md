@@ -141,6 +141,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   installed version.
 - `CattorchWarning` is the base class of every warning cattorch emits, and
   every warning an export gives is also in its result's `warnings`.
+- `CodegenConfig(layer_sharing=True)` warns, saying why, whenever it shares
+  nothing, for every kind of export, including a model with no `blocks.N`
+  layers. A program reports each entry point whose layers couldn't be
+  shared, and warns once if no entry point has layers. See
+  [layer sharing](docs/code-generation.md#layer-sharing).
 
 ### Generation
 
@@ -291,6 +296,8 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   longer stores its initial copy.
 - Hidden prefill also skips the final layer's query, attention output and
   MLP for prompt tokens before the last, with or without layer sharing.
+- Layer sharing also shares repeated layers at the start of a model, which
+  read the model's input.
 - Rotate-half RoPE (`x * cos + rotate_half(x) * sin`) runs as one rotary
   loop.
 
@@ -325,6 +332,9 @@ Python:
 - Layer sharing merged layers that differ only in a constant, could fail
   with a `KeyError`, and a decode before any prefill wrote the hidden state
   to the logits.
+- Layer sharing gave wrong output when the tensor entering the first shared
+  layer was also returned or used after the layers, and dropped an output
+  copied after the last layer, such as a returned input.
 - A tied embedding was read in the wrong layout in fast mode with weight
   transforms, and fast weight pruning of `x @ W` changed `W` for other uses.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the

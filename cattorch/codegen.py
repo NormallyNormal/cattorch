@@ -33,11 +33,13 @@ class CodegenConfig:
     by default because it is tested less widely in browser import, edit,
     and save.
 
-    ``layer_sharing=True`` factors compatible ``blocks.N`` transformer
-    stacks into one procedure and banks their weights. Cached generation also
+    ``layer_sharing=True`` factors compatible repeated ``blocks.N`` layers
+    into one procedure and banks their weights. Cached generation also
     interleaves equal-width per-layer K/V rows into shared banks. Sharing is
-    all or nothing: if any layer doesn't fit, the whole model is exported
-    without it, with a warning.
+    all or nothing: if any layer doesn't fit, or there are no ``blocks.N``
+    layers, the model is exported without it, with a warning that says why
+    (in a program, per entry point that has layers; see
+    ``docs/code-generation.md``).
     """
 
     target_json_bytes: int | None = 4 * 1024 * 1024

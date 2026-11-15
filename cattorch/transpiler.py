@@ -63,6 +63,7 @@ from cattorch.layer_sharing import (
     _LAYER_CACHE_BASE,
     _graph_layer,
     _share_repeated_transformer_layers,
+    layer_sharing_warning,
 )
 from cattorch.procedures import (
     _find_procedure_definition,
@@ -385,7 +386,10 @@ def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: froz
 
 
 class _LayerSharingUnavailable(Exception):
-    """Banked caches were requested but the layers could not be factored."""
+    """Banked caches were requested but the layers could not be factored.
+
+    Its argument is why, as ``_share_repeated_transformer_layers`` gives it.
+    """
 
 
 # A variable-length input: its name, minimum and maximum length, and the
@@ -2652,11 +2656,8 @@ def _transpile_automatic_generation(
             codegen=codegen,
             **options,
         )
-    except _LayerSharingUnavailable:
-        warn(
-            "layer_sharing=True couldn't share this model's layers; it was "
-            "exported without layer sharing"
-        )
+    except _LayerSharingUnavailable as unavailable:
+        warn(layer_sharing_warning(str(unavailable)))
         result = _transpile(
             copy.deepcopy(step),
             (example,),
@@ -2755,6 +2756,10 @@ class _CompiledSprite:
     list's peak size, which can be more than its tensor's when the compiler
     used the list as scratch space first, and ``item_kinds`` what each
     input's items must be (``_kinds_of_items``).
+
+    ``unshared_layers`` is why ``layer_sharing=True`` didn't share the
+    graph's layers (``None`` when it did, or wasn't asked to). A standalone
+    sprite's ``warnings`` say so; a program decides per entry point.
     """
 
     sprite: dict
@@ -2776,6 +2781,7 @@ class _CompiledSprite:
     item_kinds: dict[int, tuple[str | None, int | None]] = dataclasses.field(
         default_factory=dict,
     )
+    unshared_layers: str | None = None
 
 
 def _compile_sprite(
@@ -2867,17 +2873,23 @@ def _compile_sprite(
         dynamic_inputs=dynamic_inputs,
         example_kwargs=example_kwargs,
     )
+    # Why a generation step's K/V caches couldn't be banked for layer sharing.
+    cache_reason = None
     if generation is not None and codegen.layer_sharing:
         if not _layers_can_share_caches(graph):
-            log.info(
-                "Banked generation caches skipped: attention blocks are not in "
-                "consecutive `blocks.N` layers"
+            cache_reason = (
+                "its attention blocks aren't each in their own `blocks.N` layer, "
+                "numbered from `blocks.0`, so their key/value caches can't be shared"
             )
+            log.info("Banked generation caches skipped: %s", cache_reason)
         elif _bank_generation_caches(graph):
             log.info(
                 "Banked %s generation cache layers for structural sharing",
                 graph.generation.cache_layers,
             )
+        else:
+            cache_reason = "its layers' key/value caches differ in width"
+            log.info("Banked generation caches skipped: %s", cache_reason)
 
     # 2. Compile graph nodes into Scratch blocks
     compiler = _Compiler(graph, storage=storage)
@@ -2924,24 +2936,26 @@ def _compile_sprite(
         sig_figs=sig_figs,
     )
     sprite = tensor_adder.apply(sprite, list(graph.input_names.values()))
+    unshared_layers = None
     if codegen.layer_sharing:
         hidden_layers = (
             generation is not None
             and graph.generation.banked_caches
             and graph.generation.hidden_prefill_attention is not None
         )
-        shared = _share_repeated_transformer_layers(
+        unshared_layers = _share_repeated_transformer_layers(
             sprite,
             compiler,
             storage,
             layer_tail=(_LAYER_TAIL, PROJECT_OUTPUT) if hidden_layers else None,
+            cache_reason=cache_reason,
         )
-        if shared:
+        if unshared_layers is None:
             log.info("Factored repeated transformer layers into one shared procedure")
         elif generation is not None and graph.generation.banked_caches:
             # Banked caches are addressed through the shared procedure's base
             # variable; without it every layer would read layer zero's rows.
-            raise _LayerSharingUnavailable()
+            raise _LayerSharingUnavailable(unshared_layers)
 
     # 4. Name the output list and clean up
     output_lists = compiler.output_lists
@@ -3245,7 +3259,11 @@ def _compile_sprite(
             f"tied weight {table.removeprefix('W_')!r} is stored twice: {reason}"
             for table, reason in tied_copies.items()
         )
-        + tuple(filter(None, (fallback_warning(graph.fallbacks()),))),
+        + tuple(filter(None, (fallback_warning(graph.fallbacks()),)))
+        + (
+            (layer_sharing_warning(unshared_layers),)
+            if unshared_layers is not None and not entry_point else ()
+        ),
         quantization=quantization_report,
         fallback_operations=graph.fallbacks(),
         approximate_operations=tuple(sorted(compiler.approximate.items())),
@@ -3254,6 +3272,7 @@ def _compile_sprite(
             if entry_point else {}
         ),
         item_kinds=_kinds_of_items(graph, flat_inputs) if entry_point else {},
+        unshared_layers=unshared_layers,
     )
 
 
