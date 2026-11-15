@@ -93,6 +93,7 @@ from cattorch.interface import (
 )
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
+from cattorch.util.paths import output_file
 from cattorch.operator_registry import (
     INDEX_MAP_OPS,
     MATMUL_OPS,
@@ -2704,9 +2705,7 @@ def _transpile(
     ``prepared_model``, and so on) and ``_unit_inputs``, which
     ``_finalize_sprite`` takes.
     """
-    output_path = Path(output_path)
-    if output_path.suffix.lower() != ".sprite3":
-        output_path = Path(f"{output_path}.sprite3")
+    output_path = output_file(output_path, ".sprite3")
     sprite_name = output_path.stem if name is None else name
     if not isinstance(sprite_name, str) or not sprite_name.strip():
         raise ValueError("name must be a non-empty string")

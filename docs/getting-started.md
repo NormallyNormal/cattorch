@@ -54,7 +54,8 @@ assert check.passed, check
 ```
 
 `transpile` creates missing parent directories and appends `.sprite3` if the
-path does not already have that suffix. The Scratch sprite name defaults to
+path does not already have that suffix; a path that names no file, such as
+an existing directory, raises `ValueError`. The Scratch sprite name defaults to
 the output filename stem; pass `name="My model"` to choose it independently.
 
 The returned `TranspileResult` describes the sprite's input/output lists,

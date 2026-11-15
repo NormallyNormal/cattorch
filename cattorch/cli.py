@@ -24,6 +24,7 @@ from torch import nn
 
 from cattorch import __version__
 from cattorch.errors import CattorchError
+from cattorch.util.paths import output_file
 from cattorch.util.scratch.archive import dumps
 
 
@@ -246,15 +247,20 @@ def _outputs(output: str | None, name: str) -> _Outputs:
     ``-o`` may be a bare path or end in ``.sprite3`` or ``.sb3``; other dots
     stay in the name, so ``-o net.v2`` writes ``net.v2.sprite3``.
     """
-    path = Path(output or name)
-    if path.suffix.lower() in {".sprite3", ".sb3"}:
-        path = path.with_suffix("")
-    if not path.name:
-        raise CommandError(f"-o {output!r} doesn't name a file")
+    if output is None:
+        # Named after the model, beside a directory of the same name (such
+        # as an --hf directory) rather than in it.
+        return _Outputs(
+            sprite=Path(f"{name}.sprite3"),
+            tokenizer=Path(f"{name}_tokenizer.sprite3"),
+            project=Path(f"{name}.sb3"),
+        )
+    suffix = Path(output).suffix
+    base = output[: -len(suffix)] if suffix.lower() in {".sprite3", ".sb3"} else output
     return _Outputs(
-        sprite=path.with_name(f"{path.name}.sprite3"),
-        tokenizer=path.with_name(f"{path.name}_tokenizer.sprite3"),
-        project=path.with_name(f"{path.name}.sb3"),
+        sprite=output_file(base, ".sprite3", parameter="-o"),
+        tokenizer=output_file(f"{base}_tokenizer", ".sprite3", parameter="-o"),
+        project=output_file(base, ".sb3", parameter="-o"),
     )
 
 

@@ -28,6 +28,7 @@ from cattorch.program import GenerationProgram, RecurrentGenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.transpiler import transpile
+from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
     Program, append, broadcast_and_wait, change_var, clear, join, repeat, reset_timer, set_var,
     timer, var,
@@ -358,11 +359,6 @@ def _check_counts(repeats: int, warmups: int) -> None:
             )
 
 
-def _sb3_path(output_path: str | Path) -> Path:
-    output_path = Path(output_path)
-    return output_path if output_path.suffix == ".sb3" else output_path.with_suffix(".sb3")
-
-
 def _export_variant(
     model, example_inputs, base: Path, *, optimization: str, options: dict, extra_kernels=(),
 ) -> tuple[dict, dict[str, bytes]]:
@@ -497,7 +493,7 @@ def _build_suite(
             case_options["fast_config"] = case[3]
         normalized_cases.append((name, model, raw_inputs, case_options))
     _check_names([case[0] for case in normalized_cases])
-    output_path = _sb3_path(output_path)
+    output_path = output_file(output_path, ".sb3")
 
     broadcasts: dict[str, str] = {}
     controller_cases: list[dict] = []
@@ -649,7 +645,7 @@ def build_generation_benchmark_suite(
                 f"use max_context={needed} or more"
             )
     _check_names([case[0] for case in cases])
-    output_path = _sb3_path(output_path)
+    output_path = output_file(output_path, ".sb3")
     broadcasts: dict[str, str] = {}
     controller_cases = []
     sprites = []
@@ -751,7 +747,7 @@ def build_storage_benchmark_suite(
         raise ValueError("storage benchmark cases are (name, model, example_inputs) tuples")
     _check_names([case[0] for case in cases])
 
-    output_path = _sb3_path(output_path)
+    output_path = output_file(output_path, ".sb3")
     variants = {
         "plain-f32": (StorageConfig(compression=False, precision="float32"), None),
         "base92-f32": (StorageConfig(compression=True, precision="float32"), None),
@@ -866,7 +862,7 @@ def build_paired_benchmark(
         kernels=kernels,
     )
     example_inputs = _normalise_inputs(example_inputs)
-    output_path = _sb3_path(output_path)
+    output_path = output_file(output_path, ".sb3")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)

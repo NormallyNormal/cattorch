@@ -47,7 +47,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 |---|---|
 | `model` | Module to export. Export works on a copy. A model left in training mode with modules that behave differently in it (dropout, batch norm) is exported in evaluation mode, with a warning. |
 | `example_inputs` | What the sprite is called with: a tensor or tuple of tensors for `forward`, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. `None` takes it from the model's [markers](markers.md). |
-| `output_path` | Destination. `.sprite3` is appended when absent and missing parent directories are created. |
+| `output_path` | Destination file. `.sprite3` is appended unless the path already ends in it (in any case), and missing parent directories are created. A path that names no file (empty, ending in a separator, or an existing directory) raises `ValueError`. The same rule applies to every function that writes a file, with its own suffix. |
 | `name` | Scratch sprite display name. Defaults to the destination filename stem. |
 | `optimization` | `"exact"` (default) or `"fast"`. See [optimization modes](optimization.md). |
 | `fast_config` | A `FastConfig`; valid only with `optimization="fast"`. |
@@ -244,7 +244,7 @@ build_project(
 ```
 
 Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
-missing. Every operation gets a bridge to global lists that other sprites can
+missing, as `transpile`'s `output_path` does. Every operation gets a bridge to global lists that other sprites can
 run with `broadcast and wait`. A `TranspileResult` gets list monitors starting
 from `example_inputs` (or zeros) and runs on the green flag or space key;
 `labels` names a classifier's outputs. A `GenerationResult` needs `tokenizer`,
@@ -547,7 +547,8 @@ use reads as a matrix when the rest is quantized for its uses.
 
 ## Benchmark API
 
-Each builder writes an `.sb3` project (adding the suffix if needed) and returns
+Each builder writes an `.sb3` project (adding the suffix as `transpile`'s
+`output_path` does) and returns
 its `Path`. Timing happens when you run the project in Scratch; read the
 results with `analyze_benchmark`. Every builder takes `repeats` (the timed
 calls per variant), `warmups` (untimed calls first), and the export options

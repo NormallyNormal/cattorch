@@ -384,6 +384,11 @@ Python:
   error.
 - The emulator behind `verify` kept NaN through arithmetic, where Scratch
   reads it as 0, and read numbers from text differently from Scratch.
+- An `output_path` that names no file (empty, ending in a separator, or an
+  existing directory) raises `ValueError` instead of writing a hidden
+  `..sprite3` or a file beside the directory, and so does such a `-o`. The
+  benchmark builders append `.sb3` as every other writer does, instead of
+  replacing the last suffix (`results.v2` wrote `results.sb3`).
 - Tokenizer sprites looked characters up case-insensitively, so `The`
   encoded like `the`. Sprites whose vocabulary has letters now look
   characters up by costume name, so don't change their costumes. SentencePiece `scratch_casefold=True`

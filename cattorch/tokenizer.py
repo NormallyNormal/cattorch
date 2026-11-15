@@ -28,6 +28,7 @@ from cattorch.errors import collect_warnings, with_warnings
 from cattorch.results import TokenizerResult
 from cattorch.guards import _EPOCH, _add_epoch_procedure, _epoch_current, _overtaken
 from cattorch.procedures import _add_warp_procedure, _merge_variables_by_name, _procedure_mutation
+from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
     Expr,
     Program,
@@ -374,9 +375,7 @@ class _TokenizerBase(ABC):
         sprite = _add_tokenizer_interface(sprite, len(tokens))
 
         uniquify_data_ids(sprite)
-        output_path = Path(output_path)
-        if output_path.suffix.lower() != ".sprite3":
-            output_path = Path(f"{output_path}.sprite3")
+        output_path = output_file(output_path, ".sprite3")
         sprite_name = output_path.stem if name is None else name
         if not isinstance(sprite_name, str) or not sprite_name.strip():
             raise ValueError("name must be a non-empty string")

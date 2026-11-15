@@ -44,6 +44,7 @@ from cattorch.guards import (
 from cattorch.procedures import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
 )
+from cattorch.util.paths import output_file
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (
     Program, Statement, add, append, argument, broadcast_and_wait, call, change_var, clear, eq,
@@ -653,9 +654,7 @@ def transpile_program(
         storage=storage, quantization=quantization, codegen=codegen,
         sig_figs=sig_figs, adapters=adapters,
     )
-    output_path = Path(output_path)
-    if output_path.suffix.lower() != ".sprite3":
-        output_path = Path(f"{output_path}.sprite3")
+    output_path = output_file(output_path, ".sprite3")
     sprite_name = output_path.stem if name is None else name
     codegen = codegen or CodegenConfig()
     registry = default_registry().for_export(adapters=adapters, kernels=kernels)

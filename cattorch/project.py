@@ -29,6 +29,7 @@ from cattorch.procedures import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive
+from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
     Program,
     answer,
@@ -613,9 +614,7 @@ def build_project(
     sprites can run it with ``broadcast and wait``; ``ProjectResult`` lists
     the broadcasts and data. Warnings are also emitted as ``CattorchWarning``.
     """
-    output_path = Path(output_path)
-    if output_path.suffix.lower() != ".sb3":
-        output_path = Path(f"{output_path}.sb3")
+    output_path = output_file(output_path, ".sb3")
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
     builder = _Builder()
