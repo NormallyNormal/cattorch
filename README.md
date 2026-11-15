@@ -65,6 +65,7 @@ covers input layout, connecting other sprites, and saving after a run.
 - [Getting started](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md)
 - [API reference](https://github.com/NormallyNormal/cattorch/blob/main/docs/api-reference.md)
 - [Troubleshooting](https://github.com/NormallyNormal/cattorch/blob/main/docs/troubleshooting.md)
+- [Migrating from 0.5 to 1.0](https://github.com/NormallyNormal/cattorch/blob/main/docs/migrating-to-1.0.md)
 
 ## License
 

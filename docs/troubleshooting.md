@@ -15,6 +15,10 @@ Problems usually happen at one of three stages:
    the sprite's blocks from one script at a time; see
    [overlapping calls](scratch-interface.md#overlapping-calls).
 
+Code or a Scratch project written for cattorch 0.5.0, for example one that
+fails with a `TypeError` naming a parameter or reads a list the sprite
+doesn't have, needs the changes in [migrating to 1.0](migrating-to-1.0.md).
+
 ## Put the model in evaluation mode
 
 Call `model.eval()` before export. A model is always exported as an

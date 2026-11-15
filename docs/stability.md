@@ -4,6 +4,8 @@
 
 From 1.0, code written against cattorch and Scratch projects built around
 exported sprites keep working across 1.x releases.
+Coming from 0.5.0? [Migrating to 1.0](migrating-to-1.0.md) lists what
+changed on the way to 1.0.
 
 ## What 1.x keeps
 
