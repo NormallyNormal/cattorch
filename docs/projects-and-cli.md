@@ -145,8 +145,9 @@ take:
 `export` verifies against a copy of the model holding the values the sprite
 stores, so float16, symmetric quantization and `--sig-figs` are checked with
 `atol=1e-3, rtol=1e-4`, and an exact float32 export with `atol=1e-4,
-rtol=1e-5`; a `fast` or GPTQ export is compared with the model itself with
-`atol=0.05, rtol=0.05`. It also takes `--labels` for its project and
+rtol=1e-5`. A `fast` export is checked with `atol=0.05, rtol=0.05`, and so
+is a GPTQ export, which can't be reproduced and is compared with the model
+itself. It also takes `--labels` for its project and
 `--no-verify`. `generate` takes `--max-new-tokens`, `--temperature`, and
 `--eos-token-id` (defaulting to the tokenizer's end token), as
 `build_project` does. `cattorch analyze-benchmark PROJECT` prints a saved
