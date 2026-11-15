@@ -79,9 +79,10 @@ def main(
     output: Path = Path("build"), steps: int = 400, max_new_tokens: int = 30,
 ) -> cattorch.ProjectResult:
     model = trained(steps)
-    result = cattorch.transpile(
-        model, cattorch.GenerationProgram(max_context=CONTEXT), output / "rhyme",
-    )
+    program = cattorch.GenerationProgram(max_context=CONTEXT)
+    result = cattorch.transpile(model, program, output / "rhyme")
+    # Runs a prefill and a few decodes and compares them with the model's logits.
+    assert cattorch.verify(model, program, result).passed
     words = cattorch.CharTokenizer(tokenizer()).save(
         output / "rhyme_tokenizer", name="tokenizer",
     )

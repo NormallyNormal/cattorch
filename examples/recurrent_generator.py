@@ -80,6 +80,7 @@ def main(
         (cattorch.State("hidden", torch.zeros(1, 1, WIDTH)),), reference="forward",
     )
     result = cattorch.transpile(model, program, output / "gru")
+    assert cattorch.verify(model, program, result).passed
     words = cattorch.CharTokenizer(tokenizer()).save(output / "gru_tokenizer", name="tokenizer")
     return cattorch.build_project(
         result, output / "gru", tokenizer=words, max_new_tokens=max_new_tokens,
