@@ -18,18 +18,10 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 
 from shared_models import VOCAB, CachedLM, NanoGPT, NanoMQA, RopeLM, nano, tiny_decoder
 from cattorch.interface import TOKEN_IDS
-from sprite_helpers import load_sprite
+from sprite_helpers import assert_logits, load_sprite, logits_of, prefill_and_decode
 from scratch_status import INTERRUPTED
 
 TOLERANCE = 1e-4
-
-
-def logits_of(model, prefix):
-    with torch.no_grad():
-        output = model(torch.tensor([prefix]))
-    if not isinstance(output, torch.Tensor):
-        output = output[0] if isinstance(output, tuple) else output.logits
-    return output[0, -1].flatten()
 
 
 def emulator_for(model, tmp_path, name="auto", *, codegen=None, **program):
@@ -38,29 +30,6 @@ def emulator_for(model, tmp_path, name="auto", *, codegen=None, **program):
         model, GenerationProgram(**program), tmp_path / name, codegen=codegen,
     )
     return ScratchEmulator(load_sprite(result.path)), result
-
-
-def assert_logits(emulator, model, prefix):
-    actual = torch.tensor(emulator.lists["cattorch logits"])
-    torch.testing.assert_close(
-        actual, logits_of(model, prefix), atol=TOLERANCE, rtol=0,
-    )
-
-
-def prefill_and_decode(emulator, model, prompt, more):
-    emulator.run_procedure("cattorch init")
-    emulator.lists[TOKEN_IDS] = list(prompt)
-    emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "ok"
-    prefix = list(prompt)
-    assert_logits(emulator, model, prefix)
-    for token in more:
-        prefix.append(token)
-        emulator.lists[TOKEN_IDS] = [token]
-        emulator.run_procedure("cattorch decode")
-        assert emulator.variables["cattorch status"] == "ok"
-        assert_logits(emulator, model, prefix)
-    return prefix
 
 
 MODELS = {

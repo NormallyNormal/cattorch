@@ -365,7 +365,7 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     )
     from shared_models import NanoGPT
     from scratch_status import INTERRUPTED, OVERTAKEN
-    from test_generation_automatic import logits_of
+    from sprite_helpers import logits_of
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
@@ -582,7 +582,7 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     )
     from shared_models import NanoGPT
     from scratch_status import OVERTAKEN
-    from test_generation_automatic import logits_of
+    from sprite_helpers import logits_of
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
@@ -643,8 +643,7 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     )
     from cattorch.util.scratch.emulator import ScratchEmulator
     from shared_models import NanoGPT
-    from sprite_helpers import load_sprite
-    from test_generation_automatic import logits_of
+    from sprite_helpers import load_sprite, logits_of
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()

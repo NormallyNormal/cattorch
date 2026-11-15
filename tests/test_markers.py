@@ -15,8 +15,7 @@ from cattorch import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 from shared_models import nano
-from sprite_helpers import load_sprite
-from test_generation_automatic import prefill_and_decode
+from sprite_helpers import load_sprite, prefill_and_decode
 
 
 class Accumulator(nn.Module):

@@ -12,7 +12,7 @@ from cattorch import (
     UnsupportedModelError, transpile,
 )
 from cattorch.interface import TOKEN_IDS
-from sprite_helpers import load_emulator
+from sprite_helpers import load_emulator, logits
 
 transformers = pytest.importorskip("transformers")
 
@@ -66,10 +66,6 @@ def run(emulator, procedure, tokens=None):
         emulator.lists[TOKEN_IDS] = list(tokens)
     emulator.run_procedure(procedure)
     return emulator.variables["cattorch status"]
-
-
-def logits(emulator):
-    return torch.tensor(emulator.lists["cattorch logits"], dtype=torch.float64)
 
 
 def expected_rows(model, tokens):

@@ -17,8 +17,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from sprite_helpers import load_sprite
-from test_generation_automatic import logits_of
+from sprite_helpers import load_sprite, logits_of
 from shared_models import CachedLM, recurrent_model, reference_rows
 from cattorch.interface import TOKEN_IDS
 

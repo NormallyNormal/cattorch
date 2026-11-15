@@ -12,7 +12,7 @@ from cattorch import GenerationProgram, UnsupportedModelError, transpile, verify
 from cattorch import CustomMoEWarning
 from cattorch.operator_registry import default_registry
 
-from test_generation_automatic import load_sprite, prefill_and_decode
+from sprite_helpers import load_sprite, prefill_and_decode
 from cattorch.util.scratch.emulator import ScratchEmulator
 
 WIDTH, EXPERTS = 8, 4

@@ -18,7 +18,7 @@ from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list
 from cattorch.interface import TOKEN_IDS
 from shared_models import GRULM, LSTMLM, RECURRENT_MODELS, recurrent_model, reference_rows
-from sprite_helpers import load_sprite
+from sprite_helpers import load_sprite, logits
 
 
 TOLERANCE = 1e-4
@@ -32,10 +32,6 @@ def export(model, path, **options):
     fields = {key: options.pop(key) for key in PROGRAM_FIELDS & set(options)}
     result = transpile(model, RecurrentGenerationProgram(model.states(), **fields), path, **options)
     return ScratchEmulator(load_sprite(result.path)), result
-
-
-def logits(emulator):
-    return torch.tensor(emulator.lists["cattorch logits"], dtype=torch.float64)
 
 
 def run(emulator, procedure, tokens=None):
