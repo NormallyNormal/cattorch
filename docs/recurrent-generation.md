@@ -17,6 +17,12 @@ logits. The sprite has the same blocks and lists as a
 | Memory per token | Grows: every token adds a row to each layer's K/V cache. | Fixed: the states have the same size after any number of tokens. |
 | Context limit | `max_context`, required. | `max_context`, optional. Without it the sprite takes any number of tokens. |
 
+A `RecurrentGenerationProgram` is for language models: one token ID in,
+logits out. A recurrent model with other inputs or outputs, such as a GRU
+over sensor readings or a controller that keeps a memory, is exported as an
+[`ExportProgram`](programs-and-moe.md#state) whose entry points read and
+update `State`s; its sprite keeps the state between calls the same way.
+
 ## Quick start
 
 A hand-written model needs a `step` method and the states' initial values:
@@ -140,7 +146,7 @@ adapter doesn't.
 | `RecurrentGenerationProgram needs states=...` | No states were given, and the model isn't a supported Hugging Face recurrent model. |
 | `RecurrentGenerationProgram() exports a Hugging Face ... model only on its own` | No states were given, and the model holds a supported Hugging Face model inside it, at the path named. Export that model directly, or write a step and pass states. |
 | `step= and reference= need states=` | `step` or `reference` was given without `states`. |
-| `model has no callable recurrent step`, `model has no callable reference` | The named method doesn't exist. |
+| `model has no callable method` | The method `step=` or `reference=` names doesn't exist. |
 | `step returned N tensors, expected 1 + number of states` | The step doesn't return the logits and one new value per state. |
 | `step changes the shape of state` | A new state has a different shape from its initial value. |
 | `the step's logits must flatten to one vocabulary row` | The logits have more than one row, for example a batch of two. |
@@ -210,9 +216,9 @@ after that fails as in the table below and changes nothing, until
 states. `cattorch init` doesn't clear the condition. `cattorch cache length`
 keeps whatever value the stopped block left.
 
-Call the sprite's blocks from one script at a time. What happens when calls
-from several scripts overlap, or a block is stopped part way, is the same for
-every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
+Call the sprite's blocks from one script at a time. What the sprite detects
+when calls overlap, and how to recover, is in
+[overlapping calls](scratch-interface.md#overlapping-calls).
 
 Prefill and decode check `cattorch token ids` before they change anything, and
 a block that fails writes no logits and leaves the states as they were. The
@@ -283,12 +289,12 @@ first three rows use a 256-token vocabulary:
 
 | Export | Time | `.sprite3` | `sprite.json` | Blocks |
 |---|---|---|---|---|
-| One layer, float32 | 3 s | 16 MB | 23 MB | 3,447 |
-| Two layers, float32 | 4 s | 31 MB | 42 MB | 6,129 |
-| Two layers, int8 | 3 s | 8 MB | 13 MB | 4,849 |
-| All 24 layers and the 50,288-token tied embedding, int8 | 35 s | 136 MB | 180 MB | 66,659 |
+| One layer, float32 | 3 s | 16 MB | 23 MB | 3,624 |
+| Two layers, float32 | 4 s | 31 MB | 42 MB | 6,380 |
+| Two layers, int8 | 3 s | 8 MB | 13 MB | 4,983 |
+| All 24 layers and the 50,288-token tied embedding, int8 | 35 s | 136 MB | 180 MB | 67,541 |
 
-The full int8 export peaked at 2.7 GB of memory, the model itself included.
+The full int8 export peaked at about 3 GB of memory, the model itself included.
 Each layer adds about 3.8 million weights, 2 seconds and 15 MB in float32. The
 whole float32 model, about 129 million weights, would be roughly 500 MB and
 was not exported. Either is far beyond what Scratch's
