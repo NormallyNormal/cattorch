@@ -49,13 +49,15 @@ All three options are off by default.
   don't change.
 - `compact_schema=True` leaves redundant fields out of the saved block data.
 - `layer_sharing=True` generates one copy of the code for repeated
-  transformer layers named `blocks.N` and shares it across them. For cached
-  generation, every layer must also have the same cache width. Layers that
-  don't fit keep their own code.
+  transformer layers named `blocks.N` and shares it across them. The layers
+  must be consecutive and compile to the same code with weights of the same
+  shapes, and for cached generation every layer must also have the same
+  cache width. Sharing is all or nothing: if any layer doesn't fit, the whole
+  model is exported without sharing, with a warning.
 
-Schema compaction and layer sharing are newer. After enabling either, run
-`verify` and check that the project imports, edits, runs, and saves in your
-Scratch client.
+Schema compaction and layer sharing are tested less widely than the
+defaults. After enabling either, run `verify` and check that the project
+imports, edits, runs, and saves in your Scratch client.
 
 ## Reproducible exports and multiple sprites
 
