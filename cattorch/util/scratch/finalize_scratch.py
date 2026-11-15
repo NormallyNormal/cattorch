@@ -240,7 +240,6 @@ def finalize_sprite(
     codegen: CodegenConfig | None = None,
     public_data_names: frozenset[str] = frozenset(),
     public_procedures: frozenset[str] = frozenset(),
-    public_interface: bool = True,
     costume_names: Sequence[str] | None = None,
 ) -> FinalizedSprite:
     """
@@ -272,10 +271,9 @@ def finalize_sprite(
     sprite = copy.deepcopy(data)
     _ensure_costume_menu_shadows(sprite)
     sprite = compact_sprite_ids(sprite, namespace=codegen.id_namespace)
-    if public_interface:
-        _mark_internal_names(
-            sprite, public_data_names=public_data_names, public_procedures=public_procedures,
-        )
+    _mark_internal_names(
+        sprite, public_data_names=public_data_names, public_procedures=public_procedures,
+    )
     if codegen.compact_internal_names:
         _compact_internal_display_names(
             sprite,
