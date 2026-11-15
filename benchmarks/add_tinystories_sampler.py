@@ -8,7 +8,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from cattorch.sprite import (
+from cattorch.procedures import (
     _add_warp_procedure,
     _find_procedure_definition,
     _merge_lists_by_name,

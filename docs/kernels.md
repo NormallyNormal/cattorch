@@ -30,6 +30,7 @@ Where things live:
 | `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
 | `cattorch.transpiler` | Turns graph nodes into instruction programs. |
 | `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
+| `cattorch.procedures` | Adds DSL programs to a sprite as custom blocks, and finds and edits them. |
 | `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
 
 A change to an operation should come with:

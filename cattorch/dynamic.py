@@ -374,7 +374,7 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     ``_unit_inputs`` gives it, around the new forward. The sprite is changed
     in place and returned.
     """
-    from cattorch.sprite import _add_warp_procedure, _procedure_mutation
+    from cattorch.procedures import _add_warp_procedure, _procedure_mutation
     from cattorch.util.scratch.dsl import (
         Program, add, append, call, change_var, clear, div, for_each, item, length, mul,
         set_var, var,

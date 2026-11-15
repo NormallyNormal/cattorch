@@ -25,7 +25,7 @@ from cattorch.results import (
     BoundedDimension, GenerationResult, ProgramResult, ProjectResult, TokenizerResult,
     TranspileResult,
 )
-from cattorch.sprite import _add_warp_procedure
+from cattorch.procedures import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive

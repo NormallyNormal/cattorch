@@ -43,7 +43,7 @@ from cattorch.benchmark import (  # noqa: E402
 )
 from cattorch import adapter  # noqa: E402
 from cattorch.experimental import StackedSwiGLUMoE  # noqa: E402
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
+from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name  # noqa: E402
 from cattorch.util.scratch.dsl import Program, append, call, clear  # noqa: E402
 from cattorch.interface import TOKEN_IDS
 

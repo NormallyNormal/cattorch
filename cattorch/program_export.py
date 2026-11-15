@@ -34,9 +34,10 @@ from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.sprite import (
-    _BUSY, _EPOCH, _add_epoch_procedure, _add_warp_procedure, _epoch_current,
-    _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
-    _stop_overtaken_decoding,
+    _BUSY, _EPOCH, _add_epoch_procedure, _epoch_current, _stop_overtaken_decoding,
+)
+from cattorch.procedures import (
+    _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
 )
 from cattorch.util.scratch.block_combiner import _merge_slots
 from cattorch.util.scratch.dsl import (

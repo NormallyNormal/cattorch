@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 
 from cattorch.benchmark import SUITE_RESULTS, _add_broadcast_entry, _stage_target, _write_project
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.scratch.dsl import (
     Program,
     add,

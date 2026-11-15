@@ -26,14 +26,8 @@ from cattorch import interface
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import collect_warnings, with_warnings
 from cattorch.results import TokenizerResult
-from cattorch.sprite import (
-    _EPOCH,
-    _add_epoch_procedure,
-    _add_warp_procedure,
-    _epoch_current,
-    _merge_variables_by_name,
-    _procedure_mutation,
-)
+from cattorch.sprite import _EPOCH, _add_epoch_procedure, _epoch_current
+from cattorch.procedures import _add_warp_procedure, _merge_variables_by_name, _procedure_mutation
 from cattorch.util.scratch.dsl import (
     Expr,
     Program,

@@ -26,7 +26,7 @@ from cattorch.storage import StorageConfig
 from cattorch.quantization import QuantizationConfig
 from cattorch.program import GenerationProgram, RecurrentGenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.transpiler import transpile
 from cattorch.util.scratch.dsl import (
     Program, append, broadcast_and_wait, change_var, clear, join, repeat, reset_timer, set_var,

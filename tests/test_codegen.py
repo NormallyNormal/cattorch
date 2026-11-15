@@ -609,7 +609,7 @@ def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monk
     # remapping every block only if the others are already what remap_ids
     # makes of them: copied (no sub-object shared between blocks) and in
     # normal form.
-    import cattorch.sprite as sprite_module
+    import cattorch.procedures as procedures
     from cattorch import (
         EntryPoint, ExportProgram, GenerationProgram, Input, Output, RecurrentGenerationProgram,
         State, StateInput, StateUpdate,
@@ -617,7 +617,7 @@ def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monk
     from cattorch.util.scratch.remap import _remap_blocks
 
     checked = 0
-    original = sprite_module._merge_slots_by_name
+    original = procedures._merge_slots_by_name
 
     def checked_merge(sprite, section, names, added):
         nonlocal checked
@@ -635,7 +635,7 @@ def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monk
             checked += 1
         original(sprite, section, names, added)
 
-    monkeypatch.setattr(sprite_module, "_merge_slots_by_name", checked_merge)
+    monkeypatch.setattr(procedures, "_merge_slots_by_name", checked_merge)
 
     class Model(torch.nn.Module):
         def __init__(self):

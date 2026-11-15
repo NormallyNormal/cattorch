@@ -20,7 +20,7 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.sprite import _add_warp_procedure
+from cattorch.procedures import _add_warp_procedure
 from cattorch.storage import BASE92_ALPHABET
 from cattorch.util.scratch.dsl import (
     Program,

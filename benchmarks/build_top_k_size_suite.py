@@ -15,12 +15,8 @@ from cattorch.benchmark import (
     _write_project,
 )
 from cattorch.codegen import CodegenConfig
-from cattorch.sprite import (
-    _TOP_K_PROCEDURE,
-    _add_warp_procedure,
-    _build_compact_top_k_program,
-    _build_top_k_program,
-)
+from cattorch.sprite import _TOP_K_PROCEDURE, _build_compact_top_k_program, _build_top_k_program
+from cattorch.procedures import _add_warp_procedure
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
 
 

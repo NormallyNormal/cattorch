@@ -27,7 +27,7 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.util.instruction import optimized_linear
 from cattorch.util.scratch.dsl import Program, append, call, clear
 from cattorch.interface import TOKEN_IDS

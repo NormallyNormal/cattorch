@@ -18,7 +18,7 @@ from cattorch.benchmark import (
     _stage_target,
     _write_project,
 )
-from cattorch.sprite import _add_warp_procedure, _merge_lists_by_name
+from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.templates.template import TEMPLATE_DIR
 from cattorch.util.scratch.dsl import (
     Program,

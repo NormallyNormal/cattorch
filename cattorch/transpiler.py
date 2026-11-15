@@ -63,22 +63,24 @@ from cattorch.sprite import (
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
-    _find_procedure_definition,
     _finish_generation_prepare,
     _gate_chain,
     _guard_generation_init,
     _guard_plain_calls,
     _logical_list_sizes,
     _merge_duplicate_lists,
-    _remove_canvas_calls,
     _graph_layer,
-    _merge_lists_by_name,
-    _merge_variables_by_name,
     _remove_unused,
     _share_repeated_transformer_layers,
     _static_storage_shard_limits,
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
+)
+from cattorch.procedures import (
+    _find_procedure_definition,
+    _remove_canvas_calls,
+    _merge_lists_by_name,
+    _merge_variables_by_name,
 )
 from cattorch import interface
 from cattorch.interface import (

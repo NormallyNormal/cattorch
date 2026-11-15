@@ -740,7 +740,7 @@ def test_public_names_reject_unknown_and_colliding_names(tmp_path):
 @pytest.mark.parametrize("compact", [False, True])
 def test_edit_program_callback_adds_a_procedure(tmp_path, compact, small_list_limit):
     from cattorch.program_export import ProgramAssembly, transpile_program
-    from cattorch.sprite import _add_warp_procedure
+    from cattorch.procedures import _add_warp_procedure
     from cattorch.util.scratch.dsl import Program, append, call, clear, item, repeat
 
     limit = small_list_limit(100)

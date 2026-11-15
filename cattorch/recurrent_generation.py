@@ -41,9 +41,9 @@ from cattorch.program_runtime import MethodModule
 from cattorch.quantization import QuantizationConfig
 from cattorch.results import GenerationResult, generation_result
 from cattorch.sprite import (
-    _add_generation_blocks, _add_warp_procedure, _finish_generation_prepare,
-    _guard_generation_init, _remove_completion_broadcast,
+    _add_generation_blocks, _finish_generation_prepare, _guard_generation_init,
 )
+from cattorch.procedures import _add_warp_procedure, _remove_completion_broadcast
 from cattorch.storage import StorageConfig
 from cattorch.util.scratch.dsl import Program, call, eq, if_, set_var, var
 from cattorch.util.scratch.interface import rename_list, rename_procedure, rename_variable

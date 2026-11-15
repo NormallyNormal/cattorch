@@ -155,7 +155,7 @@ def test_item_number_of_uses_scratch_comparison():
 
 
 def test_procedure_arguments_are_local_to_each_call():
-    from cattorch.sprite import _add_warp_procedure
+    from cattorch.procedures import _add_warp_procedure
     from cattorch.util.scratch.dsl import Program, add, append, argument, call, gt, if_
     from cattorch.util.scratch.finalize_scratch import _compact_internal_display_names
 
@@ -183,7 +183,7 @@ def test_procedure_arguments_are_local_to_each_call():
 
 
 def test_stop_this_script_returns_from_the_procedure_running_it():
-    from cattorch.sprite import _add_warp_procedure
+    from cattorch.procedures import _add_warp_procedure
     from cattorch.util.scratch.dsl import Program, append, call, eq, if_
 
     sprite = {"blocks": {}, "variables": {}, "lists": {}, "broadcasts": {}}
