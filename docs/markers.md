@@ -85,7 +85,7 @@ interface from the markers. Each entry point becomes a block named
 
 `marked_program(model)` returns a `MarkedProgram`: the export copy of the
 model and the
-[`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state) the markers
+[`ExportProgram`](programs-and-moe.md#named-entry-points-and-state) the markers
 describe, if you want to inspect or extend them. `model, program =
 marked_program(model)` unpacks it.
 

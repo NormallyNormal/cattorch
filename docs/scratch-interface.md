@@ -191,7 +191,7 @@ initial state, `cattorch cache length` counts the tokens read since then, and
 
 ## Program sprites
 
-A sprite from an [`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state)
+A sprite from an [`ExportProgram`](programs-and-moe.md#named-entry-points-and-state)
 or [`@entrypoint` markers](markers.md) has a block per entry point, named
 after it:
 

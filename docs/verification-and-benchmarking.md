@@ -66,7 +66,7 @@ wrapped in a tuple, list, or dictionary.
 
 `verify` works for every kind of export. For a program, `calls` runs a
 sequence of `ProgramCall`s with state carried between them (see
-[program verification](programs-and-moe.md#named-entrypoints-and-state)). For
+[program verification](programs-and-moe.md#named-entry-points-and-state)). For
 a `GenerationProgram` or `RecurrentGenerationProgram`, `calls` names the
 blocks `"prefill"`, `"decode"` and `"reset"`; each call's logits and top-k
 lists are compared with the model's, and its `cattorch status` with the one

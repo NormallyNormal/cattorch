@@ -67,7 +67,7 @@ def validate_entry_outputs(program, entrypoint, specs):
     """Validate the same return bindings in analysis and sprite assembly."""
     if len(specs) != len(entrypoint.returns):
         raise UnsupportedModelError(
-            f"entrypoint {entrypoint.name!r} returns {len(specs)} tensor leaves "
+            f"entry point {entrypoint.name!r} returns {len(specs)} tensor leaves "
             f"but declares {len(entrypoint.returns)} bindings"
         )
     states = {state.name: state for state in program.states}
@@ -81,7 +81,7 @@ def validate_entry_outputs(program, entrypoint, specs):
             # An input and output with one name share a Scratch list, which
             # only works as an in-place update of the same shape.
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} output {binding.name!r} has shape "
+                f"entry point {entrypoint.name!r} output {binding.name!r} has shape "
                 f"{tuple(spec.shape)} but shares its list with an input of shape "
                 f"{tuple(shared_input.example.shape)}; give the output another name"
             )
@@ -90,14 +90,14 @@ def validate_entry_outputs(program, entrypoint, specs):
         state = states[binding.name]
         if state.mode == "replace" and tuple(spec.shape) != tuple(state.initial.shape):
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} returns shape {spec.shape} for "
+                f"entry point {entrypoint.name!r} returns shape {spec.shape} for "
                 f"replace state {state.name!r}, expected {tuple(state.initial.shape)}"
             )
         if state.mode == "append" and (
             not spec.shape or tuple(spec.shape[1:]) != tuple(state.initial.shape[1:])
         ):
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} append update for {state.name!r} "
+                f"entry point {entrypoint.name!r} append update for {state.name!r} "
                 "must preserve the state's leading axis and trailing dimensions"
             )
 
@@ -121,11 +121,11 @@ class ProgramReplay:
     def entry(self, invocation):
         entry = self.entries.get(invocation.entrypoint)
         if entry is None:
-            raise ValueError(f"unknown entrypoint {invocation.entrypoint!r}")
+            raise ValueError(f"unknown entry point {invocation.entrypoint!r}")
         expected = sum(isinstance(value, Input) for value in entry.arguments)
         if len(invocation.inputs) != expected:
             raise ValueError(
-                f"entrypoint {entry.name!r} expects {expected} public inputs, "
+                f"entry point {entry.name!r} expects {expected} public inputs, "
                 f"got {len(invocation.inputs)}"
             )
         return entry
@@ -161,7 +161,7 @@ class ProgramReplay:
             returned = getattr(self.model, entry.method)(*args)
         leaves, _ = tree_flatten(returned)
         if any(not isinstance(value, torch.Tensor) for value in leaves):
-            raise UnsupportedModelError(f"entrypoint {entry.name!r} must return only tensor leaves")
+            raise UnsupportedModelError(f"entry point {entry.name!r} must return only tensor leaves")
         validate_entry_outputs(self.program, entry, leaves)
         pending = {}
         for binding, value in zip(entry.returns, leaves):

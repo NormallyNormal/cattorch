@@ -476,7 +476,7 @@ Scratch:
   operations.
 - `verify(quantization=...)` for programs now uses the same float16 rules as
   export, including for MoE bias banks.
-- An entrypoint input and output that share a name must now have the same
+- An entry point input and output that share a name must now have the same
   shape.
 - `verify` now matches Scratch for `ln`, `log`, `sqrt`, `floor`, and `ceiling`
   of out-of-range values, for `mod` by zero, for fractional repeat counts, and

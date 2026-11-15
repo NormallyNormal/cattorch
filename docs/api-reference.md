@@ -115,7 +115,7 @@ The classes markers compile to can also be used directly:
 
 | Name | Use |
 |---|---|
-| `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entrypoints-and-state). |
+| `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entry-points-and-state). |
 | `ProgramCall` | One block call: in `verify(..., calls=...)`, and in an `ExportProgram`'s `calibration=`. |
 | `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path` and the program's `state_names`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
 
@@ -400,7 +400,7 @@ A shape with a runtime extent contains one `BoundedDimension` in its place.
 
 The `name`, `minimum`, and `maximum` (both inclusive) of a dimension whose
 length can change at runtime. See
-[programs](programs-and-moe.md#named-entrypoints-and-state).
+[programs](programs-and-moe.md#named-entry-points-and-state).
 
 ### `ArtifactResult`
 

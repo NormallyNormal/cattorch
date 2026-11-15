@@ -169,12 +169,12 @@ class EntryPoint:
     returns: tuple[ReturnBinding, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _name(self.name, "entrypoint name"))
+        object.__setattr__(self, "name", _name(self.name, "entry point name"))
         if self.name in {"init", "reset", "prepare for save"}:
-            raise ValueError(f"entrypoint name {self.name!r} is reserved for lifecycle procedures")
+            raise ValueError(f"entry point name {self.name!r} is reserved for lifecycle procedures")
         if re.search(r"%[snb]", self.name):
-            raise ValueError("entrypoint names can't contain Scratch argument placeholders")
-        object.__setattr__(self, "method", _name(self.method, "entrypoint method"))
+            raise ValueError("entry point names can't contain Scratch argument placeholders")
+        object.__setattr__(self, "method", _name(self.method, "entry point method"))
         object.__setattr__(self, "arguments", tuple(self.arguments))
         object.__setattr__(self, "returns", tuple(self.returns))
         if not self.returns:
@@ -183,18 +183,18 @@ class EntryPoint:
                 "Output or a StateUpdate"
             )
         if any(not isinstance(value, (Input, StateInput)) for value in self.arguments):
-            raise TypeError("entrypoint arguments must be Input or StateInput values")
+            raise TypeError("entry point arguments must be Input or StateInput values")
         if any(not isinstance(value, (Output, StateUpdate)) for value in self.returns):
-            raise TypeError("entrypoint returns must be Output or StateUpdate values")
+            raise TypeError("entry point returns must be Output or StateUpdate values")
         input_names = [value.name for value in self.arguments if isinstance(value, Input)]
         output_names = [value.name for value in self.returns if isinstance(value, Output)]
         if len(input_names) != len(set(input_names)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate input names")
+            raise ValueError(f"entry point {self.name!r} has duplicate input names")
         if len(output_names) != len(set(output_names)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate output names")
+            raise ValueError(f"entry point {self.name!r} has duplicate output names")
         updates = [value.name for value in self.returns if isinstance(value, StateUpdate)]
         if len(updates) != len(set(updates)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate state updates")
+            raise ValueError(f"entry point {self.name!r} has duplicate state updates")
 
 
 @dataclass(frozen=True)
@@ -208,7 +208,7 @@ class ExportProgram:
         object.__setattr__(self, "entrypoints", tuple(self.entrypoints))
         object.__setattr__(self, "states", tuple(self.states))
         if not self.entrypoints:
-            raise ValueError("ExportProgram requires at least one entrypoint")
+            raise ValueError("ExportProgram requires at least one entry point")
         if any(not isinstance(value, EntryPoint) for value in self.entrypoints):
             raise TypeError("ExportProgram.entrypoints must contain EntryPoint values")
         if any(not isinstance(value, State) for value in self.states):
@@ -216,7 +216,7 @@ class ExportProgram:
         entry_names = [value.name for value in self.entrypoints]
         state_names = [value.name for value in self.states]
         if len(entry_names) != len(set(entry_names)):
-            raise ValueError("entrypoint names must be unique")
+            raise ValueError("entry point names must be unique")
         if len(state_names) != len(set(state_names)):
             raise ValueError("state names must be unique")
         states = {value.name: value for value in self.states}
@@ -236,7 +236,7 @@ class ExportProgram:
             for argument in entrypoint.arguments:
                 if isinstance(argument, StateInput) and argument.name not in states:
                     raise ValueError(
-                        f"entrypoint {entrypoint.name!r} references unknown state "
+                        f"entry point {entrypoint.name!r} references unknown state "
                         f"{argument.name!r}"
                     )
             for returned in entrypoint.returns:
@@ -245,7 +245,7 @@ class ExportProgram:
                 state = states.get(returned.name)
                 if state is None:
                     raise ValueError(
-                        f"entrypoint {entrypoint.name!r} updates unknown state "
+                        f"entry point {entrypoint.name!r} updates unknown state "
                         f"{returned.name!r}"
                     )
                 if returned.mode is not None and returned.mode != state.mode:
@@ -375,7 +375,7 @@ class ProgramCall:
     inputs: tuple[torch.Tensor, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "entrypoint", _name(self.entrypoint, "call entrypoint"))
+        object.__setattr__(self, "entrypoint", _name(self.entrypoint, "call entry point"))
         object.__setattr__(self, "inputs", tuple(self.inputs))
         if any(not isinstance(value, torch.Tensor) for value in self.inputs):
             raise TypeError("ProgramCall.inputs must contain only tensors")

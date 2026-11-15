@@ -8,7 +8,7 @@ Parameters, buffers, and constants are stored in the sprite, and tensor
 arguments become Scratch input lists.
 
 For persistent state, use [`@entrypoint` markers](markers.md) or an
-[`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state).
+[`ExportProgram`](programs-and-moe.md#named-entry-points-and-state).
 
 ## Operations
 
@@ -60,7 +60,7 @@ SDPA support. Your model and its config aren't modified, and an explicit
 `use_cache=` in `example_kwargs` still wins.
 
 This exports a stateless forward pass over the example's sequence length. It
-doesn't add a KV cache. For cached generation, pass the same unwrapped model to
+doesn't add a K/V cache. For cached generation, pass the same unwrapped model to
 a [`GenerationProgram`](generation.md):
 
 ```python

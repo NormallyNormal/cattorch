@@ -742,7 +742,7 @@ def transpile_program(
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
             raise ValueError(
                 f"model has no callable method {entrypoint.method!r} for "
-                f"entrypoint {entrypoint.name!r}"
+                f"entry point {entrypoint.name!r}"
             )
         args, dynamic_inputs = entry_examples(program, entrypoint)
         wrapper = MethodModule(prepared_model, entrypoint.method)
@@ -791,7 +791,7 @@ def transpile_program(
             )
         if len(sub_result.inputs) != len(entrypoint.arguments):
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
+                f"entry point {entrypoint.name!r} captured an unexpected argument count"
             )
         validate_entry_outputs(program, entrypoint, sub_result.outputs)
         sprite = sub_result.sprite

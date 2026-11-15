@@ -21,7 +21,7 @@
   [how every block behaves](scratch-interface.md#how-every-block-behaves).
 - **Entry point**: a model method exported as its own block,
   `cattorch ENTRY`, in a program. See
-  [programs](programs-and-moe.md#named-entrypoints-and-state).
+  [programs](programs-and-moe.md#named-entry-points-and-state).
 - **Exact mode**: the default kernel mode, which matches PyTorch's results
   up to Scratch's floating-point behavior. Lossy storage or `sig_figs` can
   still change the output. See [optimization modes](optimization.md).
@@ -44,7 +44,7 @@
   [the output head](storage.md#the-output-head-of-a-language-model).
 - **Interface version**: the `cattorch interface version` variable, `1` for
   cattorch 1.x sprites. See the [Scratch interface](scratch-interface.md).
-- **KV cache**: attention keys and values saved from earlier tokens, so
+- **K/V cache**: attention keys and values saved from earlier tokens, so
   generation doesn't recompute the whole sequence for each new token. See
   [KV-cached generation](generation.md).
 - **One-token step**: a model method that reads one token and the recurrent
@@ -63,7 +63,7 @@
   lists, and dictionaries. cattorch uses it to number output lists. See
   [inputs and outputs](supported-models.md#inputs-and-outputs).
 - **Recurrent state**: values a recurrent model, such as a GRU, Mamba, or
-  RWKV, carries from one token to the next. Unlike a KV cache, it doesn't
+  RWKV, carries from one token to the next. Unlike a K/V cache, it doesn't
   grow with the number of tokens. See
   [states](recurrent-generation.md#states).
 - **Runtime extent**: the one dimension of a tensor whose length can change

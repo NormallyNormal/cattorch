@@ -15,7 +15,7 @@ model: `@entrypoint` methods and the buffers they update instead of
 `ExportProgram`, and `@moe` instead of rebuilding a block with `ExpertFamily`
 and `SparseMoE`. The classes here remain for code you can't decorate.
 
-## Named entrypoints and state
+## Named entry points and state
 
 Import the interface types from `cattorch`:
 
