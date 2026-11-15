@@ -47,6 +47,7 @@ connecting it to the rest of a project.
 - [Stability](stability.md): what cattorch 1.x keeps compatible, and what's
   experimental.
 - [Glossary](glossary.md): cattorch and Scratch terms used in these guides.
+- [Migrating to 1.0](migrating-to-1.0.md): update 0.5 code and Scratch projects for 1.0.
 
 ## Contribute
 
