@@ -72,9 +72,10 @@ transpile(model, example, "model_fast", optimization="fast", fast_config=config)
 the matrix's full rank. A matrix is only factored if the two smaller matrices
 need fewer multiplications than the original.
 
-`pruning` removes the smallest-magnitude weights in whole groups so the
-generated loops can skip them: groups of four input weights in linear layers,
-and whole input-channel kernels in convolutions. `neuron_pruning` removes
+`block_pruning` removes the smallest-magnitude weights in whole groups so the
+generated loops can skip them: groups of four input weights in linear layers
+and `x @ weight` products, and whole input-channel kernels in ungrouped 1D and
+2D convolutions. `neuron_pruning` removes
 entire hidden units, but only where cattorch can confirm a
 `Linear -> activation -> Linear` path, and hidden channels in
 `StackedSwiGLUMoE` experts.
