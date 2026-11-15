@@ -47,6 +47,33 @@ def read_archive(path: str | Path, document: str = SPRITE_JSON) -> tuple[dict, d
     return data, assets
 
 
+def read_user_archive(path, document: str, *, parameter: str) -> dict:
+    """``read_json`` of a file the user named, explaining a file of the wrong kind.
+
+    A missing file, a file that isn't a Scratch archive, and an archive of
+    the other kind (a project for a sprite, or the reverse) raise
+    ``ValueError`` naming ``parameter``.
+    """
+    kinds = {SPRITE_JSON: "sprite (.sprite3)", PROJECT_JSON: "project (.sb3)"}
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"{parameter}: no such file: {str(path)!r}")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if document not in names:
+                other = next((name for name in kinds if name in names), None)
+                found = f"a Scratch {kinds[other]}" if other else "not a Scratch file"
+                raise ValueError(
+                    f"{parameter} {str(path)!r} is {found}, not a Scratch {kinds[document]}"
+                )
+            return json.loads(archive.read(document))
+    except (zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError(
+            f"{parameter} {str(path)!r} is not a Scratch {kinds[document]}"
+        ) from None
+
+
 def read_json(path: str | Path, document: str = SPRITE_JSON) -> dict:
     """Only the archive's JSON document."""
     with zipfile.ZipFile(path) as archive:

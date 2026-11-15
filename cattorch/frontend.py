@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextvars import ContextVar
+import dataclasses
 from dataclasses import dataclass
 from threading import RLock
 from typing import Callable
@@ -61,6 +62,42 @@ def flat_example_inputs(example_inputs, example_kwargs=None) -> tuple[torch.Tens
     ))
 
 
+def _holds_tensors(item, depth: int = 0) -> bool:
+    """Whether an object the output traversal doesn't enter holds tensors."""
+    if isinstance(item, torch.Tensor):
+        return True
+    if depth > 8:
+        return False
+    if isinstance(item, Mapping):
+        children = list(item.values())
+    elif isinstance(item, (tuple, list)):
+        children = list(item)
+    elif dataclasses.is_dataclass(item) and not isinstance(item, type):
+        children = [getattr(item, field.name, None) for field in dataclasses.fields(item)]
+    else:
+        return False
+    return any(_holds_tensors(child, depth + 1) for child in children)
+
+
+def reject_tensor_containers(leaves) -> None:
+    """Raise for an output leaf that holds tensors in a container cattorch doesn't enter.
+
+    Model outputs are read from tensors, tuples, lists, dicts and Hugging
+    Face ``ModelOutput``s; other leaves are dropped. A leaf holding tensors,
+    such as a dataclass of tensors, would lose them, so it is an error.
+    ``leaves`` are the dropped leaves, as ``(path, item)``.
+    """
+    holding = [
+        f"{path} ({type(item).__name__})" for path, item in leaves if _holds_tensors(item)
+    ]
+    if holding:
+        raise UnsupportedModelError(
+            "the model returns tensors inside " + ", ".join(holding) + ", which cattorch "
+            "doesn't read outputs from; return a tensor, or a tuple, list, dict or "
+            "NamedTuple of tensors (a Hugging Face ModelOutput works too)"
+        )
+
+
 def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
     """Return the tensor leaves of a model output, in traversal order.
 
@@ -83,8 +120,11 @@ def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
                 visit(child, f"{path}[{index}]")
         else:
             dropped.append((path, type(item).__name__))
+            dropped_items.append((path, item))
 
+    dropped_items: list[tuple[str, object]] = []
     visit(value, "output")
+    reject_tensor_containers(dropped_items)
     if not leaves:
         raise UnsupportedModelError("cattorch requires at least one tensor output")
     if warn and dropped:
@@ -981,14 +1021,9 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
         raised = _eager_failure(model, example_inputs, example_kwargs)
         if raised is not None:
             # Not a tracing problem: the model fails on these inputs.
-            shapes = ", ".join(
-                str(tuple(value.shape)) for value in flat_example_inputs(example_inputs, example_kwargs)
-            )
-            raise UnsupportedModelError(
-                f"the model raised {type(raised).__name__} when called with inputs of shape "
-                f"{shapes}: {_first_line(raised)}; check that example_inputs match what "
-                "the model takes"
-            ) from exc
+            raise UnsupportedModelError(model_failure(
+                "the model", raised, flat_example_inputs(example_inputs, example_kwargs),
+            )) from exc
         if "aten.item.default" in str(exc) or "_local_scalar_dense" in str(exc):
             raise UnsupportedModelError(
                 "PyTorch couldn't trace this model: it converts a tensor to a Python "
@@ -1054,6 +1089,16 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
     )
     _check_input_count(captured, example_inputs, example_kwargs)
     return captured
+
+
+def model_failure(caller: str, raised: BaseException, inputs) -> str:
+    """The message for user code (``caller``) that raised ``raised`` on ``inputs``."""
+    shapes = ", ".join(str(tuple(value.shape)) for value in inputs)
+    return (
+        f"{caller} raised {type(raised).__name__} when called with inputs of shape "
+        f"{shapes}: {_first_line(raised)}; check that example_inputs match what "
+        "it takes"
+    )
 
 
 def _first_line(error: BaseException) -> str:

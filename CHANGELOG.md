@@ -384,6 +384,19 @@ Python:
   error.
 - The emulator behind `verify` kept NaN through arithmetic, where Scratch
   reads it as 0, and read numbers from text differently from Scratch.
+- Mistakes that ended in an internal exception raise one naming the
+  problem: a `model` that isn't a module or `example_inputs` that are a dict
+  or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a
+  `verify` sprite path given without `.sprite3` (now read, as `transpile`
+  named it) or that names a project, `analyze_benchmark` on a file that
+  isn't a benchmark project (`ValueError`), and a benchmark case whose
+  `example_inputs` aren't tensors (`TypeError`, before anything is
+  exported). A model that raises in `verify` or within its `dynamic=`
+  bounds raises `UnsupportedModelError` with the inputs' shapes, as
+  `transpile` does.
+- A model returning tensors inside a dataclass failed with "requires at
+  least one tensor output", or lost them with a warning; the error now names
+  the container and the supported ones.
 - An `output_path` that names no file (empty, ending in a separator, or an
   existing directory) raises `ValueError` instead of writing a hidden
   `..sprite3` or a file beside the directory, and so does such a `-o`. The

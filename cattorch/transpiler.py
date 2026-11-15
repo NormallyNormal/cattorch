@@ -13,7 +13,7 @@ import torch
 
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError, collect_warnings, warn, with_warnings
-from cattorch.export_options import validate_export_options
+from cattorch.export_options import validate_export_options, validate_model_and_inputs
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.frontend import flat_example_inputs, keep_operations, tensor_output_leaves
 from cattorch.graph import (
@@ -2122,6 +2122,7 @@ def transpile(
     behavior. Every warning is also emitted as a ``CattorchWarning``. See
     ``docs/api-reference.md`` and ``docs/supported-models.md``.
     """
+    validate_model_and_inputs(model, example_inputs)
     validate_export_options(
         name=name,
         optimization=optimization,

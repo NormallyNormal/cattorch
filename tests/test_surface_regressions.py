@@ -1,6 +1,7 @@
 """Regressions from a bug hunt of the user-facing surface: warnings, arguments, paths."""
 
 import ast
+import dataclasses
 import warnings
 from pathlib import Path
 
@@ -162,3 +163,201 @@ def test_every_writer_shares_the_output_path_rule(tmp_path):
         with pytest.raises(ValueError, match="doesn't name a file"):
             writer(f"{tmp_path}/")
     assert output_file("x", ".sb3", parameter="-o") == Path("x.sb3")
+
+
+class _Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 3)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+@pytest.mark.parametrize("model", [None, lambda x: x, "model"])
+def test_transpile_rejects_a_model_that_is_not_a_module(tmp_path, model):
+    with pytest.raises(TypeError, match="model must be a torch.nn.Module"):
+        transpile(model, torch.randn(1, 4), tmp_path / "m")
+
+
+@pytest.mark.parametrize(("inputs", "expected"), [
+    ({"x": torch.randn(1, 4)}, "can't be a dict.*example_kwargs"),
+    (1.0, "must be a tensor or a tuple of tensors.*not float"),
+    ("x", "not str"),
+])
+def test_transpile_rejects_example_inputs_of_the_wrong_kind(tmp_path, inputs, expected):
+    with pytest.raises(TypeError, match=expected):
+        transpile(_Net().eval(), inputs, tmp_path / "m")
+
+
+class _EntryWrongExample(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("total", torch.zeros(3))
+
+    @entrypoint(example_inputs=(torch.zeros(4),))
+    def add(self, value):
+        self.total = self.total + value
+        return self.total
+
+
+def test_an_entry_point_failing_on_its_example_is_a_model_error(tmp_path):
+    with pytest.raises(cattorch.UnsupportedModelError, match=(
+        r"@entrypoint add raised RuntimeError when called with inputs of shape \(4,\)"
+    )):
+        transpile(_EntryWrongExample().eval(), None, tmp_path / "m")
+
+
+class _Broadcasting(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 3)
+
+    def forward(self, x, y):
+        return self.fc(x) * y
+
+
+def test_a_model_failing_within_its_dynamic_bounds_is_a_model_error(tmp_path):
+    with pytest.raises(cattorch.UnsupportedModelError, match="with 2 items along the dynamic"):
+        transpile(
+            _Broadcasting().eval(), (torch.randn(5, 4), torch.randn(5, 3)), tmp_path / "m",
+            dynamic={0: (1, 8)},
+        )
+
+
+def test_verify_checks_its_tolerances_and_reads_the_sprite_as_transpile_named_it(
+    tmp_path, monkeypatch,
+):
+    from cattorch import build_project, verify
+
+    monkeypatch.chdir(tmp_path)
+    model, x = _Net().eval(), torch.randn(1, 4)
+    result = transpile(model, x, "model")
+    assert verify(model, x, "model").passed
+    assert verify(model, x, tmp_path / "model.sprite3").passed
+    for value, error in ((float("nan"), ValueError), (-1, ValueError), ("1", TypeError),
+                         (True, TypeError)):
+        with pytest.raises(error, match="atol"):
+            verify(model, x, result, atol=value)
+        with pytest.raises(error, match="rtol"):
+            verify(model, x, result, rtol=value)
+    project = build_project(result, "project")
+    with pytest.raises(ValueError, match="is a Scratch project \\(\\.sb3\\), not a Scratch sprite"):
+        verify(model, x, project.path)
+    with pytest.raises(ValueError, match="no such file"):
+        verify(model, x, "missing")
+    (tmp_path / "notes.txt").write_text("hello")
+    with pytest.raises(ValueError, match="is not a Scratch sprite"):
+        verify(model, x, "notes.txt")
+    with pytest.raises(TypeError, match="not a ProjectResult"):
+        verify(model, x, project)
+    with pytest.raises(TypeError, match="model must be a torch.nn.Module"):
+        verify(None, x, result)
+    # A model that fails on the inputs is the model's error, as in transpile.
+    with pytest.raises(cattorch.UnsupportedModelError, match="the model raised RuntimeError"):
+        verify(model, torch.randn(1, 5), result)
+
+
+def test_analyze_benchmark_explains_files_that_are_not_benchmark_projects(tmp_path):
+    from cattorch import analyze_benchmark, build_project
+
+    result = transpile(_Net().eval(), torch.randn(1, 4), tmp_path / "model")
+    project = build_project(result, tmp_path / "project")
+    (tmp_path / "notes.txt").write_text("hello")
+    for path, expected in (
+        (result.path, "is a Scratch sprite \\(\\.sprite3\\), not a Scratch project"),
+        (tmp_path / "notes.txt", "is not a Scratch project"),
+        (tmp_path / "missing.sb3", "no such file"),
+        (project.path, "is not a cattorch benchmark project"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            analyze_benchmark(path)
+
+
+def test_benchmark_builders_check_example_inputs_before_exporting(tmp_path):
+    from cattorch import (
+        GenerationProgram, build_benchmark_suite, build_paired_benchmark,
+        build_storage_benchmark_suite,
+    )
+
+    model = _Net().eval()
+    for inputs in (None, GenerationProgram(8), {"x": torch.randn(1, 4)}, ()):
+        with pytest.raises(TypeError, match="example_inputs (must|can.t) be"):
+            build_paired_benchmark(model, inputs, tmp_path / "b")
+    with pytest.raises(TypeError, match="model must be a torch.nn.Module"):
+        build_paired_benchmark(None, torch.randn(1, 4), tmp_path / "b")
+    for builder in (build_benchmark_suite, build_storage_benchmark_suite):
+        with pytest.raises(TypeError, match="case 'net': example_inputs must be"):
+            builder([("net", model, None)], tmp_path / "b")
+    assert not list(tmp_path.iterdir())
+
+
+@dataclasses.dataclass
+class _Pair:
+    logits: torch.Tensor
+    hidden: torch.Tensor
+
+
+@dataclasses.dataclass
+class _Note:
+    text: str
+
+
+class _DataclassOutput(nn.Module):
+    def __init__(self, holder):
+        super().__init__()
+        self.fc = nn.Linear(4, 3)
+        self.holder = holder
+
+    def forward(self, x):
+        y = self.fc(x)
+        return (y, _Note("meta")) if self.holder is _Note else self.holder(y, y * 2)
+
+
+def test_tensors_in_an_unsupported_container_are_named(tmp_path):
+    with pytest.raises(cattorch.UnsupportedModelError, match=r"inside output \(_Pair\)"):
+        transpile(_DataclassOutput(_Pair).eval(), torch.randn(1, 4), tmp_path / "m")
+    # A container without tensors is dropped with the usual warning.
+    with pytest.warns(CattorchWarning, match=r"output\[1\] \(_Note\)"):
+        result = transpile(_DataclassOutput(_Note).eval(), torch.randn(1, 4), tmp_path / "n")
+    assert len(result.outputs) == 1
+
+
+class _EntryDataclass(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 3)
+
+    @entrypoint(example_inputs=(torch.randn(1, 4),))
+    def run(self, x):
+        y = self.fc(x)
+        return _Pair(y, y)
+
+
+def test_an_entry_point_returning_tensors_in_a_dataclass_is_rejected(tmp_path):
+    with pytest.raises(cattorch.UnsupportedModelError, match=r"@entrypoint run's result \(_Pair\)"):
+        transpile(_EntryDataclass().eval(), None, tmp_path / "m")
+
+
+@pytest.mark.parametrize(("options", "error", "expected"), [
+    ({"capacity": [4]}, TypeError, "capacity must be a dict"),
+    ({"capacity": {"history": 0}}, ValueError, "positive integer"),
+    ({"capacity": {"history": True}}, ValueError, "positive integer"),
+    ({"dynamic": [(1, 4)]}, TypeError, "dynamic must be a dict"),
+    ({"input_names": "rows"}, TypeError, "input_names must be a tuple of strings"),
+    ({"output_names": ("a", 1)}, TypeError, "output_names must be a tuple of strings"),
+    ({"name": ""}, ValueError, "name must be a non-empty string"),
+    ({"name": "two\nlines"}, ValueError, "control characters"),
+])
+def test_entrypoint_options_are_checked_when_declared(options, error, expected):
+    with pytest.raises(error, match=expected):
+        entrypoint(**options)
+
+
+def test_interface_names_reject_control_characters():
+    from cattorch import EntryPoint, Output
+
+    with pytest.raises(ValueError, match="control characters"):
+        EntryPoint("a\tb", returns=(Output("y"),))
+    with pytest.raises(ValueError, match="control characters"):
+        Output("y\nz")

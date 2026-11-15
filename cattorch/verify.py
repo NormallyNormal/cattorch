@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,8 +15,8 @@ import torch
 
 from cattorch.errors import UnsupportedModelError
 from cattorch.adapters import ModuleAdapter
-from cattorch.export_options import validate_export_options
-from cattorch.frontend import flat_example_inputs, tensor_output_leaves
+from cattorch.export_options import validate_export_options, validate_model_and_inputs
+from cattorch.frontend import flat_example_inputs, model_failure, tensor_output_leaves
 from cattorch.huggingface import prepare_huggingface_models
 from cattorch.operator_registry import default_registry, eval_mode_copy_warning
 from cattorch.quantization import (
@@ -31,7 +32,8 @@ from cattorch.results import (
     GenerationResult, ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult,
     TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
-from cattorch.util.scratch.archive import read_json
+from cattorch.util.paths import output_file
+from cattorch.util.scratch.archive import SPRITE_JSON, read_json, read_user_archive
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list, write_logical_list
 from cattorch.interface import FORWARD, OK, STATUS_VARIABLE, input_name, output_name
@@ -240,13 +242,7 @@ def _verify_program(
     atol: float,
     rtol: float,
 ) -> ProgramVerifyResult:
-    if isinstance(sprite, (TranspileResult, GenerationResult)):
-        raise TypeError(
-            f"an ExportProgram's sprite is a ProgramResult or a path, not a "
-            f"{type(sprite).__name__}"
-        )
-    path = sprite.path if isinstance(sprite, ProgramResult) else Path(sprite)
-    emulator = ScratchEmulator(read_json(path))
+    emulator = ScratchEmulator(_sprite_json(sprite, ProgramResult, "an ExportProgram's"))
     registry = default_registry().for_export(adapters=adapters)
     owned = _program_reference(
         model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
@@ -438,13 +434,8 @@ def _verify_generation(
     """Run generation block calls in the emulator and compare each with PyTorch."""
     from cattorch import interface
 
-    if isinstance(sprite, (TranspileResult, ProgramResult)):
-        raise TypeError(
-            f"a generation sprite is a GenerationResult or a path, not a "
-            f"{type(sprite).__name__}"
-        )
+    project = _sprite_json(sprite, GenerationResult, "a generation")
     path = sprite.path if isinstance(sprite, GenerationResult) else Path(sprite)
-    project = read_json(path)
     emulator = ScratchEmulator(project)
     names = {entry[0] for entry in project.get("lists", {}).values()}
     if interface.LOGITS not in names:
@@ -618,17 +609,11 @@ def _verify_tensors(
     atol: float,
     rtol: float,
 ) -> VerifyResult | MultiOutputVerifyResult:
-    if isinstance(sprite, (ProgramResult, GenerationResult)):
-        raise TypeError(
-            f"a sprite from tensor inputs is a TranspileResult or a path, not a "
-            f"{type(sprite).__name__}"
-        )
+    project = _sprite_json(sprite, TranspileResult, "a tensor-input export's")
     inputs = _normalise_inputs(example_inputs)
     if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs):
         raise TypeError("example_inputs must be a tensor or tuple of tensors")
 
-    path = sprite.path if isinstance(sprite, TranspileResult) else Path(sprite)
-    project = read_json(path)
     emulator = ScratchEmulator(project)
     for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
         name = input_name(index)
@@ -639,8 +624,13 @@ def _verify_tensors(
         model, inputs, example_kwargs, adapters=adapters, quantization=quantization,
         storage=storage, sig_figs=sig_figs,
     )
-    with torch.no_grad():
-        expected = reference(*inputs, **(example_kwargs or {}))
+    try:
+        with torch.no_grad():
+            expected = reference(*inputs, **(example_kwargs or {}))
+    except Exception as raised:  # noqa: BLE001 - the model failed; reported as such
+        raise UnsupportedModelError(
+            model_failure("the model", raised, flat_example_inputs(inputs, example_kwargs)),
+        ) from raised
     leaves = tensor_output_leaves(expected, warn=False)
     output_names = tuple(output_name(index) for index in range(len(leaves)))
     actual_names = {
@@ -669,6 +659,27 @@ def _verify_tensors(
 
 
 Sprite = str | Path | TranspileResult | ProgramResult | GenerationResult
+
+
+def _sprite_json(sprite, result_type, kind: str) -> dict:
+    """The sprite ``verify`` was given: an export's result, or its path.
+
+    A path is read as ``transpile`` names its file, adding ``.sprite3``
+    unless it ends in it, so the ``output_path`` given to ``transpile``
+    works too. A file at the path exactly as given is read when that one
+    doesn't exist, so a renamed sprite, or a project passed by mistake, is
+    read and explained.
+    """
+    if isinstance(sprite, result_type):
+        return read_json(sprite.path)
+    if isinstance(sprite, (str, os.PathLike)) and not isinstance(sprite, bytes):
+        path = output_file(sprite, ".sprite3", parameter="sprite")
+        if not path.exists() and Path(sprite).is_file():
+            path = Path(sprite)
+        return read_user_archive(path, SPRITE_JSON, parameter="sprite")
+    raise TypeError(
+        f"{kind} sprite is a {result_type.__name__} or a path, not a {type(sprite).__name__}"
+    )
 
 
 def verify(
@@ -724,8 +735,12 @@ def verify(
     run as an evaluation-mode copy, with a warning. Non-tensor output leaves
     are ignored, as in ``transpile``.
     """
-    if atol < 0 or rtol < 0:
-        raise ValueError("atol and rtol must be non-negative")
+    for label, value in (("atol", atol), ("rtol", rtol)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{label} must be a number, not {type(value).__name__}")
+        if not value >= 0:
+            raise ValueError(f"{label} must be a non-negative number, not {value!r}")
+    validate_model_and_inputs(model, example_inputs)
     validate_export_options(
         storage=storage, quantization=quantization, sig_figs=sig_figs, adapters=adapters,
         example_kwargs=example_kwargs,

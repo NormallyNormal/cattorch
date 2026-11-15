@@ -85,6 +85,26 @@ def entrypoint(
     between those bounds at run time, as ``transpile(dynamic=...)`` does;
     keys are input names, and ``(1, 64)`` is short for the first dimension.
     """
+    from cattorch.program import _name
+
+    if name is not None:
+        name = _name(name, "@entrypoint name")
+    for label, names in (("input_names", input_names), ("output_names", output_names)):
+        if names is not None and (
+            isinstance(names, str) or not isinstance(names, (tuple, list))
+            or any(not isinstance(item, str) for item in names)
+        ):
+            raise TypeError(f"@entrypoint {label} must be a tuple of strings")
+    for label, mapping in (("capacity", capacity), ("dynamic", dynamic)):
+        if mapping is not None and (
+            not isinstance(mapping, dict) or any(not isinstance(key, str) for key in mapping)
+        ):
+            raise TypeError(f"@entrypoint {label} must be a dict keyed by name")
+    for buffer, length in (capacity or {}).items():
+        if isinstance(length, bool) or not isinstance(length, int) or length < 1:
+            raise ValueError(
+                f"@entrypoint capacity for {buffer!r} must be a positive integer, not {length!r}"
+            )
     options = {
         "name": name, "input_names": None if input_names is None else tuple(input_names),
         "output_names": None if output_names is None else tuple(output_names),
@@ -493,15 +513,26 @@ def _check_attributes(probe, method_name, arguments, before) -> None:
             "between calls in a tensor buffer, such as "
             f"self.register_buffer({name.rpartition('.')[2].split('[')[0]!r}, torch.tensor(0))"
         )
-    warnings.warn(
+    warn(
         f"@entrypoint {method_name} changes "
         + ", ".join(f"self.{name}" for name in sorted(changed))
         + " on its first call only. The sprite runs every call as that first call "
         "traced from the initial values; if later calls take another path because "
         "of the change, it won't follow them",
-        UserWarning,
         stacklevel=4,
     )
+
+
+def _call_method(probe, method_name: str, arguments: tuple, shown: tuple, *, again=False):
+    """Call an entry point's method, reporting its failure as the model's."""
+    from cattorch.frontend import model_failure
+
+    try:
+        with torch.no_grad():
+            return getattr(probe, method_name)(*arguments)
+    except Exception as error:  # noqa: BLE001 - the user's method failed; reported
+        caller = f"@entrypoint {method_name}" + (" called a second time" if again else "")
+        raise UnsupportedModelError(model_failure(caller, error, shown)) from error
 
 
 def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
@@ -522,8 +553,7 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
         own = {leaf: name for (owner, leaf), name in names.items() if owner == id(module)}
         module.__dict__["_buffers"] = _ReadBuffers(module._buffers, own, reads)
     try:
-        with torch.no_grad():
-            result = getattr(probe, method_name)(*copy.deepcopy(arguments))
+        result = _call_method(probe, method_name, copy.deepcopy(arguments), arguments)
     finally:
         for module in probe.modules():
             module.__dict__["_buffers"] = dict(dict.items(module.__dict__["_buffers"]))
@@ -567,10 +597,9 @@ def _rewritten_rows(model: nn.Module, method_name: str, arguments: tuple, names)
         varied_at_length(value, 0, value.shape[0], seed=1) if value.ndim else value + 1
         for value in arguments
     )
-    with torch.no_grad():
-        getattr(probe, method_name)(*copy.deepcopy(arguments))
-        first = {name: _get_buffer(probe, name).detach().clone() for name in names}
-        getattr(probe, method_name)(*others)
+    _call_method(probe, method_name, copy.deepcopy(arguments), arguments)
+    first = {name: _get_buffer(probe, name).detach().clone() for name in names}
+    _call_method(probe, method_name, others, others, again=True)
     rewritten = []
     for name, rows in first.items():
         grown = _get_buffer(probe, name)
@@ -729,10 +758,15 @@ def marked_program(model: nn.Module) -> MarkedProgram:
         if result is not None:
             from torch.utils import _pytree as pytree
 
-            dropped = [
-                type(leaf).__name__ for leaf in pytree.tree_leaves(result)
-                if not isinstance(leaf, torch.Tensor)
+            from cattorch.frontend import reject_tensor_containers
+
+            others = [
+                leaf for leaf in pytree.tree_leaves(result) if not isinstance(leaf, torch.Tensor)
             ]
+            reject_tensor_containers(
+                (f"@entrypoint {method_name}'s result", leaf) for leaf in others
+            )
+            dropped = [type(leaf).__name__ for leaf in others]
             if dropped:
                 # As transpile does for forward; declared Output bindings
                 # stay strict.

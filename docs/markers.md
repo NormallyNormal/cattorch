@@ -66,7 +66,9 @@ interface from the markers. Each entry point becomes a block named
 - `name=` names the block, `input_names=` and `output_names=` name its
   lists. Outputs default to `output`, `output_1`, and so on. Only the
   method's tensor results become outputs, as with `forward`; other results,
-  such as `None`, are skipped with a warning.
+  such as `None`, are skipped with a warning, and tensors inside a dataclass
+  fail the export. A name must be a non-empty string without control
+  characters such as newlines, and the names are tuples of strings.
 - `dynamic={"rows": {0: (1, 32)}}` lets an input's dimension vary between
   those bounds at run time, checked at several lengths during export, in the
   same form as `transpile(dynamic=...)`: keys are input names, and
@@ -83,7 +85,10 @@ interface from the markers. Each entry point becomes a block named
   does, and so can the method that grows it, after appending, with the
   [operations that follow a variable length](supported-models.md#variable-length-inputs).
 - A buffer that changes shape without a capacity, or a capacity for a buffer
-  that never grows, fails the export.
+  that never grows, fails the export. `capacity=` is a dict from buffer name
+  to a positive integer, checked when the decorator is applied.
+- A method that raises on its `example_inputs` fails the export with
+  `UnsupportedModelError`, giving the inputs' shapes.
 - A state can't share memory with another buffer or parameter, as views of
   one tensor do (`self.register_buffer("k", self.cache[0])`): each state is
   a list of its own, so a write through one wouldn't reach the other.

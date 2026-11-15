@@ -20,7 +20,7 @@ import torch
 from cattorch import interface
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import warn
-from cattorch.export_options import validate_export_options
+from cattorch.export_options import validate_export_options, validate_model_and_inputs
 from cattorch.fast import FastConfig
 from cattorch.storage import StorageConfig
 from cattorch.quantization import QuantizationConfig
@@ -35,7 +35,7 @@ from cattorch.util.scratch.dsl import (
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.archive import (
-    PROJECT_JSON, read_archive, read_json, write_archive,
+    PROJECT_JSON, read_archive, read_user_archive, write_archive,
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.interface import (
@@ -319,9 +319,29 @@ def _write_project(
 
 
 def _normalise_inputs(
-    example_inputs: torch.Tensor | tuple[torch.Tensor, ...],
+    model, example_inputs: torch.Tensor | tuple[torch.Tensor, ...], where: str = "",
 ) -> tuple[torch.Tensor, ...]:
-    return (example_inputs,) if isinstance(example_inputs, torch.Tensor) else tuple(example_inputs)
+    """A case's ``example_inputs`` as a tuple of tensors, checked before any export.
+
+    A benchmark fills the sprite's input lists with them, so they must be
+    tensors: not ``None`` (a model's markers) or a program.
+    """
+    try:
+        if example_inputs is None:
+            raise TypeError(
+                "example_inputs must be a tensor or a tuple of tensors, which a benchmark "
+                "fills the sprite's inputs with, not None"
+            )
+        validate_model_and_inputs(model, example_inputs, programs=False)
+        inputs = (
+            (example_inputs,) if isinstance(example_inputs, torch.Tensor)
+            else tuple(example_inputs)
+        )
+        if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs):
+            raise TypeError("example_inputs must be a tensor or a non-empty tuple of tensors")
+    except TypeError as error:
+        raise TypeError(f"{where}{error}") from None
+    return inputs
 
 
 def _export_options(
@@ -491,7 +511,9 @@ def _build_suite(
             if case[3] is not None and not isinstance(case[3], FastConfig):
                 raise TypeError("a case's fourth item must be a FastConfig")
             case_options["fast_config"] = case[3]
-        normalized_cases.append((name, model, raw_inputs, case_options))
+        normalized_cases.append((
+            name, model, _normalise_inputs(model, raw_inputs, f"case {name!r}: "), case_options,
+        ))
     _check_names([case[0] for case in normalized_cases])
     output_path = output_file(output_path, ".sb3")
 
@@ -502,8 +524,7 @@ def _build_suite(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
-        for index, (name, model, raw_inputs, case_options) in enumerate(normalized_cases):
-            example_inputs = _normalise_inputs(raw_inputs)
+        for index, (name, model, example_inputs, case_options) in enumerate(normalized_cases):
             controller_case = {"name": name}
             for variant, optimization, extra_kernels in variants:
                 sprite, sprite_assets = _export_variant(
@@ -746,6 +767,10 @@ def build_storage_benchmark_suite(
     if any(not isinstance(case, tuple) or len(case) != 3 for case in cases):
         raise ValueError("storage benchmark cases are (name, model, example_inputs) tuples")
     _check_names([case[0] for case in cases])
+    cases = [
+        (name, model, _normalise_inputs(model, raw_inputs, f"case {name!r}: "))
+        for name, model, raw_inputs in cases
+    ]
 
     output_path = output_file(output_path, ".sb3")
     variants = {
@@ -766,8 +791,7 @@ def build_storage_benchmark_suite(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
-        for index, (name, model, raw_inputs) in enumerate(cases):
-            example_inputs = _normalise_inputs(raw_inputs)
+        for index, (name, model, example_inputs) in enumerate(cases):
             controller = {"name": name, "index": index}
             for variant, (variant_storage, variant_quantization) in variants.items():
                 base = temp / f"storage_{index}_{variant}"
@@ -861,7 +885,7 @@ def build_paired_benchmark(
         calibration=calibration, sig_figs=sig_figs, codegen=codegen, adapters=adapters,
         kernels=kernels,
     )
-    example_inputs = _normalise_inputs(example_inputs)
+    example_inputs = _normalise_inputs(model, example_inputs)
     output_path = output_file(output_path, ".sb3")
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1222,9 +1246,15 @@ def analyze_benchmark(path: str | Path) -> BenchmarkAnalysis:
     ``BenchmarkAnalysis``. Raises ``ValueError`` for a project that hasn't
     run, or ran only part of the way.
     """
-    project = read_json(path, PROJECT_JSON)
-    stage = next(target for target in project["targets"] if target["isStage"])
+    project = read_user_archive(path, PROJECT_JSON, parameter="path")
+    stage = next(
+        (target for target in project.get("targets", ()) if target.get("isStage")), {},
+    )
     by_name = {entry[0]: entry[1] for entry in stage.get("lists", {}).values()}
+    if not by_name.keys() & {
+        STORAGE_SIZES, SUITE_RESULTS, EXACT_TIMINGS, FAST_TIMINGS, LEGACY_TIMINGS,
+    }:
+        raise ValueError(f"path {str(path)!r} is not a cattorch benchmark project")
     if STORAGE_SIZES in by_name:
         return _analyze_storage(path, project, stage, by_name)
     if SUITE_RESULTS in by_name:

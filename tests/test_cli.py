@@ -415,3 +415,20 @@ def test_an_output_option_naming_a_directory_is_rejected(models, capsys):
         code, message = run(capsys, "export", "models.py:Marked", "-o", output)
         assert code == 2 and "-o" in message, (output, message)
     assert not list(models.rglob("*.sprite3"))
+
+
+def test_an_entry_point_failing_on_its_example_exits_without_a_traceback(models, capsys):
+    (models / "entry.py").write_text(
+        "import torch\nfrom torch import nn\nimport cattorch\n\n\n"
+        "class EntryBad(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.register_buffer('total', torch.zeros(3))\n\n"
+        "    @cattorch.entrypoint(example_inputs=(torch.zeros(4),))\n"
+        "    def add(self, value):\n"
+        "        self.total = self.total + value\n"
+        "        return self.total\n"
+    )
+    code, message = run(capsys, "export", "entry.py:EntryBad")
+    assert code == 1 and "@entrypoint add raised RuntimeError" in message
+    assert "Traceback" not in message

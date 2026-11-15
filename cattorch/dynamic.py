@@ -196,10 +196,16 @@ def check_lengths(
         tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
         # verify runs the model; a fresh copy each time keeps a forward that
         # changes module state away from the caller's model and later runs.
-        return verify(
-            copy.deepcopy(reference), tuple(values[:positional]), result,
-            example_kwargs=keywords or None, **tolerance,
-        )
+        try:
+            return verify(
+                copy.deepcopy(reference), tuple(values[:positional]), result,
+                example_kwargs=keywords or None, **tolerance,
+            )
+        except UnsupportedModelError as error:
+            raise UnsupportedModelError(
+                f"the export is checked at several lengths within the dynamic bounds, and "
+                f"with {length} items along the dynamic dimension: {error}"
+            ) from error
 
     def error(outcome):
         """The largest difference, and whether it is within tolerance."""

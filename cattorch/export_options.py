@@ -51,3 +51,40 @@ def validate_export_options(
         or any(not isinstance(key, str) for key in example_kwargs)
     ):
         raise TypeError("example_kwargs must be a dict with string keys")
+
+
+def validate_model_and_inputs(model, example_inputs, *, programs: bool = True) -> None:
+    """Check ``model`` and the form of ``example_inputs``, before the model runs.
+
+    ``example_inputs`` is a tensor, a tuple or list of tensors, ``None``
+    (the model's markers) or, with ``programs``, an ``ExportProgram``,
+    ``GenerationProgram`` or ``RecurrentGenerationProgram``. The tensors in
+    a tuple are checked where they are used, with messages for each mistake.
+    """
+    import torch
+    from torch import nn
+
+    from cattorch.program import ExportProgram, GenerationProgram, RecurrentGenerationProgram
+
+    if not isinstance(model, nn.Module):
+        raise TypeError(f"model must be a torch.nn.Module, not {type(model).__name__}")
+    kinds = (ExportProgram, GenerationProgram, RecurrentGenerationProgram)
+    if example_inputs is None or isinstance(example_inputs, (torch.Tensor, tuple, list)):
+        return
+    if isinstance(example_inputs, kinds):
+        if programs:
+            return
+        raise TypeError(
+            f"example_inputs must be a tensor or a tuple of tensors here, not a "
+            f"{type(example_inputs).__name__}"
+        )
+    if isinstance(example_inputs, dict):
+        raise TypeError(
+            "example_inputs can't be a dict: pass forward's positional tensors as a tensor "
+            "or a tuple, and its keyword arguments with example_kwargs="
+        )
+    expected = "a tensor or a tuple of tensors" + (
+        ", an ExportProgram, a GenerationProgram or a RecurrentGenerationProgram"
+        if programs else ""
+    )
+    raise TypeError(f"example_inputs must be {expected}, not {type(example_inputs).__name__}")

@@ -45,8 +45,8 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 
 | Parameter | Meaning |
 |---|---|
-| `model` | Module to export. Export works on a copy. A model left in training mode with modules that behave differently in it (dropout, batch norm) is exported in evaluation mode, with a warning. |
-| `example_inputs` | What the sprite is called with: a tensor or tuple of tensors for `forward`, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. `None` takes it from the model's [markers](markers.md). |
+| `model` | Module to export (anything else raises `TypeError`). Export works on a copy. A model left in training mode with modules that behave differently in it (dropout, batch norm) is exported in evaluation mode, with a warning. |
+| `example_inputs` | What the sprite is called with: a tensor or tuple of tensors for `forward`, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. `None` takes it from the model's [markers](markers.md). Anything else, such as a dict (pass keyword arguments with `example_kwargs`), raises `TypeError`. |
 | `output_path` | Destination file. `.sprite3` is appended unless the path already ends in it (in any case), and missing parent directories are created. A path that names no file (empty, ending in a separator, or an existing directory) raises `ValueError`. The same rule applies to every function that writes a file, with its own suffix. |
 | `name` | Scratch sprite display name. Defaults to the destination filename stem. |
 | `optimization` | `"exact"` (default) or `"fast"`. See [optimization modes](optimization.md). |
@@ -191,8 +191,11 @@ verify(
 Run an exported sprite in cattorch's Python emulator and compare it with
 PyTorch. `model` and `example_inputs` are what was passed to `transpile`
 (`None` takes them from the markers), and `sprite` is the export's result or
-its path. Tolerances must be non-negative. `verify` checks correctness, not
-speed. It works for every kind of export:
+its path, spelled as for `transpile` (`.sprite3` is added unless the path
+ends in it). A path that isn't a sprite, such as a project, raises
+`ValueError`, and so does a negative or NaN tolerance. A model that raises on
+the inputs raises `UnsupportedModelError`, as in `transpile`. `verify`
+checks correctness, not speed. It works for every kind of export:
 
 - **Tensor inputs**: the sprite runs `cattorch forward` on `example_inputs`.
   A model with one tensor output returns a `VerifyResult`, even if the tensor
@@ -629,7 +632,9 @@ analyze_benchmark(path) -> BenchmarkAnalysis
 ```
 
 Read the results from a benchmark project saved after running in Scratch.
-Raises `ValueError` if the project hasn't run, or ran only part of the way.
+Raises `ValueError` if the project hasn't run, or ran only part of the way,
+or if `path` isn't a benchmark project (a missing file, a sprite, or another
+project).
 `cattorch analyze-benchmark PROJECT` prints the same as JSON; see
 [verification and benchmarking](verification-and-benchmarking.md).
 

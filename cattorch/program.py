@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import KW_ONLY, dataclass
 import math
 import re
+import unicodedata
 from typing import Literal
 
 import torch
@@ -19,6 +20,8 @@ import torch
 def _name(value: str, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
+    if any(unicodedata.category(character) == "Cc" for character in value.strip()):
+        raise ValueError(f"{field} {value!r} can't contain control characters such as newlines")
     return value.strip()
 
 

@@ -115,9 +115,10 @@ was tested with. See [recurrent generation](recurrent-generation.md).
 
 `UnsupportedOperationError` names the operation that failed and the module it
 came from. `UnsupportedModelError` covers other problems with the model, such
-as a non-tensor return value, a requirement of a `GenerationProgram` it
-doesn't meet, or an error the model raises on the example inputs (the
-message gives their shapes). Both subclass `CattorchError`, so you can catch
+as a non-tensor return value or tensors returned inside a dataclass, a
+requirement of a `GenerationProgram` it doesn't meet, or an error the model
+(or an `@entrypoint` method) raises on the example inputs (the message gives
+their shapes). Both subclass `CattorchError`, so you can catch
 that one class. A `TypeError` or `ValueError` means an argument is wrong.
 Every warning is a `CattorchWarning` and is also in `result.warnings`. See
 [exceptions](api-reference.md#exceptions).

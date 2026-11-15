@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from torch import nn
 
 from cattorch.adapters import ModuleAdapter
-from cattorch.export_options import validate_export_options
+from cattorch.export_options import validate_export_options, validate_model_and_inputs
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
 from cattorch.frontend import capture_model, keep_operations
@@ -131,6 +131,7 @@ def analyze(
     """
     from cattorch.program import GenerationProgram, RecurrentGenerationProgram
 
+    validate_model_and_inputs(model, example_inputs)
     if example_inputs is None:
         from cattorch.transpiler import interface_from_markers
 
