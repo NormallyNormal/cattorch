@@ -798,6 +798,13 @@ _SHAPE_VIEWS = {
     torch.ops.aten.unsqueeze.default, torch.ops.aten.squeeze.dim,
     torch.ops.aten.squeeze.dims, torch.ops.aten.squeeze.default,
 }
+# Views that are a function of their input's values alone, so a view taken
+# before an in-place update can be taken again from the updated tensor.
+_REBUILDABLE_VIEWS = _SHAPE_VIEWS | {
+    _VIEW_SLICE, _VIEW_SELECT, torch.ops.aten.transpose.int, torch.ops.aten.permute.default,
+    torch.ops.aten.t.default, torch.ops.aten.expand.default, torch.ops.aten.alias.default,
+    torch.ops.aten.unfold.default, torch.ops.aten.diagonal.default,
+}
 # Uninitialized buffers that a model fills by slice assignment. They become
 # zeros, so no unspecified values are stored in the sprite.
 _EMPTY_AS_ZEROS = {
@@ -849,19 +856,45 @@ def _replace_intermediate_copies(graph: Graph) -> None:
 
     The capture records ``x /= y`` on a computed tensor as ``div`` followed by
     ``copy_(x, quotient)``, and ``x[..., :4] = y`` as ``copy_`` into a slice
-    view of ``x``. When ``x`` is a fresh tensor rather than a view, and no
-    other view of it taken before the copy is read afterwards, the copy
+    view of ``x``. When ``x`` is a fresh tensor rather than a view, the copy
     becomes a new tensor: the source itself, or ``x`` with the sliced region
     replaced (a ``cat`` of the untouched parts and the source). Later reads of
-    ``x`` take that tensor. An input updated in place, as ``x += 1`` or
+    ``x`` take that tensor, and later reads of a view of ``x`` (the one written
+    through, or any other taken before the copy) take that view of the new
+    tensor. A copy seen through a view that can't be taken again, such as
+    ``as_strided``, is left for graph analysis to reject. An input updated in place, as ``x += 1`` or
     ``x.clamp_(-1, 1)`` in ``forward`` do, is rewritten the same way: the
     sprite computes the updated value without writing to the input's list.
     Copies into parameters and buffers, strided slices, or other views are
     left for graph analysis to reject.
     """
+    def views_of(base: Node, position: int) -> list[Node] | None:
+        """The views of ``base`` taken before the copy, parents first.
+
+        ``None`` if one of them that is read after the copy (itself or
+        through a view of it) can't be rebuilt from the updated value.
+        """
+        found: list[Node] = []
+        stack = [base]
+        while stack:
+            parent = stack.pop()
+            for user in parent.users:
+                if (
+                    user.op == "call_function" and order.get(user, position) < position
+                    and _returns_alias(user) and user not in found
+                ):
+                    found.append(user)
+                    stack.append(user)
+        found.sort(key=order.__getitem__)
+        for view in found:
+            if view.target not in _REBUILDABLE_VIEWS and read_after(view, position):
+                return None
+        return found
+
     def read_after(node: Node, position: int) -> bool:
         return any(
-            order[user] > position or (_returns_alias(user) and read_after(user, position))
+            order.get(user, -1) > position
+            or (_returns_alias(user) and read_after(user, position))
             for user in node.users
         )
 
@@ -887,15 +920,12 @@ def _replace_intermediate_copies(graph: Graph) -> None:
             pass  # an input: the caller's tensor, which nothing else aliases
         elif base.op != "call_function" or _returns_alias(base):
             continue
-        if chain and copy.users:
-            continue
         position = order[copy]
-        chain_nodes = {node for node, _, _ in chain}
-        if any(
-            user is not copy and user not in chain_nodes and order[user] < position
-            and _returns_alias(user) and read_after(user, position)
-            for user in base.users
-        ):
+        # Every view of the storage read after the copy (the one written
+        # through, its parents, or another view of the same tensor) must see
+        # the new values: each is rebuilt from the updated tensor.
+        views = views_of(base, position)
+        if views is None:
             continue
         expected, actual = target.meta.get("val"), source.meta.get("val")
         if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
@@ -936,15 +966,28 @@ def _replace_intermediate_copies(graph: Graph) -> None:
                                        whole.narrow(dim, end, whole.shape[dim] - end)))
                 if len(pieces) > 1:
                     value = call(torch.ops.aten.cat.default, (pieces, dim), whole)
+            rebuilt = {base: value}
+            for view in views:
+                if not read_after(view, position):
+                    continue
+                # Its parent is read after the copy through it, so it was
+                # rebuilt first.
+                node = graph.call_function(
+                    view.target, (rebuilt[view.args[0]], *view.args[1:]), dict(view.kwargs),
+                )
+                node.meta.update(view.meta)
+                rebuilt[view] = node
         if chain and base.target in _EMPTY_AS_ZEROS:
             base.target = _EMPTY_AS_ZEROS[base.target]
             base.kwargs = {
                 key: item for key, item in base.kwargs.items() if key != "memory_format"
             }
-        for user in list(base.users):
-            if user is not copy and user not in chain_nodes and order.get(user, -1) > position:
-                user.replace_input_with(base, value)
-        copy.replace_all_uses_with(value)
+        for old, new in rebuilt.items():
+            for user in list(old.users):
+                if user is not copy and order.get(user, -1) > position:
+                    user.replace_input_with(old, new)
+        # ``copy_`` returns the tensor written to, as ``row.mul_(2)`` does.
+        copy.replace_all_uses_with(rebuilt.get(target, value))
         graph.erase_node(copy)
         for view, _, _ in chain:
             if not view.users:

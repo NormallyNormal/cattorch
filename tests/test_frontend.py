@@ -444,11 +444,118 @@ def test_strided_slice_assignment_stays_unsupported(tmp_path):
         transpile(EveryOther().eval(), torch.randn(3, 4), tmp_path / "strided-assign")
 
 
-def test_in_place_update_seen_through_an_earlier_view_stays_unsupported(tmp_path):
+def _write_view_read_view(x):
+    y = x * 1
+    v = y.view(12)
+    v[3:7] = 0
+    return v * 2
+
+
+def _write_row_read_row(x):
+    y = x * 1
+    row = y[1]
+    row[2:4] = -1
+    return row + 0
+
+
+def _write_view_return_view(x):
+    z = (x * 1)[1:]
+    z[0, :2] = -5
+    return z
+
+
+def _write_input_row(x):
+    r = x[0]
+    r[1] = 7
+    return r * 1, x * 1
+
+
+def _write_input_view(x):
+    v = x.view(2, 6)
+    r = v[1]
+    r[0:4] = -1
+    return v * 1, r * 1
+
+
+def _read_sibling_view(x):
+    y = x * 1
+    a = y[0]
+    b = y[:2]
+    a[1] = 7
+    return b * 1
+
+
+def _read_transposed_sibling(x):
+    y = x * 1
+    a = y[0]
+    t = y.t()
+    a[1] = 7
+    return t
+
+
+def _write_through_two_views(x):
+    y = x * 1
+    a = y[0]
+    b = y[2]
+    a[0] = 1
+    b[1] = 2
+    return y * 1, a + b
+
+
+def _write_nested_views(x):
+    y = x * 1
+    a = y[1:]
+    b = a[:, 1:]
+    c = b[0]
+    c[0] = 3
+    return a * 1, b * 1, c * 1
+
+
+def _view_of_view_after_write(x):
+    y = x * 1
+    v = y.view(12)
+    v[3:7] = 0
+    return v.view(4, 3) * 1
+
+
+def _read_view_taken_before_update(x):
+    y = x * 2
+    row = y[:, 0]
+    y += 1
+    return row * 1
+
+
+def _in_place_on_row(x):
+    y = x * 1
+    row = y[1]
+    row.mul_(2)
+    return row * 1, y
+
+
+@pytest.mark.parametrize("function", [
+    _write_view_read_view, _write_row_read_row, _write_view_return_view, _write_input_row,
+    _write_input_view, _read_sibling_view, _read_transposed_sibling, _write_through_two_views,
+    _write_nested_views, _view_of_view_after_write, _read_view_taken_before_update,
+    _in_place_on_row,
+])
+def test_views_read_after_an_update_through_a_view_see_the_update(tmp_path, function):
+    class Model(nn.Module):
+        def forward(self, x):
+            return function(x)
+
+    model = Model().eval()
+    value = torch.randn(3, 4)
+    captured = capture_model(model, (value.clone(),))
+    assert "aten.copy_.default" not in [str(node.target) for node in captured.graph.nodes]
+    result = transpile(model, value.clone(), tmp_path / function.__name__)
+    assert verify(model, value.clone(), result).passed
+
+
+def test_in_place_update_seen_through_a_strided_view_stays_unsupported(tmp_path):
     class ViewThenUpdate(nn.Module):
         def forward(self, value):
             result = value * 2
-            row = result[:, 0]
+            row = result.as_strided((3,), (4,))
             result += 1
             return row * 1
 
