@@ -567,7 +567,7 @@ def transpile_program(
     _private_states: bool = False,
     _hidden_outputs: frozenset[str] = frozenset(),
     _calibration_resets: frozenset[int] = frozenset(),
-    _calibration_name: str = "calibration_calls",
+    _calibration_name: str = "calibration",
     _guard_overlaps: bool = True,
     _owned_model: bool = False,
     _initialized_flag: bool = True,

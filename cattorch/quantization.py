@@ -745,7 +745,7 @@ def _normalize_batch(batch) -> tuple[torch.Tensor, ...]:
     if isinstance(batch, tuple) and batch and all(isinstance(item, torch.Tensor) for item in batch):
         return batch
     raise TypeError(
-        "each calibration_inputs item must be a Tensor or a nonempty tuple of Tensors"
+        "each calibration item must be a Tensor or a nonempty tuple of Tensors"
     )
 
 
@@ -1589,7 +1589,7 @@ def quantize_model(
     orientation_inputs: Iterable | None = None,
     call_kwargs: dict | None = None,
     _registry: OperatorRegistry | None = None,
-    _calibration_name: str = "calibration_inputs",
+    _calibration_name: str = "calibration",
     _names_from: torch.nn.Module | None = None,
     _logits_of: Callable[[Any], torch.Tensor] | None = None,
 ) -> QuantizationReport:
@@ -1684,7 +1684,7 @@ def quantize_model(
             raise ValueError(f"GPTQ requires nonempty {_calibration_name}")
         observed_inputs = calibration_inputs
     elif calibration_inputs is not None:
-        raise ValueError("calibration_inputs can only be used with method='gptq'")
+        raise ValueError(f"{_calibration_name}= is only used by GPTQ quantization")
     else:
         observed_inputs = orientation_inputs or ()
     if observing:

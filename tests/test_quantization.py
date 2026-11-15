@@ -1115,7 +1115,7 @@ def test_quantization_errors_name_the_calibration_item_and_the_parameter():
     config = QuantizationConfig(
         bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1,
     )
-    with pytest.raises(ValueError, match=r"calibration_inputs\[1\] \(inputs \(2, 5\) float32\)"):
+    with pytest.raises(ValueError, match=r"calibration\[1\] \(inputs \(2, 5\) float32\)"):
         quantize_model(copy.deepcopy(model), config, [torch.randn(2, 8), torch.randn(2, 5)])
     with torch.no_grad():
         model.weight[0, 0] = float("inf")
