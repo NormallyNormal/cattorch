@@ -72,6 +72,16 @@ blocks `"prefill"`, `"decode"` and `"reset"`; each call's logits and top-k
 lists are compared with the model's, and its `cattorch status` with the one
 its input should give (see [generation](generation.md#verify-a-generator)).
 
+The reference is always your own code, never cattorch's export machinery:
+your model's `forward`, a program's entry point methods, a generation
+model's forward over every token read so far (not the cached step cattorch
+derives), and a recurrent generator's `step`. For a model with
+[`@entrypoint` markers](markers.md#entry-points-and-state), PyTorch calls the
+marked methods themselves on a copy of the model whose buffers hold the
+state, as they do when you run it, and compares every output and every state
+after each call. For a Hugging Face Mamba, Mamba-2 or RWKV model, whose step
+cattorch writes, it is the model's forward over every token read.
+
 `verify` uses cattorch's emulator, not Scratch itself. cattorch's own tests
 also run a set of exported sprites in the official `@scratch/scratch-vm`: an
 MLP, a CNN, a transformer layer (all with the default compressed float32

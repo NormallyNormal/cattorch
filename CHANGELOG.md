@@ -271,7 +271,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 - `verify` works for every kind of export, and takes the export's
   `adapters`, `quantization`, `storage` and `sig_figs` so PyTorch computes
   with the values the sprite stores. `VerifyResult.approximate_operations`
-  names fast-mode approximations.
+  names fast-mode approximations. Its reference is your own code: a marked
+  model's methods run on its buffers, a generation model's forward, and a
+  Hugging Face recurrent model's forward rather than the step cattorch
+  writes.
 - Every benchmark builder takes `repeats`, `warmups` and `transpile`'s export
   options, and generation benchmarks take a `GenerationProgram` or
   `RecurrentGenerationProgram`. See

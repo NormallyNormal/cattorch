@@ -130,30 +130,39 @@ class ProgramReplay:
             )
         return entry
 
+    def checked_inputs(self, entry, inputs) -> list[torch.Tensor]:
+        """Copies of a call's public inputs, each checked against its contract."""
+        checked = []
+        for binding, value in zip(
+            (binding for binding in entry.arguments if isinstance(binding, Input)), inputs,
+        ):
+            expected = binding.example.shape
+            if binding.dynamic is not None:
+                ((axis, (minimum, maximum)),) = binding.dynamic.items()
+                matches = (
+                    value.ndim == len(expected)
+                    and all(
+                        size == wanted for dimension, (size, wanted)
+                        in enumerate(zip(value.shape, expected)) if dimension != axis
+                    )
+                    and minimum <= value.shape[axis] <= maximum
+                )
+            else:
+                matches = value.shape == expected
+            if not matches or value.dtype != binding.example.dtype:
+                raise ValueError(
+                    f"input {binding.name!r} does not match its shape/dtype contract"
+                )
+            checked.append(value.detach().clone())
+        return checked
+
     def run(self, invocation):
         entry = self.entry(invocation)
-        public = iter(invocation.inputs)
+        public = iter(self.checked_inputs(entry, invocation.inputs))
         args = []
         for binding in entry.arguments:
             if isinstance(binding, Input):
                 value = next(public)
-                expected = binding.example.shape
-                if binding.dynamic is not None:
-                    ((axis, (minimum, maximum)),) = binding.dynamic.items()
-                    matches = (
-                        value.ndim == len(expected)
-                        and all(
-                            size == wanted for dimension, (size, wanted)
-                            in enumerate(zip(value.shape, expected)) if dimension != axis
-                        )
-                        and minimum <= value.shape[axis] <= maximum
-                    )
-                else:
-                    matches = value.shape == expected
-                if not matches or value.dtype != binding.example.dtype:
-                    raise ValueError(
-                        f"input {binding.name!r} does not match its shape/dtype contract"
-                    )
             else:
                 value = self.states[binding.name]
             args.append(value.detach().clone())
@@ -176,3 +185,70 @@ class ProgramReplay:
             pending[binding.name] = updated
         self.states.update(pending)
         return leaves
+
+
+MARKED_PREFIX = "_cattorch_entry_"
+
+
+def is_marked(model: nn.Module, program: ExportProgram) -> bool:
+    """Whether every entry point calls a method ``marked_program`` generated."""
+    return all(
+        entry.method.startswith(MARKED_PREFIX)
+        and callable(getattr(model, entry.method.removeprefix(MARKED_PREFIX), None))
+        for entry in program.entrypoints
+    )
+
+
+class MarkedReplay(ProgramReplay):
+    """Replay calls of a marked program through the user's own methods.
+
+    ``marked_program`` turns each ``@entrypoint`` method into a generated one
+    that takes the states as arguments. This replay doesn't use those: it
+    calls the user's method on the model, with the states living in its
+    buffers, as in PyTorch, so a defect in the generated methods shows as a
+    difference from the sprite.
+    """
+
+    def __init__(self, model: nn.Module, program: ExportProgram):
+        canonical: dict[int, str] = {}
+        self.aliases: dict[str, list[str]] = {}
+        for name, buffer in model.named_buffers(remove_duplicate=False):
+            self.aliases.setdefault(canonical.setdefault(id(buffer), name), []).append(name)
+        super().__init__(model, program)
+
+    @property  # type: ignore[override]
+    def states(self) -> dict[str, torch.Tensor]:
+        from cattorch.markers import _get_buffer
+
+        return {
+            state.name: _get_buffer(self.model, state.name) for state in self.program.states
+        }
+
+    @states.setter
+    def states(self, values: dict[str, torch.Tensor]) -> None:
+        from cattorch.markers import _set_buffer
+
+        for name, value in values.items():
+            value = value.detach().clone()
+            for alias in self.aliases.get(name, [name]):
+                _set_buffer(self.model, alias, value)
+
+    def run(self, invocation):
+        from cattorch.markers import _tensor_leaves
+
+        entry = self.entry(invocation)
+        inputs = self.checked_inputs(entry, invocation.inputs)
+        before = {name: value.detach().clone() for name, value in self.states.items()}
+        with torch.no_grad():
+            returned = getattr(self.model, entry.method.removeprefix(MARKED_PREFIX))(*inputs)
+        for name, value in self.states.items():
+            state = self.declarations[name]
+            if state.mode == "append" and value.shape[0] > (state.capacity or 0):
+                self.states = before
+                raise ValueError(f"state capacity exceeded: {state.name}")
+        return _tensor_leaves(returned)
+
+
+def program_replay(model: nn.Module, program: ExportProgram) -> ProgramReplay:
+    """The replay of ``program``'s calls on ``model``, which a sprite should match."""
+    return MarkedReplay(model, program) if is_marked(model, program) else ProgramReplay(model, program)

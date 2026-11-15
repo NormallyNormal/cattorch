@@ -83,6 +83,13 @@ interface from the markers. Each entry point becomes a block named
   [operations that follow a variable length](supported-models.md#variable-length-inputs).
 - A buffer that changes shape without a capacity, or a capacity for a buffer
   that never grows, fails the export.
+- A state can't share memory with another buffer or parameter, as views of
+  one tensor do (`self.register_buffer("k", self.cache[0])`): each state is
+  a list of its own, so a write through one wouldn't reach the other.
+  Register only `cache`, and take `k = self.cache[0]` inside the method. A
+  tensor registered under several names, by the model and a submodule, is
+  one state, as long as the method updates it in place; reassigning it
+  under one of its names fails the export.
 
 `marked_program(model)` returns a `MarkedProgram`: the export copy of the
 model and the

@@ -365,3 +365,33 @@ def test_the_generation_benchmark_takes_the_program_transpile_takes(tmp_path):
             [("ssm", mamba(), RecurrentGenerationProgram(max_context=3), tokens)],
             tmp_path / "c",
         )
+
+
+@pytest.mark.parametrize("kind", sorted(BUILDERS))
+def test_verify_compares_with_the_models_own_forward(tmp_path, kind, monkeypatch):
+    from cattorch import ProgramCall, verify
+
+    model = BUILDERS[kind]()
+    program = RecurrentGenerationProgram()
+    result = transpile(model, program, tmp_path / kind)
+    calls = [
+        ProgramCall("prefill", (torch.tensor([[1, 5, 7]]),)),
+        ProgramCall("decode", (torch.tensor([[3]]),)),
+        ProgramCall("reset", ()),
+        ProgramCall("prefill", (torch.tensor([[2]]),)),
+        ProgramCall("decode", (torch.tensor([[9]]),)),
+    ]
+    assert verify(model, program, result, calls=calls).passed
+    # The reference is the model's forward, not cattorch's step: a wrong
+    # step doesn't change the comparison.
+    from cattorch import huggingface_recurrent
+
+    step_class = type(huggingface_recurrent.adapt_recurrent_model(model).module)
+    step = step_class.step
+
+    def scaled(self, *values):
+        logits, *states = step(self, *values)
+        return (logits * 1.5, *states)
+
+    monkeypatch.setattr(step_class, "step", scaled)
+    assert verify(model, program, result, calls=calls).passed

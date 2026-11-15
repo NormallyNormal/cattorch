@@ -25,7 +25,7 @@ from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.program import (
     ExportProgram, GenerationProgram, Input, Output, ProgramCall, RecurrentGenerationProgram, State,
 )
-from cattorch.program_runtime import ProgramReplay
+from cattorch.program_runtime import program_replay
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
     GenerationResult, ProgramCallVerifyResult, ProgramResult, ProgramVerifyResult,
@@ -251,7 +251,8 @@ def _verify_program(
     owned = _program_reference(
         model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
     )
-    replay = ProgramReplay(owned, program)
+    # For a marked model, the user's own methods on live buffers.
+    replay = program_replay(owned, program)
     if calls is None:
         from cattorch.program_runtime import default_program_calls
         calls = default_program_calls(program)
@@ -317,6 +318,7 @@ class _GenerationReference:
 
     def __init__(self, model, program, registry, *, quantization, storage, sig_figs):
         lossy = _lossy(quantization, storage, sig_figs)
+        self.whole: str | None = None
         if isinstance(program, GenerationProgram):
             from cattorch.autoregressive import MethodLeaves
             from cattorch.markers import generation_method
@@ -356,6 +358,8 @@ class _GenerationReference:
 
         states, step = program.states, program.step
         owned = model
+        # A Hugging Face model's step is cattorch's own code, so its logits
+        # come from the model's forward over every token read instead.
         if states is None:
             adapted = adapt_recurrent_model(model)
             if adapted is None:
@@ -364,6 +368,7 @@ class _GenerationReference:
                     "supported Hugging Face recurrent model (Mamba, Mamba-2, RWKV)"
                 )
             owned, states, step = adapted.module, adapted.states, adapted.step
+            self.whole = adapted.reference
         else:
             owned = copy.deepcopy(model).float()
         states = tuple(
@@ -383,9 +388,10 @@ class _GenerationReference:
 
     def logits(self, tokens: list[int]) -> torch.Tensor:
         with torch.no_grad():
-            if self.states is None:
+            if self.states is None or self.whole is not None:
                 value = torch.tensor([tokens], dtype=torch.long)
-                output = tensor_output_leaves(self.model(value), warn=False)[0]
+                run = self.model if self.whole is None else getattr(self.model, self.whole)
+                output = tensor_output_leaves(run(value), warn=False)[0]
                 return output.reshape(len(tokens), -1)[-1]
             if len(tokens) < self.read:
                 self.states, self.read = self.initial, 0
@@ -698,7 +704,9 @@ def verify(
 
     For an ``ExportProgram`` (or ``@entrypoint`` markers), ``calls`` runs a
     sequence of ``ProgramCall``s with state carried between them, each entry
-    point once with its example inputs by default. For a ``GenerationProgram``
+    point once with its example inputs by default, comparing outputs and states
+    after every call; with markers, PyTorch runs the model's own methods on a
+    copy whose buffers hold the state. For a ``GenerationProgram``
     or ``RecurrentGenerationProgram``, ``calls`` names the blocks
     ``"prefill"``, ``"decode"`` and ``"reset"`` with their token IDs, such as
     ``ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))``; by default a

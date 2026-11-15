@@ -380,6 +380,10 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
         for name, buffer in probe.named_buffers()
     }
     names = _canonical_buffer_names(probe)
+    canonical = {id(buffer): name for name, buffer in probe.named_buffers()}
+    aliases: dict[str, list[str]] = {}
+    for name, buffer in probe.named_buffers(remove_duplicate=False):
+        aliases.setdefault(canonical[id(buffer)], []).append(name)
     reads: set[str] = set()
     for module in probe.modules():
         own = {leaf: name for (owner, leaf), name in names.items() if owner == id(module)}
@@ -390,6 +394,14 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
     finally:
         for module in probe.modules():
             module.__dict__["_buffers"] = dict(dict.items(module.__dict__["_buffers"]))
+    for name, registered in aliases.items():
+        if len({id(_get_buffer(probe, alias)) for alias in registered}) > 1:
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} reassigns buffer {name!r} under only some "
+                f"of the names it is registered as ({', '.join(map(repr, registered))}), "
+                "so they stop being one tensor. Register it once, or update it in "
+                "place (self.mem.mul_(0.5).add_(x)), which keeps the names together"
+            )
     after = dict(probe.named_buffers())
     changed = {}
     for name, (buffer, version, values) in before.items():
@@ -429,6 +441,50 @@ def _rewritten_rows(model: nn.Module, method_name: str, arguments: tuple, names)
         if grown.shape[0] < rows.shape[0] or not torch.equal(grown[:rows.shape[0]], rows):
             rewritten.append(name)
     return rewritten
+
+
+def _memory_span(value: torch.Tensor) -> tuple[int, int, int] | None:
+    """``(storage address, first byte, end byte)`` a tensor's elements occupy."""
+    if value.numel() == 0 or value.device.type == "meta":
+        return None
+    size = value.element_size()
+    start = value.storage_offset() * size
+    extent = 1 + sum((length - 1) * abs(step) for length, step in zip(value.shape, value.stride()))
+    return value.untyped_storage().data_ptr(), start, start + extent * size
+
+
+def _reject_shared_memory(model: nn.Module, state_names) -> None:
+    """Reject a state whose memory another buffer or parameter also uses.
+
+    Each state is a list of its own in the sprite, so a write through one
+    view (``self.k = self.cache[0]``) wouldn't reach the other, as it does
+    in PyTorch.
+    """
+    tensors = [
+        (kind, name, value)
+        for kind, named in (("buffer", model.named_buffers()), ("parameter", model.named_parameters()))
+        for name, value in named
+    ]
+    spans = {name: _memory_span(value) for _, name, value in tensors}
+    for state in state_names:
+        mine = spans.get(state)
+        if mine is None:
+            continue
+        for kind, name, _ in tensors:
+            other = spans[name]
+            if name == state or other is None or other[0] != mine[0]:
+                continue
+            if other[1] < mine[2] and mine[1] < other[2]:
+                inside = other[1] <= mine[1] and mine[2] <= other[2]
+                inner, outer = (state, name) if inside else (name, state)
+                raise UnsupportedModelError(
+                    f"buffer {state!r} shares memory with {kind} {name!r} ({inner!r} is a "
+                    f"view of {outer!r}, as self.k = self.cache[0] makes one), so a write "
+                    "to one changes the other in PyTorch. cattorch keeps each state in a "
+                    f"list of its own and can't follow that. Register only {outer!r} as a "
+                    "buffer and take the view inside the method, as in "
+                    f"k = self.{outer.rpartition('.')[2]}[0]"
+                )
 
 
 def has_entrypoints(model: nn.Module) -> bool:
@@ -560,6 +616,7 @@ def marked_program(model: nn.Module) -> MarkedProgram:
         plans.append((method_name, options["name"] or method_name, input_names, arguments,
                       output_names, set(changed) & set(buffers), reads, options["dynamic"]))
 
+    _reject_shared_memory(model, modes)
     states = tuple(
         State(name, buffers[name].detach().clone(), mode="append", capacity=capacities[name])
         if mode == "append" else State(name, buffers[name].detach().clone())

@@ -265,7 +265,7 @@ def check_entry_lengths(
     from cattorch.interface import OK, STATUS_VARIABLE
     from cattorch.operator_registry import default_registry
     from cattorch.program import Input, Output, ProgramCall, StateInput
-    from cattorch.program_runtime import ProgramReplay
+    from cattorch.program_runtime import program_replay
     from cattorch.util.scratch.archive import read_json
     from cattorch.util.scratch.emulator import ScratchEmulator
     from cattorch.verify import _compare_values, _get_logical_list, _program_reference, _set_logical_list
@@ -283,8 +283,8 @@ def check_entry_lengths(
 
     def error(entry, inputs, overrides):
         """The largest difference of one call, whether it matches, and whether it ran."""
-        replay = ProgramReplay(reference, program)
-        replay.states.update(overrides)
+        replay = program_replay(reference, program)
+        replay.states = {**replay.states, **overrides}
         for name, value in replay.states.items():
             _set_logical_list(emulator, f"cattorch state {name}", value.flatten().tolist())
         bindings = [binding for binding in entry.arguments if isinstance(binding, Input)]
