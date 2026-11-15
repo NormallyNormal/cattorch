@@ -15,6 +15,8 @@ Scratch's floating-point behavior.
 export with those options is not lossless.
 
 ```python
+from cattorch import transpile
+
 artifact = transpile(model, example, "model", optimization="exact")
 ```
 
@@ -43,7 +45,7 @@ stay exact.
 Each approximation can be turned off separately:
 
 ```python
-from cattorch import FastConfig
+from cattorch import FastConfig, transpile
 
 config = FastConfig(activations=True, layer_norm=False, softmax=False)
 transpile(model, example, "model_fast", optimization="fast", fast_config=config)

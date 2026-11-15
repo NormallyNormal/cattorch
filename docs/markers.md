@@ -9,7 +9,7 @@ module should look like during export. They replace building
 [programs and MoE classes](programs-and-moe.md) by hand.
 
 A marker only attaches metadata. Your model runs, trains, and saves exactly
-as before, and an unmarked model exports as it always has. Import them from
+as before, and markers change nothing for a model without them. Import them from
 `cattorch`, as in `@cattorch.entrypoint`.
 
 ## Entry points and state
