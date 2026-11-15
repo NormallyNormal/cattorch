@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
@@ -19,7 +16,7 @@ from cattorch.operator_registry import default_registry
 from cattorch.experimental import (
     ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, select_routes,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import load_emulator, load_sprite
 
 
 class Scale(nn.Module):
@@ -259,8 +256,7 @@ def test_generic_expert_block_graph_does_not_grow_with_expert_count(tmp_path):
             ),
         ).eval()
         result = transpile(model, torch.ones(1, 2), tmp_path / f"experts-{experts}")
-        with zipfile.ZipFile(result.path) as archive:
-            counts.append(len(json.loads(archive.read("sprite.json"))["blocks"]))
+        counts.append(len(load_sprite(result.path)["blocks"]))
     assert counts[1] == counts[0]
 
 
@@ -453,8 +449,7 @@ def test_generic_exact_gelu_expert_matches_eager_including_the_tail(tmp_path):
     result = transpile(model, value, tmp_path / "exact-gelu-expert")
     comparison = verify(model, value, result, atol=1e-5)
     assert comparison.passed, comparison
-    with zipfile.ZipFile(result.path) as archive:
-        variables = json.loads(archive.read("sprite.json"))["variables"].values()
+    variables = load_sprite(result.path)["variables"].values()
     assert "_expert gelu erfc" in {name for name, _ in variables}
 
 
@@ -580,8 +575,7 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
                 id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        with zipfile.ZipFile(result.path) as archive:
-            emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+        emulator = load_emulator(result.path)
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run_procedure("cattorch forward")
         outputs[mode] = torch.tensor(emulator.lists["output"])

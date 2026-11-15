@@ -50,6 +50,7 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.instruction import optimized_linear
 from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_sprite
 
 
 class LinearActivation(nn.Module):
@@ -206,11 +207,6 @@ class CachedMQALM(CachedLM):
         super().__init__(context=context, layers=layers)
         for block in self.blocks:
             block.attention = CachedMQAAttention(context=context)
-
-
-def _load_sprite(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def _run(sprite, values):
@@ -405,7 +401,7 @@ def test_optimization_modes_preserve_results(tmp_path, mode):
     expected = model(x).flatten().tolist()
     path = tmp_path / mode
     transpile(model, x, str(path), optimization=mode)
-    actual = _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+    actual = _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     torch.testing.assert_close(torch.tensor(actual), torch.tensor(expected), atol=1e-4, rtol=0)
 
 
@@ -446,7 +442,7 @@ def test_multi_head_causal_softmax_broadcasts_mask_and_stays_finite(tmp_path, mo
     path = tmp_path / f"causal_{mode}"
     transpile(model, scores, str(path), optimization=mode)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), scores.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), scores.flatten().tolist())
     ).reshape_as(scores)
     expected = model(scores)
     assert torch.isfinite(actual).all()
@@ -460,7 +456,7 @@ def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
     second = torch.randn(2, 3)
     path = tmp_path / "lifecycle"
     transpile(model, first, str(path), optimization="exact")
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     opcodes = {block["opcode"] for block in sprite["blocks"].values()}
     assert {"procedures_definition", "procedures_prototype", "procedures_call"} <= opcodes
 
@@ -483,7 +479,7 @@ def test_exact_linear_uses_direct_weight_layout_and_fuses_epilogue(tmp_path):
     x = torch.randn(2, 3)
     base = tmp_path / "exact"
     transpile(model, x, str(base), optimization="exact")
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
     exact_variables = {entry[0] for entry in sprite["variables"].values()}
     assert "_weight_offset" in exact_variables
     assert "_weight_index" not in exact_variables
@@ -505,7 +501,7 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
             model, (value, residual), str(base), optimization="exact",
             storage=StorageConfig(compression=False),
         )
-        sprite = _load_sprite(base.with_suffix(".sprite3"))
+        sprite = load_sprite(base.with_suffix(".sprite3"))
         sprites[name] = sprite
         emulator = ScratchEmulator(sprite)
         emulator.lists["input"] = value.flatten().tolist()
@@ -551,7 +547,7 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
         optimization="exact",
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     physical = [
         entry
         for entry in sprite["lists"].values()
@@ -582,7 +578,7 @@ def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
         model, value, str(base), optimization="exact",
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
     assert "_sum a" not in variables
     assert "_weight_offset" in variables
@@ -615,7 +611,7 @@ def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
 
     base = tmp_path / "arithmetic_exact"
     transpile(model, inputs, str(base), optimization="exact")
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
 
     emulator = ScratchEmulator(sprite)
     for index, value in enumerate(inputs):
@@ -818,7 +814,7 @@ def test_exact_adaptive_pool_handles_nonuniform_receptive_fields(tmp_path):
     path = tmp_path / "adaptive_nonuniform"
     transpile(model, x, str(path), optimization="exact")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -835,7 +831,7 @@ def test_fast_activations_use_documented_approximations(tmp_path, model, expecte
     path = tmp_path / type(model).__name__
     transpile(model, x, str(path), optimization="fast")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.tolist())
     )
     torch.testing.assert_close(actual, expected(x), atol=1e-5, rtol=0)
 
@@ -849,7 +845,7 @@ def test_fast_fused_linear_uses_quick_gelu_and_can_be_disabled(tmp_path):
     fast_path = tmp_path / "fused_quick_gelu"
     transpile(model, x, str(fast_path), optimization="fast")
     fast = torch.tensor(
-        _run(_load_sprite(fast_path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(fast_path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape(2, 4)
     torch.testing.assert_close(
         fast, linear * torch.sigmoid(1.702 * linear), atol=1e-4, rtol=0,
@@ -861,7 +857,7 @@ def test_fast_fused_linear_uses_quick_gelu_and_can_be_disabled(tmp_path):
         fast_config=FastConfig(activations=False),
     )
     disabled = torch.tensor(
-        _run(_load_sprite(disabled_path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(disabled_path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape(2, 4)
     torch.testing.assert_close(disabled, model(x), atol=1e-4, rtol=0)
 
@@ -874,12 +870,12 @@ def test_swiglu_fusion_is_exact_in_both_modes(tmp_path, mode):
     path = tmp_path / f"swiglu_{mode}"
     transpile(model, x, str(path), optimization=mode)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(model(x))
     torch.testing.assert_close(actual, model(x), atol=1e-4, rtol=0)
     graph = _prepare_graph(model, (x,), optimization=mode)
     assert len(graph.paired_swiglu_fusions) == 1
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
     assert {"_gate sum", "_value sum", "_input value"} <= variables
 
@@ -894,7 +890,7 @@ def test_fast_layernorm_matches_one_pass_formula(tmp_path):
     path = tmp_path / "fast_layernorm"
     transpile(model, x, str(path), optimization="fast")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist()),
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist()),
         dtype=torch.double,
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
@@ -943,7 +939,7 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
         str(path),
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weights = [
         entry
         for entry in sprite["lists"].values()
@@ -984,7 +980,7 @@ def test_fast_weight_transforms_match_the_transformed_pytorch_model(tmp_path, po
     path = tmp_path / "fast_weights"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
     torch.testing.assert_close(model.projection.weight, original_weight)
@@ -1018,7 +1014,7 @@ def test_fast_pruned_linear_preserves_non_block_remainder(tmp_path):
     path = tmp_path / "pruned_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1050,7 +1046,7 @@ def test_fast_static_matmul_matches_export_time_weight_transform(tmp_path, polic
     path = tmp_path / "static_matmul"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
     torch.testing.assert_close(model.weight, original)
@@ -1066,7 +1062,7 @@ def test_fast_static_matmul_pruning_preserves_remainder(tmp_path):
     path = tmp_path / "static_matmul_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1084,7 +1080,7 @@ def test_fast_transposed_static_matmul_is_transformed(tmp_path):
         fast_config=FastConfig(layers=policy),
     )
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1099,7 +1095,7 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
         model, (left, right), str(path), optimization="fast",
         fast_config=FastConfig(layers=FastLayerConfig(rank_ratio=0.25)),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     # Multiple inputs occupy distinct Scratch lists; use the emulator directly.
     emulator = ScratchEmulator(sprite)
     emulator.lists["input"] = left.flatten().tolist()
@@ -1130,7 +1126,7 @@ def test_fast_convolution_transforms_match_transformed_model(tmp_path, model, x,
     path = tmp_path / "fast_conv"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1162,7 +1158,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         GenerationProgram(max_context=5),
         str(path),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
     assert {
         "_cattorch token step for epoch %s", "cattorch init", "cattorch reset",
@@ -1225,7 +1221,7 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
         GenerationProgram(max_context=5, top_k=3),
         path,
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     for invalid in ([], [1, 2]):
         emulator.lists[TOKEN_IDS] = invalid
@@ -1256,7 +1252,7 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
         GenerationProgram(max_context=5),
         str(path),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     prompt = [1, 3, 5]
     emulator.lists[TOKEN_IDS] = prompt
@@ -1293,7 +1289,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
         codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
     assert result.block_count < baseline.block_count * 0.8
-    sprite = _load_sprite(result.path)
+    sprite = load_sprite(result.path)
     emulator = ScratchEmulator(sprite)
     assert "_cattorch shared transformer layer" in emulator._procedures
     assert "_cattorch K cache" in emulator.lists
@@ -1332,7 +1328,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         GenerationProgram(max_context=5, top_k=5),
         str(path),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
     assert "_cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
@@ -1396,7 +1392,7 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
             GenerationProgram(max_context=5, hidden_prefill=hidden_prefill),
             str(path),
         )
-        emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+        emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
         emulator.lists[TOKEN_IDS] = prompt
         emulator._exec_chain(emulator._procedures["cattorch prefill"])
         emulators[hidden_prefill] = emulator
@@ -1454,7 +1450,7 @@ def test_eval_conv_batchnorm_is_folded_without_mutating_model(tmp_path):
     path = tmp_path / "folded_batchnorm"
     transpile(model, x, str(path))
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(model(x))
     torch.testing.assert_close(actual, model(x), atol=1e-4, rtol=0)
     torch.testing.assert_close(model[0].weight, original_weight)
@@ -1477,7 +1473,7 @@ def test_fast_whole_neuron_pruning_changes_hidden_shape_and_exports(tmp_path):
     path = tmp_path / "neuron_pruned"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(transformed(x))
     torch.testing.assert_close(actual, transformed(x), atol=1e-4, rtol=0)
 
@@ -1523,7 +1519,7 @@ def test_parameter_resolution_uses_export_signature_without_name_collisions(tmp_
     value = torch.tensor([[1.0, 2.0]])
     path = tmp_path / "colliding_state_names"
     transpile(model, value, str(path), storage=StorageConfig(compression=False))
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     input_names = {entry[0] for entry in sprite["lists"].values() if entry[0].startswith("input")}
     assert input_names == {"input"}
     torch.testing.assert_close(
@@ -1552,7 +1548,7 @@ def test_batchnorm_folding_requires_real_dataflow_connection(tmp_path):
     path = tmp_path / "branched_batchnorm"
     transpile(model, value, str(path), storage=StorageConfig(compression=False))
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), value.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), value.flatten().tolist())
     ).reshape_as(model(value))
     torch.testing.assert_close(actual, model(value), atol=1e-4, rtol=0)
 
@@ -1572,7 +1568,7 @@ def test_exact_elementwise_supports_general_pytorch_broadcasting(
     right = torch.randn(right_shape)
     path = tmp_path / f"broadcast_{len(left_shape)}_{len(right_shape)}"
     transpile(Add().eval(), (left, right), str(path), storage=StorageConfig(compression=False))
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
     emulator.run()
@@ -1592,7 +1588,7 @@ def test_identity_model_materializes_a_distinct_output(tmp_path):
     value = torch.randn(2, 3)
     path = tmp_path / "identity"
     transpile(Identity().eval(), value, str(path))
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     assert {entry[0] for entry in sprite["lists"].values()} >= {"input", "output"}
     torch.testing.assert_close(
         torch.tensor(_run(sprite, value.flatten().tolist())), value.flatten(),
@@ -1625,7 +1621,7 @@ def test_runtime_integer_cast_truncates_toward_zero(tmp_path):
     value = torch.tensor([1.2, -2.8, 0.0, 3.0])
     path = tmp_path / "dtype"
     transpile(ToInteger().eval(), value, str(path))
-    assert _run(_load_sprite(path.with_suffix(".sprite3")), value.tolist()) == [1, -2, 0, 3]
+    assert _run(load_sprite(path.with_suffix(".sprite3")), value.tolist()) == [1, -2, 0, 3]
 
 
 def test_evaluation_dropout_remains_a_safe_alias(tmp_path):
@@ -1633,7 +1629,7 @@ def test_evaluation_dropout_remains_a_safe_alias(tmp_path):
     path = tmp_path / "eval_dropout"
     transpile(nn.Dropout(0.5).eval(), value, str(path))
     torch.testing.assert_close(
-        torch.tensor(_run(_load_sprite(path.with_suffix(".sprite3")), value.tolist())),
+        torch.tensor(_run(load_sprite(path.with_suffix(".sprite3")), value.tolist())),
         value,
     )
 
@@ -1650,7 +1646,7 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
         Mask().eval(), (value, mask), str(path),
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = value.flatten().tolist()
     emulator.lists["input_1"] = mask.flatten().tolist()
     emulator.run()
@@ -1701,7 +1697,7 @@ def test_transpile_returns_metadata_and_separates_path_from_sprite_name(tmp_path
     assert {"cattorch init", "cattorch forward", "cattorch prepare for save"} <= set(
         result.procedures
     )
-    assert _load_sprite(result.path)["name"] == "Friendly model"
+    assert load_sprite(result.path)["name"] == "Friendly model"
 
 
 def test_transpile_defaults_sprite_name_to_path_stem_and_avoids_double_extension(tmp_path):

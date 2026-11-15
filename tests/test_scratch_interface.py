@@ -17,9 +17,7 @@ once in ``scratch_status``. Other tests take the names from
 
 from __future__ import annotations
 
-import json
 import re
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -33,6 +31,7 @@ from cattorch import (
 )
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive
 from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import load_sprite
 from scratch_status import INTERRUPTED, OVERTAKEN
 
 PAGE = Path(__file__).parents[1] / "docs" / "scratch-interface.md"
@@ -91,11 +90,6 @@ def documented(title: str) -> dict[str, set[str]]:
     for row, kind in sections()[title]:
         names[KINDS[kind]].update(row)
     return names
-
-
-def load(path) -> dict:
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def sprite_names(sprite: dict) -> dict[str, set[str]]:
@@ -202,7 +196,7 @@ def test_a_model_sprite(tmp_path, kind):
         model = nn.TransformerEncoderLayer(4, 1, 8, dropout=0.0, batch_first=True).eval()
         example, options = torch.randn(2, 3, 4), {"dynamic": {0: (1, 4)}}
     result = transpile(model, example, tmp_path / "model", **options)
-    check(load(result.path), model_names(result))
+    check(load_sprite(result.path), model_names(result))
 
 
 @pytest.mark.parametrize("recurrent", [False, True])
@@ -216,7 +210,7 @@ def test_a_generation_sprite(tmp_path, recurrent):
     else:
         model, program = Language().eval(), GenerationProgram(max_context=16, top_k=3)
     result = transpile(model, program, tmp_path / "lm")
-    check(load(result.path), union(documented("Generation sprites"), every()))
+    check(load_sprite(result.path), union(documented("Generation sprites"), every()))
 
 
 class Memory(nn.Module):
@@ -269,7 +263,7 @@ def test_a_program_sprite(tmp_path, kind):
             ),),
         )
         result = transpile(Memory().eval(), program, tmp_path / "program")
-    check(load(result.path), program_names(result))
+    check(load_sprite(result.path), program_names(result))
 
 
 class _SentencePiece:
@@ -311,7 +305,7 @@ def test_a_tokenizer_sprite(tmp_path, kind):
         ).save(tmp_path / "bpe")
     else:
         result = SentencePieceBPETokenizer(_SentencePiece()).save(tmp_path / "sentencepiece")
-    check(load(result.path), union(documented("Tokenizer sprites"), every(storage=False)))
+    check(load_sprite(result.path), union(documented("Tokenizer sprites"), every(storage=False)))
 
 
 def project_names(project) -> dict[str, set[str]]:
@@ -382,7 +376,7 @@ def test_project_names(tmp_path):
 def test_a_split_output_keeps_its_public_names(tmp_path):
     model = nn.Linear(1, 200_005, bias=False).eval()
     result = transpile(model, torch.ones(1, 1), tmp_path / "wide")
-    names = sprite_names(load(result.path))["data"]
+    names = sprite_names(load_sprite(result.path))["data"]
     assert "output" in result.sharded_lists
     assert {"output", "output shard 2", *interface.shard_variables("output")} <= names
 
@@ -392,7 +386,7 @@ def test_a_reduced_output_adds_no_variable_named_like_a_list(tmp_path):
     # beside the public list.
     example = torch.randn(3, 2)
     result = transpile(Sums().eval(), (example, torch.tensor([[1, 2]])), tmp_path / "sums")
-    sprite = load(result.path)
+    sprite = load_sprite(result.path)
     lists = {entry[0] for entry in sprite["lists"].values()}
     assert not lists & {entry[0] for entry in sprite["variables"].values()}
     emulator = ScratchEmulator(sprite)

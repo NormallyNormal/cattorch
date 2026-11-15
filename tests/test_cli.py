@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from cattorch.cli import main
+from sprite_helpers import load_sprite
 
 MODELS = '''
 import torch
@@ -277,8 +278,7 @@ def test_every_output_is_named_after_the_output_option(models, capsys, output):
 
 
 def max_context(sprite_path):
-    with zipfile.ZipFile(sprite_path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
+    sprite = load_sprite(sprite_path)
     (value,) = (
         entry[1] for entry in sprite["variables"].values() if entry[0] == "cattorch max context"
     )

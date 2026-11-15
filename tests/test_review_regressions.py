@@ -1,8 +1,6 @@
 """Regression coverage for program boundaries and shared export infrastructure."""
 
 from cattorch import interface
-import json
-import zipfile
 
 import pytest
 import torch
@@ -32,11 +30,7 @@ from cattorch.util.scratch.interface import (
     rename_list,
     write_logical_list,
 )
-
-
-def emulator(artifact):
-    with zipfile.ZipFile(artifact.path) as archive:
-        return ScratchEmulator(json.loads(archive.read("sprite.json")))
+from sprite_helpers import load_emulator
 
 
 class SharedBatchNorm(nn.Module):
@@ -207,7 +201,7 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
             ),
         ),
     )
-    em = emulator(transpile(Model().eval(), program, tmp_path / "append"))
+    em = load_emulator(transpile(Model().eval(), program, tmp_path / "append"))
     for rows, expected in (([], [0.0]), ([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
         em.lists["cattorch state source"] = rows
         em.run_procedure("cattorch copy")
@@ -441,7 +435,7 @@ def test_adapters_preserve_shared_module_references(tmp_path):
             EntryPoint("run", arguments=(Input("x", torch.zeros(1)),), returns=(Output("y"),)),
         )
     )
-    em = emulator(transpile(original, program, tmp_path / "adapters", adapters=(adapter,)))
+    em = load_emulator(transpile(original, program, tmp_path / "adapters", adapters=(adapter,)))
     em.lists["cattorch run x"] = [0.0]
     em.run_procedure("cattorch run")
     assert em.lists["cattorch run y"] == [0.0]

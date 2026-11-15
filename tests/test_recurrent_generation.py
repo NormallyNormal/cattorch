@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from cattorch import interface
-import json
-import zipfile
 
 import pytest
 import torch
@@ -19,6 +17,7 @@ from cattorch import (
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list
 from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_sprite
 
 
 TOLERANCE = 1e-4
@@ -172,11 +171,6 @@ MODELS = {"gru": GRULM, "lstm": LSTMLM, "ssm": SSMLM}
 def make(name):
     torch.manual_seed({"gru": 1, "lstm": 2, "ssm": 3}[name])
     return MODELS[name]().eval()
-
-
-def load_sprite(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 PROGRAM_FIELDS = {"step", "max_context", "hidden_prefill", "top_k", "reference"}

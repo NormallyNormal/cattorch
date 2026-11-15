@@ -40,6 +40,7 @@ from cattorch.util.scratch.finalize_scratch import (
     online_json_size_warning,
 )
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
+from sprite_helpers import load_sprite
 
 
 class TinyLinear(torch.nn.Module):
@@ -49,11 +50,6 @@ class TinyLinear(torch.nn.Module):
 
     def forward(self, value):
         return self.linear(value)
-
-
-def _load(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def _codec_sprite(program):
@@ -226,7 +222,7 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
     value = torch.randn(2, 3)
     path = tmp_path / "compressed"
     transpile(model, value, str(path))
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
     weight_lists = [entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")]
     assert weight_lists and all(not entry[1] for entry in weight_lists)
@@ -336,7 +332,7 @@ def test_split_scale_banks_decode_every_tensor_value(tmp_path):
         ),
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    emulator = ScratchEmulator(_load(result.path))
+    emulator = ScratchEmulator(load_sprite(result.path))
     emulator.run_procedure("cattorch init")
 
     decoded = [
@@ -388,7 +384,7 @@ def test_default_float32_export_shards_for_temporary_decode_limit(tmp_path):
         tmp_path / "large-f32",
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    sprite = _load(result.path)
+    sprite = load_sprite(result.path)
     emulator = ScratchEmulator(sprite)
     emulator.run_procedure("cattorch init")
 
@@ -440,7 +436,7 @@ def test_float16_storage_is_explicitly_lossy_in_exact_mode(tmp_path):
         optimization="exact",
         storage=StorageConfig(precision="float16"),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
@@ -474,7 +470,7 @@ def test_integer_storage_dequantizes_before_forward_and_reinitializes(
             bits=int(precision[3:]), group_size=4, min_quantized_values=1,
         ),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     emulator = ScratchEmulator(sprite)
 
     outputs = []
@@ -534,7 +530,7 @@ def test_uncompressed_prepare_save_keeps_static_weights(tmp_path):
         model, value, str(path),
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
     before = {
         name: list(emulator.lists[name])
         for name in emulator._list_name_to_ids
@@ -564,7 +560,7 @@ def test_nonfloating_static_tensor_cannot_silently_round_through_float32(tmp_pat
         model, value, path,
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load(path.with_suffix(".sprite3")))
+    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = [0]
     emulator.run_procedure("cattorch forward")
     assert emulator.lists["output"] == [16_777_217]
@@ -680,7 +676,7 @@ def test_small_matrices_use_float16_instead_of_integer_decoder(tmp_path, precisi
     transpile(
         model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
     assert not any(
         "scale bank payload" in entry[0]
@@ -712,7 +708,7 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
     value = torch.randn(1, 128)
     path = tmp_path / f"large-{precision}"
     transpile(model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])))
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
     assert any(
         "scale bank payload" in entry[0]
@@ -818,7 +814,7 @@ def test_prepare_for_save_leaves_the_data_of_a_fresh_export(tmp_path, options):
         torch.nn.Linear(200, 128), torch.nn.ReLU(), torch.nn.Linear(128, 10),
     ).eval()
     example = torch.randn(1, 200)
-    sprite = _load(transpile(model, example, tmp_path / "m", **options).path)
+    sprite = load_sprite(transpile(model, example, tmp_path / "m", **options).path)
     emulator = ScratchEmulator(sprite)
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")

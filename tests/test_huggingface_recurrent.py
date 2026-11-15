@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from cattorch import interface
-import json
-import zipfile
 
 import pytest
 import torch
@@ -13,8 +11,8 @@ from cattorch import (
     GenerationProgram, QuantizationConfig, RecurrentGenerationProgram, State,
     UnsupportedModelError, transpile,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_emulator
 
 transformers = pytest.importorskip("transformers")
 
@@ -63,11 +61,6 @@ def rwkv(seed=0, **overrides):
 BUILDERS = {"mamba2": mamba2, "mamba": mamba, "rwkv": rwkv}
 
 
-def load(result):
-    with zipfile.ZipFile(result.path) as archive:
-        return ScratchEmulator(json.loads(archive.read("sprite.json")))
-
-
 def run(emulator, procedure, tokens=None):
     if tokens is not None:
         emulator.lists[TOKEN_IDS] = list(tokens)
@@ -113,7 +106,7 @@ def exported(request, tmp_path_factory):
     result = transpile(
         model, RecurrentGenerationProgram(top_k=3), tmp_path_factory.mktemp(request.param) / "lm",
     )
-    return model, load(result), result, before
+    return model, load_emulator(result), result, before
 
 
 def test_prefill_and_decode_match_the_stateless_forward(exported):
@@ -196,7 +189,7 @@ def test_hidden_prefill_gives_the_same_logits(tmp_path, name):
     model = BUILDERS[name]()
     results = {}
     for hidden in (True, False):
-        emulator = load(transpile(
+        emulator = load_emulator(transpile(
             model, RecurrentGenerationProgram(hidden_prefill=hidden), tmp_path / f"{name}{hidden}",
         ))
         assert run(emulator, "cattorch prefill", TOKENS[:6]) == "ok"
@@ -207,7 +200,9 @@ def test_hidden_prefill_gives_the_same_logits(tmp_path, name):
 
 def test_max_context_limits_the_tokens_between_resets(tmp_path):
     model = mamba2()
-    emulator = load(transpile(model, RecurrentGenerationProgram(max_context=3), tmp_path / "m"))
+    emulator = load_emulator(
+        transpile(model, RecurrentGenerationProgram(max_context=3), tmp_path / "m"),
+    )
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", TOKENS[:3]) == "ok"
     assert run(emulator, "cattorch decode", [TOKENS[3]]) == interface.CONTEXT_FULL
@@ -217,7 +212,7 @@ def test_max_context_limits_the_tokens_between_resets(tmp_path):
 def test_rescaled_rwkv_layers_follow_transformers_without_changing_the_model(tmp_path):
     model = rwkv(rescale_every=1)
     before = {key: value.clone() for key, value in model.state_dict().items()}
-    emulator = load(transpile(model, RecurrentGenerationProgram(), tmp_path / "rescaled"))
+    emulator = load_emulator(transpile(model, RecurrentGenerationProgram(), tmp_path / "rescaled"))
     assert not model.rwkv.layers_are_rescaled
     assert all(torch.equal(before[key], value) for key, value in model.state_dict().items())
     # transformers rescales the weights in place on the first evaluation call.
@@ -226,7 +221,7 @@ def test_rescaled_rwkv_layers_follow_transformers_without_changing_the_model(tmp
     run(emulator, "cattorch prefill", TOKENS[:6])
     torch.testing.assert_close(logits(emulator), expected[-1], atol=TOLERANCE, rtol=0)
     # A model whose weights are already rescaled exports the same way.
-    emulator = load(transpile(model, RecurrentGenerationProgram(), tmp_path / "already"))
+    emulator = load_emulator(transpile(model, RecurrentGenerationProgram(), tmp_path / "already"))
     run(emulator, "cattorch prefill", TOKENS[:6])
     torch.testing.assert_close(logits(emulator), expected[-1], atol=TOLERANCE, rtol=0)
 
@@ -310,7 +305,7 @@ def test_int8_quantized_mamba2_stays_close(tmp_path):
         quantization=QuantizationConfig(bits=8, min_quantized_values=16),
     )
     assert result.quantization is not None and result.quantization.tensors
-    emulator = load(result)
+    emulator = load_emulator(result)
     expected = expected_rows(model, TOKENS)
     run(emulator, "cattorch prefill", TOKENS[:4])
     rows = [logits(emulator)]

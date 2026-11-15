@@ -1,6 +1,5 @@
 import json
 import math
-import zipfile
 
 import pytest
 import torch
@@ -15,11 +14,7 @@ from cattorch.util.scratch.ids import (
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.sprite import _build_compact_top_k_program, _build_top_k_program
-
-
-def _load(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
+from sprite_helpers import load_sprite
 
 
 def test_codegen_config_validation():
@@ -196,7 +191,7 @@ def test_finalizer_repairs_costume_menu_shadow_for_editor(tmp_path):
         path,
         codegen=CodegenConfig(id_namespace="", compact_schema=True),
     )
-    finalized = _load(path)
+    finalized = load_sprite(path)
     switch = next(
         block for block in finalized["blocks"].values()
         if block["opcode"] == "looks_switchcostumeto"
@@ -253,7 +248,7 @@ def test_internal_name_compaction_preserves_public_interface(tmp_path):
             compact_schema=True,
         ),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     data_names = {
         entry[0]
         for section in ("variables", "lists")
@@ -325,7 +320,7 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
                 id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        sprites[mode] = _load(results[mode].path)
+        sprites[mode] = load_sprite(results[mode].path)
     assert results["auto"].block_count < results["off"].block_count
     auto = ScratchEmulator(sprites["auto"])
     off = ScratchEmulator(sprites["off"])
@@ -388,7 +383,7 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
                 id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        sprites[mode] = ScratchEmulator(_load(result.path))
+        sprites[mode] = ScratchEmulator(load_sprite(result.path))
         sprites[mode].lists["input"] = value.flatten().tolist()
         sprites[mode].run_procedure("cattorch forward")
 
@@ -414,7 +409,7 @@ def test_tied_grouped_embedding_head_uses_one_physical_weight(tmp_path):
         storage=StorageConfig(compression=False),
         codegen=CodegenConfig(id_namespace=""),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weight_lists = [
         entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
@@ -452,7 +447,7 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
         storage=StorageConfig(compression=False),
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weight_lists = [
         entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
@@ -469,7 +464,7 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
             unrolling="compact", id_namespace="", target_json_bytes=None,
         ),
     )
-    compressed_sprite = _load(compressed.path)
+    compressed_sprite = load_sprite(compressed.path)
     payloads = [
         entry[1]
         for entry in compressed_sprite["variables"].values()

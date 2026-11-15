@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from cattorch import BoundedDimension, UnsupportedModelError, entrypoint, transpile, verify
 from cattorch import ProgramCall
+from sprite_helpers import load_sprite
 
 
 class Lambda(nn.Module):
@@ -388,8 +389,6 @@ def test_length_check_reaches_the_maximum(tmp_path):
 
 @pytest.mark.parametrize("by_item", [False, True])
 def test_a_wrong_input_length_is_reported(tmp_path, by_item):
-    import json
-    import zipfile
 
     from cattorch.util.scratch.emulator import ScratchEmulator
 
@@ -399,8 +398,7 @@ def test_a_wrong_input_length_is_reported(tmp_path, by_item):
     else:
         model, example, width = nn.Linear(3, 2), torch.randn(4, 3), 3
     result = transpile(model.eval(), example, tmp_path / "bounded", dynamic={0: (1, 4)})
-    with zipfile.ZipFile(result.path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
+    sprite = load_sprite(result.path)
     for count, status in (
         (0, interface.too_few_items("input")), (5 * width, interface.too_many_items("input")),
         (width + 1, interface.wrong_number_of_items("input")), (2 * width, interface.OK),

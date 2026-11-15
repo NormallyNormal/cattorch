@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from cattorch import interface
-import json
 import math
-import zipfile
 
 import pytest
 import torch
@@ -21,14 +19,10 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder
 from test_optimization import CachedLM
 from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_sprite
 from scratch_status import INTERRUPTED
 
 TOLERANCE = 1e-4
-
-
-def load_sprite(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def logits_of(model, prefix):
@@ -261,8 +255,6 @@ def stop_on_call(emulator, procedure, call):
 
     emulator._chains[start] = run
     return lambda: emulator._chains.__setitem__(start, chain)
-
-
 
 
 def stop_during(emulator, public, procedure, call, tokens=None):

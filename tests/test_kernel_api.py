@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
@@ -27,6 +24,7 @@ from cattorch.util.scratch.dsl import (
     set_var,
     var,
 )
+from sprite_helpers import load_sprite
 
 
 @torch.library.custom_op("cattorch_kernel_test::scale_shift", mutates_args=())
@@ -102,11 +100,6 @@ def _export(tmp_path, model, registry, *, name="model", **options):
         _registry=registry, **options,
     )
     return model, value, result
-
-
-def _sprite(result):
-    with zipfile.ZipFile(result.path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def test_tensor_info_derived_properties():
@@ -353,7 +346,7 @@ def test_large_temp_list_is_sharded(tmp_path):
     registry = _registry(Kernel(TARGET, emit))
     model, value, result = _export(tmp_path, ScaleShift(), registry)
     assert verify(model, value, result, atol=1e-5, rtol=0).passed
-    names = [entry[0] for entry in _sprite(result)["lists"].values()]
+    names = [entry[0] for entry in load_sprite(result)["lists"].values()]
     shards = [name for name in names if name.startswith("_kernel_test_buffer")]
     assert len(shards) == 2, shards
 

@@ -6,10 +6,8 @@ and compares against the HuggingFace tokenizer output.
 """
 
 from cattorch import interface
-import json
 import os
 import tempfile
-import zipfile
 
 import pytest
 from transformers import PreTrainedTokenizerFast
@@ -23,6 +21,7 @@ from cattorch.tokenizer import (
 )
 from cattorch.results import TokenizerResult
 from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import load_emulator, load_sprite
 
 # One directory per process, so parallel test workers never share the file.
 SPRITE_PATH = os.path.join(tempfile.mkdtemp(prefix="cattorch-tokenizer-"), "tokenizer")
@@ -41,8 +40,7 @@ def _load_sprite() -> dict:
     """Transpile and load the sprite JSON, cleaning up the file."""
     sprite_path = SPRITE_PATH + ".sprite3"
     try:
-        with zipfile.ZipFile(sprite_path, "r") as z:
-            return json.loads(z.read("sprite.json"))
+        return load_sprite(sprite_path)
     finally:
         os.remove(sprite_path)
 
@@ -560,8 +558,7 @@ class _CasedBytesSentencePieceProcessor(_FakeSentencePieceProcessor):
 
 
 def _tokenize(result, text):
-    with zipfile.ZipFile(result.path) as archive:
-        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator = load_emulator(result.path)
     emulator.variables["cattorch text"] = text
     emulator.run_procedure("cattorch tokenize")
     return [int(value) for value in emulator.lists["cattorch token ids"]]
@@ -604,8 +601,7 @@ class TestSentencePieceBPE:
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
         emulator = ScratchEmulator(sprite)
         emulator.variables["cattorch text"] = "AB_ab!"
@@ -629,8 +625,7 @@ class TestSentencePieceBPE:
         result = SentencePieceBPETokenizer(
             _ManySplitSentencePieceProcessor(),
         ).save(tmp_path / "many_split_sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
         emulator = ScratchEmulator(sprite)
         emulator.variables["cattorch text"] = "aaaaaaaa"
@@ -642,8 +637,7 @@ class TestSentencePieceBPE:
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
         emulator = ScratchEmulator(sprite)
         emulator.lists["cattorch token ids"] = [0, 1, 3, 2, 4, 8]
@@ -655,8 +649,7 @@ class TestSentencePieceBPE:
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
         emulator = ScratchEmulator(sprite)
         assert {
@@ -684,8 +677,7 @@ def test_tokenizer_export_returns_metadata_and_separates_name(tmp_path):
     assert result.tokenizer_type == "char"
     assert result.token_count == 4
     assert result.archive_bytes == result.path.stat().st_size
-    with zipfile.ZipFile(result.path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
+    sprite = load_sprite(result.path)
     assert sprite["name"] == "Friendly tokenizer"
 
 

@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
@@ -13,6 +10,7 @@ from cattorch import FastConfig, FastLayerConfig, QuantizationConfig, transpile,
 from cattorch.experimental import ExpertFamily, SparseMoE, routed_experts
 from cattorch.operator_registry import default_registry
 from cattorch.quantization import quantize_model
+from sprite_helpers import load_sprite
 
 
 class Expert(nn.Module):
@@ -177,8 +175,7 @@ def test_block_count_does_not_grow_with_expert_count(tmp_path):
         model = RoutesAsInputs(experts).eval()
         inputs = (torch.ones(1, 4), torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1))
         result = transpile(model, inputs, tmp_path / f"experts-{experts}")
-        with zipfile.ZipFile(result.path) as archive:
-            counts.append(len(json.loads(archive.read("sprite.json"))["blocks"]))
+        counts.append(len(load_sprite(result.path)["blocks"]))
     assert counts[1] == counts[0]
 
 

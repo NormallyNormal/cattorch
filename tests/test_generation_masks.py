@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import math
-import zipfile
 
 import pytest
 import torch
@@ -14,8 +12,9 @@ import torch.nn.functional as F
 from cattorch import CodegenConfig, GenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_generation_automatic import load_sprite, nano, prefill_and_decode
+from test_generation_automatic import nano, prefill_and_decode
 from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_emulator, load_sprite
 
 CONTEXT, VOCAB, WIDTH, HEADS = 16, 24, 16, 2
 
@@ -96,8 +95,7 @@ def test_huggingface_sliding_window_model_generates(tmp_path):
     )
     model = transformers.AutoModelForCausalLM.from_config(config).eval()
     result = transpile(model, GenerationProgram(max_context=10), tmp_path / "mistral")
-    with zipfile.ZipFile(result.path) as archive:
-        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator = load_emulator(result.path)
     prefill_and_decode(emulator, model, [3, 17, 5], [40, 9, 2])
 
 
