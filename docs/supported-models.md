@@ -16,19 +16,19 @@ For persistent state, use [`@entrypoint` markers](markers.md) or an
 |---|---|
 | Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
 | Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
-| Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item |
+| Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item; `torch.einsum`, `torch.cdist` |
 | Embeddings | `nn.Embedding`; `nn.EmbeddingBag` and `F.embedding_bag` in `sum`, `mean` and `max` modes, with `per_sample_weights`, `padding_idx` and `include_last_offset`, and a 2D input or offsets that are fixed in the model or passed as an input. The offsets' shape fixes the number of bags, and offsets passed as an input must be valid for PyTorch (start at 0, never decrease, and end with the number of indices under `include_last_offset`); only the bags are computed, not `offset2bag` or the other results of `torch.ops.aten.embedding_bag`. `max_norm` is rejected: rescale the table before export |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
-| Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
+| Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.norm` and `torch.linalg.vector_norm`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
 | Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`, `lgamma`, `mvlgamma`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
 | Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `median`, `kthvalue`, over any dimensions; `cumsum`, `cumprod`, `cummax`, `cummin`; `torch.topk`, `torch.sort`, `argsort` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
-| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
+| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like`, `F.one_hot` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
 | Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
-| In-place updates | `x /= y`, `x.copy_(y)`, and slice or index assignment such as `x[..., :4] = y` on a tensor the model created, with step-one slices; updates of inputs, parameters, or a tensor read through an earlier view are rejected |
+| In-place updates | `x += 1`, `x.clamp_(-1, 1)`, `x.copy_(y)`, and slice or index assignment such as `x[0] = 0` or `x[..., :4] = y`, with step-one slices, on a tensor the model computed or on a `forward` input. The sprite computes the updated value and leaves the input list unchanged. Updates of a parameter or buffer (use [`@entrypoint` state](markers.md#entry-points-and-state)) and of a tensor read through a view taken before the update are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs
 once during export, whatever operations it uses. Masks such as
@@ -39,8 +39,9 @@ These operations cover many MLPs and CNNs, along with transformer components
 such as multi-head attention, combined QKV projections, rotary position
 embeddings, causal masks, pre-norm residual blocks, and SwiGLU gates. Support
 depends on the operations the model actually runs, not on its architecture
-name. `nn.MultiheadAttention`, `nn.TransformerEncoder`, and nanoGPT- or
-Llama-style attention written in plain PyTorch export without changes. A
+name. `nn.MultiheadAttention` (with a boolean or float `attn_mask`),
+`nn.TransformerEncoder`, and nanoGPT- or Llama-style attention written in
+plain PyTorch export without changes. A
 wrapper around a supported module can still fail, for example when a block
 returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
 
@@ -89,7 +90,7 @@ that take their routes from the model's own router, and only the selected expert
 run in Scratch. Experts with their own gate function, such as GPT-OSS's
 clamped GLU, run that function in Scratch. Experts using operations that
 [experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
-hand-written normalization, can't export yet. GPT-OSS, with its attention
+hand-written normalization, can't export. GPT-OSS, with its attention
 sinks and sliding-window layers, exports with or without a `GenerationProgram`.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
@@ -104,11 +105,12 @@ through the [`@moe` marker](markers.md), or the experimental `ExpertFamily`
 and `SparseMoE` classes and `routed_experts` with your own router code; see
 [programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
-Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
-`var`, export when PyTorch can express them in terms of supported
-operations. They may run slower than an operation with a dedicated kernel;
-`TranspileResult.fallback_operations` and `warnings` list the ones a sprite
-uses. [Operator coverage](operator-coverage.md) shows which operators pass
+Some listed operations, such as `nn.Mish`, `var`, and 3D convolutions, have
+no kernel of their own. They export through PyTorch's decomposition into
+supported operations, and so does any other operation PyTorch can express
+that way, such as `torch.lerp` or `F.hardsigmoid`. They may run slower than
+an operation with a dedicated kernel; `TranspileResult.fallback_operations`
+and `warnings` list the ones a sprite uses. [Operator coverage](operator-coverage.md) shows which operators pass
 PyTorch's own test samples.
 
 `nn.GRU`, `nn.LSTM` (including `proj_size`) and `nn.RNN` export with stacked
