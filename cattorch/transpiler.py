@@ -60,9 +60,6 @@ from cattorch.quantization import (
 from cattorch.sprite import (
     _add_input_checks,
     _add_prepare_for_save,
-    _apply_static_storage,
-    _apply_tied_static_aliases,
-    _deduplicate_static_tensors,
     _finish_generation_prepare,
     _gate_chain,
     _logical_list_sizes,
@@ -70,9 +67,14 @@ from cattorch.sprite import (
     _graph_layer,
     _remove_unused,
     _share_repeated_transformer_layers,
-    _static_storage_shard_limits,
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
+)
+from cattorch.static_storage import (
+    _apply_static_storage,
+    _apply_tied_static_aliases,
+    _deduplicate_static_tensors,
+    _static_storage_shard_limits,
 )
 from cattorch.guards import _guard_generation_init, _guard_plain_calls
 from cattorch.procedures import (

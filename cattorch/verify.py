@@ -122,7 +122,7 @@ def round_as_stored(
     of the model's quantization, gives the integer formats only it knows of,
     such as an output head's.
     """
-    from cattorch.sprite import _static_storage_group_size, _static_storage_precision
+    from cattorch.static_storage import _static_storage_group_size, _static_storage_precision
     from cattorch.storage import rounded_values
 
     if quantization is not None:

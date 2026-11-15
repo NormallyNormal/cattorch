@@ -32,6 +32,7 @@ Where things live:
 | `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
 | `cattorch.procedures` | Adds DSL programs to a sprite as custom blocks, and finds and edits them. |
 | `cattorch.guards` | Keeps stopped and overlapping calls of a sprite's blocks from reporting ok wrongly; its docstring compares what each kind of export does. |
+| `cattorch.static_storage` | Chooses each static tensor's storage precision, shares identical tensors, and installs the compressed payloads and their decoder. |
 | `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
 
 A change to an operation should come with:

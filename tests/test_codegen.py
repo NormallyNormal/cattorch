@@ -571,7 +571,7 @@ def test_tensor_adder_copies_only_the_lists():
 
 def test_static_values_stand_in_for_the_list_tolist_makes():
     import numpy as np
-    from cattorch.sprite import _deinterleave_static_values
+    from cattorch.static_storage import _deinterleave_static_values
     from cattorch.util.scratch.tensor_adder import StaticValues, TensorAdder
 
     tensor = torch.tensor([1.5, -0.0, float("nan"), 3.25, 1e-30, 7.0, 2.0, -4.0])

@@ -2200,7 +2200,7 @@ def _stored_precisions(
     static_tensors, storage, *, sprite, layouts, effective_ndims, interleaved_layouts,
 ):
     """``(float16 values, all values, tensor-level precision)`` by stored list."""
-    from cattorch.sprite import _static_storage_precision
+    from cattorch.static_storage import _static_storage_precision
 
     stored = {}
     for key, tensor in static_tensors.items():

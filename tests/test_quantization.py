@@ -338,7 +338,7 @@ class _TiedHead(torch.nn.Module):
 def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
     tmp_path, monkeypatch, method, model_type,
 ):
-    import cattorch.sprite as sprite_module
+    import cattorch.static_storage as static_storage
 
     torch.manual_seed(4)
     model = model_type().eval()
@@ -358,7 +358,7 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
     )
 
     precisions = []
-    original = sprite_module._static_storage_precision
+    original = static_storage._static_storage_precision
 
     def record(tensor, storage, *args):
         precision = original(tensor, storage, *args)
@@ -366,7 +366,7 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
             precisions.append(precision)
         return precision
 
-    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
     result = transpile(
         model, example, tmp_path / f"{model_type.__name__}-{method}",
         quantization=config,
@@ -449,10 +449,10 @@ class _Conv1DPair(torch.nn.Module):
 
 
 def _record_matrix_precisions(monkeypatch):
-    import cattorch.sprite as sprite_module
+    import cattorch.static_storage as static_storage
 
     precisions = []
-    original = sprite_module._static_storage_precision
+    original = static_storage._static_storage_precision
 
     def record(tensor, storage, *args):
         precision = original(tensor, storage, *args)
@@ -460,7 +460,7 @@ def _record_matrix_precisions(monkeypatch):
             precisions.append((tuple(tensor.shape), precision))
         return precision
 
-    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
     return precisions
 
 
@@ -667,7 +667,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
     # width, the axis storage groups it along, so it is stored in integers,
     # and GPTQ calibrates it. A weight above the folding size limit is still
     # rearranged at export, not in Scratch.
-    import cattorch.sprite as sprite_module
+    import cattorch.static_storage as static_storage
 
     if fold_limit is not None:
         import cattorch.graph as graph_module
@@ -695,7 +695,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
             parameter.copy_(parameter.half().float())
 
     precisions = []
-    original = sprite_module._static_storage_precision
+    original = static_storage._static_storage_precision
 
     def record(tensor, storage, *args):
         precision = original(tensor, storage, *args)
@@ -703,7 +703,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
             precisions.append((tuple(tensor.shape), precision))
         return precision
 
-    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
     result = transpile(
         model, example, tmp_path / "product", quantization=config,
         calibration=calibration,
@@ -870,7 +870,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
     # output channel's whole fan-in (2 x 3 x 3 here, so 6 of at most 8), and
     # a transposed convolution's within one kernel (3), as storage reads
     # them, so the kernels stay integers.
-    import cattorch.sprite as sprite_module
+    import cattorch.static_storage as static_storage
 
     torch.manual_seed(15)
     model = _Functional(
@@ -902,7 +902,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
             parameter.copy_(parameter.half().float())
 
     precisions = []
-    original = sprite_module._static_storage_precision
+    original = static_storage._static_storage_precision
 
     def record(tensor, storage, *args):
         precision = original(tensor, storage, *args)
@@ -910,7 +910,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
             precisions.append((tuple(tensor.shape), precision))
         return precision
 
-    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
     result = transpile(
         model, example, tmp_path / "convolutions", quantization=config,
         calibration=calibration,
@@ -1035,7 +1035,7 @@ def test_quantized_values_are_a_fixed_point_of_the_storage_codec(bits, scale_pre
     # Group maxima across the subnormal scale range, where rounding the scale
     # used to leave a group's largest code one short and storage then
     # rejected the whole tensor.
-    from cattorch.sprite import _check_integer_codec_grid
+    from cattorch.static_storage import _check_integer_codec_grid
     from cattorch.storage import StorageConfig, quantized_storage
 
     generator = torch.Generator().manual_seed(bits)
@@ -1218,8 +1218,8 @@ def test_integers_no_smaller_than_float16_stay_float16(tmp_path, monkeypatch):
     example = torch.randn(1, 97)
     config = QuantizationConfig(bits=8, min_quantized_values=1024)
     precisions = []
-    import cattorch.sprite as sprite_module
-    original = sprite_module._static_storage_precision
+    import cattorch.static_storage as static_storage
+    original = static_storage._static_storage_precision
 
     def record(tensor, storage, *args):
         precision = original(tensor, storage, *args)
@@ -1227,7 +1227,7 @@ def test_integers_no_smaller_than_float16_stay_float16(tmp_path, monkeypatch):
             precisions.append((tuple(tensor.shape), precision))
         return precision
 
-    monkeypatch.setattr(sprite_module, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
     result = transpile(model, example, tmp_path / "skip", quantization=config)
     report = {item.name: item for item in result.quantization.tensors}
     assert (report["prime.weight"].method, report["prime.weight"].fallback_reason) == (
