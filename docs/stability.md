@@ -35,25 +35,30 @@ names, and supported operations. A name that is replaced keeps working, with a
 - **Experimental APIs**, imported from `cattorch.experimental`: the kernel
   interface (`Kernel`, `KernelContext`, `TensorInfo`, `check_kernel`,
   `build_kernel_benchmark`, `cattorch.scratch`, and `transpile(kernels=...)`),
-  `op`, the explicit mixture-of-experts classes (`ExpertFamily`, `SparseMoE`,
-  `StackedSwiGLUMoE`, `routed_experts`, `select_routes`, `RoutingScores`),
-  and `analyze` with `AnalysisReport` and `EntryPointAnalysis`. They can change in any release;
-  the [changelog](../CHANGELOG.md) notes when they do.
+  `op` and `Operation`, the explicit mixture-of-experts classes
+  (`ExpertFamily`, `SparseMoE`, `StackedSwiGLUMoE`, `routed_experts`,
+  `select_routes`, `RoutingScores`), and `analyze` with `AnalysisReport` and
+  `EntryPointAnalysis`. They can change in any release; the
+  [changelog](../CHANGELOG.md) notes when they do.
 - **Internals:** submodules of `cattorch` (other than
   `cattorch.interface.INTERFACE_VERSION`) and names not in `cattorch.__all__`
   or `cattorch.experimental.__all__`, and names starting with `_`.
 - **Sprite internals:** blocks, lists, and variables that aren't part of the
-  Scratch interface, and the exact sprite size, block count, and speed.
+  Scratch interface (their names start with `_`), and the exact sprite size,
+  block count, and speed.
 - **Numbers within tolerance:** results of `optimization="fast"`, float16, or
   quantization, which can change as approximations improve. Exact exports keep
   matching PyTorch.
 - **Wording:** the text of warnings and error messages. Exception and
   warning classes don't change: invalid arguments raise `TypeError` or
   `ValueError`, an unconvertible operation `UnsupportedOperationError`, and
-  any other model cattorch can't export `UnsupportedModelError`. The values of a sprite's `cattorch status` aren't wording:
-  they're part of the [Scratch interface](scratch-interface.md#status-values).
+  any other model cattorch can't export `UnsupportedModelError`. The values
+  of a sprite's `cattorch status` aren't wording: they're part of the
+  [Scratch interface](scratch-interface.md#status-values).
 
-Programs, markers, and adapters were imported from `cattorch.experimental`
-before 1.0. Those imports still work, with a `DeprecationWarning`.
+Programs, markers, `GenerationProgram`, `ModuleAdapter`, `AdapterContext`
+and `CustomMoEWarning` can also be imported from `cattorch.experimental`,
+where they were before 1.0. Those imports give a `DeprecationWarning` and
+keep working until 2.0.
 
 Related: [Scratch interface](scratch-interface.md), [API reference](api-reference.md).
