@@ -50,14 +50,14 @@ def _merge_slots_by_name(
 def _merge_lists_by_name(
     sprite, names: set[str], *, added: tuple[frozenset[str], frozenset[str]] | None = None,
 ) -> None:
-    """Unify repeated DSL declarations of persistent generation lists."""
+    """Keep one list for each of ``names`` that several added programs declared."""
     _merge_slots_by_name(sprite, "lists", names, added)
 
 
 def _merge_variables_by_name(
     sprite, names: set[str], *, added: tuple[frozenset[str], frozenset[str]] | None = None,
 ) -> None:
-    """Unify repeated DSL declarations of persistent generation variables."""
+    """Keep one variable for each of ``names`` that several added programs declared."""
     _merge_slots_by_name(sprite, "variables", names, added)
 
 
