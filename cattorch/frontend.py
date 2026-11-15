@@ -421,12 +421,11 @@ def own_decompositions() -> dict:
     return table
 
 
-# In-place operations that change a tensor's shape or storage, not its
-# values, and the copy itself.
-_NOT_VALUE_UPDATES = frozenset({
-    "copy_", "detach_", "resize_", "resize_as_", "set_", "as_strided_",
-    "squeeze_", "unsqueeze_", "t_", "transpose_", "swapdims_", "swapaxes_",
-})
+# In-place operations whose out-of-place form returns a new tensor but which
+# change a tensor's shape or storage, not its values, and the copy itself.
+# Those whose out-of-place form returns a view, such as squeeze_, are
+# recognized by their schema.
+_NOT_VALUE_UPDATES = frozenset({"copy_", "resize_", "resize_as_", "set_"})
 
 
 def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | None:
@@ -508,13 +507,13 @@ def _fx_decompositions() -> dict:
         # mapping back to ATen would only rename the unsupported operation.
         packet = operator.overloadpacket.__name__
         dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
-        in_place = _in_place_as_copy(
-            operator, _recorded_fallback(name, decomposition), registry, kept,
-        )
-        if rule is None and name not in kept and in_place is not None:
-            table[operator] = in_place
-        elif rule is None and name not in kept and not dead_end:
-            table[operator] = _recorded_fallback(name, decomposition)
+        if rule is None and name not in kept:
+            fallback = _recorded_fallback(name, decomposition)
+            in_place = _in_place_as_copy(operator, fallback, registry, kept)
+            if in_place is not None:
+                table[operator] = in_place
+            elif not dead_end:
+                table[operator] = fallback
         elif (
             rule is not None and rule.validator is not None
             and name in _DECOMPOSE_WHEN_REJECTED
