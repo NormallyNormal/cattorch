@@ -763,3 +763,77 @@ def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
         "cattorch forward complete", interface.wrong_number_of_items("input"), 0,
     ]
     assert stage["heard"][3:] == ["cattorch prepare for save complete", interface.OK]
+
+
+def test_a_project_bridges_every_shard_of_a_long_input_and_output(tmp_path):
+    from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
+
+    torch.manual_seed(0)
+    size = SCRATCH_LIST_LIMIT + 5
+    model = nn.Linear(size, 1, bias=False).eval()
+    wide = nn.Sequential(model, nn.Linear(1, size)).eval()
+    example = torch.randn(1, size)
+    result = transpile(wide, example, tmp_path / "wide")
+    assert set(result.sharded_lists) == {"input", "output"}
+    project = build_project(result, tmp_path / "wide", example_inputs=example)
+    assert {"wide input shard 2", "wide output shard 2"} <= set(project.lists)
+    stage = run_vm(project, tmp_path)["stage"]
+    assert stage["wide status"] == interface.OK
+    assert len(stage["wide input"]) == SCRATCH_LIST_LIMIT
+    assert len(stage["wide input shard 2"]) == 5
+    actual = torch.cat([values(stage, "wide output"), values(stage, "wide output shard 2")])
+    with torch.no_grad():
+        expected = wide(example).flatten()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-4)
+
+
+def demo_said(run) -> list[str]:
+    """What the Demo said, without its questions, which a sprite says too."""
+    return [
+        entry["text"] for entry in run["said"]
+        if entry["text"] and "Type the start of some text" not in entry["text"]
+    ]
+
+
+def test_the_demo_stops_and_says_a_tokenizer_failure(tmp_path):
+    import warnings
+
+    from shared_models import CHARACTERS, Language, char_tokenizer
+
+    class Padded(Language):
+        """A vocabulary padded past the tokenizer's, preferring a padding ID."""
+
+        def __init__(self, size):
+            super().__init__()
+            self.tokens = nn.Embedding(size, 8)
+            self.head = nn.Linear(8, size)
+            with torch.no_grad():
+                self.head.bias[size - 2] = 50.0
+
+    torch.manual_seed(1)
+    tokenizer = CharTokenizer(char_tokenizer()).save(tmp_path / "chars", name="chars")
+    result = transpile(Padded(32).eval(), GenerationProgram(max_context=16), tmp_path / "lm")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        project = build_project(
+            result, tmp_path / "padded", tokenizer=tokenizer, temperature=0, max_new_tokens=4,
+        )
+    message = f"the model has 32 token IDs and the tokenizer {len(CHARACTERS)}"
+    assert any(message in str(item.message) for item in caught)
+    assert any(message in text for text in project.warnings)
+    run = run_vm(project, tmp_path, answers=["hi", ""])
+    said = demo_said(run)
+    failure = f"chars detokenize: {interface.invalid_item(interface.TOKEN_IDS)}"
+    # The prompt, then the failure, instead of the prompt again and again.
+    assert said == ["hi...", failure], said
+    asked = [entry["text"] for entry in run["said"] if "Type the start" in entry["text"]]
+    assert asked[-1].startswith(failure)
+    assert run["stage"]["lm status"] == interface.OK
+
+    # A tokenizer with IDs past the model's: the prefill refuses them.
+    small = transpile(Padded(16).eval(), GenerationProgram(max_context=16), tmp_path / "small")
+    with pytest.warns(UserWarning, match=f"the tokenizer has {len(CHARACTERS)} token IDs"):
+        project = build_project(small, tmp_path / "small", tokenizer=tokenizer, temperature=0)
+    run = run_vm(project, tmp_path, answers=["zz", ""])
+    said = demo_said(run)
+    assert said == ["zz...", f"small prefill: {interface.invalid_item(interface.TOKEN_IDS)}"]

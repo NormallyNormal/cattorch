@@ -247,13 +247,24 @@ build_project(
 ```
 
 Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
-missing, as `transpile`'s `output_path` does. Every operation gets a bridge to global lists that other sprites can
-run with `broadcast and wait`. A `TranspileResult` gets list monitors starting
-from `example_inputs` (or zeros) and runs on the green flag or space key;
-`labels` names a classifier's outputs. A `GenerationResult` needs `tokenizer`,
-a `TokenizerResult`, and gets a Demo sprite that continues typed prompts. A
+missing, as `transpile`'s `output_path` does. Every operation gets a bridge
+to global lists that other sprites can run with `broadcast and wait`. A
+`TranspileResult` gets list monitors starting from `example_inputs` (or
+zeros) and runs on the green flag or space key; `labels` names a
+classifier's outputs. A `GenerationResult` needs `tokenizer`, a
+`TokenizerResult`, and gets a Demo sprite that continues typed prompts. A
 `ProgramResult` gets bridges only. See
 [projects and the command line](projects-and-cli.md).
+
+Each option applies to one kind of result, and given to another kind raises
+`ValueError`: `example_inputs` and `labels` to a `TranspileResult`, and
+`tokenizer`, `max_new_tokens`, `temperature`, `eos_token_id` and `prompt` to a
+`GenerationResult`. `example_inputs` holds a tensor per input, in order, each
+of the input's shape and dtype (inputs without one start at zeros).
+`max_new_tokens` is a positive integer, `temperature` a finite number of 0 or
+more, `eos_token_id` one of the model's token IDs, and `prompt` a non-empty
+string. A tokenizer with more or fewer token IDs than the model's vocabulary
+warns, since some IDs of one then mean nothing to the other.
 
 ### `ProjectResult`
 
@@ -263,7 +274,7 @@ a `TokenizerResult`, and gets a Demo sprite that continues typed prompts. A
 | `sprites` | Names of the project's sprites. |
 | `broadcasts` | The project's public broadcasts: each bridge's message followed by its completion broadcast, such as `points run`, `points run complete`. |
 | `lists`, `variables` | The global lists and variables the bridges read and write. |
-| `warnings` | Size warnings; each is also emitted as a `CattorchWarning`. |
+| `warnings` | Size warnings, and a tokenizer that doesn't match the model's vocabulary; each is also emitted as a `CattorchWarning`. |
 
 All names are Scratch names.
 

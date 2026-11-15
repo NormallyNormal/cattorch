@@ -49,7 +49,18 @@ temperature slider sets how random the choices are; 0 always picks the
 likeliest token. Generation stops after `max_new_tokens`, at `eos_token_id`
 when you give one, or when the model's context is full (never, for a recurrent
 generator without `max_context`). `prompt` replaces the
-question it asks.
+question it asks. When the model or the tokenizer fails, such as a prompt
+longer than the context or a token ID the tokenizer doesn't have, the Demo
+stops, says which bridge failed with its status (`chars detokenize: invalid
+item: cattorch token ids`), and repeats it before the next question.
+
+The model's vocabulary and the tokenizer's token IDs should match.
+`build_project` warns when they don't: a vocabulary padded past the
+tokenizer's (50304 for 50257) works until the model picks a padding ID, and a
+tokenizer with an ID past the model's, such as an added padding token, works
+until the text contains it. Options of another kind of project, such as
+`temperature` for a classifier, raise `ValueError`; see
+[`build_project`](api-reference.md#build_project).
 
 A model with [entry points](markers.md) gets a bridge for each one but no
 demo, since only you know what its calls mean.
@@ -62,7 +73,9 @@ global inputs into the sprite's own lists, runs the operation, and copies the
 results back, inside a block that runs without screen refresh. It sets
 `NAME status` to the sprite's `cattorch status`, copies the results only when
 it is `ok`, and ends with a `broadcast and wait` of the message followed by
-` complete`, such as `NAME run complete`. The names start with the sprite's
+` complete`, such as `NAME run complete`. A list over 200,000 items, which
+the sprite [splits into shards](storage.md#list-sharding), is bridged shard
+by shard to global lists of the same names, such as `NAME output shard 2`. The names start with the sprite's
 name; the [Scratch interface](scratch-interface.md#projects) lists them all:
 
 | Model | Broadcast | Reads | Writes |

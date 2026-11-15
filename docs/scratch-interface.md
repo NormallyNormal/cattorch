@@ -270,7 +270,7 @@ sprite, `cattorch bridge MESSAGE`, which ends with a `broadcast and wait` of
 | `NAME tokenize`, `NAME detokenize` | broadcast | A tokenizer: runs the block. |
 | `NAME run complete`, `NAME predict complete`, `NAME ENTRY complete`, `NAME prefill complete`, `NAME decode complete`, `NAME tokenize complete`, `NAME detokenize complete` | broadcast | Sent when each bridge ends. |
 | `cattorch bridge NAME run`, `cattorch bridge NAME predict`, `cattorch bridge NAME ENTRY`, `cattorch bridge NAME prefill`, `cattorch bridge NAME decode`, `cattorch bridge NAME tokenize`, `cattorch bridge NAME detokenize` | block | The bridges, in the model's or tokenizer's sprite. |
-| `NAME input`, `NAME output`, ... | list | A model's input and output lists. |
+| `NAME input`, `NAME output`, ... | list | A model's input and output lists. A list split into [shards](#long-lists) is bridged shard by shard, to `NAME output`, `NAME output shard 2`, and so on. |
 | `NAME ENTRY INPUT`, `NAME ENTRY OUTPUT` | list | A program's entry point lists. |
 | `NAME labels` | list | A classifier's labels, one per output. |
 | `NAME token ids` | list | A text generator's prompt or one token, and a tokenizer's token IDs. |

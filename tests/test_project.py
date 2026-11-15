@@ -196,3 +196,88 @@ def test_reserved_sprite_names_are_renamed(tmp_path, name):
     assert name not in project.sprites
     assert len(set(project.sprites)) == len(project.sprites)
     assert not any(entry.startswith("cattorch ") for entry in project.lists)
+
+
+@pytest.mark.parametrize(("options", "error", "expected"), [
+    ({"max_new_tokens": 2.5}, TypeError, "max_new_tokens must be an integer"),
+    ({"max_new_tokens": True}, TypeError, "max_new_tokens must be an integer"),
+    ({"max_new_tokens": 0}, ValueError, "max_new_tokens must be positive"),
+    ({"temperature": -1}, ValueError, "temperature must be a finite number of 0 or more"),
+    ({"temperature": math.nan}, ValueError, "temperature must be a finite"),
+    ({"temperature": math.inf}, ValueError, "temperature must be a finite"),
+    ({"temperature": "0.5"}, TypeError, "temperature must be a number"),
+    ({"eos_token_id": len(CHARACTERS)}, ValueError, "not a token ID of the model"),
+    ({"eos_token_id": -1}, ValueError, "not a token ID of the model"),
+    ({"eos_token_id": 1.0}, TypeError, "eos_token_id must be an integer"),
+    ({"prompt": ""}, ValueError, "prompt must be a non-empty string"),
+    ({"labels": ["a"]}, ValueError, "labels= applies only to a TranspileResult"),
+    ({"example_inputs": torch.zeros(1, 2)}, ValueError, "example_inputs= applies only"),
+])
+def test_generation_project_options_are_checked(generator, options, error, expected):
+    _, result, tokenizer, directory = generator
+    with pytest.raises(error, match=expected):
+        build_project(result, directory / "bad", tokenizer=tokenizer, **options)
+    assert not (directory / "bad.sb3").exists()
+
+
+def test_generation_project_without_its_tokenizer_mismatch_does_not_warn(generator):
+    import warnings
+
+    _, result, tokenizer, directory = generator
+    assert result.vocabulary_size == tokenizer.token_count
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        project = build_project(result, directory / "matched", tokenizer=tokenizer)
+    assert project.warnings == ()
+
+
+def test_options_of_another_kind_of_project_are_rejected(tmp_path):
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2).eval()
+    example = torch.randn(1, 4)
+    result = transpile(model, example, tmp_path / "net")
+    for options, expected in (
+        ({"temperature": 0.5}, "temperature= applies only to a text generator"),
+        ({"max_new_tokens": 3}, "max_new_tokens= applies only"),
+        ({"eos_token_id": 1}, "eos_token_id= applies only"),
+        ({"prompt": "Say"}, "prompt= applies only"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            build_project(result, tmp_path / "bad", **options)
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(2))
+
+        @entrypoint(example_inputs=(torch.ones(2),))
+        def add(self, value):
+            self.total = self.total + value
+            return self.total
+
+    program = transpile(Counter().eval(), None, tmp_path / "counter")
+    for options, expected in (
+        ({"labels": ["a", "b"]}, "labels= applies only to a TranspileResult"),
+        ({"example_inputs": (torch.ones(2),)}, "example_inputs= applies only"),
+        ({"temperature": 0}, "temperature= applies only"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            build_project(program, tmp_path / "bad", **options)
+    assert not list(tmp_path.glob("bad*"))
+
+
+def test_example_inputs_must_fit_the_exported_inputs(tmp_path):
+    model = nn.Linear(4, 2).eval()
+    result = transpile(model, torch.randn(1, 4), tmp_path / "net")
+    for example, error, expected in (
+        (torch.randn(2, 4), ValueError, r"shape \(2, 4\), but 'input' takes float32 of shape \(1, 4\)"),
+        (torch.zeros(1, 4, dtype=torch.int64), ValueError, "int64 tensor"),
+        ((torch.randn(1, 4), torch.randn(1, 4)), ValueError, "has 2 tensors, but the export has 1"),
+        (([1.0, 2.0, 3.0, 4.0],), TypeError, "example input 0 is a list"),
+        ({"x": torch.randn(1, 4)}, TypeError, "example_inputs must be a tensor or a tuple"),
+    ):
+        with pytest.raises(error, match=expected):
+            build_project(result, tmp_path / "bad", example_inputs=example)
+    with pytest.raises(TypeError, match="labels must be a sequence"):
+        build_project(result, tmp_path / "bad", labels="ab")
+    assert build_project(result, tmp_path / "ok", example_inputs=torch.randn(1, 4)).path.exists()

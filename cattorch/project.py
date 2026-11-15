@@ -13,6 +13,7 @@ prompt-and-continue loop for a text generator with its tokenizer.
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 
 import torch
 
-from cattorch.errors import warn
+from cattorch.errors import collect_warnings, warn
 from cattorch.results import (
     BoundedDimension, GenerationResult, ProgramResult, ProjectResult, TokenizerResult,
     TranspileResult,
@@ -44,6 +45,7 @@ from cattorch.util.scratch.dsl import (
     for_each,
     gt,
     if_,
+    if_else,
     item,
     join,
     length,
@@ -59,8 +61,11 @@ from cattorch.util.scratch.dsl import (
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
 from cattorch.util.scratch.remap import remap_ids
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 from cattorch import interface
-from cattorch.interface import STATUS_VARIABLE, bridge_procedure, completion, project_name
+from cattorch.interface import (
+    STATUS_VARIABLE, bridge_procedure, completion, project_name, shard_name,
+)
 
 
 _INDEX = "_cattorch bridge index"
@@ -374,37 +379,49 @@ def _example_values(spec, example) -> list:
     return [0] * count
 
 
-def _bridge_operation(builder, sprite, message, procedure, inputs, outputs, examples, sharded):
+def _shards(sprite: dict, list_name: str) -> list[str]:
+    """A public list's physical lists in the sprite: ``LIST``, ``LIST shard 2``, ..."""
+    names = {entry[0] for entry in sprite.get("lists", {}).values()}
+    shards = [list_name]
+    while shard_name(list_name, len(shards)) in names:
+        shards.append(shard_name(list_name, len(shards)))
+    return shards
+
+
+def _bridge_operation(builder, sprite, message, procedure, inputs, outputs, examples):
     """Copy global inputs in, call ``procedure``, and copy outputs back out.
 
     The sprite's status goes to the global ``NAME status``, and the outputs
-    only when it is ok, as a block that fails writes no output.
+    only when it is ok, as a block that fails writes no output. A list split
+    into shards is bridged shard by shard, each to a global list named after
+    it (``NAME output``, ``NAME output shard 2``, ...), since a global list
+    has the same length limit. Returns the global lists, inputs first.
     """
     name = sprite["name"]
     status = builder.global_variable(project_name(name, STATUS_VARIABLE), interface.INITIAL_STATUS)
-    lists, body = [], []
+    lists, body, shown = [], [], []
     for spec, example in zip(inputs, examples):
-        if spec.list_name in sharded:
-            raise ValueError(
-                f"{spec.list_name!r} is split into several lists, which a bridge can't fill"
-            )
-        source = builder.global_list(
-            project_name(name, spec.list_name), _example_values(spec, example),
-        )
-        lists += [source, spec.list_name]
-        body += _copy(source, spec.list_name)
+        values = _example_values(spec, example)
+        for position, shard in enumerate(_shards(sprite, spec.list_name)):
+            chunk = values[position * SCRATCH_LIST_LIMIT:(position + 1) * SCRATCH_LIST_LIMIT]
+            source = builder.global_list(project_name(name, shard), chunk)
+            lists += [source, shard]
+            body += _copy(source, shard)
+            shown.append(source)
     body += [call(procedure), set_var(status, var(STATUS_VARIABLE))]
     copies: list = []
     for spec in outputs:
-        target = builder.global_list(project_name(name, spec.list_name))
-        lists += [spec.list_name, target]
-        copies += _copy(spec.list_name, target)
+        for shard in _shards(sprite, spec.list_name):
+            target = builder.global_list(project_name(name, shard))
+            lists += [shard, target]
+            copies += _copy(shard, target)
+            shown.append(target)
     if copies:
         body.append(if_(eq(var(STATUS_VARIABLE), interface.OK), tuple(copies)))
     builder.receiver(
         sprite, message, body, lists=lists, variables=(_INDEX, status, STATUS_VARIABLE),
     )
-    return [project_name(name, spec.list_name) for spec in (*inputs, *outputs)]
+    return shown
 
 
 def _layout(builder, names: list[str]) -> None:
@@ -418,8 +435,7 @@ def _forward_project(builder, result, example_inputs, labels) -> None:
     message = project_name(name, "run")
     examples = list(example_inputs) + [None] * (len(result.inputs) - len(example_inputs))
     shown = _bridge_operation(
-        builder, sprite, message, interface.FORWARD, result.inputs, result.outputs,
-        examples, result.sharded_lists,
+        builder, sprite, message, interface.FORWARD, result.inputs, result.outputs, examples,
     )
     _layout(builder, shown)
     if labels is not None:
@@ -464,7 +480,7 @@ def _program_project(builder, result) -> None:
         message = project_name(name, entry.procedure)
         shown += _bridge_operation(
             builder, sprite, message, entry.procedure, entry.inputs, entry.outputs,
-            [None] * len(entry.inputs), result.sharded_lists,
+            [None] * len(entry.inputs),
         )
         lines.append(f"broadcast \"{message}\" and wait")
     _layout(builder, list(dict.fromkeys(shown)))
@@ -528,48 +544,75 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
     demo = builder.add_demo_sprite("Demo")
     generated = "_cattorch demo generated"
     count, done, seed = "_cattorch demo count", "_cattorch demo done", "_cattorch demo prompt"
+    problem = "_cattorch demo problem"
     builder.procedure(demo, "_cattorch demo prompt tokens", _copy(ids, tokens),
                       lists=(ids, tokens), variables=(_INDEX,))
     builder.procedure(demo, "_cattorch demo generated tokens", _copy(generated, ids),
                       lists=(generated, ids), variables=(_INDEX,))
     stop = -1 if eos_token_id is None else int(eos_token_id)
+
+    def failed(who: str, operation: str, status_variable: str, *, normal=()) -> tuple:
+        """Report ``who``'s status after ``operation`` unless it is ok (or ``normal``)."""
+        report: tuple = (
+            set_var(problem, join(f"{project_name(who, operation)}: ", var(status_variable))),
+            say(var(problem)),
+        )
+        for status_value in normal:
+            report = (if_(not_(eq(var(status_variable), status_value)), report),)
+        return (if_(not_(eq(var(status_variable), interface.OK)), report),)
+
     check = (
         set_var(done, 0),
+        # A full context ends the continuation as the token budget does.
         if_(not_(eq(var(status), interface.OK)), (set_var(done, 1),)),
+        if_(not_(eq(var(problem), "")), (set_var(done, 1),)),
         if_(eq(var(count), max_new_tokens), (set_var(done, 1),)),
         if_(eq(var(next_token), stop), (set_var(done, 1),)),
     )
     question = prompt or "Type the start of some text (leave it empty to stop)"
+    # A failure (the model's or the tokenizer's) ends the continuation and
+    # starts the next question, which would hide a said message at once.
+    ask_again = if_else(
+        eq(var(problem), ""), (ask(question),), (ask(join(join(var(problem), ". "), question)),),
+    )
     body = (
         ask(question),
         repeat_until(eq(answer(), ""), (
             set_var(seed, answer()),
             set_var(text, answer()),
+            set_var(problem, ""),
             broadcast_and_wait(project_name(tokenizer_name, interface.TOKENIZE)),
-            call("_cattorch demo prompt tokens"),
-            say(join(var(seed), "...")),
-            broadcast_and_wait(project_name(name, interface.PREFILL)),
-            if_(not_(eq(var(status), interface.OK)), (say(var(status)),)),
-            clear(generated),
-            set_var(count, 0),
-            *check,
-            repeat_until(eq(var(done), 1), (
-                append(generated, var(next_token)),
-                call("_cattorch demo generated tokens"),
-                broadcast_and_wait(project_name(tokenizer_name, interface.DETOKENIZE)),
-                say(join(var(seed), var(text))),
-                clear(tokens),
-                append(tokens, var(next_token)),
-                broadcast_and_wait(project_name(name, interface.DECODE)),
-                change_var(count, 1),
+            *failed(tokenizer_name, interface.TOKENIZE, words_status),
+            if_(eq(var(problem), ""), (
+                call("_cattorch demo prompt tokens"),
+                say(join(var(seed), "...")),
+                broadcast_and_wait(project_name(name, interface.PREFILL)),
+                *failed(name, interface.PREFILL, status),
+                clear(generated),
+                set_var(count, 0),
                 *check,
+                repeat_until(eq(var(done), 1), (
+                    append(generated, var(next_token)),
+                    call("_cattorch demo generated tokens"),
+                    broadcast_and_wait(project_name(tokenizer_name, interface.DETOKENIZE)),
+                    *failed(tokenizer_name, interface.DETOKENIZE, words_status),
+                    if_(eq(var(problem), ""), (
+                        say(join(var(seed), var(text))),
+                        clear(tokens),
+                        append(tokens, var(next_token)),
+                        broadcast_and_wait(project_name(name, interface.DECODE)),
+                        *failed(name, interface.DECODE, status, normal=(interface.CONTEXT_FULL,)),
+                        change_var(count, 1),
+                    )),
+                    *check,
+                )),
             )),
-            ask(question),
+            ask_again,
         )),
     )
     builder.script(demo, {"opcode": "event_whenflagclicked", "fields": {}}, body,
                    lists=(generated, tokens), variables=(count, done, seed, text, status,
-                                                         next_token))
+                                                         next_token, words_status, problem))
     builder.monitor(heat, kind="slider", x=5, y=5, sliderMin=0, sliderMax=2, isDiscrete=False)
     builder.note(
         f"Click the green flag and type a prompt. The Demo sprite continues it with "
@@ -584,6 +627,129 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
         f"\"{name} status\"; and broadcast \"{tokenizer_name} detokenize\" to turn "
         f"\"{tokenizer_name} token ids\" back into \"{tokenizer_name} text\"."
     )
+
+
+# The generation options' defaults, which other kinds of project accept as given.
+_GENERATION_DEFAULTS = {
+    "max_new_tokens": 40, "temperature": 0.8, "eos_token_id": None, "prompt": None,
+}
+
+
+def _check_options(model, *, tokenizer, example_inputs, labels, **generation) -> None:
+    """Reject options of another kind of project, and values a project can't use.
+
+    Every option applies to one kind of model: ``tokenizer`` and the
+    generation options to a ``GenerationResult``, ``example_inputs`` and
+    ``labels`` to a ``TranspileResult``. Given to another kind, an option
+    would be ignored, so it raises ``ValueError``.
+    """
+    kind = type(model).__name__
+    if isinstance(model, GenerationResult):
+        if tokenizer is None:
+            raise ValueError("a text generator's project needs its tokenizer= result")
+        if not isinstance(tokenizer, TokenizerResult):
+            raise TypeError("tokenizer must be the result of cattorch.transpile_tokenizer")
+        _check_generation_options(model, **generation)
+    else:
+        if tokenizer is not None:
+            raise ValueError("tokenizer= applies only to a text generator, a GenerationResult")
+        for option, value in generation.items():
+            if value != _GENERATION_DEFAULTS[option]:
+                raise ValueError(
+                    f"{option}= applies only to a text generator's project, not a {kind}'s"
+                )
+    if isinstance(model, TranspileResult):
+        _check_examples(model, example_inputs)
+        if labels is not None and (
+            isinstance(labels, (str, bytes)) or not isinstance(labels, Sequence)
+        ):
+            raise TypeError("labels must be a sequence of labels, such as a list of strings")
+    else:
+        if not isinstance(example_inputs, (tuple, list)) or len(example_inputs):
+            raise ValueError(
+                f"example_inputs= applies only to a TranspileResult's project, not a {kind}'s"
+            )
+        if labels is not None:
+            raise ValueError(f"labels= applies only to a TranspileResult's project, not a {kind}'s")
+
+
+def _check_examples(model: TranspileResult, example_inputs) -> None:
+    """``example_inputs`` must fit the export's inputs, in order; the rest start at zeros."""
+    if not isinstance(example_inputs, (tuple, list)):
+        raise TypeError(
+            "example_inputs must be a tensor or a tuple of tensors, not "
+            f"{type(example_inputs).__name__}"
+        )
+    if len(example_inputs) > len(model.inputs):
+        raise ValueError(
+            f"example_inputs has {len(example_inputs)} tensors, but the export has "
+            f"{len(model.inputs)} inputs"
+        )
+    for index, (spec, value) in enumerate(zip(model.inputs, example_inputs)):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"example input {index} is a {type(value).__name__}, not a tensor")
+        shape = tuple(value.shape)
+        fits = len(shape) == len(spec.shape) and all(
+            extent.minimum <= size <= extent.maximum
+            if isinstance(extent, BoundedDimension) else size == extent
+            for size, extent in zip(shape, spec.shape)
+        )
+        dtype = str(value.dtype).removeprefix("torch.")
+        if not fits or dtype != spec.dtype:
+            expected = tuple(
+                f"{extent.minimum}..{extent.maximum}" if isinstance(extent, BoundedDimension)
+                else extent for extent in spec.shape
+            )
+            raise ValueError(
+                f"example input {index} is a {dtype} tensor of shape {shape}, but "
+                f"{spec.list_name!r} takes {spec.dtype} of shape {expected}"
+            )
+
+
+def _check_generation_options(model, *, max_new_tokens, temperature, eos_token_id, prompt):
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
+        raise TypeError(f"max_new_tokens must be an integer, not {type(max_new_tokens).__name__}")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError(f"temperature must be a number, not {type(temperature).__name__}")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError(f"temperature must be a finite number of 0 or more, not {temperature!r}")
+    if eos_token_id is not None:
+        if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
+            raise TypeError(
+                f"eos_token_id must be an integer or None, not {type(eos_token_id).__name__}"
+            )
+        if not 0 <= eos_token_id < model.vocabulary_size:
+            raise ValueError(
+                f"eos_token_id {eos_token_id} is not a token ID of the model, whose "
+                f"vocabulary has {model.vocabulary_size}"
+            )
+    if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+        raise ValueError("prompt must be a non-empty string or None")
+
+
+def _check_vocabularies(model: GenerationResult, tokenizer: TokenizerResult) -> None:
+    """Warn when the model and tokenizer don't have the same token IDs.
+
+    A model whose vocabulary is padded past the tokenizer's (50304 for 50257)
+    is common and works until the model picks a padding ID; a tokenizer with
+    IDs past the model's (an added padding token) works until the text
+    contains one. Either way the Demo stops and says the failing status.
+    """
+    tokens, vocabulary = tokenizer.token_count, model.vocabulary_size
+    if tokens < vocabulary:
+        warn(
+            f"the model has {vocabulary} token IDs and the tokenizer {tokens}: if the model "
+            f"picks an ID from {tokens} up, detokenize fails with an invalid item, and the "
+            "Demo stops there"
+        )
+    elif tokens > vocabulary:
+        warn(
+            f"the tokenizer has {tokens} token IDs and the model {vocabulary}: text that "
+            f"tokenizes to an ID from {vocabulary} up fails the model's prefill with an "
+            "invalid item, and the Demo stops there"
+        )
 
 
 def build_project(
@@ -614,36 +780,34 @@ def build_project(
     sprites can run it with ``broadcast and wait``; ``ProjectResult`` lists
     the broadcasts and data. Warnings are also emitted as ``CattorchWarning``.
     """
-    output_path = output_file(output_path, ".sb3")
-    if isinstance(example_inputs, torch.Tensor):
-        example_inputs = (example_inputs,)
-    builder = _Builder()
-    if isinstance(model, ProgramResult):
-        if tokenizer is not None:
-            raise ValueError("tokenizer= applies only to a text generator, a GenerationResult")
-        _program_project(builder, model)
-    elif isinstance(model, GenerationResult):
-        if tokenizer is None:
-            raise ValueError("a text generator's project needs its tokenizer= result")
-        if not isinstance(tokenizer, TokenizerResult):
-            raise TypeError("tokenizer must be the result of cattorch.transpile_tokenizer")
-        if max_new_tokens < 1:
-            raise ValueError("max_new_tokens must be positive")
-        _generation_project(
-            builder, model, tokenizer, max_new_tokens=max_new_tokens,
-            temperature=temperature, eos_token_id=eos_token_id, prompt=prompt,
-        )
-    elif isinstance(model, TranspileResult):
-        if tokenizer is not None:
-            raise ValueError("tokenizer= applies only to a text generator, a GenerationResult")
-        _forward_project(builder, model, tuple(example_inputs), labels)
-    else:
+    if not isinstance(model, (TranspileResult, ProgramResult, GenerationResult)):
         raise TypeError(
             f"model must be the result of cattorch.transpile, not a {type(model).__name__}"
         )
-    project_warnings = builder.write(output_path)
-    for message in project_warnings:
-        warn(message)
+    output_path = output_file(output_path, ".sb3")
+    if isinstance(example_inputs, torch.Tensor):
+        example_inputs = (example_inputs,)
+    _check_options(
+        model, tokenizer=tokenizer, example_inputs=example_inputs, labels=labels,
+        max_new_tokens=max_new_tokens, temperature=temperature, eos_token_id=eos_token_id,
+        prompt=prompt,
+    )
+    with collect_warnings() as collected:
+        builder = _Builder()
+        if isinstance(model, ProgramResult):
+            _program_project(builder, model)
+        elif isinstance(model, GenerationResult):
+            assert isinstance(tokenizer, TokenizerResult)
+            _check_vocabularies(model, tokenizer)
+            _generation_project(
+                builder, model, tokenizer, max_new_tokens=max_new_tokens,
+                temperature=float(temperature), eos_token_id=eos_token_id, prompt=prompt,
+            )
+        else:
+            _forward_project(builder, model, tuple(example_inputs), labels)
+        for message in builder.write(output_path):
+            warn(message)
+    project_warnings = list(collected)
     return ProjectResult(
         path=output_path,
         sprites=tuple(sprite["name"] for sprite in builder.sprites),
