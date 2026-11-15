@@ -1568,6 +1568,20 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
     )
 
 
+def test_masked_fill_casts_its_value_to_the_tensors_dtype(tmp_path):
+    class Fill(nn.Module):
+        def forward(self, value):
+            flags = value > 1
+            filled = value.masked_fill(value > 2, 1.5)
+            filled.masked_fill_(value == 0, -2.7)
+            return filled + flags.masked_fill(value > 3, 0.5)
+
+    model = Fill().eval()
+    value = torch.tensor([[0, 1, 2], [3, 4, 2]])
+    result = transpile(model, value, tmp_path / "integer")
+    assert verify(model, value, result).passed
+
+
 def test_neuron_pruning_requires_real_linear_activation_linear_dataflow():
     class BranchedMLP(nn.Module):
         def __init__(self):

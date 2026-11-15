@@ -205,13 +205,21 @@ def _emit_masked_fill(ctx: KernelContext):
     out = ctx.output.list
     if mask_map is not None:
         ctx.static_list("_mask_broadcast_map", mask_map)
+    value = ctx.scalars["value"]
+    if (
+        isinstance(value, (bool, int, float)) and math.isfinite(value)
+        and source.dtype is not None and not source.dtype.is_floating_point
+    ):
+        # The tensor keeps its dtype: 1.5 fills an integer tensor with 1,
+        # and a boolean one with 1 (true).
+        value = int(torch.tensor(value).to(source.dtype).item())
     return (
         clear(out),
         set_var(index, 1),
         *_static_unrolled_repeat(source.numel, (
             if_else(
                 eq(item(mask.list, mask_index), 1),
-                (append(out, ctx.scalars["value"]),),
+                (append(out, value),),
                 (append(out, item(source.list, var(index))),),
             ),
             change_var(index, 1),
