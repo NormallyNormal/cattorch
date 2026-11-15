@@ -300,6 +300,9 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   read the model's input.
 - Rotate-half RoPE (`x * cos + rotate_half(x) * sin`) runs as one rotary
   loop.
+- In-place operations, such as `x.clamp_(-1, 1)`, `x.sigmoid_()` and
+  `x[0] = 0`, run the kernel of their out-of-place operation instead of a
+  PyTorch decomposition.
 
 ## Fixes
 

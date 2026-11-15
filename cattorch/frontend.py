@@ -421,6 +421,54 @@ def own_decompositions() -> dict:
     return table
 
 
+# In-place operations that change a tensor's shape or storage, not its
+# values, and the copy itself.
+_NOT_VALUE_UPDATES = frozenset({
+    "copy_", "detach_", "resize_", "resize_as_", "set_", "as_strided_",
+    "squeeze_", "unsqueeze_", "t_", "transpose_", "swapdims_", "swapaxes_",
+})
+
+
+def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | None:
+    """``x.op_(...)`` as ``x.copy_(op(x, ...))`` when ``op`` has a kernel.
+
+    PyTorch's own decomposition of an in-place operation decomposes the
+    operation itself, so ``x.clamp_()`` would run as primitives rather than
+    the clamp kernel. Written as a copy, the capture's in-place handling
+    turns it into dataflow (``_replace_intermediate_copies``). ``fill_``
+    copies a constant of the tensor's shape (times the value, for a tensor
+    value), and runs ``decomposition`` for a variable-length tensor.
+    """
+    aten = torch.ops.aten
+    packet = operator.overloadpacket.__name__
+    if operator in (aten.fill_.Tensor, aten.fill_.Scalar):
+        def fill(self, value):
+            shape = list(self.shape)
+            if not all(isinstance(size, int) for size in shape):
+                return decomposition(self, value)
+            if isinstance(value, torch.Tensor):
+                filled = aten.mul.Tensor(aten.full.default(shape, 1, dtype=self.dtype), value)
+            else:
+                filled = aten.full.default(shape, value, dtype=self.dtype)
+            return aten.copy_.default(self, filled)
+        return fill
+    if not packet.endswith("_") or packet.startswith("_") or packet in _NOT_VALUE_UPDATES:
+        return None
+    functional = getattr(aten, packet[:-1], None)
+    overload = operator._overloadname
+    if functional is None or overload not in functional.overloads():
+        return None
+    out_of_place = getattr(functional, overload)
+    if any(result.alias_info is not None for result in out_of_place._schema.returns):
+        return None
+    if registry.operation(str(out_of_place)) is None and str(out_of_place) not in kept:
+        return None
+
+    def update(self, *args, **kwargs):
+        return aten.copy_.default(self, out_of_place(self, *args, **kwargs))
+    return update
+
+
 def _fx_decompositions() -> dict:
     """Decompose every operation cattorch can't lower directly.
 
@@ -443,7 +491,12 @@ def _fx_decompositions() -> dict:
         # mapping back to ATen would only rename the unsupported operation.
         packet = operator.overloadpacket.__name__
         dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
-        if rule is None and name not in kept and not dead_end:
+        in_place = _in_place_as_copy(
+            operator, _recorded_fallback(name, decomposition), registry, kept,
+        )
+        if rule is None and name not in kept and in_place is not None:
+            table[operator] = in_place
+        elif rule is None and name not in kept and not dead_end:
             table[operator] = _recorded_fallback(name, decomposition)
         elif (
             rule is not None and rule.validator is not None

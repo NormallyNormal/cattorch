@@ -294,6 +294,29 @@ def test_in_place_updates_of_an_input_become_dataflow(tmp_path):
     torch.manual_seed(0)
     model = UpdatesItsInput().eval()
     result = transpile(model, torch.randn(3, 4), tmp_path / "input")
+    # Each update runs its operation's own kernel, not a decomposition.
+    assert result.fallback_operations == ()
+    value = torch.randn(3, 4)
+    assert verify(model, value.clone(), result).passed
+
+
+class InPlaceOperations(nn.Module):
+    def forward(self, x):
+        y = x * 2
+        y.clamp_(-1, 1)
+        y[1].fill_(0.25)
+        y.masked_fill_(y > 0.9, -3.0)
+        y.mul_(x).sigmoid_()
+        x.fill_(2.0)
+        x.lt_(y)
+        return y + x
+
+
+def test_in_place_operations_run_their_out_of_place_kernels(tmp_path):
+    torch.manual_seed(1)
+    model = InPlaceOperations().eval()
+    result = transpile(model, torch.randn(3, 4), tmp_path / "operations")
+    assert result.fallback_operations == ()
     value = torch.randn(3, 4)
     assert verify(model, value.clone(), result).passed
 
