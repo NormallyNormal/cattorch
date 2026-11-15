@@ -319,6 +319,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   `RecurrentGenerationProgram`. See
   [verification and benchmarking](docs/verification-and-benchmarking.md).
 - `benchmarks/run_project_vm.cjs` runs a project in the official Scratch VM.
+- Every export checks that the code it generates computes each value before
+  reading it, and that every list a block reads exists. A failure raises a
+  `RuntimeError` naming an internal error instead of writing a sprite that
+  would compute wrong numbers.
 
 ### Custom kernels (experimental)
 
@@ -361,6 +365,9 @@ Python:
   [layer sharing](docs/code-generation.md#layer-sharing).
 - `masked_fill` on an integer or boolean tensor wrote a fractional fill
   value as it was instead of casting it to the tensor's type.
+- A SiLU multiplied by itself (`s * s`) or by another SiLU
+  (`F.silu(a) * F.silu(b)`) gave zeros, and causal attention whose scores are
+  `t @ t` for one transposed tensor read values that were never computed.
 - A Linear followed by two residual additions added the first one twice, and
   a residual add that broadcasts the Linear's output gave too few values.
 - A Linear followed by BatchNorm1d was folded even when the BatchNorm

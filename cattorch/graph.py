@@ -381,6 +381,8 @@ class _GraphInfo:
     protected: frozenset[str] = frozenset()
     # Fixed items along a node's runtime axis beyond the runtime length.
     dynamic_offsets: dict[str, int] = field(default_factory=dict)
+    # Every fusion, as what it reads, writes and absorbs.
+    fusion_records: tuple = ()
 
     def runtime_capacity(self, name: str, shape) -> int:
         """The most items ``name``'s list can hold."""
@@ -2104,6 +2106,201 @@ class _Fusions:
         )
 
 
+class _FusionRecord(NamedTuple):
+    """What one fusion compiles, in terms of graph nodes.
+
+    The kernel runs where ``key`` is in the graph, reads the lists of
+    ``operands``, and writes ``writes``'s list. The other ``covered`` nodes
+    are absorbed: their values exist only inside the kernel.
+    """
+
+    kind: str
+    key: torch.fx.Node
+    writes: torch.fx.Node
+    covered: tuple
+    operands: tuple
+    # QKV reads its absorbed items through view aliases, which its matcher
+    # checks itself.
+    direct_readers: bool = True
+
+    @property
+    def absorbed(self) -> tuple:
+        return tuple(node for node in self.covered if node is not self.writes)
+
+
+def _tensor_nodes(values) -> tuple:
+    return tuple(value for value in values if isinstance(value, torch.fx.Node))
+
+
+def _fusion_records(fusions, by_name) -> tuple[_FusionRecord, ...]:
+    """Every fusion ``fusions`` holds, as a ``_FusionRecord``."""
+    records = []
+    for name, epilogue in fusions.linear.items():
+        linear = by_name[name]
+        residuals = _tensor_nodes(operand for _, operand in epilogue.epilogue)
+        records.append(_FusionRecord(
+            "linear", linear, epilogue.final, (linear, *epilogue.chain),
+            (*linear.all_input_nodes, *residuals),
+        ))
+    for name, (silu, gate, other) in fusions.paired_swiglu.items():
+        multiply = by_name[name]
+        records.append(_FusionRecord(
+            "paired SwiGLU", multiply, multiply, (multiply, silu, gate, other),
+            (*gate.all_input_nodes, *other.all_input_nodes),
+        ))
+    for name, (silu, gate, other) in fusions.silu_mul.items():
+        multiply = by_name[name]
+        records.append(_FusionRecord(
+            "SiLU product", multiply, multiply, (multiply, silu), (gate, other),
+        ))
+    for name, (first, second) in fusions.embedding_add.items():
+        add = by_name[name]
+        records.append(_FusionRecord(
+            "embedding add", add, add, (add, first, second),
+            (*first.all_input_nodes, *second.all_input_nodes),
+        ))
+    for name, chain in fusions.elementwise.items():
+        records.append(_FusionRecord(
+            "elementwise chain", by_name[name], chain[-1], tuple(chain),
+            tuple(dict.fromkeys(
+                value for step in chain for value in _tensor_nodes(step.args)
+                if value not in chain
+            )),
+        ))
+    for name, score in fusions.causal_scores.items():
+        product = by_name[name]
+        records.append(_FusionRecord(
+            "causal scores", product, score.mask,
+            _tensor_nodes((product, score.transposed_key, score.scale_node, score.mask)),
+            (score.query, score.key),
+        ))
+    for name, projection in fusions.qkv_linear.items():
+        linear = by_name[name]
+        records.append(_FusionRecord(
+            "QKV projection", linear, linear,
+            (linear, projection.query_item, projection.key_item, projection.value_item),
+            tuple(linear.all_input_nodes), direct_readers=False,
+        ))
+    return tuple(records)
+
+
+def _check_fusions(records, fused_nodes, aliases) -> None:
+    """Raise an internal error unless the fusions compute every value they skip.
+
+    A fusion may absorb a node only if the fusion's own operations are its
+    only readers, no fusion's kernel reads a node any fusion absorbed (its
+    list is never written), no node is absorbed twice, and every node the
+    compiler skips belongs to a fusion that runs.
+    """
+    def fail(record, problem):
+        raise RuntimeError(
+            f"cattorch internal error: the {record.kind} fusion at {record.key.name!r} "
+            f"{problem}; please report this model"
+        )
+
+    def source(node):
+        name = node.name
+        seen = set()
+        while name in aliases and name not in seen:
+            seen.add(name)
+            name = aliases[name]
+        return name
+
+    absorbed: dict[str, _FusionRecord] = {}
+    keys: dict[str, _FusionRecord] = {}
+    for record in records:
+        if record.key.name in keys:
+            fail(record, f"compiles at the same node as the {keys[record.key.name].kind} fusion")
+        keys[record.key.name] = record
+        for node in record.absorbed:
+            if node.name in absorbed:
+                fail(record, f"absorbs {node.name!r}, which the {absorbed[node.name].kind} "
+                             "fusion absorbs too")
+            absorbed[node.name] = record
+    skipped = set()
+    for record in records:
+        for operand in record.operands:
+            if operand.name in absorbed or source(operand) in absorbed:
+                fail(record, f"reads {operand.name!r}, whose value a fusion never writes")
+        members = set(record.covered)
+        for node in record.absorbed:
+            if record.direct_readers and any(user not in members for user in node.users):
+                fail(record, f"absorbs {node.name!r}, which is also read elsewhere")
+        skipped.update(node.name for node in record.covered if node is not record.key)
+    if set(fused_nodes) != skipped:
+        names = sorted(set(fused_nodes) ^ skipped)
+        raise RuntimeError(
+            f"cattorch internal error: the nodes the fusions skip ({', '.join(names)}) "
+            "don't match what they compute; please report this model"
+        )
+
+
+def _check_emission_plan(graph, coded, order, shared=frozenset()) -> None:
+    """Raise an internal error if emitted code reads a value before it is computed.
+
+    ``coded`` holds every node the compiler emitted code for, and ``order``
+    the ones whose code is still in the sprite, in the order it runs.
+    ``shared`` holds the nodes the calls of a shared layer compute: all of
+    them are computed where the first of them runs. A value counts as
+    computed once code writing it has run, or when it is an input, a weight
+    or a constant; a node with no code of its own (a view) is available when
+    what it reads is.
+    """
+    by_name = {node.name: node for node in graph.nodes}
+    records = {record.key.name: record for record in graph.fusion_records}
+    # Values only a fusion's kernel holds: no list of theirs is ever written.
+    absorbed = (
+        {node.name for record in records.values() for node in record.absorbed}
+        | set(graph.fused_nodes)
+    ) - {record.writes.name for record in records.values()}
+    coded = set(coded)
+    computed: set[str] = set()
+
+    def source(name):
+        seen = set()
+        while name in graph.aliases and name not in seen:
+            seen.add(name)
+            name = graph.aliases[name]
+        return name
+
+    def available(name, seen=frozenset()) -> bool:
+        name = source(name)
+        if name in computed or name in seen:
+            return True
+        node = by_name.get(name)
+        if node is None or node.op != "call_function":
+            return True
+        if name in graph.generated_weights or isinstance(graph.resolve_weight(name), torch.Tensor):
+            return True
+        if name in absorbed or name in coded:
+            return False
+        return all(available(value.name, seen | {name}) for value in node.all_input_nodes)
+
+    def fail(name, value):
+        raise RuntimeError(
+            f"cattorch internal error: the code for {name!r} reads {value!r} before "
+            "anything computes it; please report this model"
+        )
+
+    for name in dict.fromkeys(order):
+        if name in shared:
+            computed.update(shared)
+        record = records.get(name)
+        node = by_name.get(name)
+        if node is None:
+            continue
+        reads = record.operands if record is not None else node.all_input_nodes
+        for value in reads:
+            if not available(value.name):
+                fail(name, value.name)
+        computed.add(name)
+        if record is not None:
+            computed.add(record.writes.name)
+    for name, _, _ in graph.outputs:
+        if not available(name):
+            fail("the model's output", name)
+
+
 def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config):
     """A linear followed by scalar arithmetic, a residual add or an activation."""
     linear_fusions, approximate_fusions = fusions.linear, fusions.approximate
@@ -2170,12 +2367,13 @@ def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast,
                 )
                 if exact_gelu and not (fast and fast_config.activations):
                     break
-                # Leave SiLU materialization to the broader SiLU-times-
-                # tensor fusion below when it feeds a single multiply.
-                if target == "aten.silu.default" and len(user.users) == 1:
-                    next_user = next(iter(user.users))
-                    if str(next_user.target) == "aten.mul.Tensor":
-                        break
+                # Leave the SiLU to the SiLU-times-tensor fusion below when
+                # that fusion takes it.
+                if (
+                    target == "aten.silu.default"
+                    and _silu_product_other(fusions, user, node_order) is not None
+                ):
+                    break
                 epilogue.append((activation_ops[target], None))
                 if exact_gelu:
                     approximate_fusions.append(target)
@@ -2191,32 +2389,67 @@ def _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast,
             fused_nodes.update(item.name for item in chain)
 
 
-def _match_swiglu(fusions, nodes):
+def _silu_product_other(fusions, node, node_order):
+    """For a SiLU the SiLU-times-tensor fusion absorbs, the product's other operand.
+
+    The fusion computes ``silu(gate)`` inside the product's kernel, so the
+    SiLU's one reader must be the product, reading it once: in ``s * s`` the
+    other operand is the SiLU itself, whose list would never be written. In
+    ``silu(a) * silu(b)`` the product absorbs the SiLU that comes first, and
+    reads the other one's list.
+    """
+    other = _silu_product_candidate(fusions, node)
+    if other is None:
+        return None
+    if (
+        _silu_product_candidate(fusions, other) is not None
+        and node_order[other.name] < node_order[node.name]
+    ):
+        return None
+    return other
+
+
+def _silu_product_candidate(fusions, node):
+    """``_silu_product_other`` before choosing between two SiLU operands."""
+    if node.op != "call_function" or str(node.target) != "aten.silu.default":
+        return None
+    if len(node.users) != 1:
+        return None
+    multiply = next(iter(node.users))
+    if (
+        multiply.op != "call_function" or str(multiply.target) != "aten.mul.Tensor"
+        or len(multiply.args) != 2 or multiply.kwargs
+    ):
+        return None
+    if multiply.args[0] is node:
+        other = multiply.args[1]
+    elif multiply.args[1] is node:
+        other = multiply.args[0]
+    else:
+        return None
+    if other is node or not hasattr(other, "name") or _get_shape(other) != _get_shape(multiply):
+        return None
+    gate = node.args[0]
+    if not hasattr(gate, "name") or _get_shape(gate) != _get_shape(multiply):
+        return None
+    if not fusions.allows(node, multiply):
+        return None
+    return other
+
+
+def _match_swiglu(fusions, nodes, node_order):
     """``silu(a) * b``, and the paired form where ``a`` and ``b`` are linears of one input."""
     paired_swiglu_fusions, silu_mul_fusions = fusions.paired_swiglu, fusions.silu_mul
     fused_nodes = fusions.fused_nodes
 
     for node in nodes:
-        if node.op != "call_function" or str(node.target) != "aten.silu.default":
-            continue
-        if len(node.users) != 1:
+        other = _silu_product_other(fusions, node, node_order)
+        if other is None or node.name in fused_nodes:
             continue
         multiply = next(iter(node.users))
-        if multiply.op != "call_function" or str(multiply.target) != "aten.mul.Tensor":
-            continue
-        if multiply.args[0] is node:
-            other = multiply.args[1]
-        elif multiply.args[1] is node:
-            other = multiply.args[0]
-        else:
-            continue
-        if not hasattr(other, "name") or _get_shape(other) != _get_shape(multiply):
+        if multiply.name in silu_mul_fusions or multiply.name in paired_swiglu_fusions:
             continue
         gate = node.args[0]
-        if not hasattr(gate, "name") or _get_shape(gate) != _get_shape(multiply):
-            continue
-        if not fusions.allows(node, multiply):
-            continue
         if (
             fusions.allows(gate, other)
             and gate.op == "call_function"
@@ -2416,6 +2649,9 @@ def _match_causal_attention(fusions, nodes, aliases, resolve_weight):
             or str(transposed_k.target) != "aten.transpose.int"
             or len(transposed_k.users) != 1
         ):
+            continue
+        if q is transposed_k:
+            # ``t @ t``: the kernel reads ``q``'s list, which the fusion absorbs.
             continue
         k = transposed_k.args[0]
         k_shape = _get_shape(k)
@@ -2701,12 +2937,15 @@ def _prepare_graph(
     )
     fusions = _Fusions(protected=protected)
     _match_linear_epilogues(fusions, nodes, node_order, generated_weights, fast, fast_config)
-    _match_swiglu(fusions, nodes)
+    _match_swiglu(fusions, nodes, node_order)
     _match_embedding_adds(fusions, nodes)
     _match_elementwise_chains(fusions, nodes, runtime_axes.row_loops)
     _match_causal_attention(fusions, nodes, aliases, resolve_weight)
     # Rewrites aliases so Q, K and V read the shared projection.
     _match_qkv(fusions, nodes, aliases)
+    by_name = {node.name: node for node in nodes}
+    fusion_records = _fusion_records(fusions, by_name)
+    _check_fusions(fusion_records, fusions.fused_nodes, aliases)
     graph = _GraphInfo(
         nodes=nodes,
         resolve_weight=resolve_weight,
@@ -2732,6 +2971,7 @@ def _prepare_graph(
         causal_softmaxes=fusions.causal_softmaxes,
         causal_value_matmuls=fusions.causal_value_matmuls,
         fused_nodes=fusions.fused_nodes,
+        fusion_records=fusion_records,
         registry=registry,
         dynamic_axes=runtime_axes.axes,
         dynamic_bounds=runtime_axes.bounds,

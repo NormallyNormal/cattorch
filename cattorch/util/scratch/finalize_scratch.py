@@ -30,6 +30,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import warn
 from cattorch.storage import BASE92_ALPHABET
 from cattorch.templates.template import TEMPLATE_DIR
+from cattorch.util.scratch.dataflow import check_list_dataflow
 from cattorch.util.scratch.ids import compact_sprite_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
@@ -268,6 +269,8 @@ def finalize_sprite(
     codegen = codegen or CodegenConfig()
     if not isinstance(codegen, CodegenConfig):
         raise TypeError("codegen must be a CodegenConfig")
+    # Before any renaming, while public lists still have their own names.
+    check_list_dataflow(data, public_data_names)
     sprite = copy.deepcopy(data)
     _ensure_costume_menu_shadows(sprite)
     sprite = compact_sprite_ids(sprite, namespace=codegen.id_namespace)

@@ -21,6 +21,7 @@ from cattorch.graph import (
     _NOOP_OPS,
     _GenerationSpec,
     _GraphInfo,
+    _check_emission_plan,
     _get_dtype,
     _get_shape,
     _prepare_graph,
@@ -3024,6 +3025,7 @@ def _compile_sprite(
             # Banked caches are addressed through the shared procedure's base
             # variable; without it every layer would read layer zero's rows.
             raise _LayerSharingUnavailable(unshared_layers)
+    _check_compiled_plan(sprite, compiler, shared=codegen.layer_sharing and unshared_layers is None)
 
     # 4. Name the output list and clean up
     output_lists = compiler.output_lists
@@ -3345,6 +3347,24 @@ def _compile_sprite(
         ),
         item_kinds=_kinds_of_items(graph, flat_inputs) if entry_point else {},
         unshared_layers=unshared_layers,
+    )
+
+
+def _check_compiled_plan(sprite: dict, compiler, *, shared: bool) -> None:
+    """Check that the code left in ``sprite`` computes each value before reading it.
+
+    Runs after every rewrite of the compiled roots (layer sharing deletes the
+    roots of layers 1..N, whose values the shared layer's calls compute).
+    """
+    roots = compiler.emitted_roots[:compiler.node_roots]
+    blocks = sprite.get("blocks", {})
+    _check_emission_plan(
+        compiler.graph,
+        coded=(name for name, _ in roots),
+        order=[name for name, root in roots if root in blocks],
+        shared=frozenset(
+            node.name for node in compiler.graph.nodes if _graph_layer(node) is not None
+        ) if shared else frozenset(),
     )
 
 
