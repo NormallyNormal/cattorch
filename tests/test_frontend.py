@@ -321,6 +321,21 @@ def test_in_place_operations_run_their_out_of_place_kernels(tmp_path):
     assert verify(model, value.clone(), result).passed
 
 
+@pytest.mark.parametrize("update", [
+    lambda x: x.add_(0.5), lambda x: x.clamp_(0.5), lambda x: x.mul_(torch.full((4,), 0.5)),
+], ids=["add", "clamp", "mul"])
+def test_in_place_operations_keep_pytorchs_casting_rule(tmp_path, update):
+    # PyTorch can't write a float result into an integer tensor in place;
+    # the copy back mustn't cast it silently.
+    class Updates(nn.Module):
+        def forward(self, x):
+            update(x)
+            return x
+
+    with pytest.raises(UnsupportedModelError, match="Float can.t be cast to the desired output type"):
+        transpile(Updates().eval(), torch.randint(0, 5, (3, 4)), tmp_path / "integer")
+
+
 def test_a_buffer_updated_in_forward_points_to_entry_points(tmp_path):
     class Counter(nn.Module):
         def __init__(self):

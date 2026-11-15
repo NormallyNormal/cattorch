@@ -465,8 +465,25 @@ def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | Non
         return None
 
     def update(self, *args, **kwargs):
-        return aten.copy_.default(self, out_of_place(self, *args, **kwargs))
+        result = out_of_place(self, *args, **kwargs)
+        # copy_ would cast silently where the in-place operation raises,
+        # such as for an integer tensor's x.add_(0.5).
+        if not torch.can_cast(result.dtype, self.dtype):
+            raise RuntimeError(
+                f"result type {_dtype_name(result.dtype)} can't be cast to the "
+                f"desired output type {_dtype_name(self.dtype)}"
+            )
+        return aten.copy_.default(self, result)
     return update
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    """``torch.int64`` as PyTorch's errors name it, ``Long``."""
+    return {
+        torch.bool: "Bool", torch.uint8: "Byte", torch.int8: "Char", torch.int16: "Short",
+        torch.int32: "Int", torch.int64: "Long", torch.float16: "Half",
+        torch.bfloat16: "BFloat16", torch.float32: "Float", torch.float64: "Double",
+    }.get(dtype, str(dtype).removeprefix("torch."))
 
 
 def _fx_decompositions() -> dict:
