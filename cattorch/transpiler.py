@@ -57,30 +57,33 @@ from cattorch.quantization import (
     expert_bank_effective_ndims,
     quantize_model,
 )
+from cattorch.generation_blocks import _finish_generation_prepare, _wrap_generation_lifecycle
+from cattorch.guards import _guard_generation_init, _guard_plain_calls
+from cattorch.layer_sharing import (
+    _LAYER_CACHE_BASE,
+    _graph_layer,
+    _share_repeated_transformer_layers,
+)
+from cattorch.procedures import (
+    _find_procedure_definition,
+    _merge_lists_by_name,
+    _merge_variables_by_name,
+    _remove_canvas_calls,
+)
 from cattorch.sprite import (
     _add_input_checks,
     _add_prepare_for_save,
     _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
-    _graph_layer,
     _remove_unused,
-    _share_repeated_transformer_layers,
     _wrap_optimized_lifecycle,
 )
-from cattorch.generation_blocks import _finish_generation_prepare, _wrap_generation_lifecycle
 from cattorch.static_storage import (
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
     _static_storage_shard_limits,
-)
-from cattorch.guards import _guard_generation_init, _guard_plain_calls
-from cattorch.procedures import (
-    _find_procedure_definition,
-    _remove_canvas_calls,
-    _merge_lists_by_name,
-    _merge_variables_by_name,
 )
 from cattorch import interface
 from cattorch.interface import (
@@ -145,7 +148,6 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 
 log = logging.getLogger(__name__)
 
-_LAYER_CACHE_BASE = "cattorch layer cache base"
 # 1 when a shared layer computes past its K/V append: always, except in the
 # final layer for a hidden prefill token.
 _LAYER_TAIL = "cattorch layer tail"

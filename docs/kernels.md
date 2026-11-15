@@ -29,11 +29,12 @@ Where things live:
 | `cattorch.graph` | Constant folding, aliases, validation, and recognizing fusable patterns. |
 | `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
 | `cattorch.transpiler` | Turns graph nodes into instruction programs. |
-| `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
+| `cattorch.sprite` | Wraps the compiled program in `cattorch init` and `cattorch forward`, adds input checks and `cattorch prepare for save`, and sizes the lists for sharding. |
 | `cattorch.procedures` | Adds DSL programs to a sprite as custom blocks, and finds and edits them. |
 | `cattorch.guards` | Keeps stopped and overlapping calls of a sprite's blocks from reporting ok wrongly; its docstring compares what each kind of export does. |
 | `cattorch.static_storage` | Chooses each static tensor's storage precision, shares identical tensors, and installs the compressed payloads and their decoder. |
 | `cattorch.generation_blocks` | Adds the reset, prefill and decode blocks, top-k selection and cache bookkeeping around a generation sprite's one-token step. |
+| `cattorch.layer_sharing` | Replaces a transformer's identical repeated layers with one custom block called once per layer. |
 | `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
 
 A change to an operation should come with:

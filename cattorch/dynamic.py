@@ -8,7 +8,7 @@ import math
 import torch
 
 from cattorch.errors import UnsupportedModelError
-from cattorch.interface import input_name, output_name
+from cattorch.interface import FORWARD, input_name, output_name
 
 
 def normalize_dynamic(dynamic, flat_inputs, kwarg_names) -> dict[int, tuple[str, int, int, int]]:
@@ -389,7 +389,7 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
     unit, position = "_cattorch unit", "_cattorch unit item"
     public_input = input_name(index)
     private_input = f"_cattorch unit {public_input}"
-    rename_procedure(sprite, "cattorch forward", "_cattorch forward unit")
+    rename_procedure(sprite, FORWARD, "_cattorch forward unit")
     input_size = math.prod(input_shapes[index])
     outputs = []
     for position_index in range(output_count):
@@ -418,14 +418,14 @@ def run_per_unit(sprite: dict, spec, input_shapes, output_count: int) -> dict:
         lists=(public_input, private_input, *(entry for pair in outputs for entry in pair)),
         body=body,
     )
-    sprite = _add_warp_procedure(sprite, "cattorch forward", program, x=640, y=40)
+    sprite = _add_warp_procedure(sprite, FORWARD, program, x=640, y=40)
     # The loose forward block on the canvas runs the public block.
     for block in sprite["blocks"].values():
         if (
             block.get("opcode") == "procedures_call" and block.get("topLevel")
             and block["mutation"].get("proccode") == "_cattorch forward unit"
         ):
-            block["mutation"] = _procedure_mutation("cattorch forward")
+            block["mutation"] = _procedure_mutation(FORWARD)
     return sprite
 
 

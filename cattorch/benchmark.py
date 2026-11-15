@@ -143,7 +143,7 @@ def _add_broadcast_entry(
     sprite: dict,
     message: str,
     broadcast_id: str,
-    procedure: str = "cattorch forward",
+    procedure: str = interface.FORWARD,
 ) -> None:
     prefix = f"cattorch_benchmark_{uuid.uuid4().hex[:8]}"
     event_id = f"{prefix}_event"
