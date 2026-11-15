@@ -669,7 +669,7 @@ def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monk
         model, RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 4)),)),
         tmp_path / "recurrent",
     )
-    from test_autoregressive import NanoGPT
+    from shared_models import NanoGPT
 
     transpile(
         NanoGPT(layers=1, width=8, heads=2, context=4).eval(), GenerationProgram(max_context=4),

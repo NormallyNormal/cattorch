@@ -29,8 +29,7 @@ import test_program_overlap as program
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
 from sprite_helpers import load_sprite
-from test_optimization import CachedLM
-from test_recurrent_generation import make
+from shared_models import CachedLM, recurrent_model
 
 INT8 = {"quantization": QuantizationConfig(bits=8, min_quantized_values=1)}
 STORAGES = {"compressed": {}, "int8": INT8}
@@ -175,7 +174,7 @@ class Generator(Kind):
                 codegen=CodegenConfig(unrolling="compact"), **options,
             )
         else:
-            model = make("lstm")
+            model = recurrent_model("lstm")
             result = transpile(
                 model, RecurrentGenerationProgram(model.states()), path / kind, **options,
             )

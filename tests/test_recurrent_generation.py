@@ -17,160 +17,11 @@ from cattorch import (
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list
 from cattorch.interface import TOKEN_IDS
+from shared_models import GRULM, LSTMLM, RECURRENT_MODELS, recurrent_model, reference_rows
 from sprite_helpers import load_sprite
 
 
 TOLERANCE = 1e-4
-
-
-class GRULM(nn.Module):
-    """A GRU language model that starts from a learned, non-constant state."""
-
-    def __init__(self, vocab=16, width=8):
-        super().__init__()
-        self.embed = nn.Embedding(vocab, width)
-        self.gru = nn.GRU(width, width, batch_first=True)
-        self.head = nn.Linear(width, vocab)
-        self.register_buffer("h0", torch.randn(1, 1, width))
-
-    def states(self):
-        return (State("hidden", self.h0.clone()),)
-
-    def forward(self, tokens):
-        output, _ = self.gru(self.embed(tokens), self.h0)
-        return self.head(output)
-
-    def step(self, token, hidden):
-        output, hidden = self.gru(self.embed(token), hidden)
-        return self.head(output), hidden
-
-
-class LSTMLM(nn.Module):
-    """Two states; the cell starts at one non-zero value everywhere."""
-
-    def __init__(self, vocab=16, width=8):
-        super().__init__()
-        self.embed = nn.Embedding(vocab, width)
-        self.lstm = nn.LSTM(width, width, batch_first=True)
-        self.head = nn.Linear(width, vocab)
-        self.width = width
-
-    def states(self):
-        return (
-            State("hidden", torch.zeros(1, 1, self.width)),
-            State("cell", torch.full((1, 1, self.width), 0.25)),
-        )
-
-    def forward(self, tokens):
-        hidden, cell = (state.initial for state in self.states())
-        output, _ = self.lstm(self.embed(tokens), (hidden, cell))
-        return self.head(output)
-
-    def step(self, token, hidden, cell):
-        output, (hidden, cell) = self.lstm(self.embed(token), (hidden, cell))
-        return self.head(output)[:, 0], hidden, cell
-
-
-def rms(value, weight, eps=1e-5):
-    return weight * value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + eps)
-
-
-class SSMBlock(nn.Module):
-    """A Mamba-2 mixer: gated depthwise causal convolution and a selective scan."""
-
-    def __init__(self, width, heads, head_dim, state, kernel):
-        super().__init__()
-        self.inner, self.heads, self.head_dim = heads * head_dim, heads, head_dim
-        self.state, self.kernel = state, kernel
-        self.conv_dim = self.inner + 2 * state
-        self.norm = nn.Parameter(1 + 0.1 * torch.randn(width))
-        self.in_proj = nn.Linear(width, self.inner + self.conv_dim + heads, bias=False)
-        self.conv_weight = nn.Parameter(0.5 * torch.randn(self.conv_dim, kernel))
-        self.conv_bias = nn.Parameter(0.1 * torch.randn(self.conv_dim))
-        self.dt_bias = nn.Parameter(0.1 * torch.randn(heads))
-        self.A_log = nn.Parameter(torch.log(torch.linspace(1, 4, heads)))
-        self.D = nn.Parameter(torch.ones(heads))
-        self.gate_norm = nn.Parameter(1 + 0.1 * torch.randn(self.inner))
-        self.out_proj = nn.Linear(self.inner, width, bias=False)
-
-    def project(self, h):
-        return self.in_proj(rms(h, self.norm)).split(
-            [self.inner, self.conv_dim, self.heads], dim=-1,
-        )
-
-    def scan(self, ssm, xbc, dt):
-        x, B, C = F.silu(xbc).split([self.inner, self.state, self.state], dim=-1)
-        x = x.reshape(self.heads, self.head_dim)
-        dt = F.softplus(dt.reshape(self.heads) + self.dt_bias)
-        decay = torch.exp(-dt * torch.exp(self.A_log))
-        ssm = ssm * decay[:, None, None] + (dt[:, None] * x)[:, :, None] * B[None, None, :]
-        y = (ssm * C[None, None, :]).sum(-1) + self.D[:, None] * x
-        return ssm, y.reshape(1, self.inner)
-
-    def finish(self, h, y, gate):
-        return h + self.out_proj(rms(y * F.silu(gate), self.gate_norm))
-
-    def step(self, h, conv, ssm):
-        gate, xbc, dt = self.project(h)
-        window = torch.cat([conv, xbc.reshape(self.conv_dim, 1)], dim=-1)
-        mixed = (window * self.conv_weight).sum(-1) + self.conv_bias
-        ssm, y = self.scan(ssm, mixed, dt)
-        return self.finish(h, y, gate), window[:, 1:], ssm
-
-    def forward(self, h):
-        gate, xbc, dt = self.project(h)
-        length = h.shape[0]
-        mixed = F.conv1d(
-            xbc.T[None], self.conv_weight[:, None], self.conv_bias,
-            padding=self.kernel - 1, groups=self.conv_dim,
-        )[0, :, :length].T
-        ssm = torch.zeros(self.heads, self.head_dim, self.state)
-        rows = []
-        for position in range(length):
-            ssm, y = self.scan(ssm, mixed[position], dt[position])
-            rows.append(y)
-        return self.finish(h, torch.cat(rows), gate)
-
-
-class SSMLM(nn.Module):
-    def __init__(self, vocab=24, width=8, layers=2, heads=2, head_dim=4, state=4, kernel=3):
-        super().__init__()
-        self.embed = nn.Embedding(vocab, width)
-        self.blocks = nn.ModuleList(
-            SSMBlock(width, heads, head_dim, state, kernel) for _ in range(layers)
-        )
-        self.norm = nn.Parameter(1 + 0.1 * torch.randn(width))
-        self.head = nn.Linear(width, vocab, bias=False)
-
-    def states(self):
-        block = self.blocks[0]
-        return (
-            State("conv", torch.zeros(len(self.blocks), block.conv_dim, block.kernel - 1)),
-            State("ssm", torch.zeros(len(self.blocks), block.heads, block.head_dim, block.state)),
-        )
-
-    def forward(self, tokens):
-        h = self.embed(tokens)[0]
-        for block in self.blocks:
-            h = block(h)
-        return self.head(rms(h, self.norm))[None]
-
-    def step(self, token, conv, ssm):
-        h = self.embed(token).reshape(1, -1)
-        convs, ssms = [], []
-        for index, block in enumerate(self.blocks):
-            h, new_conv, new_ssm = block.step(h, conv[index], ssm[index])
-            convs.append(new_conv)
-            ssms.append(new_ssm)
-        return self.head(rms(h, self.norm)), torch.stack(convs), torch.stack(ssms)
-
-
-MODELS = {"gru": GRULM, "lstm": LSTMLM, "ssm": SSMLM}
-
-
-def make(name):
-    torch.manual_seed({"gru": 1, "lstm": 2, "ssm": 3}[name])
-    return MODELS[name]().eval()
 
 
 PROGRAM_FIELDS = {"step", "max_context", "hidden_prefill", "top_k", "reference"}
@@ -181,11 +32,6 @@ def export(model, path, **options):
     fields = {key: options.pop(key) for key in PROGRAM_FIELDS & set(options)}
     result = transpile(model, RecurrentGenerationProgram(model.states(), **fields), path, **options)
     return ScratchEmulator(load_sprite(result.path)), result
-
-
-def reference_rows(model, tokens):
-    with torch.no_grad():
-        return model(torch.tensor([tokens])).reshape(len(tokens), -1)
 
 
 def logits(emulator):
@@ -205,9 +51,9 @@ def states(emulator, model):
     return {state.name: list(emulator.lists[f"_cattorch state {state.name}"]) for state in model.states()}
 
 
-@pytest.fixture(scope="module", params=sorted(MODELS))
+@pytest.fixture(scope="module", params=sorted(RECURRENT_MODELS))
 def exported(request, tmp_path_factory):
-    model = make(request.param)
+    model = recurrent_model(request.param)
     emulator, result = export(
         model, tmp_path_factory.mktemp(request.param) / "lm", top_k=3, reference="forward",
     )
@@ -307,7 +153,7 @@ def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
     from scratch_status import INTERRUPTED
     from test_generation_automatic import stop_during
 
-    model = make("lstm")
+    model = recurrent_model("lstm")
     emulator, _ = export(model, tmp_path / "lstm", top_k=2)
     assert run(emulator, "cattorch prefill", [2, 7]) == "ok"
     stop_during(emulator, public, procedure, call, tokens)
@@ -334,7 +180,7 @@ def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
 
 
 def test_decode_in_a_freshly_loaded_sprite_fills_constant_states(tmp_path):
-    model = make("lstm")
+    model = recurrent_model("lstm")
     emulator, result = export(model, tmp_path / "lstm")
     sprite = load_sprite(result.path)
     stored = {entry[0]: entry[1] for entry in sprite["lists"].values()}
@@ -346,7 +192,7 @@ def test_decode_in_a_freshly_loaded_sprite_fills_constant_states(tmp_path):
 
 
 def test_max_context_limits_decode_and_prefill(tmp_path):
-    model = make("gru")
+    model = recurrent_model("gru")
     emulator, _ = export(model, tmp_path / "bounded", max_context=3, top_k=2)
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
@@ -370,14 +216,14 @@ def test_a_max_context_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_li
     # A prompt arrives in the one `cattorch token ids` list, so the buffer that
     # copies it never needs more than a list holds.
     limit = small_list_limit(400)
-    model = make("gru")
+    model = recurrent_model("gru")
     emulator, result = export(model, tmp_path / "long", max_context=50 * limit)
     assert not [name for name in result.sharded_lists if "prefill" in name]
     assert run(emulator, "cattorch prefill", [1, 2, 3]) == "ok"
 
 
 def test_unbounded_generation_runs_past_any_small_limit(tmp_path):
-    model = make("gru")
+    model = recurrent_model("gru")
     emulator, _ = export(model, tmp_path / "unbounded", hidden_prefill=False)
     tokens = [(7 * index + 3) % 16 for index in range(40)]
     assert run(emulator, "cattorch prefill", tokens[:1]) == "ok"
@@ -392,7 +238,7 @@ def test_unbounded_generation_runs_past_any_small_limit(tmp_path):
 
 @pytest.mark.parametrize("name", ["gru", "ssm"])
 def test_hidden_prefill_skips_the_logits_of_prompt_tokens(tmp_path, name):
-    model = make(name)
+    model = recurrent_model(name)
     prompt = [1, 2, 3, 4, 5, 6, 7, 8]
     counts, results = {}, {}
     for hidden in (False, True):
@@ -422,7 +268,7 @@ def test_hidden_prefill_skips_the_logits_of_prompt_tokens(tmp_path, name):
 
 
 def test_a_hidden_step_still_commits_its_states(tmp_path):
-    model = make("ssm")
+    model = recurrent_model("ssm")
     emulator, _ = export(model, tmp_path / "ssm")
     run(emulator, "cattorch prefill", [1])
     emulator.variables["_cattorch project output"] = 0
@@ -438,7 +284,7 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
 
 
 def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
-    model = make("ssm")
+    model = recurrent_model("ssm")
     emulator, _ = export(model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True))
     run(emulator, "cattorch prefill", [3, 1, 4])
     run(emulator, "cattorch decode", [1])
@@ -448,7 +294,7 @@ def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
 
 
 def test_lifecycle_broadcasts(tmp_path):
-    model = make("gru")
+    model = recurrent_model("gru")
     emulator, result = export(model, tmp_path / "gru")
     messages = set(load_sprite(result.path)["broadcasts"].values())
     assert messages == {
@@ -470,7 +316,7 @@ def test_lifecycle_broadcasts(tmp_path):
 
 
 def test_no_loose_canvas_block_runs_a_private_procedure(tmp_path):
-    _, result = export(make("gru"), tmp_path / "gru")
+    _, result = export(recurrent_model("gru"), tmp_path / "gru")
     sprite = load_sprite(result.path)
     loose = {
         block["mutation"]["proccode"] for block in sprite["blocks"].values()
@@ -510,7 +356,7 @@ class SharedZerosLSTM(LSTMLM):
 
 
 def test_states_sharing_one_initial_tensor_each_keep_their_own_list(tmp_path):
-    model = make("lstm")
+    model = recurrent_model("lstm")
     shared = SharedZerosLSTM()
     shared.load_state_dict(model.state_dict())
     shared.eval()
@@ -540,7 +386,7 @@ def test_a_recurrent_model_given_a_generation_program_is_pointed_here(tmp_path, 
     from cattorch import CattorchError, GenerationProgram
 
     with pytest.raises(CattorchError, match="RecurrentGenerationProgram"):
-        transpile(make(name), GenerationProgram(max_context=8), tmp_path / name)
+        transpile(recurrent_model(name), GenerationProgram(max_context=8), tmp_path / name)
 
 
 def test_reference_must_return_one_row_per_token(tmp_path):
@@ -706,7 +552,7 @@ def max_error(emulator, model, tokens):
 
 
 def test_int8_quantized_export_stays_close(tmp_path):
-    model = make("ssm")
+    model = recurrent_model("ssm")
     emulator, result = export(
         model, tmp_path / "q8", quantization=QuantizationConfig(bits=8, min_quantized_values=16),
     )
@@ -716,7 +562,7 @@ def test_int8_quantized_export_stays_close(tmp_path):
 
 
 def test_gptq_calibrates_over_token_sequences(tmp_path):
-    model = make("ssm")
+    model = recurrent_model("ssm")
     generator = torch.Generator().manual_seed(0)
     sequences = [torch.randint(0, 24, (1, 48), generator=generator) for _ in range(3)]
     emulator, result = export(
@@ -741,7 +587,7 @@ def test_gptq_resets_the_states_between_sequences(monkeypatch, tmp_path):
         original(self)
 
     monkeypatch.setattr(program_runtime.ProgramReplay, "reset", counting)
-    model = make("gru")
+    model = recurrent_model("gru")
     sequences = [torch.tensor([[1, 2, 3]]), (torch.tensor([[4, 5]]),)]
     export(
         model, tmp_path / "gptq",
@@ -877,13 +723,13 @@ def test_a_fixed_table_longer_than_a_list_is_rejected_as_for_plain_exports(
 ):
     # The storage decoder's table of powers of two can't be sharded.
     small_list_limit(200)
-    model = make("gru")
+    model = recurrent_model("gru")
     with pytest.raises(ValueError, match="_cattorch f32 powers.* exceeds Scratch's limit of 200"):
         export(model, tmp_path / "tiny")
 
 
 def test_build_project_runs_the_generation_demo(tmp_path):
-    from test_project import CHARACTERS, char_tokenizer
+    from shared_models import CHARACTERS, char_tokenizer
 
     torch.manual_seed(5)
     model = GRULM(vocab=len(CHARACTERS)).eval()
@@ -903,7 +749,7 @@ def test_build_project_runs_the_generation_demo(tmp_path):
 
 
 def test_verify_runs_prefill_and_decode_against_the_step(tmp_path):
-    model = make("gru")
+    model = recurrent_model("gru")
     program = RecurrentGenerationProgram(model.states(), max_context=5, top_k=2)
     result = transpile(model, program, tmp_path / "gru")
     report = verify(model, program, result, calls=[

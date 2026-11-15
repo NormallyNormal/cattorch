@@ -224,7 +224,7 @@ def test_an_output_list_holding_a_longer_intermediate_is_sharded(tmp_path):
 
 
 def _layered_language():
-    from test_project import Language
+    from shared_models import Language
 
     class Layered(Language):
         """Two ``blocks.N`` layers, which layer sharing factors into one."""
@@ -250,7 +250,7 @@ def _layered_language():
 
 @pytest.mark.parametrize("sharing", ["off", "auto"])
 def test_generation_with_its_tokenizer_matches_pytorch(tmp_path, sharing):
-    from test_project import CHARACTERS, Language, char_tokenizer, greedy
+    from shared_models import CHARACTERS, Language, char_tokenizer, greedy
 
     torch.manual_seed(2)
     model = (Language() if sharing == "off" else _layered_language()).eval()
@@ -363,7 +363,7 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
         add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
         set_var, var,
     )
-    from test_autoregressive import NanoGPT
+    from shared_models import NanoGPT
     from scratch_status import INTERRUPTED, OVERTAKEN
     from test_generation_automatic import logits_of
 
@@ -580,7 +580,7 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
         add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
         set_var, var,
     )
-    from test_autoregressive import NanoGPT
+    from shared_models import NanoGPT
     from scratch_status import OVERTAKEN
     from test_generation_automatic import logits_of
 
@@ -642,8 +642,9 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
         append, call, change_var, clear, eq, for_each, item, length, repeat_until, set_var, var,
     )
     from cattorch.util.scratch.emulator import ScratchEmulator
-    from test_autoregressive import NanoGPT
-    from test_generation_automatic import load_sprite, logits_of
+    from shared_models import NanoGPT
+    from sprite_helpers import load_sprite
+    from test_generation_automatic import logits_of
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()

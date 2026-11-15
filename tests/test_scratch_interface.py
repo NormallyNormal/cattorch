@@ -201,8 +201,7 @@ def test_a_model_sprite(tmp_path, kind):
 
 @pytest.mark.parametrize("recurrent", [False, True])
 def test_a_generation_sprite(tmp_path, recurrent):
-    from test_project import Language
-    from test_recurrent_generation import GRULM
+    from shared_models import GRULM, Language
 
     if recurrent:
         model = GRULM().eval()
@@ -290,7 +289,7 @@ class _SentencePiece:
 
 @pytest.mark.parametrize("kind", ["characters", "bpe", "sentencepiece"])
 def test_a_tokenizer_sprite(tmp_path, kind):
-    from test_project import char_tokenizer
+    from shared_models import char_tokenizer
 
     if kind == "characters":
         result = CharTokenizer(char_tokenizer()).save(tmp_path / "chars")
@@ -337,7 +336,7 @@ def project_names(project) -> dict[str, set[str]]:
 
 
 def test_project_names(tmp_path):
-    from test_project import Language, char_tokenizer
+    from shared_models import Language, char_tokenizer
 
     torch.manual_seed(0)
     plain = transpile(nn.Linear(2, 3).eval(), torch.randn(1, 2), tmp_path / "points")

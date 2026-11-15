@@ -50,6 +50,7 @@ from cattorch.util.scratch.dsl import (
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.instruction import optimized_linear
 from cattorch.interface import TOKEN_IDS
+from shared_models import CachedAttention, CachedLM, CachedMQALM
 from sprite_helpers import load_sprite
 
 
@@ -118,95 +119,6 @@ class MultiHeadCausalSoftmax(nn.Module):
 class NonDivisibleAdaptivePool(nn.Module):
     def forward(self, x):
         return F.adaptive_avg_pool2d(x, (3, 2))
-
-
-class CachedAttention(nn.Module):
-    def __init__(self, width=8, heads=2, context=6):
-        super().__init__()
-        self.heads = heads
-        self.head_width = width // heads
-        self.qkv = nn.Linear(width, width * 3, bias=False)
-        self.projection = nn.Linear(width, width, bias=False)
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context, context, dtype=torch.bool), diagonal=1),
-        )
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        k = k.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        v = v.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
-        weights = F.softmax(
-            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
-        )
-        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
-        return self.projection(joined)
-
-
-class CachedMQAAttention(nn.Module):
-    def __init__(self, width=8, heads=2, context=6):
-        super().__init__()
-        self.heads = heads
-        self.head_width = width // heads
-        self.qkv = nn.Linear(width, width + 2 * self.head_width, bias=False)
-        self.projection = nn.Linear(width, width, bias=False)
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context, context, dtype=torch.bool), diagonal=1),
-        )
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        q, k, v = self.qkv(x).split(
-            (width, self.head_width, self.head_width), dim=-1,
-        )
-        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        k = k.view(batch, length, 1, self.head_width).transpose(1, 2)
-        v = v.view(batch, length, 1, self.head_width).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
-        weights = F.softmax(
-            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
-        )
-        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
-        return self.projection(joined)
-
-
-class CachedBlock(nn.Module):
-    def __init__(self, context=6):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(8)
-        self.attention = CachedAttention(context=context)
-        self.norm2 = nn.LayerNorm(8)
-        self.mlp = nn.Sequential(
-            nn.Linear(8, 12), nn.GELU(approximate="tanh"), nn.Linear(12, 8),
-        )
-
-    def forward(self, x):
-        x = x + self.attention(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
-
-
-class CachedLM(nn.Module):
-    def __init__(self, context=6, layers=2):
-        super().__init__()
-        self.token = nn.Embedding(13, 8)
-        self.position = nn.Embedding(context, 8)
-        self.blocks = nn.Sequential(*(CachedBlock(context) for _ in range(layers)))
-        self.norm = nn.LayerNorm(8)
-        self.head = nn.Linear(8, 13, bias=False)
-
-    def forward(self, tokens):
-        length = tokens.shape[1]
-        x = self.token(tokens) + self.position(torch.arange(length))
-        return self.head(self.norm(self.blocks(x)))
-
-
-class CachedMQALM(CachedLM):
-    def __init__(self, context=6, layers=2):
-        super().__init__(context=context, layers=layers)
-        for block in self.blocks:
-            block.attention = CachedMQAAttention(context=context)
 
 
 def _run(sprite, values):

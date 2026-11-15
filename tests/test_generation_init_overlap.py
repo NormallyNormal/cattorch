@@ -21,8 +21,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
 from sprite_helpers import load_sprite
-from test_optimization import CachedLM
-from test_recurrent_generation import make
+from shared_models import CachedLM, recurrent_model
 from cattorch.interface import TOKEN_IDS
 
 INIT, RESET = ("cattorch init", None), ("cattorch reset", None)
@@ -169,7 +168,7 @@ def generator(request, tmp_path_factory):
         )
     else:
         # Its cell state, one value everywhere, is filled at run time too.
-        model = make("lstm")
+        model = recurrent_model("lstm")
         result = transpile(
             model, RecurrentGenerationProgram(model.states()), path, **STORAGES[storage],
         )

@@ -20,7 +20,7 @@ from cattorch import (
     entrypoint, transpile, verify,
 )
 
-from test_autoregressive import NanoGPT
+from shared_models import NanoGPT
 
 
 class Doubler(nn.Module):

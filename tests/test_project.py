@@ -16,6 +16,7 @@ from cattorch import (
 from cattorch.project import _sample
 from cattorch.util.scratch.dsl import Program
 from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
+from shared_models import CHARACTERS, Language, char_tokenizer, greedy
 
 
 def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
@@ -113,35 +114,6 @@ def test_entry_points_are_bridged(tmp_path):
     )
 
 
-CHARACTERS = "?abcdefghijklmnopqrstuvwxyz ."
-
-
-def char_tokenizer():
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
-    backend = Tokenizer(models.WordLevel(
-        vocab={character: index for index, character in enumerate(CHARACTERS)}, unk_token="?",
-    ))
-    backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
-    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="?")
-
-
-class Language(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tokens = nn.Embedding(len(CHARACTERS), 8)
-        self.positions = nn.Embedding(16, 8)
-        self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
-        self.head = nn.Linear(8, len(CHARACTERS))
-
-    def forward(self, tokens):
-        length = tokens.shape[1]
-        x = self.tokens(tokens) + self.positions(torch.arange(length))
-        mask = nn.Transformer.generate_square_subsequent_mask(length)
-        return self.head(self.layer(x, src_mask=mask, is_causal=True))
-
-
 @pytest.fixture(scope="module")
 def generator(tmp_path_factory):
     torch.manual_seed(2)
@@ -150,14 +122,6 @@ def generator(tmp_path_factory):
     result = transpile(model, GenerationProgram(max_context=16), directory / "lm")
     tokenizer = CharTokenizer(char_tokenizer()).save(directory / "chars", name="chars")
     return model, result, tokenizer, directory
-
-
-def greedy(model, prompt, count):
-    ids = [CHARACTERS.index(character) for character in prompt]
-    with torch.no_grad():
-        for _ in range(count):
-            ids.append(int(model(torch.tensor([ids]))[0, -1].argmax()))
-    return ids[len(prompt):]
 
 
 def test_a_text_generator_continues_each_prompt(generator):

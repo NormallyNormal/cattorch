@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from cattorch import CodegenConfig, GenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_generation_automatic import nano, prefill_and_decode
+from shared_models import nano
+from test_generation_automatic import prefill_and_decode
 from cattorch.interface import TOKEN_IDS
 from sprite_helpers import load_emulator, load_sprite
 

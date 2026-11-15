@@ -16,8 +16,7 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder
-from test_optimization import CachedLM
+from shared_models import VOCAB, CachedLM, NanoGPT, NanoMQA, RopeLM, nano, tiny_decoder
 from cattorch.interface import TOKEN_IDS
 from sprite_helpers import load_sprite
 from scratch_status import INTERRUPTED
@@ -62,11 +61,6 @@ def prefill_and_decode(emulator, model, prompt, more):
         assert emulator.variables["cattorch status"] == "ok"
         assert_logits(emulator, model, prefix)
     return prefix
-
-
-def nano():
-    torch.manual_seed(5)
-    return NanoGPT(layers=2, width=16, heads=2, context=16).eval()
 
 
 MODELS = {

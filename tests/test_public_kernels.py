@@ -101,7 +101,9 @@ def test_kernels_must_be_kernels(tmp_path):
 
 
 def test_kernels_apply_to_generation_and_programs(tmp_path):
-    from test_generation_automatic import nano, prefill_and_decode, load_sprite
+    from shared_models import nano
+    from sprite_helpers import load_sprite
+    from test_generation_automatic import prefill_and_decode
     from cattorch.util.scratch.emulator import ScratchEmulator
 
     class Block(nn.Module):

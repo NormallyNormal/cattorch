@@ -19,8 +19,7 @@ from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
 from sprite_helpers import load_sprite
 from test_generation_automatic import logits_of
-from test_optimization import CachedLM
-from test_recurrent_generation import make, reference_rows
+from shared_models import CachedLM, recurrent_model, reference_rows
 from cattorch.interface import TOKEN_IDS
 
 TOLERANCE = 1e-4
@@ -173,7 +172,7 @@ def kv_generator(tmp_path, sharing, hidden_prefill=True):
 
 
 def recurrent_generator(tmp_path, hidden_prefill=True):
-    model = make("gru")
+    model = recurrent_model("gru")
     result = transpile(
         model, RecurrentGenerationProgram(model.states(), top_k=2, hidden_prefill=hidden_prefill),
         tmp_path / "recurrent",
