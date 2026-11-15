@@ -5,9 +5,7 @@ from __future__ import annotations
 from cattorch import interface
 import json
 import math
-import sys
 import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -20,9 +18,8 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
-from test_optimization import CachedLM  # noqa: E402
+from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder
+from test_optimization import CachedLM
 from cattorch.interface import TOKEN_IDS
 
 TOLERANCE = 1e-4

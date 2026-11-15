@@ -10,9 +10,7 @@ logits and that a later reset or prefill always recovers.
 from __future__ import annotations
 
 from cattorch import interface
-import sys
 import threading
-from pathlib import Path
 
 import pytest
 import torch
@@ -20,10 +18,9 @@ import torch
 from cattorch import CodegenConfig, GenerationProgram, RecurrentGenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import INTERRUPTED, load_sprite, logits_of  # noqa: E402
-from test_optimization import CachedLM  # noqa: E402
-from test_recurrent_generation import make, reference_rows  # noqa: E402
+from test_generation_automatic import INTERRUPTED, load_sprite, logits_of
+from test_optimization import CachedLM
+from test_recurrent_generation import make, reference_rows
 from cattorch.interface import TOKEN_IDS
 
 TOLERANCE = 1e-4

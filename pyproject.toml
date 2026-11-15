@@ -51,6 +51,8 @@ line-length = 100
 select = ["E9", "F"]
 
 [tool.pytest.ini_options]
+# Tests import shared helpers from tests/ and benchmark scripts by module name.
+pythonpath = ["tests", "benchmarks"]
 markers = [
     "vm: runs exported sprites in the official Scratch VM (needs Node.js and npm ci in benchmarks/)",
 ]

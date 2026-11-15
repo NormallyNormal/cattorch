@@ -9,8 +9,6 @@ that finds them undecoded.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -21,13 +19,12 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import INTERRUPTED, load_sprite  # noqa: E402
-from test_generation_overlap import OVERTAKEN, SETUP, Script, Scripts  # noqa: E402
-from test_optimization import CachedLM  # noqa: E402
-from test_plain_overlap import spread  # noqa: E402
-from test_program_overlap import LOOPS  # noqa: E402
-from test_recurrent_generation import make  # noqa: E402
+from test_generation_automatic import INTERRUPTED, load_sprite
+from test_generation_overlap import OVERTAKEN, SETUP, Script, Scripts
+from test_optimization import CachedLM
+from test_plain_overlap import spread
+from test_program_overlap import LOOPS
+from test_recurrent_generation import make
 from cattorch.interface import TOKEN_IDS
 
 INIT, RESET = ("cattorch init", None), ("cattorch reset", None)

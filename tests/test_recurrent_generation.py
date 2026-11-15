@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from cattorch import interface
 import json
-import sys
 import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -22,7 +20,6 @@ from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list
 from cattorch.interface import TOKEN_IDS
 
-sys.path.insert(0, str(Path(__file__).parent))
 
 TOLERANCE = 1e-4
 

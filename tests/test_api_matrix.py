@@ -7,9 +7,7 @@ options as ``transpile`` and passes with tight tolerances on every kind.
 
 from __future__ import annotations
 
-import sys
 import warnings
-from pathlib import Path
 
 import pytest
 import torch
@@ -22,8 +20,7 @@ from cattorch import (
     entrypoint, transpile, verify,
 )
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_autoregressive import NanoGPT  # noqa: E402
+from test_autoregressive import NanoGPT
 
 
 class Doubler(nn.Module):

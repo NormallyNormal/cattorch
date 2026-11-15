@@ -1,9 +1,4 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-
-from add_tinystories_sampler import (  # noqa: E402
+from add_tinystories_sampler import (
     build_initializer_program,
     build_one_token_program,
     build_sampler_program,

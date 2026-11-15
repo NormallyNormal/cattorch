@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -16,8 +14,7 @@ import torch.nn.functional as F
 from cattorch import CodegenConfig, GenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite, nano, prefill_and_decode  # noqa: E402
+from test_generation_automatic import load_sprite, nano, prefill_and_decode
 from cattorch.interface import TOKEN_IDS
 
 CONTEXT, VOCAB, WIDTH, HEADS = 16, 24, 16, 2

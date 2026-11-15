@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -16,8 +14,7 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite, nano, prefill_and_decode  # noqa: E402
+from test_generation_automatic import load_sprite, nano, prefill_and_decode
 
 
 class Accumulator(nn.Module):

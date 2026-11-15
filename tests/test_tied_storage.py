@@ -7,9 +7,7 @@ must hold exactly one table fewer and compute exactly what the twin computes.
 
 import copy
 import json
-import sys
 import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -23,7 +21,6 @@ from cattorch.quantization import _symmetric_matrix
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.interface import TOKEN_IDS
 
-sys.path.insert(0, str(Path(__file__).parent))
 
 LIMIT = 4000
 

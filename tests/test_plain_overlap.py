@@ -7,10 +7,8 @@ procedure, and at each repeat of a loop.
 
 from __future__ import annotations
 
-import sys
 import threading
 from collections import defaultdict
-from pathlib import Path
 
 import pytest
 import torch
@@ -19,10 +17,9 @@ from torch import nn
 from cattorch import QuantizationConfig, StorageConfig, interface, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite  # noqa: E402
-from test_generation_overlap import Script, Scripts, spread  # noqa: E402
-from test_program_overlap import LOOPS, OVERTAKEN  # noqa: E402
+from test_generation_automatic import load_sprite
+from test_generation_overlap import Script, Scripts, spread
+from test_program_overlap import LOOPS, OVERTAKEN
 
 TOLERANCE = 1e-5
 FORWARD, INIT, PREPARE = "cattorch forward", "cattorch init", "cattorch prepare for save"

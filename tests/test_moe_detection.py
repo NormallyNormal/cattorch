@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -14,9 +12,8 @@ from cattorch import GenerationProgram, UnsupportedModelError, transpile, verify
 from cattorch import CustomMoEWarning
 from cattorch.operator_registry import default_registry
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite, prefill_and_decode  # noqa: E402
-from cattorch.util.scratch.emulator import ScratchEmulator  # noqa: E402
+from test_generation_automatic import load_sprite, prefill_and_decode
+from cattorch.util.scratch.emulator import ScratchEmulator
 
 WIDTH, EXPERTS = 8, 4
 

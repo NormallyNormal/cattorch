@@ -15,8 +15,6 @@ have it switched on.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -26,16 +24,15 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-import test_generation_init_overlap as generation  # noqa: E402
-import test_plain_overlap as plain  # noqa: E402
-import test_program_overlap as program  # noqa: E402
-from test_generation_automatic import INTERRUPTED as GENERATION_INTERRUPTED  # noqa: E402
-from test_generation_automatic import load_sprite  # noqa: E402
-from test_generation_overlap import OVERTAKEN as GENERATION_OVERTAKEN  # noqa: E402
-from test_generation_overlap import Script, Scripts  # noqa: E402
-from test_optimization import CachedLM  # noqa: E402
-from test_recurrent_generation import make  # noqa: E402
+import test_generation_init_overlap as generation
+import test_plain_overlap as plain
+import test_program_overlap as program
+from test_generation_automatic import INTERRUPTED as GENERATION_INTERRUPTED
+from test_generation_automatic import load_sprite
+from test_generation_overlap import OVERTAKEN as GENERATION_OVERTAKEN
+from test_generation_overlap import Script, Scripts
+from test_optimization import CachedLM
+from test_recurrent_generation import make
 
 INT8 = {"quantization": QuantizationConfig(bits=8, min_quantized_values=1)}
 STORAGES = {"compressed": {}, "int8": INT8}
