@@ -999,78 +999,11 @@ def _remove_canvas_calls(sprite: dict, name: str) -> None:
         del blocks[identifier]
 
 
-def _add_procedure_completion_broadcast(
-    sprite: dict,
-    procedure: str,
-    message: str,
-    *,
-    status: str | None = None,
-) -> None:
-    """Broadcast a public lifecycle notification after a procedure finishes.
-
-    ``broadcast and wait`` is intentional: lifecycle procedures are warp
-    blocks, so an ordinary broadcast would not let receiver scripts run at the
-    boundary before the caller continued into the next expensive phase.
-    """
-    broadcasts = sprite.setdefault("broadcasts", {})
-    broadcast_id = next(
-        (
-            identifier
-            for identifier, existing_message in broadcasts.items()
-            if existing_message == message
-        ),
-        None,
-    )
-    if broadcast_id is None:
-        broadcast_id = f"cattorch_broadcast_{uuid.uuid4().hex[:8]}"
-        broadcasts[broadcast_id] = message
-
-    blocks = sprite["blocks"]
-    definition = _find_procedure_definition(sprite, procedure)
-    terminal = blocks[definition].get("next")
-    if terminal is None:
-        raise ValueError(f"procedure {procedure!r} has no executable body")
-    while blocks[terminal].get("next") is not None:
-        terminal = blocks[terminal]["next"]
-
-    notification = f"cattorch_completion_{uuid.uuid4().hex[:8]}"
-    if status is not None:
-        status_id = next(
-            identifier
-            for identifier, entry in sprite.get("variables", {}).items()
-            if entry[0] == STATUS_VARIABLE
-        )
-        status_block = f"cattorch_completion_status_{uuid.uuid4().hex[:8]}"
-        blocks[terminal]["next"] = status_block
-        blocks[status_block] = {
-            "opcode": "data_setvariableto", "next": notification,
-            "parent": terminal,
-            "inputs": {"VALUE": [1, [10, status]]},
-            "fields": {"VARIABLE": [STATUS_VARIABLE, status_id]},
-            "shadow": False, "topLevel": False,
-        }
-        notification_parent = status_block
-    else:
-        blocks[terminal]["next"] = notification
-        notification_parent = terminal
-    blocks[notification] = {
-        "opcode": "event_broadcastandwait",
-        "next": None,
-        "parent": notification_parent,
-        "inputs": {
-            "BROADCAST_INPUT": [1, [11, message, broadcast_id]],
-        },
-        "fields": {},
-        "shadow": False,
-        "topLevel": False,
-    }
-
-
 def _remove_completion_broadcast(sprite: dict, message: str) -> None:
-    """Undo ``_add_procedure_completion_broadcast`` for ``message``.
+    """Remove every ``broadcast and wait`` of ``message`` that ends a procedure.
 
-    The notification, and the status it sets, are the last blocks of their
-    procedure.
+    A ``cattorch status`` set just before the broadcast goes with it; the
+    two must be the last blocks of their procedure.
     """
     blocks = sprite["blocks"]
     for identifier, block in list(blocks.items()):
@@ -1953,29 +1886,6 @@ def _add_epoch_entry(
         program_name, variables=dict.fromkeys(variables), lists=lists, body=body,
     )
     return _add_warp_procedure(sprite, name, public, x=x, y=y)
-
-
-def _unlink_broadcasts(sprite: dict, message: str) -> None:
-    """Remove every ``broadcast and wait`` of ``message``; each must end its chain."""
-    blocks = sprite["blocks"]
-    for identifier, block in list(blocks.items()):
-        if block.get("opcode") != "event_broadcastandwait":
-            continue
-        menu = block.get("inputs", {}).get("BROADCAST_INPUT", [None, None])[1]
-        if not (isinstance(menu, list) and len(menu) > 1 and menu[1] == message):
-            continue
-        if block.get("next") is not None:
-            raise ValueError(f"the {message!r} broadcast doesn't end its chain")
-        parent = blocks[block["parent"]]
-        if parent.get("next") == identifier:
-            parent["next"] = None
-        else:
-            # The only block of an ``if`` branch.
-            inputs = parent.get("inputs", {})
-            for key in ("SUBSTACK", "SUBSTACK2"):
-                if inputs.get(key, [None, None])[1] == identifier:
-                    del inputs[key]
-        del blocks[identifier]
 
 
 def _take_epoch_argument(sprite: dict, name: str) -> str:
@@ -3036,3 +2946,4 @@ def _finish_generation_prepare(sprite: dict, reset: str) -> None:
             broadcast_and_wait(interface.completion(prepare)),
         ),
     ))
+
