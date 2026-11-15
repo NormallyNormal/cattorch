@@ -135,12 +135,15 @@ def _program(*names):
     ))
 
 
-def test_program_entry_points_without_layers_are_not_reported(tmp_path):
+@pytest.mark.parametrize("kind", ["input", "skip"])
+def test_program_entry_points_without_layers_are_not_reported(tmp_path, kind):
     torch.manual_seed(5)
-    model = Stack("input").eval()
-    result, emitted = export(model, _program("forward", "clear"), tmp_path / "program")
+    model = Stack(kind).eval()
+    program = _program("forward", "clear")
+    result, emitted = export(model, program, tmp_path / "program")
     assert not result.warnings and not emitted
     assert shared_procedure(result)
+    assert verify(model, program, result).passed
 
 
 def test_program_reports_the_entry_point_whose_layers_did_not_share(tmp_path):
