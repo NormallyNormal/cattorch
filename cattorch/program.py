@@ -1,4 +1,4 @@
-"""Experimental multi-entrypoint and persistent-state export contracts.
+"""Multi-entrypoint, persistent-state and generation export contracts.
 
 The objects in this module describe the public Scratch interface without
 coupling it to FX placeholder names.  They are intentionally small immutable

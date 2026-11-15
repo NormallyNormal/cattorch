@@ -2087,8 +2087,8 @@ def transpile(
         export. A kernel for an operation cattorch already lowers replaces the
         built-in one; an approximate kernel applies only in fast mode.
     example_kwargs:
-        Keyword arguments for the traced call of ``forward``, like
-        ``torch.export``'s ``kwargs``. Tensor values become inputs after the
+        Keyword arguments for the traced call of ``forward``, as a dict.
+        Tensor values become inputs after the
         positional ones (``input_k`` in order); other values, such as
         ``use_cache=False``, are constants of the trace. Only for tensor
         ``example_inputs``, and tensor values can't be combined with GPTQ.

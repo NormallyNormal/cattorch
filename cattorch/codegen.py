@@ -29,14 +29,15 @@ class CodegenConfig:
     display names. Public model/tokenizer interfaces keep their documented
     names so other sprites can continue to call and inspect them.
 
-    ``compact_schema`` drops redundant false-valued block fields. It stays
-    opt-in until it has been tested more widely in browser import, edit, and
-    save.
+    ``compact_schema`` drops redundant false-valued block fields. It is off
+    by default because it is tested less widely in browser import, edit,
+    and save.
 
     ``layer_sharing=True`` factors compatible ``blocks.N`` transformer
     stacks into one procedure and banks their weights. Cached generation also
-    interleaves equal-width per-layer K/V rows into shared banks. It falls back
-    when incompatible layouts make the transform unsafe, and is opt-in for now.
+    interleaves equal-width per-layer K/V rows into shared banks. Sharing is
+    all or nothing: if any layer doesn't fit, the whole model is exported
+    without it, with a warning.
     """
 
     target_json_bytes: int | None = 4 * 1024 * 1024

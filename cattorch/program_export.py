@@ -1,4 +1,4 @@
-"""Lower experimental ``ExportProgram`` interfaces into one Scratch sprite."""
+"""Lower an ``ExportProgram`` interface into one Scratch sprite."""
 
 from __future__ import annotations
 

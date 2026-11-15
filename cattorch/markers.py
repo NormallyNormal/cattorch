@@ -1,4 +1,4 @@
-"""Declarative markers on a model's own classes and methods (experimental).
+"""Declarative markers on a model's own classes and methods.
 
 A marker only attaches metadata: a ``__cattorch__`` dictionary on the class or
 function. The model runs, trains, and saves exactly as without it. At export,
