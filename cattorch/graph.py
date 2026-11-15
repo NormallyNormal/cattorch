@@ -921,14 +921,16 @@ _RUNTIME_END = 2**63 - 1
 
 def _length_literals(
     model, example_inputs, example_kwargs, dynamic_inputs, captured, items=2,
-    protected=frozenset(),
+    protected=frozenset(), varied=None,
 ):
-    """Literal arguments that change when each dynamic input has ``items`` items.
+    """Literal arguments that change when a dynamic input has ``items`` items.
 
     The graph is traced with one item, where ``x[-1]`` and ``x[0]`` are the
-    same slice. A second trace with two items tells them apart. Returns
-    ``{node name: {location: value}}``, with the value at ``items`` items, or
-    ``None`` if the trace fails or has another structure.
+    same slice. A second trace with two items tells them apart. ``varied``
+    is the index of the one input to lengthen, the others keeping one item;
+    every dynamic input by default. Returns ``{node name: {location:
+    value}}``, with the value at ``items`` items, or ``None`` if the trace
+    fails or has another structure.
     """
     from cattorch.dynamic import at_length
     from cattorch.frontend import flat_example_inputs
@@ -941,7 +943,8 @@ def _length_literals(
         axis = bound[3] if len(bound) > 3 else 0
         if index >= len(values) or values[index].shape[axis] != 1:
             return None
-        values[index] = at_length(values[index], axis, items)
+        if varied is None or index == varied:
+            values[index] = at_length(values[index], axis, items)
     keywords = dict(example_kwargs or {})
     names = [key for key, value in keywords.items() if isinstance(value, torch.Tensor)]
     keywords.update(zip(names, values[len(example_inputs):]))
@@ -1258,21 +1261,56 @@ def _mix_runtime_axis(
 _ARITHMETIC = {"aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"}
 
 
-def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis) -> None:
-    """Replace arithmetic constants computed from the length by its runtime value.
+class JointLengthError(UnsupportedModelError):
+    """A constant computed from the lengths of several variable-length inputs."""
+
+
+class _LengthSource(NamedTuple):
+    """How one variable-length input changes the graph's literal arguments.
+
+    ``at_two`` and ``at_three`` hold the literals that change when only this
+    input has two or three items, as ``_length_literals`` returns them.
+    """
+
+    name: str
+    placeholder: object
+    axis: int
+    at_two: dict
+    at_three: dict
+
+
+def _follow_length_literals(node, sources, graph, runtime) -> None:
+    """Replace arithmetic constants computed from a length by its runtime value.
 
     A constant that changes between the traces with one, two and three items
     is rebuilt from ``n``, read from the list's length, when it is ``a + b n``
     (the ``n - 1`` in a variance, ``x.shape[0]`` in a hand-written mean) or
     ``a + b / n`` (``1 / x.shape[0]``). Without a third trace it is taken to
-    be ``a + b n``.
+    be ``a + b n``. ``sources`` are the variable-length inputs, each traced
+    longer on its own, so each constant is rebuilt from the length of the
+    input it depends on; one that depends on several is rejected.
     """
     for position in (0, 1):
         location = ("args", position)
         one = node.args[position] if position < len(node.args) else None
-        if location not in at_two or isinstance(one, (bool, torch.fx.Node)):
+        if isinstance(one, (bool, torch.fx.Node)):
             continue
-        two, three = at_two[location], at_three.get(location)
+        changing = [source for source in sources if location in source.at_two.get(node.name, {})]
+        if not changing:
+            continue
+        if len(changing) > 1:
+            names = ", ".join(repr(source.name) for source in changing)
+            raise JointLengthError(
+                f"computes a number from the lengths of {names} together, which "
+                "cattorch can't follow: it rebuilds a number computed from one "
+                "variable length at run time, not from several. Use one length at "
+                "a time (divide by each length separately), or keep the count you "
+                "need in a state of its own, such as a buffer the entry point "
+                "increments"
+            )
+        (source,) = changing
+        two = source.at_two[node.name][location]
+        three = source.at_three.get(node.name, {}).get(location)
         slope = two - one
         # ``a + b / n`` through one and two items.
         scale = 2 * (one - two)
@@ -1286,7 +1324,8 @@ def _follow_length_literals(node, at_two, at_three, graph, runtime, source, axis
                 "cattorch can't follow; it follows a + b * n and a + b / n"
             )
         count = _insert(
-            graph, node, runtime.runtime_length.default, (source, axis), (), torch.float32,
+            graph, node, runtime.runtime_length.default, (source.placeholder, source.axis), (),
+            torch.float32,
         )
         if reciprocal:
             count = _insert(
@@ -1589,24 +1628,30 @@ def _propagate_runtime_axes(
     # Items along a node's dynamic axis beyond the runtime length, from a
     # ``cat`` with static tensors along it; a slice can make it negative.
     dynamic_offsets: dict[str, int] = {}
-    length_literals = None
-    third_literals: dict = {}
-    if dynamic_inputs:
+    # Each variable-length input is traced longer on its own, so every
+    # literal that changes is attributed to the input whose length it
+    # depends on.
+    sources: dict[str, _LengthSource] = {}
+    protected = registry.replaced_targets(fast=fast, config=fast_config) if dynamic_inputs else ()
+
+    def trace(index, items):
         with _expert_family_context(registry.expert_families):
-            length_literals = _length_literals(
+            return _length_literals(
                 model, example_inputs, example_kwargs, dynamic_inputs, captured,
-                protected=registry.replaced_targets(fast=fast, config=fast_config),
+                items=items, protected=protected, varied=index,
             )
-            # A third trace tells how arithmetic constants depend on the length.
-            if length_literals and len(dynamic_inputs) == 1 and any(
-                str(node.target) in _ARITHMETIC and node.name in length_literals
-                for node in nodes
-            ):
-                third_literals = _length_literals(
-                    model, example_inputs, example_kwargs, dynamic_inputs, captured,
-                    items=3,
-                    protected=registry.replaced_targets(fast=fast, config=fast_config),
-                ) or {}
+
+    for index, bound in dynamic_inputs.items():
+        node = placeholders[index]
+        at_two = trace(index, 2) or {}
+        # A third trace tells how arithmetic constants depend on the length.
+        arithmetic = any(
+            str(value.target) in _ARITHMETIC and value.name in at_two for value in nodes
+        )
+        sources[bound[0]] = _LengthSource(
+            bound[0], node, dynamic_axes[node.name], at_two,
+            (trace(index, 3) or {}) if arithmetic else {},
+        )
     graph = captured.graph
     import cattorch.ops  # noqa: F401 - registers the runtime operations
     runtime = torch.ops.cattorch
@@ -1624,12 +1669,8 @@ def _propagate_runtime_axes(
     for node in nodes:
         if node.op != "call_function":
             continue
-        if len(dynamic_inputs) == 1 and str(node.target) in _ARITHMETIC:
-            _follow_length_literals(
-                node, (length_literals or {}).get(node.name, {}),
-                third_literals.get(node.name, {}), graph, runtime,
-                placeholders[next(iter(dynamic_inputs))], next(iter(dynamic_axes.values())),
-            )
+        if str(node.target) in _ARITHMETIC:
+            _follow_length_literals(node, sources.values(), graph, runtime)
         dynamic_parents = [
             value for value in node.all_input_nodes if value.name in dynamic_axes
         ]
@@ -1641,6 +1682,8 @@ def _propagate_runtime_axes(
                 f"{node.target} combines multiple independent runtime extents"
             )
         parent = dynamic_parents[0]
+        # Literals that change with the length this operation follows.
+        literals = sources[next(iter(origins))].at_two.get(node.name, {})
         axis = dynamic_axes[parent.name]
         unit = dynamic_units.get(parent.name, 1)
         target = str(node.target)
@@ -1655,15 +1698,14 @@ def _propagate_runtime_axes(
             node, target, parent, axis, offset, input_shape, output_shape,
             graph=graph, runtime=runtime, dynamic_axes=dynamic_axes,
             dynamic_units=dynamic_units, dynamic_offsets=dynamic_offsets,
-            literals=(length_literals or {}).get(node.name, {}),
-            shortest=shortest, mark=mark,
+            literals=literals, shortest=shortest, mark=mark,
         ):
             continue
         followed = _follow_runtime_axis(
             node, target, parent, dynamic_parents, axis, unit, offset, input_shape,
             output_shape, dynamic_axes=dynamic_axes, dynamic_units=dynamic_units,
             row_loops=row_loops, registry=registry, fast=fast, fast_config=fast_config,
-            runtime=runtime, literals=(length_literals or {}).get(node.name, {}),
+            runtime=runtime, literals=literals,
         )
         if followed is None:
             continue

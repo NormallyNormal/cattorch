@@ -17,6 +17,7 @@ from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError
 from cattorch.export_options import validate_export_options
 from cattorch.fast import FastConfig, prepare_fast_model
+from cattorch.graph import JointLengthError
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.operator_registry import default_registry
 from cattorch.program import (
@@ -780,6 +781,8 @@ def transpile_program(
 
         try:
             sub_result = capture(args, dynamic_inputs)
+        except JointLengthError as error:
+            raise UnsupportedModelError(f"entry point {entrypoint.name!r} {error}") from None
         except UnsupportedModelError as error:
             sub_result = _entry_by_item(
                 error, entrypoint, wrapper, args, dynamic_inputs, capture,
@@ -1228,14 +1231,14 @@ def transpile_program(
         approximate_operations=tuple(sorted(approximations.items())),
     )
     if any(
-        isinstance(binding, Input) and binding.dynamic is not None
+        (isinstance(binding, Input) and binding.dynamic is not None)
+        or (isinstance(binding, StateInput) and states[binding.name].mode == "append")
         for entry in program.entrypoints for binding in entry.arguments
     ):
         from cattorch.dynamic import check_entry_lengths
-        from cattorch.verify import verify
 
         check_entry_lengths(
-            model, program, result, verify, adapters=adapters, optimization=optimization,
+            model, program, result, adapters=adapters, optimization=optimization,
             storage=storage, quantization=quantization, sig_figs=sig_figs,
         )
     return result

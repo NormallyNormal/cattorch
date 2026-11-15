@@ -239,63 +239,163 @@ def _lengths(minimum, original, maximum) -> list[int]:
     })
 
 
+def _state_at_length(state, length: int) -> torch.Tensor:
+    """An append state's value with ``length`` rows that differ from each other."""
+    initial = state.initial
+    if initial.shape[0] == 0:
+        initial = initial.new_zeros((1, *initial.shape[1:]))
+    return varied_at_length(initial, 0, length, seed=7)
+
+
 def check_entry_lengths(
-    model, program, result, verify, *, adapters=(), optimization="exact", storage=None,
+    model, program, result, *, adapters=(), optimization="exact", storage=None,
     quantization=None, sig_figs=None,
 ) -> None:
-    """``check_lengths`` for each variable-length input of a program's entry points.
+    """Compare a program's entry points with PyTorch at lengths other than the traced one.
 
-    Each check calls the entry point once, from the initial state, with that
-    input at another length and the other inputs at their examples. verify
-    gives the model the values the sprite stores.
+    Every variable-length input of an entry point, a ``dynamic=`` input or
+    an append state it reads, is checked at several lengths on its own, the
+    others at their examples and initial values, and then all together.
+    Each check calls the entry point once in the emulator, with its state
+    lists set to the values being checked, and compares its outputs and
+    updated states with the method's. The model gets the values the sprite
+    stores.
     """
-    from cattorch.program import Input, ProgramCall
+    from cattorch.experts import _expert_family_context
+    from cattorch.interface import OK, STATUS_VARIABLE
+    from cattorch.operator_registry import default_registry
+    from cattorch.program import Input, Output, ProgramCall, StateInput
+    from cattorch.program_runtime import ProgramReplay
+    from cattorch.util.scratch.archive import read_json
+    from cattorch.util.scratch.emulator import ScratchEmulator
+    from cattorch.verify import _compare_values, _get_logical_list, _program_reference, _set_logical_list
 
     if quantization is not None and quantization.method != "symmetric":
         return  # verify can't reproduce other quantization methods
     exact = reproducible_export(optimization=optimization, quantization=quantization)
+    tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
+    registry = default_registry().for_export(adapters=adapters)
+    reference = _program_reference(
+        model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
+    )
+    emulator = ScratchEmulator(read_json(result.path))
+    states = {state.name: state for state in program.states}
+
+    def error(entry, inputs, overrides):
+        """The largest difference of one call, whether it matches, and whether it ran."""
+        replay = ProgramReplay(reference, program)
+        replay.states.update(overrides)
+        for name, value in replay.states.items():
+            _set_logical_list(emulator, f"cattorch state {name}", value.flatten().tolist())
+        bindings = [binding for binding in entry.arguments if isinstance(binding, Input)]
+        for binding, value in zip(bindings, inputs):
+            _set_logical_list(emulator, f"cattorch {entry.name} {binding.name}", value.flatten().tolist())
+        emulator.run_procedure(f"cattorch {entry.name}")
+        status = str(emulator.variables.get(STATUS_VARIABLE, ""))
+        try:
+            with _expert_family_context(registry.expert_families):
+                leaves = replay.run(ProgramCall(entry.name, tuple(inputs)))
+        except ValueError as refused:
+            if "capacity exceeded" not in str(refused):
+                raise
+            # A call past an append state's capacity must be refused, and
+            # then has nothing to compare.
+            return (0.0, True, False) if status != OK else (math.inf, False, True)
+        if status != OK:
+            return math.inf, False, True
+        reports = [
+            _compare_values(
+                expected, _get_logical_list(emulator, f"cattorch {entry.name} {binding.name}"),
+                **tolerance,
+            )
+            for binding, expected in zip(entry.returns, leaves) if isinstance(binding, Output)
+        ]
+        reports += [
+            _compare_values(
+                replay.states[name], _get_logical_list(emulator, f"cattorch state {name}"),
+                **tolerance,
+            )
+            for name in states
+        ]
+        if any(report.values_compared != report.actual_values for report in reports):
+            return math.inf, False, True
+        found = max((report.max_abs_error for report in reports), default=0.0)
+        return found, all(report.passed for report in reports), True
+
     for entry in program.entrypoints:
         inputs = [binding for binding in entry.arguments if isinstance(binding, Input)]
+        # ``(what it is, how to set it to a length, lengths to check)``.
+        # ``(what it is, its key, lengths to check)``: an input's position,
+        # or an append state's name.
+        varying: list[tuple[str, int | str, list[int]]] = []
         for position, binding in enumerate(inputs):
-            if binding.dynamic is None:
-                continue
-            ((axis, (minimum, maximum)),) = binding.dynamic.items()
+            if binding.dynamic is not None:
+                ((axis, (minimum, maximum)),) = binding.dynamic.items()
+                varying.append((
+                    f"input {binding.name!r}", position,
+                    _lengths(minimum, binding.example.shape[axis], maximum),
+                ))
+        for binding in entry.arguments:
+            state = states.get(binding.name) if isinstance(binding, StateInput) else None
+            if state is not None and state.mode == "append":
+                rows = int(state.initial.shape[0])
+                varying.append((
+                    f"state {state.name!r}", state.name,
+                    _lengths(rows, rows, int(state.capacity or rows)),
+                ))
+        if not varying:
+            continue
 
-            def error(length):
-                values = [value.example for value in inputs]
-                values[position] = varied_at_length(binding.example, axis, length)
-                tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
-                outcome = verify(
-                    model, program, result, calls=(ProgramCall(entry.name, tuple(values)),),
-                    adapters=adapters, quantization=quantization, storage=storage,
-                    sig_figs=sig_figs, **tolerance,
-                )
-                (call,) = outcome.calls
-                reports = [*call.outputs, *call.states.values()]
-                if call.status != "ok" or any(
-                    report.values_compared != report.actual_values for report in reports
-                ):
-                    return math.inf, False
-                found = max((report.max_abs_error for report in reports), default=0.0)
-                return found, outcome.passed
+        def run(settings):
+            """One call with each ``(key, length)`` in ``settings`` at that length."""
+            values = [binding.example for binding in inputs]
+            overrides = {}
+            for key, length in settings:
+                if isinstance(key, str):
+                    overrides[key] = _state_at_length(states[key], length)
+                else:
+                    ((axis, _),) = inputs[key].dynamic.items()
+                    values[key] = varied_at_length(inputs[key].example, axis, length)
+            return error(entry, values, overrides)
 
-            lengths = _lengths(minimum, binding.example.shape[axis], maximum)
-            baseline, matches = error(lengths[0])
-            where = f"input {binding.name!r} of entry point {entry.name!r}"
-            if not matches:
+        def described(parts):
+            return " and ".join(
+                f"{length} {'row' if length == 1 else 'rows'} in {what}" for what, length in parts
+            )
+
+        examples = (
+            "for example torch.arange over it, a table sliced to it, or a slice of "
+            "one tensor to another's length"
+        )
+        baseline, matches, _ = run([])
+        if not matches:
+            names = " or ".join(what for what, _, _ in varying)
+            raise UnsupportedModelError(
+                f"entry point {entry.name!r} with its example inputs and the states' "
+                "initial values fails or doesn't match the method in the sprite (largest "
+                f"difference {baseline:.3g}). The method may compute something from the "
+                f"length of {names}, which the export traces with one row, that the "
+                f"sprite can't follow, {examples}"
+            )
+        checks = [
+            [(what, key, length)] for what, key, lengths in varying for length in lengths
+        ]
+        if len(varying) > 1:
+            # All together, at a short and at the longest checked length.
+            checks += [
+                [(what, key, pick(lengths)) for what, key, lengths in varying]
+                for pick in (lambda lengths: min(lengths, key=lambda value: abs(value - 3)), max)
+            ]
+        for check in checks:
+            found, matches, _ = run([(key, length) for _, key, length in check])
+            if not matches or (not exact and found > 10 * baseline + 1e-4):
                 raise UnsupportedModelError(
-                    f"with {lengths[0]} items in {where} the sprite fails or doesn't "
-                    f"match the model (largest difference {baseline:.3g})"
+                    f"entry point {entry.name!r} with {described((what, length) for what, _, length in check)} "
+                    f"doesn't match the method in the sprite (largest difference {found:.3g}), "
+                    "though it does with its example inputs and the states' initial values. "
+                    f"The method computes something from that length that the sprite can't "
+                    f"follow, {examples}"
                 )
-            for length in lengths[1:]:
-                found, matches = error(length)
-                if not matches or (not exact and found > 10 * baseline + 1e-4):
-                    raise UnsupportedModelError(
-                        f"with {length} items in {where} the sprite doesn't match the model "
-                        f"(largest difference {found:.3g}), though it does with {lengths[0]}. "
-                        "The method probably uses the length itself, for example "
-                        "torch.arange or a table sliced to it, which a dynamic input can't follow"
-                    )
 
 
 def unit_output_axes(model, flat_inputs, kwarg_names, spec, example_kwargs) -> list[int]:

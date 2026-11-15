@@ -260,7 +260,7 @@ def test_an_entry_point_using_the_length_itself_is_rejected(tmp_path):
         def add(self, rows):
             return rows + self.table[torch.arange(rows.shape[0])]
 
-    with pytest.raises(UnsupportedModelError, match="input 'rows' of entry point 'add'"):
+    with pytest.raises(UnsupportedModelError, match="entry point 'add' .*input 'rows'"):
         transpile(Positions().eval(), None, tmp_path / "positions")
 
 

@@ -322,15 +322,74 @@ def _tensor_leaves(value) -> list[torch.Tensor]:
     return [leaf for leaf in pytree.tree_leaves(value) if isinstance(leaf, torch.Tensor)]
 
 
+class _ReadBuffers(dict):
+    """A module's ``_buffers`` that records which buffers are read."""
+
+    def __init__(self, values, names, reads):
+        super().__init__(values)
+        self._names, self._reads = names, reads
+
+    def _read(self, key) -> None:
+        self._reads.add(self._names.get(key, key))
+
+    def __getitem__(self, key):
+        self._read(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key in self:
+            self._read(key)
+        return super().get(key, default)
+
+    def _read_all(self) -> None:
+        for key in super().__iter__():
+            self._read(key)
+
+    def __iter__(self):
+        self._read_all()
+        return super().__iter__()
+
+    def keys(self):
+        self._read_all()
+        return super().keys()
+
+    def values(self):
+        self._read_all()
+        return super().values()
+
+    def items(self):
+        self._read_all()
+        return super().items()
+
+
+def _canonical_buffer_names(model: nn.Module) -> dict[tuple[int, str], str]:
+    """``{(id(owner module), attribute): buffer name}``, aliases mapped to one name."""
+    canonical = {id(buffer): name for name, buffer in model.named_buffers()}
+    found = {}
+    for name, buffer in model.named_buffers(remove_duplicate=False):
+        owner, leaf = _buffer_owner(model, name)
+        found[(id(owner), leaf)] = canonical[id(buffer)]
+    return found
+
+
 def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
-    """Run a method on a copy and return the buffers it changed, with outputs."""
+    """Run a method on a copy: the buffers it changed and read, and its outputs."""
     probe = copy.deepcopy(model).eval()
     before = {
         name: (buffer, buffer._version, buffer.detach().clone())
         for name, buffer in probe.named_buffers()
     }
-    with torch.no_grad():
-        result = getattr(probe, method_name)(*copy.deepcopy(arguments))
+    names = _canonical_buffer_names(probe)
+    reads: set[str] = set()
+    for module in probe.modules():
+        own = {leaf: name for (owner, leaf), name in names.items() if owner == id(module)}
+        module.__dict__["_buffers"] = _ReadBuffers(module._buffers, own, reads)
+    try:
+        with torch.no_grad():
+            result = getattr(probe, method_name)(*copy.deepcopy(arguments))
+    finally:
+        for module in probe.modules():
+            module.__dict__["_buffers"] = dict(dict.items(module.__dict__["_buffers"]))
     after = dict(probe.named_buffers())
     changed = {}
     for name, (buffer, version, values) in before.items():
@@ -342,7 +401,7 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
             or current.shape != values.shape or not torch.equal(current, values)
         ):
             changed[name] = (values, current.detach().clone())
-    return changed, result
+    return changed, reads, result
 
 
 def _rewritten_rows(model: nn.Module, method_name: str, arguments: tuple, names) -> list[str]:
@@ -393,9 +452,9 @@ def marked_program(model: nn.Module) -> MarkedProgram:
     """Build the export model and ``ExportProgram`` from ``@entrypoint`` markers.
 
     The export model is a copy whose class gains one generated method per
-    entry point. Each takes the entry point's inputs and every state's value,
-    installs the values as buffers, calls the marked method, and returns its
-    outputs and the updated states, which is how ``ExportProgram`` threads
+    entry point. Each takes the entry point's inputs and the values of the
+    states the method reads or writes, installs them as buffers, calls the
+    marked method, and returns its outputs and the updated states, which is how ``ExportProgram`` threads
     state. ``transpile``, ``verify`` and ``analyze`` do this themselves when
     given the model and ``None``; call it to inspect the program.
     """
@@ -434,7 +493,7 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                 f"@entrypoint {method_name} has {len(input_names)} input_names for "
                 f"{len(arguments)} example inputs"
             )
-        changed, result = _changed_buffers(model, method_name, arguments)
+        changed, reads, result = _changed_buffers(model, method_name, arguments)
         for name in options["capacity"]:
             if name not in buffers:
                 raise UnsupportedModelError(
@@ -499,7 +558,7 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                 f"{sorted(unknown)}; its inputs are {list(input_names)}"
             )
         plans.append((method_name, options["name"] or method_name, input_names, arguments,
-                      output_names, set(changed) & set(buffers), options["dynamic"]))
+                      output_names, set(changed) & set(buffers), reads, options["dynamic"]))
 
     states = tuple(
         State(name, buffers[name].detach().clone(), mode="append", capacity=capacities[name])
@@ -509,10 +568,14 @@ def marked_program(model: nn.Module) -> MarkedProgram:
     state_order = [(state.name, state.mode) for state in states]
     generated = {}
     entrypoints = []
-    for method_name, entry_name, input_names, arguments, output_names, changed, dynamic in plans:
+    for method_name, entry_name, input_names, arguments, output_names, changed, reads, dynamic in plans:
         wrapper_name = f"_cattorch_entry_{method_name}"
+        # Only the states the method reads or writes are its arguments; it
+        # neither checks nor rewrites the others.
+        used = [(name, mode) for name, mode in state_order if name in changed or name in reads]
+        unused = {name: aliases[name] for name, _ in state_order if name not in changed | reads}
         generated[wrapper_name] = _entry_method(
-            method_name, len(arguments), state_order, changed, aliases,
+            method_name, len(arguments), used, changed, aliases, unused,
         )
         entrypoints.append(EntryPoint(
             entry_name, method=wrapper_name,
@@ -521,11 +584,11 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                     Input(name, value, dynamic=dynamic.get(name))
                     for name, value in zip(input_names, arguments)
                 ),
-                *(StateInput(name) for name, _ in state_order),
+                *(StateInput(name) for name, _ in used),
             ),
             returns=(
                 *(Output(name) for name in output_names),
-                *(StateUpdate(name) for name, _ in state_order if name in changed),
+                *(StateUpdate(name) for name, _ in used if name in changed),
             ),
         ))
     exported = copy.deepcopy(model)
@@ -533,7 +596,57 @@ def marked_program(model: nn.Module) -> MarkedProgram:
     return MarkedProgram(exported, ExportProgram(entrypoints=tuple(entrypoints), states=states))
 
 
-def _entry_method(method_name: str, inputs: int, states, changed, aliases):
+class _GuardedBuffers(dict):
+    """A module's ``_buffers`` during a generated entry method.
+
+    Reading a state that the method didn't read when cattorch ran it, so
+    that isn't among its arguments, would bake that state's initial value
+    into the export; it raises instead.
+    """
+
+    def __init__(self, values, forbidden, method_name):
+        super().__init__(values)
+        self._forbidden, self._method = forbidden, method_name
+
+    def _refuse(self, key) -> None:
+        if key in self._forbidden:
+            raise UnsupportedModelError(
+                f"@entrypoint {self._method} read buffer {self._forbidden[key]!r} when "
+                "cattorch traced it, but not when cattorch ran it on its example "
+                "inputs, so the buffer isn't one of its states. Read the same buffers "
+                "on every call, without a Python branch on a buffer's shape or values"
+            )
+
+    def __getitem__(self, key):
+        self._refuse(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._refuse(key)
+        return super().get(key, default)
+
+    def _refuse_all(self) -> None:
+        for key in super().__iter__():
+            self._refuse(key)
+
+    def __iter__(self):
+        self._refuse_all()
+        return super().__iter__()
+
+    def keys(self):
+        self._refuse_all()
+        return super().keys()
+
+    def values(self):
+        self._refuse_all()
+        return super().values()
+
+    def items(self):
+        self._refuse_all()
+        return super().items()
+
+
+def _entry_method(method_name: str, inputs: int, states, changed, aliases, unused):
     def entry(self, *values):
         arguments, values = values[:inputs], values[inputs:]
         for (name, _), value in zip(states, values):
@@ -541,7 +654,18 @@ def _entry_method(method_name: str, inputs: int, states, changed, aliases):
             value = value.clone()
             for alias in aliases.get(name, (name,)):
                 _set_buffer(self, alias, value)
-        result = getattr(self, method_name)(*arguments)
+        guarded = {}
+        for name, names in unused.items():
+            for alias in names:
+                owner, leaf = _buffer_owner(self, alias)
+                guarded.setdefault(id(owner), (owner, {}))[1][leaf] = name
+        for owner, forbidden in guarded.values():
+            owner.__dict__["_buffers"] = _GuardedBuffers(owner._buffers, forbidden, method_name)
+        try:
+            result = getattr(self, method_name)(*arguments)
+        finally:
+            for owner, _ in guarded.values():
+                owner.__dict__["_buffers"] = dict(dict.items(owner.__dict__["_buffers"]))
         updates = []
         for (name, mode), value in zip(states, values):
             if name not in changed:

@@ -242,8 +242,9 @@ Entry points take the same bounds, in the same form, with
 `Input(..., dynamic={1: (1, 32)})`, or
 `@cattorch.entrypoint(dynamic={"rows": {1: (1, 32)}})` in [markers](markers.md);
 `(1, 32)` alone is short for the first dimension, as for `transpile`, and
-the command line's `--dynamic INPUT.DIM=MIN:MAX` is the same again. Export checks each such input at several
-lengths in the same way, calling the entry point from the initial state. An
+the command line's `--dynamic INPUT.DIM=MIN:MAX` is the same again. Export checks each such input, and each
+[append state](programs-and-moe.md#state) an entry point reads, at several
+lengths in the same way, one at a time and then together. An
 entry point whose operations can't follow the length runs once per item, as
 `forward` does, if it has one variable-length input and updates no state.
 

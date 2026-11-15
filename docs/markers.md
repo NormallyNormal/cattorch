@@ -74,8 +74,9 @@ interface from the markers. Each entry point becomes a block named
   [variable-length inputs](supported-models.md#variable-length-inputs)).
 - cattorch runs each entry point once on a copy of the model to find the
   buffers it changes. Each one becomes a state list, `cattorch state total`,
-  starting from the buffer's value; `cattorch reset` restores it. Every entry
-  point can read every state.
+  starting from the buffer's value; `cattorch reset` restores it. Each entry
+  point takes, and checks, only the states it reads or writes; the others
+  aren't part of its interface.
 - A buffer that grows along its first dimension, like `seen`, needs its
   largest length in `capacity=`. Another entry point can read it, as `score`
   does, and so can the method that grows it, after appending, with the

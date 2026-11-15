@@ -179,7 +179,8 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   `AdapterContext` are stable and imported from `cattorch`.
 - [Markers](docs/markers.md) describe the export interface on your own
   classes without changing how they run: `@entrypoint` exports a method as a
-  block and turns the buffers it updates into state, `@example_inputs` gives
+  block and turns the buffers it updates into state, which each entry point
+  takes only if it reads or writes it, `@example_inputs` gives
   `forward` example inputs, `@export_forward` swaps in an export-only method,
   `@moe` declares a block's routing, `@generate` picks a generation method,
   and `@adapter` builds a `ModuleAdapter`. `transpile(model, None, path)` and
@@ -355,6 +356,14 @@ Python:
   example's values as constants; it is rejected, like `.item()`.
 - `sig_figs` rounded integer buffers.
 - Two states sharing one initial tensor read one state's list for both.
+- An entry point that computed something from an append state's length,
+  such as `history.sum(0) / history.shape[0]`, `history.var(0)` or
+  `torch.arange(history.shape[0])`, used the length it was traced with.
+  Arithmetic with a length now follows it at run time, for each of an entry
+  point's append states and variable-length inputs, a number computed from
+  two lengths together is rejected, and export checks every entry point at
+  several lengths of each append state it reads, rejecting what the sprite
+  can't follow.
 - Quantization: the report could claim int8 or int4 for weights storage
   kept in float16, a weight with small values or groups of one could be
   stored in float16 without a warning, `min_quantized_values` was applied to

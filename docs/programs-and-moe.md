@@ -97,6 +97,19 @@ limits, all checked at export:
   another.
 - It can't be partly sliced, and output shapes can't depend on tensor values.
 - Convolution and pooling accept it only as the batch dimension.
+- Arithmetic with a length, as in `self.history.sum(0) / self.history.shape[0]`
+  or the `n - 1` of `var`, follows that length at run time, whichever of an
+  entry point's variable-length inputs and append states it comes from. A
+  number computed from two of those lengths together, as in
+  `x / (a.shape[0] + b.shape[0])`, fails the export; keep such a count in a
+  state of its own.
+
+Export checks each entry point at several lengths of each of its
+variable-length inputs and append states, one at a time and then all
+together, with the append state's list filled to that length, and compares
+its outputs and updated states with the method's. A method that builds
+something from a length that the sprite can't follow, such as
+`torch.arange(self.history.shape[0])`, fails that check.
 
 With [markers](markers.md#entry-points-and-state), each buffer an
 `@entrypoint` method changes becomes a state: a replace state, or an append
