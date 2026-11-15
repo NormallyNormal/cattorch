@@ -83,7 +83,8 @@ From the terminal, `cattorch generate --hf REPO` does the same; see
   in an embedding table; cattorch uses the table's size as the vocabulary when
   it checks token IDs in Scratch. The token may be reshaped, indexed,
   transposed, expanded or cast first, as in `self.embed(token[:, 0])`, but not
-  computed with, as in `self.embed(token + 1)`.
+  computed with, as in `self.embed(token + 1)`, and no other table may be
+  indexed with an index computed from it.
 - The states come in the order of `RecurrentGenerationProgram.states`, and the
   step returns the new values in the same order, each with its state's shape.
 - The logits flatten to one row of vocabulary scores: `[V]`, `[1, V]` and
@@ -151,6 +152,7 @@ adapter doesn't.
 | `step changes the shape of state` | A new state has a different shape from its initial value. |
 | `the step's logits must flatten to one vocabulary row` | The logits have more than one row, for example a batch of two. |
 | `the step's token must index an embedding table` | The token isn't looked up in an `nn.Embedding` (or `F.embedding`), for example a one-hot product. |
+| `can't use an index its model computes from the token IDs` | A table indexed with an index computed from the token, such as `table[token // 2]`. Index it with the token itself. |
 | `REFERENCE returned logits of shape` | The reference doesn't return one row per token. |
 | `the recurrent step disagrees with REFERENCE at logits row N` | The reference check failed. The message gives the first differing row and the largest errors. For a Hugging Face model, it adds that the installed transformers version may be unsupported. |
 | `top_k (N) exceeds output size (V)` | `top_k` is larger than the vocabulary. |

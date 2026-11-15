@@ -51,8 +51,15 @@ benchmark case and its variant.
 - A block checks its input lists before it runs: the number of items, and
   each item. A list of floating-point values must hold numbers (`Infinity`
   and `-Infinity` count; text, an empty item and `NaN` don't); a list of
-  integers must hold whole numbers, and token IDs and other indices into a
-  table must be from 0 to its size minus 1. A bool list takes any values.
+  integers must hold whole numbers. Token IDs must be from 0 to the
+  vocabulary size minus 1, and an integer input the model uses as an index
+  must hold indices valid for every operation that uses it, as in PyTorch:
+  from 0 to the size minus 1, or, where PyTorch counts a negative index from
+  the end, as in `x[ids]`, from minus the size; see
+  [index inputs](supported-models.md#index-inputs). An index the model
+  computes from its inputs, such as `x[ids + 1]`, is checked as the block
+  runs, and one out of range fails the block with `invalid item: LIST`
+  naming the input it comes from. A bool list takes any values.
 - A block decodes the stored weights itself when they aren't decoded yet,
   which is `cattorch init` running inside it: it sends
   `cattorch init complete` too. A program's entry point decodes only its own

@@ -113,6 +113,17 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   wrong number of items or a non-number item, and a generation block with a
   token ID that isn't a whole number in the vocabulary, fail with a status
   instead of computing meaningless output.
+- Indices are checked as PyTorch checks them: an integer input used as an
+  index, by tensor indexing, `gather`, `index_select`, `take`,
+  `take_along_dim`, `one_hot`, `scatter`, `index_add`, `index_put`, an
+  embedding or an embedding bag's offsets, must hold indices valid for every
+  operation that uses it, and an index computed from the inputs, such as
+  `x[ids + 1]` or a loss's targets, is checked as the block runs; either
+  fails with `invalid item: LIST` naming the input. `index_select`,
+  `index_add`, `index_copy`, `index_reduce` and `take_along_dim` refuse
+  negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
+  A generator can't index with an index computed from the token IDs. See
+  [index inputs](docs/supported-models.md#index-inputs).
 - `cattorch prepare for save` keeps the public lists. It used to empty a
   model's input and output lists and a program's input and state lists.
 - Every internal block, list and variable starts with `_`, including the

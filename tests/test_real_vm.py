@@ -1028,3 +1028,35 @@ def test_tokenizers_match_added_tokens_as_hugging_face_does(tmp_path):
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
     for name, want in expected.items():
         assert stage[name] == want, name
+
+
+def test_index_inputs_are_checked_before_and_while_the_block_runs(tmp_path):
+    # ``table[ids]`` takes -5 to 4, checked before the block runs;
+    # ``table[ids + 1]`` needs ids + 1 in that range, checked as it runs.
+    class Rows(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = nn.Parameter(torch.arange(10.0).reshape(5, 2))
+
+        def forward(self, ids):
+            return self.table[ids] - self.table[ids + 1]
+
+    model = Rows().eval()
+    result = transpile(model, torch.tensor([1, 2]), tmp_path / "rows")
+    project = build_project(result, tmp_path / "rows")
+    first = [-5, 1]
+    expected = model(torch.tensor(first)).detach().flatten()
+    for ids, status in (
+        ([3, 1], interface.OK), ([4, 1], interface.invalid_item("input")),
+        ([-6, 1], interface.invalid_item("input")), ([5, 1], interface.invalid_item("input")),
+        ([-1, 1], interface.OK),
+    ):
+        stage = run_vm(project, tmp_path, flag=False, calls=[
+            ("rows run", {"rows input": first}), ("rows run", {"rows input": ids}),
+        ])["stage"]
+        assert stage["rows status"] == status, ids
+        if status == interface.OK:
+            expected_now = model(torch.tensor(ids)).detach().flatten()
+            torch.testing.assert_close(values(stage, "rows output"), expected_now)
+        else:
+            torch.testing.assert_close(values(stage, "rows output"), expected)

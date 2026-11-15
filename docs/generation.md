@@ -77,6 +77,9 @@ caught.
 - The model returns logits for every position, not only the last. Slicing to
   the last position inside `forward` isn't supported.
 - The input is a `[1, length]` tensor of token IDs, looked up in an embedding.
+  Other tables may be indexed with the token IDs too, but not with an index
+  computed from them, such as `table[ids // 2]`, which the sprite would have
+  to check part way through a step.
 - Attention masks are causal masks, optionally limited to a sliding window of
   the last N tokens (Mistral, GPT-OSS). The scores may also carry an ALiBi
   bias, `slope * (key - query)` per head, possibly plus a constant per row, and
@@ -94,6 +97,7 @@ caught.
 | `changes when more tokens follow it` | The output for a token depends on the prompt's length: a length-dependent Python branch that takes the same path at the two traced lengths, or positions scaled by the length (dynamic NTK RoPE). |
 | `isn't a recognised attention pattern` | A softmax over the sequence that isn't matmul, scale, causal mask, softmax, matmul. The message says which part didn't match. |
 | `the table's first N rows ... differ` | A position table whose rows depend on the sequence length. |
+| `can't use an index its model computes from the token IDs` | A table indexed with an index computed from the token IDs, such as `table[ids // 2]`. Index it with the token IDs themselves. |
 | `the cached step disagrees with the model` | The export-time check failed. The message gives the first differing row and the largest error. |
 | `GenerationProgram caches attention keys and values, and this ... model has no attention` | A Hugging Face Mamba, Mamba-2, or RWKV model. Use [`RecurrentGenerationProgram()`](recurrent-generation.md). |
 

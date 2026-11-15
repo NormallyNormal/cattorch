@@ -29,6 +29,7 @@ from cattorch.scratch import (
     clear,
     div,
     eq,
+    for_each,
     gt,
     if_,
     item,
@@ -535,6 +536,32 @@ def _validate_scatter_reduce(ctx: KernelContext) -> str | None:
     if reduce not in _SCATTER_REDUCTIONS:
         return f"scatter reduction {reduce!r} is not supported"
     return _validate_runtime_index(ctx)
+
+
+def _emit_check_index(ctx: KernelContext):
+    """Copy indices the model computed, failing the call on one out of range.
+
+    ``cattorch::check_index``: an index outside ``low`` to ``high - 1`` sets
+    the status to ``invalid item`` for the input it came from, unless an
+    earlier one did, and the block then writes no output.
+    """
+    index = ctx.inputs["index"]
+    low, high = int(ctx.scalars["low"]), int(ctx.scalars["high"])
+    status = ctx.temp_var(interface.STATUS_VARIABLE)
+    position = ctx.temp_var("index")
+    invalid = interface.invalid_item(interface.input_name(int(ctx.scalars["position"])))
+    value = item(index.list, var(position))
+    out = ctx.output.list
+    return (
+        clear(out),
+        for_each(position, length(index.list), (
+            # Negative exactly when the index is outside low to high - 1.
+            if_(lt(mul(sub(value, low), sub(high - 1, value)), 0), (
+                if_(eq(var(status), interface.OK), (set_var(status, invalid),)),
+            )),
+            append(out, value),
+        )),
+    )
 
 
 def _emit_gather(ctx: KernelContext):
@@ -1198,6 +1225,7 @@ BUILTIN_KERNELS = (
     Kernel(
         "cattorch.recurrent_final.default", _emit_recurrent_final, name="recurrent_final",
     ),
+    Kernel("cattorch.check_index.default", _emit_check_index, name="check_index"),
     Kernel(
         "aten.gather.default", _emit_gather, name="gather_runtime",
         validator=_validate_runtime_index,

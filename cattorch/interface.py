@@ -230,13 +230,16 @@ NUMBERS, WHOLE_NUMBERS = "numbers", "whole numbers"
 
 
 def item_checks(
-    list_name: str, kind: str | None, rows: int | None = None, *, lists=None, status=None,
+    list_name: str, kind: str | None, rows: int | tuple[int, int] | None = None, *,
+    lists=None, status=None,
 ):
     """Statements that set the status to ``invalid_item(list_name)`` unless every item is valid.
 
     ``kind`` is NUMBERS (any number, ``Infinity`` included), WHOLE_NUMBERS, or
     None for no check (bool lists). With ``rows``, a whole number must also be
-    from 0 to ``rows - 1``: an index into a table of that many rows.
+    from 0 to ``rows - 1``: an index into a table of that many rows; or, as
+    ``(low, high)``, from ``low`` to ``high - 1``, such as ``-size`` to
+    ``size - 1`` for an index PyTorch counts from the end when negative.
     ``lists`` are the lists read, by default ``list_name`` (the shards of a
     split list, or a copy). ``status`` names the variable to set,
     ``cattorch status`` by default.
@@ -260,8 +263,10 @@ def item_checks(
         else:
             checks = (if_(not_(eq(value, round_(value))), invalid),)
             if rows is not None:
-                # Negative exactly when the index is outside 0 to rows - 1.
-                checks += (if_(lt(mul(value, sub(rows - 1, value)), 0), invalid),)
+                low, high = (0, rows) if isinstance(rows, int) else rows
+                # Negative exactly when the index is outside low to high - 1.
+                below = value if low == 0 else sub(value, low)
+                checks += (if_(lt(mul(below, sub(high - 1, value)), 0), invalid),)
         statements.append(for_each(index, length(read), checks))
     return tuple(statements)
 

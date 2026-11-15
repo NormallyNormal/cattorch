@@ -40,6 +40,227 @@ def traced_from_input(value) -> bool | None:
     return False
 
 
+def _traced_node(value):
+    """The graph node a tensor being traced comes from, if the tracer knows it."""
+    import torch.fx.experimental.proxy_tensor as proxy_tensor
+
+    mode = proxy_tensor.get_proxy_mode()
+    if mode is None:
+        return None
+    slot = proxy_tensor.get_proxy_slot(value, mode.tracer, None)
+    proxy = getattr(slot, "proxy", slot)
+    return proxy.node if isinstance(proxy, torch.fx.Proxy) else None
+
+
+# ``node.meta`` key of an integer input's placeholder: ``(low, high)``, the
+# range every one of its items must be in, because the model uses the input,
+# whole, as an index (``_mark_index``). The input checks read it.
+INDEX_BOUND_META = "cattorch_index_bound"
+
+# Operations whose result holds exactly the values of their first argument,
+# each of them at least once, so an index range carries through them.
+_SAME_VALUES = frozenset({
+    "aten.view.default", "aten.reshape.default", "aten._unsafe_view.default",
+    "aten.unsqueeze.default", "aten.squeeze.dim", "aten.squeeze.dims",
+    "aten.squeeze.default", "aten.expand.default", "aten.permute.default",
+    "aten.transpose.int", "aten.t.default", "aten.numpy_T.default", "aten.movedim.int",
+    "aten.flip.default", "aten.roll.default", "aten.clone.default",
+    "aten.contiguous.default", "aten.alias.default", "aten.detach.default",
+    "aten.flatten.using_ints", "aten.unflatten.int", "aten.lift_fresh_copy.default",
+    "aten.repeat.default", "aten.to.dtype", "aten._to_copy.default",
+    "aten.to.dtype_layout",
+})
+# Operations whose integer result is in ``range(extent)`` by construction, by
+# the extent they compute it over.
+_INDEX_RESULTS = frozenset({
+    "aten.argmax.default", "aten.argmin.default", "cattorch.topk_indices.default",
+})
+
+
+def _is_integer(node) -> bool:
+    value = node.meta.get("val")
+    return (
+        isinstance(value, torch.Tensor) and not value.is_floating_point()
+        and not value.is_complex() and value.dtype != torch.bool
+    )
+
+
+def _is_number(node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and not value.is_complex() and value.dtype != torch.bool
+
+
+def _same_values_source(node):
+    """The node whose values ``node`` holds, through ``_SAME_VALUES`` operations.
+
+    Casts between integer and floating dtypes count: Scratch keeps a whole
+    number as it is through both.
+    """
+    while (
+        node.op == "call_function"
+        and (str(node.target) in _SAME_VALUES or (
+            # A selection that keeps every value.
+            str(node.target) in _SELECTIONS
+            and node.args and isinstance(node.args[0], torch.fx.Node)
+            and node.args[0].meta.get("val") is not None
+            and node.meta["val"].numel() == node.args[0].meta["val"].numel()
+        ))
+        and node.args and isinstance(node.args[0], torch.fx.Node)
+        and _is_number(node.args[0]) and _is_number(node)
+    ):
+        node = node.args[0]
+    return node
+
+
+_SELECTIONS = frozenset({"aten.slice.Tensor", "aten.select.int", "aten.narrow.default"})
+
+
+# Operations whose values don't depend on their tensor arguments' values.
+_FILLS = {
+    "aten.zeros_like.default": 0, "aten.ones_like.default": 1, "aten.full_like.default": None,
+    "aten.new_zeros.default": 0, "aten.new_ones.default": 1, "aten.new_full.default": None,
+}
+
+
+def _fill_value(node):
+    """The one value a ``_FILLS`` node holds, if known."""
+    fill = _FILLS[str(node.target)]
+    if fill is None and len(node.args) > 1 and isinstance(node.args[-1], (int, float)):
+        fill = node.args[-1]
+    return fill
+
+
+def _index_extent(node) -> int | None:
+    """The extent an ``_INDEX_RESULTS`` node's indices are below."""
+    source = node.args[0].meta.get("val") if node.args else None
+    if not isinstance(source, torch.Tensor):
+        return None
+    if str(node.target) == "cattorch.topk_indices.default":
+        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+    else:
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if dim is None or source.ndim == 0:
+        return source.numel()
+    return source.shape[dim]
+
+
+def _value_range(node) -> tuple[int, int] | None:
+    """Bounds, ``(lowest, highest)``, every value of an integer node is within by
+    construction, where they are known: an ``argmax`` or top-k index, a
+    ``clamp`` or a remainder by a constant, and those shifted by a constant."""
+    node = _same_values_source(node)
+    if node.op != "call_function" or not _is_integer(node):
+        return None
+    target, args = str(node.target), node.args
+    if target in _FILLS:
+        fill = _fill_value(node)
+        return None if fill is None else (int(fill), int(fill))
+    if target in _INDEX_RESULTS:
+        extent = _index_extent(node)
+        return None if extent is None else (0, extent - 1)
+    if target == "aten.clamp.default":
+        inner = _value_range(args[0]) if isinstance(args[0], torch.fx.Node) else None
+        lowest = args[1] if len(args) > 1 else node.kwargs.get("min")
+        highest = args[2] if len(args) > 2 else node.kwargs.get("max")
+        if inner is not None:
+            lowest = inner[0] if lowest is None else max(lowest, inner[0])
+            highest = inner[1] if highest is None else min(highest, inner[1])
+        if isinstance(lowest, int) and isinstance(highest, int):
+            return lowest, highest
+        return None
+    if target in {"aten.add.Tensor", "aten.sub.Tensor"} and len(args) == 2:
+        left, right = args
+        # ``a - floor(a / n) * n``: PyTorch's remainder of ``a`` by ``n``.
+        if (
+            target == "aten.sub.Tensor" and isinstance(right, torch.fx.Node)
+            and str(right.target) == "aten.mul.Tensor" and isinstance(right.args[1], int)
+            and right.args[1] > 0
+        ):
+            divisor = right.args[1]
+            floored = right.args[0]
+            while str(floored.target) in _SAME_VALUES and floored.args:
+                floored = floored.args[0]
+            if (
+                str(floored.target) == "aten.floor.default"
+                and str(floored.args[0].target) == "aten.div.Tensor"
+                and floored.args[0].args == (left, divisor)
+            ):
+                return 0, divisor - 1
+        if isinstance(left, torch.fx.Node) and isinstance(right, int):
+            inner = _value_range(left)
+            if inner is not None:
+                shift = right if target == "aten.add.Tensor" else -right
+                return inner[0] + shift, inner[1] + shift
+    return None
+
+
+class _IndicesMarked:
+    """While active, ``_mark_index`` marks nothing: a decomposition that marked
+    the indices it was given computes others from them."""
+
+    depth = 0
+
+    def __enter__(self):
+        _IndicesMarked.depth += 1
+
+    def __exit__(self, *exc):
+        _IndicesMarked.depth -= 1
+
+
+def _mark_index(index, low: int, high: int):
+    """Make the sprite refuse an ``index`` outside ``low`` to ``high - 1``.
+
+    ``index`` is an index tensor an operation is about to use, along an
+    extent where PyTorch takes ``low`` to ``high - 1`` (``-size`` to
+    ``size - 1`` where it counts negative indices from the end, else 0 to
+    ``size - 1``).
+
+    - The values of an integer input, through views, copies and casts:
+      the input's placeholder records the range, and the input check refuses
+      an item outside it with ``invalid item``.
+    - Indices the model computes from its inputs in another way, such as
+      ``idx + 1``: ``cattorch::check_index`` checks them as the sprite runs
+      and fails the call with ``invalid item`` naming the first input they
+      come from. Returns its result, to use in place of ``index``.
+    - Constant indices, and those in range by construction, such as an
+      ``argmax`` index over an extent within the range, or ``idx % size``
+      (``_value_range``), aren't checked.
+
+    Returns ``index`` when it adds no check to the graph.
+    """
+    if _IndicesMarked.depth:
+        return index
+    node = _traced_node(index)
+    if node is None:
+        return index
+    source = _same_values_source(node)
+    if source.op == "placeholder" and _is_integer(source):
+        known = source.meta.get(INDEX_BOUND_META)
+        if known is not None:
+            low, high = max(low, known[0]), min(high, known[1])
+        source.meta[INDEX_BOUND_META] = (low, high)
+        return index
+    known = _value_range(node)
+    if known is not None and low <= known[0] and known[1] < high:
+        return index
+    placeholders = [n for n in node.graph.nodes if n.op == "placeholder"]
+    seen, stack, reached = set(), [node], set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current.op == "placeholder":
+            reached.add(current)
+        if current.op == "call_function" and str(current.target) in _FILLS:
+            continue
+        stack.extend(current.all_input_nodes)
+    if not reached:
+        return index
+    position = next(i for i, placeholder in enumerate(placeholders) if placeholder in reached)
+    return torch.ops.cattorch.check_index(index, low, high, position)
+
+
 def _sign(value):
     positive = _aten.gt.Scalar(value, 0)
     negative = _aten.lt.Scalar(value, 0)
@@ -772,24 +993,50 @@ def _index_select(value, dim, index):
     if not traced_from_input(index):
         return NotImplemented
     dim %= value.ndim
-    index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
-    return _aten.gather.default(
-        value, dim, _along(index, dim, _replaced(value.shape, dim, index.numel())),
-    )
+    # PyTorch refuses negative indices here.
+    index = _mark_index(_aten.reshape.default(index, [-1]), 0, value.shape[dim])
+    with _IndicesMarked():
+        return _aten.gather.default(
+            value, dim, _along(index, dim, _replaced(value.shape, dim, index.numel())),
+        )
 
 
 def _take(value, index):
     flat = _aten.reshape.default(value, [-1])
-    positions = _positive_index(_aten.reshape.default(index, [-1]), flat.numel())
-    return _aten.reshape.default(_aten.gather.default(flat, 0, positions), list(index.shape))
+    size = flat.numel()
+    positions = _mark_index(_aten.reshape.default(index, [-1]), -size, size)
+    with _IndicesMarked():
+        positions = _positive_index(positions, size)
+        return _aten.reshape.default(_aten.gather.default(flat, 0, positions), list(index.shape))
+
+
+def _take_along_dim(value, indices, dim=None):
+    """``take_along_dim`` as a ``gather``, which checks its indices.
+
+    PyTorch's decomposition wraps every index into range, so an index past
+    the end would read another row.
+    """
+    if dim is None:
+        return _aten.gather.default(
+            _aten.reshape.default(value, [-1]), 0, _aten.reshape.default(indices, [-1]),
+        )
+    dim %= max(value.ndim, 1)
+    shape = list(torch.broadcast_shapes(
+        _replaced(value.shape, dim, 1), _replaced(indices.shape, dim, 1),
+    ))
+    value = _aten.expand.default(value, _replaced(shape, dim, value.shape[dim]))
+    indices = _aten.expand.default(indices, _replaced(shape, dim, indices.shape[dim]))
+    return _aten.gather.default(value, dim, indices)
 
 
 def _scatter_along(update):
     """``index_add``, ``index_copy`` and ``index_reduce`` as scatters."""
     def decomposition(value, dim, index, source, *args, **kwargs):
         dim %= value.ndim
-        index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
-        return update(value, dim, _along(index, dim, source.shape), source, *args, **kwargs)
+        # PyTorch refuses negative indices here.
+        index = _mark_index(_aten.reshape.default(index, [-1]), 0, value.shape[dim])
+        with _IndicesMarked():
+            return update(value, dim, _along(index, dim, source.shape), source, *args, **kwargs)
     return _as_vector(decomposition)
 
 
@@ -806,12 +1053,17 @@ def _index_reduce(value, dim, index, source, reduce, *, include_self=True):
 @_as_vector
 def _index_fill(value, dim, index, fill):
     dim %= value.ndim
-    index = _positive_index(_aten.reshape.default(index, [-1]), value.shape[dim])
+    size = value.shape[dim]
+    index = _mark_index(_aten.reshape.default(index, [-1]), -size, size)
+    index = _positive_index(index, size)
     expanded = _along(index, dim, _replaced(value.shape, dim, index.numel()))
-    if isinstance(fill, torch.Tensor):
-        source = _aten.expand.default(_aten.to.dtype(fill, value.dtype), list(expanded.shape))
-        return _aten.scatter.src(value, dim, expanded, source)
-    return _aten.scatter.value(value, dim, expanded, fill)
+    with _IndicesMarked():
+        if isinstance(fill, torch.Tensor):
+            source = _aten.expand.default(
+                _aten.to.dtype(fill, value.dtype), list(expanded.shape),
+            )
+            return _aten.scatter.src(value, dim, expanded, source)
+        return _aten.scatter.value(value, dim, expanded, fill)
 
 
 def _advanced_index(value, indices):
@@ -828,7 +1080,8 @@ def _advanced_index(value, indices):
     broadcast = list(torch.broadcast_shapes(*(indices[dim].shape for dim in indexed)))
     linear, stride = None, 1
     for dim in reversed(indexed):
-        term = _positive_index(indices[dim], value.shape[dim])
+        size = value.shape[dim]
+        term = _positive_index(_mark_index(indices[dim], -size, size), size)
         if stride != 1:
             term = _aten.mul.Tensor(term, stride)
         linear = term if linear is None else _aten.add.Tensor(linear, term)
@@ -873,7 +1126,8 @@ def _index(value, indices):
     ):
         return NotImplemented
     rows, linear, broadcast, rest_shape, front, _ = _advanced_index(value, indices)
-    picked = _aten.gather.default(rows, 0, _rows_index(linear, rest_shape))
+    with _IndicesMarked():
+        picked = _aten.gather.default(rows, 0, _rows_index(linear, rest_shape))
     picked = _aten.reshape.default(picked, [*broadcast, *rest_shape])
     return _aten.permute.default(picked, _result_order(broadcast, rest_shape, front))
 
@@ -911,10 +1165,11 @@ def _index_put(value, indices, values, accumulate=False):
         _aten.permute.default(values, inverse), [linear.numel(), *rest_shape],
     )
     positions = _rows_index(linear, rest_shape)
-    if accumulate:
-        rows = _aten.scatter_add.default(rows, 0, positions, values)
-    else:
-        rows = _aten.scatter.src(rows, 0, positions, values)
+    with _IndicesMarked():
+        if accumulate:
+            rows = _aten.scatter_add.default(rows, 0, positions, values)
+        else:
+            rows = _aten.scatter.src(rows, 0, positions, values)
     permuted = [value.shape[dim] for dim in order]
     restore = [order.index(dim) for dim in range(value.ndim)]
     return _aten.permute.default(_aten.reshape.default(rows, permuted), restore)
@@ -926,6 +1181,90 @@ def _put(value, index, source, accumulate=False):
         flat, [_aten.reshape.default(index, [-1])], _aten.reshape.default(source, [-1]), accumulate,
     )
     return _aten.reshape.default(updated, list(value.shape))
+
+
+def _marked(operator, dim_extent):
+    """``operator`` with its ``index`` argument marked (``_mark_index``).
+
+    ``dim_extent(args)`` is the extent the indices select along. These
+    operations stay whole: they are traced as they are, with the marked
+    index, or untouched when the mark adds nothing to the graph.
+    """
+    def decomposition(value, dim, index, *args, **kwargs):
+        extent = dim_extent(value, dim)
+        marked = _mark_index(index, 0, extent)
+        if marked is index:
+            return NotImplemented
+        return operator(value, dim, marked, *args, **kwargs)
+    return decomposition
+
+
+def _dim_size(value, dim):
+    return value.shape[dim] if value.ndim else 1
+
+
+def _gather(value, dim, index, *, sparse_grad=False):
+    return _marked(_aten.gather.default, _dim_size)(value, dim, index, sparse_grad=sparse_grad)
+
+
+def _scatter_src(value, dim, index, src):
+    return _marked(_aten.scatter.src, _dim_size)(value, dim, index, src)
+
+
+def _scatter_value(value, dim, index, fill):
+    return _marked(_aten.scatter.value, _dim_size)(value, dim, index, fill)
+
+
+def _scatter_add(value, dim, index, src):
+    return _marked(_aten.scatter_add.default, _dim_size)(value, dim, index, src)
+
+
+def _scatter_reduce(value, dim, index, src, reduce, *, include_self=True):
+    return _marked(_aten.scatter_reduce.two, _dim_size)(
+        value, dim, index, src, reduce, include_self=include_self,
+    )
+
+
+def _scatter_src_reduce(value, dim, index, src, *, reduce):
+    return _marked(_aten.scatter.reduce, _dim_size)(value, dim, index, src, reduce=reduce)
+
+
+def _scatter_value_reduce(value, dim, index, fill, *, reduce):
+    return _marked(_aten.scatter.value_reduce, _dim_size)(
+        value, dim, index, fill, reduce=reduce,
+    )
+
+
+def _embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    marked = _mark_index(indices, 0, weight.shape[0])
+    if marked is indices:
+        return NotImplemented
+    return _aten.embedding.default(weight, marked, padding_idx, scale_grad_by_freq, sparse)
+
+
+def _one_hot(value, num_classes=-1):
+    """``one_hot`` with its indices checked against ``num_classes``.
+
+    Without ``num_classes``, PyTorch reads it from the largest index, which
+    would make the output's size depend on the input's values.
+    """
+    if num_classes < 0:
+        from cattorch.errors import UnsupportedModelError
+
+        known = _static_values(value)
+        if known is not None:
+            num_classes = max(torch.tensor(known).flatten().tolist(), default=-1) + 1
+            return _one_hot(value, num_classes)
+        raise UnsupportedModelError(
+            "one_hot needs num_classes: without it, PyTorch reads the number of "
+            "classes from the largest index, so the output's size would depend on "
+            "the input's values"
+        )
+    value = _mark_index(value, 0, num_classes)
+    classes = _aten.arange.default(num_classes, device=value.device)
+    return _aten.to.dtype(
+        _aten.eq.Tensor(_aten.unsqueeze.default(value, -1), classes), torch.long,
+    )
 
 
 _BAG_MODES = ("sum", "mean", "max")
@@ -1049,7 +1388,10 @@ def _embedding_bag(operator):
         count = indices.numel()
         bags = offsets.numel() - (1 if include_last_offset else 0)
         starts = _static_values(offsets)
-        if starts is not None:
+        if starts is None:
+            # Each offset is a position in ``indices``, or its end.
+            offsets = _mark_index(offsets, 0, count + 1)
+        else:
             if starts and starts[0] != 0:
                 raise UnsupportedModelError(
                     f"embedding_bag: offsets[0] has to be 0, got {starts[0]}"
@@ -1072,9 +1414,13 @@ def _embedding_bag(operator):
             result = _reduce_equal_bags(rows, keep, mode, bags, size)
         else:
             segment = _bag_segments(offsets, starts, count, bags)
+            # Offsets passed as an input that don't start at 0 leave the
+            # first indices in no bag, which PyTorch refuses.
+            segment = _mark_index(segment, 0, bags)
             if keep is not None:
                 segment = _aten.where.ScalarOther(keep, segment, bags)
-            result = _reduce_segments(rows, segment, mode, bags)
+            with _IndicesMarked():
+                result = _reduce_segments(rows, segment, mode, bags)
         # Traced as the operation itself, and dropped unless something reads it.
         whole = operator(
             weight, indices, offsets, scale_grad_by_freq, _BAG_MODES.index(mode), sparse,
@@ -1369,6 +1715,16 @@ POINTWISE_DECOMPOSITIONS = {
     _aten.index_select.default: _as_vector(_index_select),
     _aten.index.Tensor: _index,
     _aten.take.default: _take,
+    _aten.take_along_dim.default: _take_along_dim,
+    _aten.gather.default: _gather,
+    _aten.scatter.src: _scatter_src,
+    _aten.scatter.value: _scatter_value,
+    _aten.scatter_add.default: _scatter_add,
+    _aten.scatter_reduce.two: _scatter_reduce,
+    _aten.scatter.reduce: _scatter_src_reduce,
+    _aten.scatter.value_reduce: _scatter_value_reduce,
+    _aten.embedding.default: _embedding,
+    _aten.one_hot.default: _one_hot,
     _aten.index_add.default: _scatter_along(_index_add),
     _aten.index_copy.default: _scatter_along(_aten.scatter.src),
     _aten.index_reduce.default: _scatter_along(_index_reduce),

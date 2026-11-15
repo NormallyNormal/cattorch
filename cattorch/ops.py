@@ -345,6 +345,23 @@ def _cached_attention_fake(
     return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
 
+@torch.library.custom_op("cattorch::check_index", mutates_args=())
+def _check_index(index: torch.Tensor, low: int, high: int, position: int) -> torch.Tensor:
+    """``index``, which the sprite checks is from ``low`` to ``high - 1`` as it runs.
+
+    Indices the model computes from its inputs, such as ``idx + 1``, can't be
+    checked before the call: the sprite checks them here, and an index out
+    of range fails the call with ``invalid item`` naming input ``position``
+    (``decompositions._mark_index``). PyTorch raises for one itself.
+    """
+    return index.clone()
+
+
+@_check_index.register_fake
+def _check_index_fake(index, low, high, position):
+    return torch.empty_like(index)
+
+
 @torch.library.custom_op("cattorch::advance_position", mutates_args=("position",))
 def _advance_position(position: torch.Tensor) -> None:
     """Move the step module on by one token."""

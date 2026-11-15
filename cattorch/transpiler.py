@@ -13,6 +13,7 @@ import torch
 
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import UnsupportedModelError, collect_warnings, warn, with_warnings
+from cattorch.decompositions import INDEX_BOUND_META
 from cattorch.export_options import validate_export_options, validate_model_and_inputs
 from cattorch.fast import FastConfig, prepare_fast_model
 from cattorch.frontend import flat_example_inputs, keep_operations, tensor_output_leaves
@@ -205,21 +206,23 @@ def _query_only_nodes(graph: _GraphInfo, attention: str) -> set[str]:
     return query_only
 
 
-def _kinds_of_items(graph: _GraphInfo, flat_inputs) -> dict[int, tuple[str | None, int | None]]:
-    """What each input's items must be, by position, and the rows of the table it indexes.
+def _kinds_of_items(
+    graph: _GraphInfo, flat_inputs,
+) -> dict[int, tuple[str | None, tuple[int, int] | None]]:
+    """What each input's items must be, by position, and the range of an index.
 
     Numbers in a floating-point list, whole numbers in an integer one, and,
-    for an index into an embedding table, whole numbers within its rows.
-    Bool lists take any values.
+    for an input the model uses as an index, whole numbers in the range
+    every use takes (``_index_bounds``). Bool lists take any values.
     """
-    kinds: dict[int, tuple[str | None, int | None]] = {}
+    kinds: dict[int, tuple[str | None, tuple[int, int] | None]] = {}
     for index, example in enumerate(flat_inputs):
         if example.is_floating_point():
             kinds[index] = (NUMBERS, None)
         elif example.dtype == torch.bool or example.is_complex():
             kinds[index] = (None, None)
         else:
-            kinds[index] = (WHOLE_NUMBERS, _index_rows(graph, input_name(index)))
+            kinds[index] = (WHOLE_NUMBERS, _index_bounds(graph, input_name(index)))
     return kinds
 
 
@@ -272,26 +275,81 @@ def _input_lists(layouts, flat_inputs) -> list[str]:
     return names
 
 
-def _index_rows(graph: _GraphInfo, list_name: str = "input") -> int | None:
-    """Rows of the smallest embedding table an input list indexes, if it indexes one."""
+def _index_bounds(graph: _GraphInfo, list_name: str = "input") -> tuple[int, int] | None:
+    """The range, ``(low, high)``, an input list's items must be in, if it is an index.
+
+    Tracing records it on the input's placeholder for every operation that
+    uses the input, whole, as an index (``decompositions._mark_index``): the
+    intersection of their ranges. A graph traced from an already-traced one,
+    as automatic generation's step is, keeps its embedding lookups, which
+    give the rows of the smallest table the input looks up.
+    """
     tokens = {name for name, value in graph.input_names.items() if value == list_name}
-    rows: int | None = None
+    bounds: tuple[int, int] | None = None
+
+    def narrow(low: int, high: int) -> None:
+        nonlocal bounds
+        bounds = (low, high) if bounds is None else (max(bounds[0], low), min(bounds[1], high))
+
     for node in graph.nodes:
+        if node.op == "placeholder" and node.name in tokens:
+            recorded = node.meta.get(INDEX_BOUND_META)
+            if recorded is not None:
+                narrow(*recorded)
         if node.op != "call_function":
             continue
         if (
             str(node.target) == "aten.embedding.default"
             and getattr(node.args[1], "name", None) in tokens
         ):
-            table = int(_get_shape(node.args[0])[0])
-            rows = table if rows is None else min(rows, table)
+            narrow(0, int(_get_shape(node.args[0])[0]))
         if (
             node.all_input_nodes
             and node.all_input_nodes[0].name in tokens
             and str(node.target) in _NOOP_OPS | {"aten.to.dtype", "aten._to_copy.default"}
         ):
             tokens.add(node.name)
-    return rows
+    return bounds
+
+
+def _checked_index_inputs(graph: _GraphInfo) -> frozenset[int]:
+    """The inputs, by position, that indices checked as the sprite runs come from.
+
+    ``cattorch::check_index`` names the input as ``input_name(position)``,
+    in the status it sets.
+    """
+    return frozenset(
+        int(node.args[3]) for node in graph.nodes
+        if node.op == "call_function" and str(node.target) == "cattorch.check_index.default"
+    )
+
+
+def refuse_runtime_index_checks(nodes, kind: str) -> None:
+    """Refuse a generator whose step computes an index from its inputs.
+
+    A generation step can't fail part way: its cache or states would keep
+    part of the call. So an index the step computes from the token, such as
+    ``table[token // 2]``, which only the running sprite could check
+    (``cattorch::check_index``), isn't supported there.
+    """
+    from cattorch.autoregressive import _module_path
+
+    for node in nodes:
+        if node.op == "call_function" and str(node.target) == "cattorch.check_index.default":
+            path = _module_path(node)
+            where = f" in module {path!r}" if path else ""
+            raise UnsupportedModelError(
+                f"a {kind} can't use an index its model computes from the token IDs{where}: "
+                "the sprite would have to check it part way through a step, which "
+                "would leave the cache half updated. Index tables with the token IDs "
+                "themselves, as an embedding does, or export the model with transpile"
+            )
+
+
+def _vocabulary(graph: _GraphInfo) -> int | None:
+    """The token IDs a generation step takes, from 0, if its token is an index."""
+    bounds = _index_bounds(graph)
+    return None if bounds is None else bounds[1]
 
 
 def _shared_layer_attention(graph: _GraphInfo) -> str:
@@ -2781,7 +2839,7 @@ class _CompiledSprite:
     fallback_operations: tuple[tuple[str, int], ...]
     approximate_operations: tuple[tuple[str, int], ...]
     interface_sizes: dict[str, int] = dataclasses.field(default_factory=dict)
-    item_kinds: dict[int, tuple[str | None, int | None]] = dataclasses.field(
+    item_kinds: dict[int, tuple[str | None, tuple[int, int] | None]] = dataclasses.field(
         default_factory=dict,
     )
     unshared_layers: str | None = None
@@ -3022,6 +3080,7 @@ def _compile_sprite(
     if hidden_outputs:
         _gate_hidden_outputs(sprite, graph, compiler, hidden_outputs)
     if generation is not None:
+        refuse_runtime_index_checks(graph.nodes, "GenerationProgram")
         if generation.hidden_prefill:
             root_entries = compiler.emitted_roots
             root_names = [name for name, _ in root_entries]
@@ -3068,7 +3127,7 @@ def _compile_sprite(
             hidden_prefill=generation.hidden_prefill,
             top_k=generation.top_k,
             compact_top_k=codegen.unrolling != "speed",
-            vocabulary=_index_rows(graph),
+            vocabulary=_vocabulary(graph),
         )
         # Kernels declare `cattorch cache length` themselves; unify them with
         # the lifecycle's variable.

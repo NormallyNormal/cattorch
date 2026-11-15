@@ -17,17 +17,17 @@ For persistent state, use [`@entrypoint` markers](markers.md) or an
 | Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
 | Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
 | Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item; `torch.einsum`, `torch.cdist` |
-| Embeddings | `nn.Embedding`; `nn.EmbeddingBag` and `F.embedding_bag` in `sum`, `mean` and `max` modes, with `per_sample_weights`, `padding_idx` and `include_last_offset`, and a 2D input or offsets that are fixed in the model or passed as an input. The offsets' shape fixes the number of bags, and offsets passed as an input must be valid for PyTorch (start at 0, never decrease, and end with the number of indices under `include_last_offset`); only the bags are computed, not `offset2bag` or the other results of `torch.ops.aten.embedding_bag`. `max_norm` is rejected: rescale the table before export |
+| Embeddings | `nn.Embedding`; `nn.EmbeddingBag` and `F.embedding_bag` in `sum`, `mean` and `max` modes, with `per_sample_weights`, `padding_idx` and `include_last_offset`, and a 2D input or offsets that are fixed in the model or passed as an input. The offsets' shape fixes the number of bags, and offsets passed as an input must be valid for PyTorch (start at 0, never decrease, and end with the number of indices under `include_last_offset`): an offset outside 0 to the number of indices, or a first offset that isn't 0, is refused (see [index inputs](#index-inputs)), and other invalid offsets give undefined results; only the bags are computed, not `offset2bag` or the other results of `torch.ops.aten.embedding_bag`. `max_norm` is rejected: rescale the table before export |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
 | Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.norm` and `torch.linalg.vector_norm`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
 | Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`, `lgamma`, `mvlgamma`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
 | Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `median`, `kthvalue`, over any dimensions; `cumsum`, `cumprod`, `cummax`, `cummin`; `torch.topk`, `torch.sort`, `argsort` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
-| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like`, `F.one_hot` |
+| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like`, `F.one_hot` with `num_classes` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
-| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, `take_along_dim`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
 | In-place updates | `x += 1`, `x.clamp_(-1, 1)`, `x.copy_(y)`, and slice or index assignment such as `x[0] = 0` or `x[..., :4] = y`, with step-one slices, on a tensor the model computed or on a `forward` input. Every in-place method and augmented assignment (`x %= 2`, `x.remainder_(2)`, `x.trunc_()`) exports exactly when its out-of-place form does, keeping PyTorch's rule that a float result can't be written into an integer tensor. The sprite computes the updated value and leaves the input list unchanged. In-place shape changes (`x.t_()`, `x.unsqueeze_(0)`) are rejected; write `x = x.t()`. Updates of a parameter or buffer (use [`@entrypoint` state](markers.md#entry-points-and-state)) and of a tensor read through a view taken before the update are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs
@@ -164,13 +164,45 @@ broadcasting pattern, or option. The error names the operation that failed.
   `torch.round(x, decimals=1)` does for -0.05 (-0.0 in PyTorch, -0.1 in the
   sprite). A zero can also come out as 0 where PyTorch gives -0; `atan2`,
   `signbit` and `copysign` read the sign of -0 as PyTorch does.
-- Run-time checks of input values, such as `F.one_hot`'s check that its
-  indices are in range, are left out: an out-of-range index gives a wrong
-  result instead of an error.
+- Indices are checked as PyTorch checks them; see
+  [index inputs](#index-inputs). Other run-time checks a model makes of its
+  input values, such as `torch._assert_async`, are left out.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
 return value without any tensors, raise `UnsupportedModelError`.
+
+## Index inputs
+
+An integer input the model uses as an index is checked before the block
+runs: an item outside the valid indices of an operation that uses it is
+refused with `invalid item: LIST`, LIST being the input, and the block
+writes no output. The valid indices are PyTorch's:
+
+| Operation | Valid indices |
+|---|---|
+| `nn.Embedding`, `F.embedding`, `nn.EmbeddingBag`, `F.embedding_bag` | 0 to the table's rows minus 1 |
+| `gather`, `take_along_dim`, `index_select`, `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_reduce` | 0 to the size of the dimension minus 1 |
+| `F.one_hot` | 0 to `num_classes` minus 1. Give `num_classes`: without it, PyTorch takes it from the largest index, and the export fails |
+| Tensor indexing such as `x[ids]` or `x[ids, other]`, `index_put` and assignment such as `x[ids] = v`, `index_fill`, `take`, `put` | minus the size to the size minus 1: a negative index counts from the end |
+| `nn.EmbeddingBag` and `F.embedding_bag` offsets | 0 to the number of indices |
+
+- An input that several operations use, or that indexes several
+  dimensions, must be valid for each of them.
+- The check follows the input through reshapes, views, copies and integer
+  casts, such as `table[ids.long().view(-1, 1)]`.
+- An index the model computes from its inputs in another way, such as
+  `x[ids + 1]` or a loss's targets, is checked as the block runs: one out of
+  range fails the block with `invalid item: LIST`, LIST being the input it
+  comes from (the first one, if several), and it writes no output.
+- Indices in range by construction aren't checked: those that come from
+  constants, `argmax`, `argmin`, `topk` or `sort` over a dimension no larger
+  than the one indexed, `clamp` into range, or `% size`.
+- `take_along_dim` takes 0 to the size minus 1: PyTorch doesn't check its
+  indices on every device, and reads past the end on some.
+- A [generation sprite](generation.md) can't use an index computed from the
+  token IDs, which it would have to check part way through a step; the
+  export refuses it.
 
 ## Variable-length inputs
 

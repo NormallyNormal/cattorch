@@ -353,6 +353,7 @@ def _build_entry_wrapper(
     finish: tuple[Statement, ...] = (),
     finish_variables: tuple[str, ...] = (),
     item_kinds: Mapping[int, tuple] = {},
+    index_checked: frozenset[int] = frozenset(),
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
     """The procedure body that checks, computes and commits one entry point.
 
@@ -364,7 +365,10 @@ def _build_entry_wrapper(
     whatever happened, with the ``finish_variables``. An unguarded body then
     sends its completion broadcast, which a guarded one's public block sends. ``item_kinds`` say
     what each input's items must be (``interface.item_checks``), by position;
-    a guarded body computes nothing once another call started.
+    a guarded body computes nothing once another call started. The
+    ``index_checked`` inputs, by position, are those indices the entry point
+    computes come from: an index out of range fails the call naming the
+    input as the compiled entry point knows it, ``input_name(position)``.
     """
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
@@ -428,6 +432,15 @@ def _build_entry_wrapper(
 
     # What the model returned, checked against what the lists can hold.
     computation: list[Statement] = [call(internal)]
+    for index in sorted(index_checked):
+        binding = entrypoint.arguments[index]
+        name = (
+            _input_list(entrypoint.name, binding.name)
+            if isinstance(binding, Input) else _state_list(binding.name)
+        )
+        computation.append(if_(eq(var(status), interface.invalid_item(input_name(index))), (
+            set_var(status, interface.invalid_item(display(name))),
+        )))
     for index, (binding, spec) in enumerate(zip(entrypoint.returns, temporary_specs)):
         temporary = _temporary_return(entrypoint.name, index)
         if isinstance(binding, Output):
@@ -737,7 +750,9 @@ def transpile_program(
     payload_names: set[str] = set()
     storage_warnings: list[str] = []
 
-    from cattorch.transpiler import _compile_sprite
+    from cattorch.transpiler import (
+        _checked_index_inputs, _compile_sprite, refuse_runtime_index_checks,
+    )
 
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
@@ -797,6 +812,9 @@ def transpile_program(
                 f"entry point {entrypoint.name!r} captured an unexpected argument count"
             )
         validate_entry_outputs(program, entrypoint, sub_result.outputs)
+        if not _guard_overlaps:
+            # A recurrent generator's step, which gets the generation guards.
+            refuse_runtime_index_checks(sub_result.graph.nodes, "RecurrentGenerationProgram")
         sprite = sub_result.sprite
         # An interface list's peak size, when the compiler used it as scratch
         # space for a larger intermediate first.
@@ -857,6 +875,7 @@ def transpile_program(
             finish=all_initialized,
             finish_variables=(interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else (),
             item_kinds=sub_result.item_kinds if _check_items else {},
+            index_checked=_checked_index_inputs(sub_result.graph),
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(

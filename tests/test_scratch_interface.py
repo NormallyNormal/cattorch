@@ -441,3 +441,167 @@ def test_benchmark_project_names(tmp_path):
             if not entry[0].startswith(interface.INTERNAL_PREFIX)
         }
         assert public == expected[kind], kind
+
+
+# ── Index inputs (docs/supported-models.md#index-inputs) ────────────────────
+
+class Indexes(nn.Module):
+    """One operation that takes integer input ``ids`` as indices."""
+
+    def __init__(self, operation):
+        super().__init__()
+        self.table = nn.Parameter(torch.arange(10.0).reshape(5, 2))
+        self.operation = operation
+
+    def forward(self, value, ids):
+        return self.operation(self.table, value, ids)
+
+
+F = torch.nn.functional
+# The operation, the ids, and the valid range of the first id: (lowest, highest).
+INDEXING = {
+    "embedding": (lambda t, x, i: F.embedding(i, t), [1, 3], (0, 4)),
+    "embedding padding_idx": (lambda t, x, i: F.embedding(i, t, padding_idx=0), [1, 3], (0, 4)),
+    "embedding_bag": (lambda t, x, i: F.embedding_bag(i.view(1, 2), t), [1, 3], (0, 4)),
+    "index_select": (lambda t, x, i: t.index_select(0, i), [1, 3], (0, 4)),
+    "gather": (lambda t, x, i: x.gather(1, i.view(1, 2)), [1, 2], (0, 2)),
+    "take_along_dim": (lambda t, x, i: torch.take_along_dim(t, i.view(1, 2), 0), [1, 3], (0, 4)),
+    "one_hot": (lambda t, x, i: F.one_hot(i, 4).float(), [1, 3], (0, 3)),
+    "scatter": (
+        lambda t, x, i: torch.zeros(1, 3).scatter(1, i.view(1, 2), x[:, :2]), [0, 2], (0, 2),
+    ),
+    "index_add": (lambda t, x, i: t.index_add(0, i, x.view(-1)[:2].expand(2, 2)), [1, 3], (0, 4)),
+    "index_copy": (lambda t, x, i: t.index_copy(0, i, x.view(-1)[:2].expand(2, 2)), [1, 3], (0, 4)),
+    "getitem": (lambda t, x, i: t[i], [1, 3], (-5, 4)),
+    "getitem columns": (lambda t, x, i: t[:, i], [1, 0], (-2, 1)),
+    "take": (lambda t, x, i: torch.take(t, i), [1, 3], (-10, 9)),
+    "index_put": (lambda t, x, i: t.index_put((i,), x[0, :2]), [1, 3], (-5, 4)),
+    "put": (lambda t, x, i: t.put(i, x[0, :2]), [1, 3], (-10, 9)),
+    "index_fill": (lambda t, x, i: t.index_fill(0, i, -1.0), [1, 3], (-5, 4)),
+    # Used twice: the intersection.
+    "two uses": (lambda t, x, i: t[i] + F.embedding(i, t[:3]), [1, 2], (0, 2)),
+    # Through a cast and a view.
+    "cast and view": (lambda t, x, i: t[i.long().view(2, 1)], [1, 3], (-5, 4)),
+}
+
+
+def forward_status(sprite: dict, value: torch.Tensor, ids: list) -> tuple[str, list]:
+    emulator = ScratchEmulator(sprite)
+    emulator.lists["input"] = value.flatten().tolist()
+    emulator.lists["input_1"] = list(ids)
+    emulator.run_procedure(interface.FORWARD)
+    return emulator.variables[interface.STATUS_VARIABLE], emulator.lists["output"]
+
+
+def assert_index_range(sprite, model, value, ids, lowest, highest):
+    """Every first id from ``lowest`` to ``highest`` gives PyTorch's output, and
+    every other one, which PyTorch refuses, fails naming the input."""
+    for first in range(lowest - 2, highest + 3):
+        status, output = forward_status(sprite, value, [first, *ids[1:]])
+        if lowest <= first <= highest:
+            expected = model(value, torch.tensor([first, *ids[1:]]))
+            assert status == interface.OK, first
+            torch.testing.assert_close(
+                torch.tensor([float(item) for item in output]), expected.detach().flatten(),
+            )
+        else:
+            assert status == interface.invalid_item("input_1"), first
+
+
+@pytest.mark.parametrize("name", sorted(INDEXING))
+def test_an_index_input_takes_pytorchs_indices(tmp_path, name):
+    operation, ids, (lowest, highest) = INDEXING[name]
+    model = Indexes(operation).eval()
+    value = torch.randn(1, 3)
+    dtype = torch.int32 if name == "cast and view" else torch.long
+    result = transpile(model, (value, torch.tensor(ids, dtype=dtype)), tmp_path / "ids")
+    sprite = load_sprite(result.path)
+    assert_index_range(sprite, model, value, ids, lowest, highest)
+    for invalid in (0.5, "", "x", "Infinity"):
+        status, _ = forward_status(sprite, value, [invalid, *ids[1:]])
+        assert status == interface.invalid_item("input_1"), invalid
+
+
+COMPUTED = {
+    "shifted": (lambda t, x, i: t[i + 1], [1, 3], (-6, 3)),
+    "cross_entropy": (lambda t, x, i: F.cross_entropy(x, i).view(1), [1, 2], (0, 2)),
+    # Bags that don't start at 0 leave indices in no bag.
+    "embedding_bag offsets": (
+        lambda t, x, i: F.embedding_bag(torch.tensor([1, 2, 3]), t, i), [0, 2], (0, 0),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(COMPUTED))
+def test_an_index_computed_from_an_input_is_checked_as_the_block_runs(tmp_path, name):
+    operation, ids, (lowest, highest) = COMPUTED[name]
+    model = Indexes(operation).eval()
+    value = torch.randn(2, 3)
+    result = transpile(model, (value, torch.tensor(ids)), tmp_path / "computed")
+    sprite = load_sprite(result.path)
+    assert any(
+        isinstance(block, dict) and block.get("opcode") == "data_setvariableto"
+        and interface.invalid_item("input_1") in str(block.get("inputs"))
+        for block in sprite["blocks"].values()
+    )
+    for first in (lowest - 1, highest + 1):
+        with pytest.raises((IndexError, RuntimeError)):
+            model(value, torch.tensor([first, *ids[1:]]))
+    assert_index_range(sprite, model, value, ids, lowest, highest)
+
+
+def test_a_program_entry_points_index_inputs(tmp_path):
+    class Tables(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = nn.Parameter(torch.arange(10.0).reshape(5, 2))
+
+        def look(self, ids):
+            return self.table[ids]
+
+        def shifted(self, ids, total):
+            rows = self.table[ids + 1]
+            return rows, total + rows.sum().reshape(1)
+
+    program = ExportProgram(
+        states=(State("total", torch.zeros(1)),),
+        entrypoints=(
+            EntryPoint("look", method="look", arguments=(Input("ids", torch.tensor([1, 2])),),
+                       returns=(Output("rows"),)),
+            EntryPoint("shift", method="shifted", arguments=(
+                Input("ids", torch.tensor([1, 2])), StateInput("total"),
+            ), returns=(Output("rows"), StateUpdate("total"))),
+        ),
+    )
+    result = transpile(Tables().eval(), program, tmp_path / "program")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    for entry, valid, invalid in (("look", (-5, 4), (-6, 5)), ("shift", (-6, 3), (-7, 4))):
+        for first in (*valid, *invalid):
+            emulator.lists[f"cattorch {entry} ids"] = [first, 1]
+            state = list(emulator.lists["cattorch state total"])
+            emulator.run_procedure(f"cattorch {entry}")
+            status = emulator.variables[interface.STATUS_VARIABLE]
+            if first in valid:
+                assert status == interface.OK, (entry, first)
+            else:
+                assert status == interface.invalid_item(f"cattorch {entry} ids"), (entry, first)
+                assert emulator.lists["cattorch state total"] == state
+
+
+def test_a_generator_refuses_an_index_computed_from_the_token_ids(tmp_path):
+    from shared_models import VOCAB, NanoGPT
+
+    from cattorch import UnsupportedModelError
+
+    class Halves(NanoGPT):
+        def __init__(self):
+            super().__init__(layers=1)
+            self.halves = nn.Parameter(torch.randn(VOCAB // 2, 16))
+
+        def forward(self, tokens):
+            positions = torch.arange(0, tokens.shape[1])
+            x = self.wte(tokens) + self.halves[tokens // 2] + self.wpe(positions)
+            return self.head(self.ln_f(self.blocks[0](x)))
+
+    with pytest.raises(UnsupportedModelError, match="index its model computes from the token IDs"):
+        transpile(Halves().eval(), GenerationProgram(max_context=8), tmp_path / "lm")
