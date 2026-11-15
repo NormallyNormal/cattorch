@@ -267,6 +267,9 @@ def _run_case(op, sample, directory, *, static_integers=False) -> tuple[str, str
     model, inputs = build(op, sample, static_integers=static_integers)
     if model is None:
         return "skip", inputs
+    if any(value.is_floating_point() and value.isnan().any() for value in inputs):
+        # A sprite rejects a NaN input item (`invalid item`), as its contract says.
+        return "skip", "NaN input"
     try:
         # The eager reference can warn about deprecated PyTorch arguments.
         with torch.no_grad(), warnings.catch_warnings():
@@ -395,7 +398,8 @@ def write_coverage(results) -> str:
         "for what cattorch is designed to handle.",
         "",
         f"Of {tried} samples tried with PyTorch {torch_version()}, {totals['pass']} pass.",
-        "Samples were skipped when their output is random, complex, or not a tensor.",
+        "Samples were skipped when their output is random, complex, or not a tensor,",
+        "or an input holds NaN, which a sprite rejects.",
         "",
     ]
     for title, key in (

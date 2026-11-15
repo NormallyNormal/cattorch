@@ -13,8 +13,9 @@ an argument a model rarely uses, so a partial or failing operator may
 still work in your model; see [supported models](supported-models.md)
 for what cattorch is designed to handle.
 
-Of 2152 samples tried with PyTorch 2.14, 1940 pass.
-Samples were skipped when their output is random, complex, or not a tensor.
+Of 2151 samples tried with PyTorch 2.14, 1939 pass.
+Samples were skipped when their output is random, complex, or not a tensor,
+or an input holds NaN, which a sprite rejects.
 
 ## Every sample passes (401)
 
