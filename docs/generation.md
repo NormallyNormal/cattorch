@@ -16,10 +16,13 @@ artifact = transpile(model, GenerationProgram(max_context=64), "cached_model")
 The model can be a hand-written decoder or an unwrapped Hugging Face causal
 language model (GPT-2, Llama, Qwen2) loaded as it is. Models without attention,
 whose tokens mix through a recurrence (GRU and LSTM language models, Mamba,
-RWKV), use a [`RecurrentGenerationProgram`](recurrent-generation.md) instead. It must be in evaluation
-mode. `max_context` is fixed at export. Other fields are `hidden_prefill`,
-`top_k`, and `method`, which names the method to export when it isn't
-`forward` (by default the method marked [`@generate`](markers.md), if any).
+RWKV), use a [`RecurrentGenerationProgram`](recurrent-generation.md) instead.
+As with any export, the model is exported as an
+[evaluation-mode copy](troubleshooting.md#put-the-model-in-evaluation-mode).
+`max_context` is fixed at export, and at least 3. The other fields are
+`hidden_prefill`, `top_k`, and `method`, which names the method to export
+when it isn't `forward` (by default the method marked
+[`@generate`](markers.md), if any).
 See [`GenerationProgram`](api-reference.md#generationprogram) for all fields.
 The export returns a `GenerationResult`, which describes the token list, the
 logits and top-k lists, `max_context`, and the blocks.
@@ -76,8 +79,9 @@ that break the requirements below in ways the analysis can't see.
 | Message contains | Cause |
 |---|---|
 | `attention over the sequence isn't causal` | A bidirectional model such as BERT, or a mask that lets a token see a later one. The message names the token pair. |
-| `mixes tokens outside attention`, `allows mixing tokens only in causal attention` | An operation combines positions: `cumsum`, a mean over the sequence, `roll`, `flip`, a convolution along it. The message names the operation and its module. |
-| `the model computes something else when the sequence is one token shorter` | A length-dependent Python branch. Remove it or fix it to one path. |
+| `allows mixing tokens only in causal attention` | An operation combines positions: `cumsum`, a mean over the sequence, `roll`, `flip`, a convolution along it. The message names the operation and its module. |
+| `the model computes something else when the sequence is one token shorter` | A length-dependent Python branch that takes another path at `max_context - 1` tokens. Remove it or fix it to one path. |
+| `changes when more tokens follow it` | The output for a token depends on the prompt's length: a length-dependent Python branch that takes the same path at the two traced lengths, or positions scaled by the length (dynamic NTK RoPE). |
 | `isn't a recognised attention pattern` | A softmax over the sequence that isn't matmul, scale, causal mask, softmax, matmul. The message says which part didn't match. |
 | `the table's first N rows ... differ` | A position table whose rows depend on the sequence length. |
 | `the cached step disagrees with the model` | The export-time check failed. The message gives the first differing row and the largest error. |
@@ -98,7 +102,7 @@ shared code checks whether it is running as the final layer. Set it to
 `CodegenConfig(layer_sharing=True)` shares one block of code across repeated
 layers when the attention blocks sit in consecutive modules named `blocks.0`,
 `blocks.1`, and so on. The caches are then banked into one list per K and V
-(`_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
+(the internal lists `_cattorch K cache` and `_cattorch V cache`). Models with other layer names, such as
 Hugging Face's `model.layers.N`, export without sharing and with one list per
 layer (`_cattorch K cache 1`, `_cattorch V cache 1`, ...). If the layers look
 repeated but can't be factored, for example because the MLP widths differ,
@@ -158,29 +162,23 @@ the values the sprite stores.
 
 ## Scratch interface
 
-The sprite has these My Blocks, all of which run without screen refresh:
+The sprite has `cattorch init`, `cattorch reset`, `cattorch prefill`,
+`cattorch decode` and `cattorch prepare for save` blocks. Put the prompt's
+token IDs in the `cattorch token ids` list and run `cattorch prefill`; it
+resets the cache, reads the prompt, and writes the next token's logits to
+`cattorch logits`, one per zero-based token ID. Then put one token ID in
+`cattorch token ids` and run `cattorch decode` for each token after that.
+`cattorch cache length` counts the tokens in the cache, and
+`cattorch max context` holds `max_context`. Each block sets `cattorch status`
+and sends its completion broadcast, such as `cattorch prefill complete`, when
+it ends; check that the status is `ok` before you read the logits. The
+[Scratch interface](scratch-interface.md#generation-sprites) page lists every
+name and status.
 
-| Procedure | Input | Result |
-|---|---|---|
-| `cattorch init` | none | Decodes static storage and prepares the model. |
-| `cattorch reset` | none | Clears the K/V cache, logits, and top-k lists. |
-| `cattorch prefill` | one or more prompt IDs in `cattorch token ids` | Resets state, caches the prompt, and leaves final-token logits in `cattorch logits`. |
-| `cattorch decode` | exactly one token ID in `cattorch token ids` | Adds the token to the cache and writes next-token logits. |
-| `cattorch prepare for save` | none | Clears the decoded weights and resets, before saving the project. |
-
-The variables and lists you use are:
-
-| Name | Contents |
-|---|---|
-| `cattorch cache length` | Number of tokens currently in the cache. |
-| `cattorch max context` | The `max_context` set at export. |
-| `cattorch status` | `ok` after a successful block; otherwise why it failed, from the [status table](scratch-interface.md#status-values). |
-| `cattorch token ids` | Prompt tokens for prefill, or one token for decode. The blocks don't change it. |
-| `cattorch logits` | Logits for every token, indexed by zero-based token ID. |
-| `cattorch top k values`, `cattorch top k ids` | When `top_k` is set, the largest logits in descending order and their zero-based token IDs. |
-
-`top_k` can be `None` (the default) or an integer from 1 to 64. With `None`,
-no top-k work is done. Top-k only sorts candidates; it doesn't pick a token.
+`top_k` can be `None` (the default) or an integer from 1 to 64. With an
+integer, each prefill and decode also writes the `top_k` largest logits,
+largest first, to `cattorch top k values`, and their token IDs to
+`cattorch top k ids`. Top-k only sorts candidates; it doesn't pick a token.
 Like `torch.topk`, it always gives `top_k` real token IDs, including tokens
 whose logit is `-Infinity`, and ranks a NaN logit first. Equal logits are
 listed lowest token ID first; `torch.topk` doesn't specify their order, so
@@ -193,19 +191,6 @@ another sprite, use the
 [global-list bridge](getting-started.md#connect-another-sprite), or let
 [`build_project`](projects-and-cli.md) write a project with the model, its
 tokenizer, bridges, and a generation loop already wired together.
-
-## Lifecycle notifications
-
-When each block ends, whether or not it succeeded, it does a
-`broadcast and wait` of `cattorch init complete`, `cattorch reset complete`,
-`cattorch prefill complete`, `cattorch decode complete`, or
-`cattorch prepare for save complete`. A prefill or decode that decodes the
-weights first also sends `cattorch init complete`.
-
-Other sprites can use these to update a UI, for example showing "loading" until
-`cattorch init complete` and "thinking" until `cattorch prefill complete`.
-After prefill, check that `cattorch status` is `ok` before decoding. The
-broadcasts don't give other sprites access to the generated sprite's lists.
 
 ## Generation loop
 
@@ -237,21 +222,23 @@ reaches `cattorch max context`.
 
 Prefill and decode check `cattorch token ids` before they change anything. A
 block that fails writes no logits and leaves the cache as it was: a prefill
-that fails doesn't reset first. TOK below is `cattorch token ids`.
+that fails doesn't reset first.
 
 | Situation | `cattorch status` |
 |---|---|
-| Decode with zero or several tokens | `wrong number of items: TOK` |
+| Decode with zero or several tokens | `wrong number of items: cattorch token ids` |
 | Decode when the cache is full | `context full` |
-| Prefill with no tokens | `too few items: TOK` |
-| Prefill longer than `max_context` | `too many items: TOK` |
-| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: TOK` |
+| Prefill with no tokens | `too few items: cattorch token ids` |
+| Prefill longer than `max_context` | `too many items: cattorch token ids` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: cattorch token ids` |
 | Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
-| A block that another of the sprite's blocks started during | `another call ran during this one` |
+| A block that another of the sprite's blocks started during | `another call ran during this one`; see [overlapping calls](scratch-interface.md#overlapping-calls) |
 
 ## Cache behavior
 
-A step past `max_context` is refused before it changes any cache.
+A step past `max_context` is refused before it changes any cache. Caches
+longer than 200,000 items are [sharded](storage.md#list-sharding)
+automatically. To shrink the sprite, see [layer sharing](#layer-sharing).
 
 Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
 `cattorch prefill` or `cattorch decode` partway, leaving some layers' caches a
@@ -261,18 +248,14 @@ after that fails as in the table above and changes nothing, until
 `cattorch init` doesn't clear the condition. `cattorch cache length` keeps
 whatever value the stopped block left.
 
-### Overlapping calls
-
-Call the sprite's blocks from one script at a time. What happens when calls
-from several scripts overlap, or a block is stopped part way, is the same for
-every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
-
-Caches longer than 200,000 items are [sharded](storage.md#list-sharding) automatically. To
-shrink the sprite, see layer sharing in
-[code generation](code-generation.md#optional-compaction).
-
 Before saving a project that has generated, call `cattorch prepare for save`;
 see [save after running](storage.md#save-after-running).
+
+### Overlapping calls
+
+Call the sprite's blocks from one script at a time. What the sprite detects
+when calls overlap, and how to recover, is in
+[overlapping calls](scratch-interface.md#overlapping-calls).
 
 Related: [recurrent generation](recurrent-generation.md),
 [tokenizers](tokenizers.md), [storage and GPTQ](storage.md),
