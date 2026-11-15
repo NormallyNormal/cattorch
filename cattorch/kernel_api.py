@@ -40,7 +40,6 @@ Rules for kernel authors:
 from __future__ import annotations
 
 import math
-import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -48,6 +47,7 @@ from typing import Callable
 
 import torch
 
+from cattorch.errors import warn
 from cattorch.fast import FastConfig
 from cattorch.util.argument import Argument
 from cattorch.util.scratch.dsl import Program, Statement
@@ -324,9 +324,9 @@ def warn_unused_kernels(kernels, *, fast: bool):
             reason = "an approximate kernel runs only with optimization='fast'"
         else:
             reason = f"the model has no {kernel.target_name} call for it to lower"
-        warnings.warn(
+        warn(
             f"the kernel passed for {kernel.target_name} was not used: {reason}",
-            UserWarning, stacklevel=4,
+            stacklevel=4,
         )
 
 

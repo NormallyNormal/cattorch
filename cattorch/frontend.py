@@ -14,7 +14,6 @@ import itertools
 import logging
 import math
 import threading
-import warnings
 
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -25,6 +24,7 @@ from torch._decomp import core_aten_decompositions, get_decompositions
 
 from cattorch.decompositions import POINTWISE_DECOMPOSITIONS, traced_from_input
 from cattorch.errors import UnsupportedModelError
+from cattorch.errors import warn as warn_export
 
 
 log = logging.getLogger(__name__)
@@ -88,11 +88,9 @@ def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
     if not leaves:
         raise UnsupportedModelError("cattorch requires at least one tensor output")
     if warn and dropped:
-        warnings.warn(
+        warn_export(
             "ignoring non-tensor model outputs: "
             + ", ".join(f"{path} ({kind})" for path, kind in dropped),
-            UserWarning,
-            stacklevel=2,
         )
     return leaves
 

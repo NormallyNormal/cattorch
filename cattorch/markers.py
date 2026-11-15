@@ -13,14 +13,13 @@ from __future__ import annotations
 import copy
 import inspect
 import types
-import warnings
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 from torch import nn
 
 from cattorch.adapters import AdapterContext, ModuleAdapter
-from cattorch.errors import UnsupportedModelError
+from cattorch.errors import UnsupportedModelError, warn
 from cattorch.interface import output_name
 
 if TYPE_CHECKING:
@@ -737,10 +736,9 @@ def marked_program(model: nn.Module) -> MarkedProgram:
             if dropped:
                 # As transpile does for forward; declared Output bindings
                 # stay strict.
-                warnings.warn(
+                warn(
                     f"@entrypoint {method_name}: ignoring non-tensor results ("
                     + ", ".join(dropped) + ")",
-                    UserWarning,
                     stacklevel=3,
                 )
         output_names = options["output_names"] or tuple(
