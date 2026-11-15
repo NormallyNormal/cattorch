@@ -1124,7 +1124,7 @@ def _logical_list_sizes(
     if generation is not None:
         for name, cache_width in graph.generation.cache_widths.items():
             sizes[name] = generation.max_context * cache_width
-        sizes["cattorch prefill buffer"] = generation.max_context
+        sizes[interface.PREFILL_BUFFER] = generation.max_context
         if generation.top_k is not None:
             sizes[_TOP_K_VALUES] = generation.top_k
             sizes[_TOP_K_IDS] = generation.top_k
@@ -1831,7 +1831,7 @@ def _add_prepare_for_save(
 
 
 def _gate_chain(
-    sprite: dict, start: str, gate: str = "cattorch project output", stop: str | None = None,
+    sprite: dict, start: str, gate: str = interface.PROJECT_OUTPUT, stop: str | None = None,
 ) -> None:
     """Run the command chain from ``start`` only while the ``gate`` variable is 1.
 
@@ -2671,14 +2671,6 @@ def _guard_cache_capacity(first_cache: tuple[str, int]) -> _TokenCount:
     return report
 
 
-# The internal reset of a generation sprite's states, which the public
-# ``cattorch reset``, prefill and prepare for save run.
-_GENERATION_RESET = "_cattorch reset state"
-# The one-token list a generation step reads, and the logits it writes.
-_STEP_TOKEN = "_cattorch step token"
-_STEP_LOGITS = "_cattorch step logits"
-
-
 def _add_generation_blocks(
     sprite: dict,
     *,
@@ -2715,7 +2707,7 @@ def _add_generation_blocks(
         item, length, not_, set_var, sub, var,
     )
 
-    buffer = "cattorch prefill buffer"
+    buffer = interface.PREFILL_BUFFER
     top_k_lists = (_TOP_K_VALUES, _TOP_K_IDS) if top_k is not None else ()
     if top_k is not None:
         sprite = _add_warp_procedure(
@@ -2802,12 +2794,12 @@ def _add_generation_blocks(
         "generation_decode",
         variables=(
             *lifecycle_variables, "_cattorch check index",
-            *(("cattorch project output",) if hidden_prefill else ()),
+            *((interface.PROJECT_OUTPUT,) if hidden_prefill else ()),
         ),
         lists=(tokens, step_tokens, *lifecycle_lists),
         body=(
             # A stopped hidden prefill can leave it 0.
-            *((set_var("cattorch project output", 1),) if hidden_prefill else ()),
+            *((set_var(interface.PROJECT_OUTPUT, 1),) if hidden_prefill else ()),
             set_var(STATUS_VARIABLE, interface.OK),
             *interface.length_checks(tokens, numel=1),
             if_(ok, check_tokens(tokens)),
@@ -2826,12 +2818,12 @@ def _add_generation_blocks(
     # over skips the rest of its work.
     if hidden_prefill:
         steps: tuple = (
-            if_(current, (set_var("cattorch project output", 0),)),
+            if_(current, (set_var(interface.PROJECT_OUTPUT, 0),)),
             for_each("prefill index", sub(length(buffer), 1), (
                 if_(current, one_step(buffer, var("prefill index"))),
             )),
             if_(current, (
-                set_var("cattorch project output", 1), *one_step(buffer, length(buffer)),
+                set_var(interface.PROJECT_OUTPUT, 1), *one_step(buffer, length(buffer)),
             )),
         )
     else:
@@ -2844,7 +2836,7 @@ def _add_generation_blocks(
         "generation_prefill",
         variables=(
             "prefill index", "_cattorch check index", *lifecycle_variables,
-            *(("cattorch project output",) if hidden_prefill else ()),
+            *((interface.PROJECT_OUTPUT,) if hidden_prefill else ()),
         ),
         lists=(tokens, buffer, step_tokens, *lifecycle_lists),
         body=(
@@ -2863,7 +2855,7 @@ def _add_generation_blocks(
     if hidden_prefill:
         # Only prefill clears it, so a decode before any prefill must find 1.
         for entry in sprite["variables"].values():
-            if entry[0] == "cattorch project output":
+            if entry[0] == interface.PROJECT_OUTPUT:
                 entry[1] = 1
     if top_k_lists:
         _merge_lists_by_name(sprite, set(top_k_lists))
@@ -3014,7 +3006,7 @@ def _wrap_generation_lifecycle(
         compact_top_k=compact_top_k,
         vocabulary=vocabulary,
         token_count=_guard_cache_capacity(first_cache),
-        reset=_GENERATION_RESET,
+        reset=interface.STATE_RESET,
     )
 
 

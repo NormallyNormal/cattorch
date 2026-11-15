@@ -417,7 +417,7 @@ def _forward_project(builder, result, example_inputs, labels) -> None:
     message = project_name(name, "run")
     examples = list(example_inputs) + [None] * (len(result.inputs) - len(example_inputs))
     shown = _bridge_operation(
-        builder, sprite, message, "cattorch forward", result.inputs, result.outputs,
+        builder, sprite, message, interface.FORWARD, result.inputs, result.outputs,
         examples, result.sharded_lists,
     )
     _layout(builder, shown)

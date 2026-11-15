@@ -56,11 +56,6 @@ from cattorch.quantization import (
     quantize_model,
 )
 from cattorch.sprite import (
-    _TOP_K_IDS,
-    _TOP_K_VALUES,
-    _GENERATION_RESET,
-    _STEP_LOGITS,
-    _STEP_TOKEN,
     _add_input_checks,
     _add_prepare_for_save,
     _apply_static_storage,
@@ -85,8 +80,8 @@ from cattorch.sprite import (
 )
 from cattorch import interface
 from cattorch.interface import (
-    NUMBERS, OK, STATUS_VARIABLE, WHOLE_NUMBERS, final_data_name, input_name, item_checks,
-    length_checks, output_name,
+    NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, final_data_name, input_name,
+    item_checks, length_checks, output_name,
 )
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
@@ -147,7 +142,6 @@ from cattorch.util.scratch.tensor_replacer import TensorReplacer
 log = logging.getLogger(__name__)
 
 _LAYER_CACHE_BASE = "cattorch layer cache base"
-_PROJECT_OUTPUT = "cattorch project output"
 # 1 when a shared layer computes past its K/V append: always, except in the
 # final layer for a hidden prefill token.
 _LAYER_TAIL = "cattorch layer tail"
@@ -305,7 +299,7 @@ def _guard_hidden_layer_tail(sprite: dict, graph: _GraphInfo, compiler, attentio
     work stops at the end of the layer's code and the gate is the layer tail;
     otherwise it runs to the end of the step.
     """
-    gate = _LAYER_TAIL if graph.generation.banked_caches else _PROJECT_OUTPUT
+    gate = _LAYER_TAIL if graph.generation.banked_caches else PROJECT_OUTPUT
     root_entries = compiler.emitted_roots
     root_names = [name for name, _ in root_entries]
     attention_position = root_names.index(attention)
@@ -354,7 +348,7 @@ def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: froz
     if not any(gated):
         return
     blocks = sprite["blocks"]
-    definition = _find_procedure_definition(sprite, "cattorch forward")
+    definition = _find_procedure_definition(sprite, interface.FORWARD)
     chain = []
     current = blocks[blocks[definition]["next"]]["next"]
     while current is not None:
@@ -375,7 +369,7 @@ def _gate_hidden_outputs(sprite: dict, graph: _GraphInfo, compiler, hidden: froz
         _gate_chain(
             sprite,
             roots[position][1],
-            _PROJECT_OUTPUT,
+            PROJECT_OUTPUT,
             stop=roots[end][1] if end < len(roots) else None,
         )
         position = end
@@ -716,7 +710,7 @@ class _Compiler:
                 options["hidden_prefill_gate"] = _LAYER_TAIL
             return options
         if node.name == generation.hidden_prefill_attention:
-            return {"hidden_prefill_gate": _PROJECT_OUTPUT}
+            return {"hidden_prefill_gate": PROJECT_OUTPUT}
         return {}
 
     # ── public ───────────────────────────────────────────────────────────
@@ -2838,7 +2832,7 @@ def _transpile(
             sprite,
             compiler,
             storage,
-            layer_tail=(_LAYER_TAIL, _PROJECT_OUTPUT) if hidden_layers else None,
+            layer_tail=(_LAYER_TAIL, PROJECT_OUTPUT) if hidden_layers else None,
         )
         if shared:
             log.info("Factored repeated transformer layers into one shared procedure")
@@ -2927,16 +2921,16 @@ def _transpile(
                 _gate_chain(
                     sprite,
                     root_entries[last_layer + 1][1],
-                    _PROJECT_OUTPUT,
+                    PROJECT_OUTPUT,
                 )
-                _merge_variables_by_name(sprite, {_PROJECT_OUTPUT, _LAYER_TAIL})
+                _merge_variables_by_name(sprite, {PROJECT_OUTPUT, _LAYER_TAIL})
             elif hidden_attention in root_names and root_names.index(hidden_attention) + 1 < len(
                 root_entries
             ):
                 # Keep the final layer's K/V append, skip its attention output
                 # and everything after it for hidden prompt tokens.
                 for entry in sprite.get("variables", {}).values():
-                    if entry[0] == _PROJECT_OUTPUT:
+                    if entry[0] == PROJECT_OUTPUT:
                         entry[1] = 1
                 _guard_hidden_layer_tail(sprite, graph, compiler, hidden_attention)
             else:
@@ -2959,33 +2953,33 @@ def _transpile(
         # the lifecycle's variable.
         _merge_variables_by_name(sprite, {interface.CACHE_LENGTH})
         generation_lists = {
-            "input",
-            "output",
-            "cattorch prefill buffer",
+            input_name(0),
+            output_name(0),
+            interface.PREFILL_BUFFER,
             interface.TOKEN_IDS,
             interface.LOGITS,
         }
         if generation.top_k is not None:
-            generation_lists.update({_TOP_K_VALUES, _TOP_K_IDS})
+            generation_lists.update({interface.TOP_K_VALUES, interface.TOP_K_IDS})
         _merge_lists_by_name(
             sprite,
             cache_names | generation_lists,
         )
         _merge_duplicate_lists(sprite)
         # The step is private; only reset, prefill and decode run it.
-        _remove_canvas_calls(sprite, "cattorch forward")
-        _rename_procedure(sprite, "cattorch forward", "_cattorch token step")
+        _remove_canvas_calls(sprite, interface.FORWARD)
+        _rename_procedure(sprite, interface.FORWARD, interface.TOKEN_STEP)
         private_lists = {
-            "input": _STEP_TOKEN,
-            "output": _STEP_LOGITS,
-            "cattorch prefill buffer": "_cattorch prefill buffer",
+            input_name(0): interface.STEP_TOKEN,
+            output_name(0): interface.STEP_LOGITS,
+            interface.PREFILL_BUFFER: interface.internal_name(interface.PREFILL_BUFFER),
         }
         _rename_lists(sprite, private_lists)
         for old, new in private_lists.items():
             if old in logical_sizes:
                 logical_sizes[new] = logical_sizes.pop(old)
         # The public logits are a copy of the step's.
-        logical_sizes[interface.LOGITS] = logical_sizes.get(_STEP_LOGITS, 0)
+        logical_sizes[interface.LOGITS] = logical_sizes.get(interface.STEP_LOGITS, 0)
 
     deferred_names = (
         frozenset((*graph.input_names.values(), *output_names))
@@ -3056,12 +3050,12 @@ def _transpile(
         static_names=static_names,
         compressed=storage.compression,
         inputs=(
-            {interface.TOKEN_IDS, interface.LOGITS, _TOP_K_VALUES, _TOP_K_IDS}
+            {interface.TOKEN_IDS, interface.LOGITS, interface.TOP_K_VALUES, interface.TOP_K_IDS}
             if generation is not None else set(graph.input_names.values())
         ),
     )
     if generation is not None:
-        _finish_generation_prepare(sprite, _GENERATION_RESET)
+        _finish_generation_prepare(sprite, interface.STATE_RESET)
     sprite.setdefault("variables", {}).update(
         {
             "cattorch_storage_compression": [
@@ -3136,11 +3130,11 @@ def _transpile(
         )
         for index, value in enumerate(flat_example_inputs(example_inputs, example_kwargs))
     )
-    procedures = ["cattorch init", "cattorch forward", "cattorch prepare for save"]
+    procedures = [interface.INIT, interface.FORWARD, interface.PREPARE_FOR_SAVE]
     if generation is not None:
         procedures = [
-            "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
-            "cattorch prepare for save",
+            interface.INIT, interface.RESET, interface.PREFILL, interface.DECODE,
+            interface.PREPARE_FOR_SAVE,
         ]
     return TranspileResult(
         path=finalized.path,

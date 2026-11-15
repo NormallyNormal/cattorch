@@ -44,6 +44,25 @@ RESET, PREFILL, DECODE = "cattorch reset", "cattorch prefill", "cattorch decode"
 TOKENIZE, DETOKENIZE = "cattorch tokenize", "cattorch detokenize"
 
 
+# Internal names the generation exports share. They are not part of the
+# interface; they are here so that the modules that build a generation
+# sprite (KV-cached and recurrent) and those that read one agree on them.
+# The one-token step that prefill and decode run, and the reset of the
+# states that ``cattorch reset``, prefill and prepare for save run.
+TOKEN_STEP = "_cattorch token step"
+STATE_RESET = "_cattorch reset state"
+# The one-token list the step reads, and the logits it writes; the public
+# logits are a copy.
+STEP_TOKEN = "_cattorch step token"
+STEP_LOGITS = "_cattorch step logits"
+# The copy of the prompt that prefill steps through, as built; the finished
+# sprite has it under its internal name, ``internal_name(PREFILL_BUFFER)``.
+PREFILL_BUFFER = "cattorch prefill buffer"
+# 1 while a step computes its outputs; a hidden prefill token sets it to 0
+# and skips the operations only the outputs need.
+PROJECT_OUTPUT = "cattorch project output"
+
+
 def completion(block: str) -> str:
     """The broadcast a block sends, with ``broadcast and wait``, whenever it ends."""
     return f"{block} complete"

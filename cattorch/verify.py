@@ -34,7 +34,7 @@ from cattorch.results import (
 from cattorch.util.scratch.archive import read_json
 from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import read_logical_list, write_logical_list
-from cattorch.interface import OK, STATUS_VARIABLE, input_name, output_name
+from cattorch.interface import FORWARD, OK, STATUS_VARIABLE, input_name, output_name
 
 
 def _normalise_inputs(example_inputs):
@@ -627,7 +627,7 @@ def _verify_tensors(
     for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
         name = input_name(index)
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
-    emulator.run_procedure("cattorch forward")
+    emulator.run_procedure(FORWARD)
 
     reference = _tensor_reference(
         model, inputs, example_kwargs, adapters=adapters, quantization=quantization,

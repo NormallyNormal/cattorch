@@ -12,6 +12,7 @@ from functools import partial
 
 import torch
 
+from cattorch import interface
 from cattorch.kernel_api import Kernel, KernelContext
 from cattorch.util.instruction.generic import _reduction_layout
 from cattorch.util.instruction.optimized_common import (
@@ -243,7 +244,7 @@ def _emit_topk(ctx: KernelContext, *, values: bool):
 # kernels read the position from ``cattorch cache length``, which the
 # generation wrapper keeps equal to the number of cached tokens.
 
-_POSITION = "cattorch cache length"
+_POSITION = interface.CACHE_LENGTH
 
 
 def _attention_geometry(shapes):

@@ -748,7 +748,7 @@ def transpile_program(
             warnings=(),
         )
 
-    from cattorch.transpiler import _PROJECT_OUTPUT, _transpile
+    from cattorch.transpiler import _transpile
 
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
@@ -822,17 +822,17 @@ def transpile_program(
 
         # The entry point's own forward and init become private helpers of
         # the public blocks.
-        _remove_canvas_calls(sprite, "cattorch forward")
-        _remove_canvas_calls(sprite, "cattorch init")
+        _remove_canvas_calls(sprite, interface.FORWARD)
+        _remove_canvas_calls(sprite, interface.INIT)
         internal = f"_cattorch {entrypoint.name} compute"
-        _rename_procedure(sprite, "cattorch forward", internal)
-        _rename_procedure(sprite, "cattorch init", f"_cattorch {entrypoint.name} init")
+        _rename_procedure(sprite, interface.FORWARD, internal)
+        _rename_procedure(sprite, interface.INIT, f"_cattorch {entrypoint.name} init")
         _rename_procedure(
-            sprite, "cattorch prepare for save",
+            sprite, interface.PREPARE_FOR_SAVE,
             f"_cattorch {entrypoint.name} prepare for save",
         )
         _rename_variable(
-            sprite, "cattorch initialized",
+            sprite, interface.INITIALIZED_VARIABLE,
             f"_cattorch {entrypoint.name} initialized",
         )
         _namespace_entry_procedures(sprite, entrypoint.name)
@@ -870,7 +870,7 @@ def transpile_program(
         combined = sprite if combined is None else _merge_sprite_targets(combined, sprite)
         wrapper_program, output_specs = _build_entry_wrapper(
             entrypoint, sub_result, program, ensure_states=any_filled,
-            hidden=hidden, gate=_PROJECT_OUTPUT, guarded=_guard_overlaps, display=name_of,
+            hidden=hidden, gate=interface.PROJECT_OUTPUT, guarded=_guard_overlaps, display=name_of,
             finish=all_initialized,
             finish_variables=(interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else (),
             item_kinds=item_kinds if _check_items else {},
@@ -914,8 +914,8 @@ def transpile_program(
         )
         entry_results.append(EntryPointResult(
             name=entrypoint.name,
-            procedure=f"cattorch {entrypoint.name}",
-            completion_broadcast=f"cattorch {entrypoint.name} complete",
+            procedure=interface.entry_procedure(entrypoint.name),
+            completion_broadcast=interface.completion(interface.entry_procedure(entrypoint.name)),
             inputs=public_inputs,
             outputs=output_specs,
             state_inputs=tuple(
@@ -1087,9 +1087,9 @@ def transpile_program(
         },
     )
     if _hidden_outputs:
-        _merge_variables_by_name(combined, {_PROJECT_OUTPUT})
+        _merge_variables_by_name(combined, {interface.PROJECT_OUTPUT})
         for entry in combined["variables"].values():
-            if entry[0] == _PROJECT_OUTPUT:
+            if entry[0] == interface.PROJECT_OUTPUT:
                 entry[1] = 1
 
     _rename_lists(combined, list_renames)
@@ -1133,8 +1133,10 @@ def transpile_program(
         public_data_names.update(value.list_name for value in entry_result.outputs)
     if not _private_states:
         public_data_names.update(_state_list(state.name) for state in program.states)
-    lifecycle_procedures = ("cattorch init", "cattorch reset", "cattorch prepare for save")
-    entry_procedures = tuple(name_of(f"cattorch {entry.name}") for entry in program.entrypoints)
+    lifecycle_procedures = (interface.INIT, interface.RESET, interface.PREPARE_FOR_SAVE)
+    entry_procedures = tuple(
+        name_of(interface.entry_procedure(entry.name)) for entry in program.entrypoints
+    )
     public_procedures = {*lifecycle_procedures, *entry_procedures}
     if _edit_program is not None:
         defaults = [

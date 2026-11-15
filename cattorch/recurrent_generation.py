@@ -41,9 +41,8 @@ from cattorch.program_runtime import MethodModule
 from cattorch.quantization import QuantizationConfig
 from cattorch.results import GenerationResult, generation_result
 from cattorch.sprite import (
-    _STEP_LOGITS, _STEP_TOKEN, _TOP_K_IDS, _TOP_K_VALUES, _add_generation_blocks,
-    _add_warp_procedure, _finish_generation_prepare, _guard_generation_init,
-    _remove_completion_broadcast,
+    _add_generation_blocks, _add_warp_procedure, _finish_generation_prepare,
+    _guard_generation_init, _remove_completion_broadcast,
 )
 from cattorch.storage import StorageConfig
 from cattorch.util.scratch.dsl import Program, call, eq, if_, set_var, var
@@ -52,8 +51,6 @@ from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 _ENTRY = "step"
 _COMPUTE = "_cattorch token compute"
-_STEP = "_cattorch token step"
-_RESET = "_cattorch reset state"
 _RESTORE = "_cattorch restore states"
 # As in the check of a cached generation step.
 _TOLERANCE = 1e-4
@@ -196,7 +193,7 @@ def _generation_interface(
     def edit(sprite: dict, assembly: ProgramAssembly) -> None:
         # Like a GenerationProgram: no notification per step, and the
         # program's reset and prepare for save become generation's.
-        completion = assembly.names[interface.completion(f"cattorch {_ENTRY}")]
+        completion = assembly.names[interface.completion(interface.entry_procedure(_ENTRY))]
         _remove_completion_broadcast(sprite, completion)
         sprite["broadcasts"] = {
             identifier: message for identifier, message in sprite["broadcasts"].items()
@@ -210,10 +207,12 @@ def _generation_interface(
         _remove_completion_broadcast(sprite, interface.completion(interface.INIT))
         rename_variable(sprite, f"_cattorch {_ENTRY} initialized", interface.INITIALIZED_VARIABLE)
 
-        top_k_lists = (_TOP_K_VALUES, _TOP_K_IDS) if program.top_k is not None else ()
+        top_k_lists = (
+            (interface.TOP_K_VALUES, interface.TOP_K_IDS) if program.top_k is not None else ()
+        )
         _add_warp_procedure(
             sprite,
-            _STEP,
+            interface.TOKEN_STEP,
             Program(
                 "recurrent_generation_step",
                 variables=(STATUS_VARIABLE, interface.INITIALIZED_VARIABLE),
@@ -230,13 +229,13 @@ def _generation_interface(
         )
         _add_generation_blocks(
             sprite,
-            step=_STEP,
-            reset=_RESET,
+            step=interface.TOKEN_STEP,
+            reset=interface.STATE_RESET,
             restore=_RESTORE,
             tokens=interface.TOKEN_IDS,
-            step_tokens=_STEP_TOKEN,
+            step_tokens=interface.STEP_TOKEN,
             logits=interface.LOGITS,
-            step_logits=_STEP_LOGITS,
+            step_logits=interface.STEP_LOGITS,
             capacity=program.max_context,
             hidden_prefill=program.hidden_prefill,
             top_k=program.top_k,
@@ -249,18 +248,19 @@ def _generation_interface(
             sprite["variables"]["cattorch_recurrent_max_context"] = [
                 interface.MAX_CONTEXT, "Infinity",
             ]
-        rename_list(sprite, "cattorch prefill buffer", "_cattorch prefill buffer")
+        buffer = interface.internal_name(interface.PREFILL_BUFFER)
+        rename_list(sprite, interface.PREFILL_BUFFER, buffer)
         # The prompt arrives in the one `cattorch token ids` list: no more
         # than a Scratch list holds, however large max_context is.
-        assembly.capacities["_cattorch prefill buffer"] = min(
+        assembly.capacities[buffer] = min(
             program.max_context or SCRATCH_LIST_LIMIT, SCRATCH_LIST_LIMIT,
         )
-        logits = assembly.capacities.get(_STEP_LOGITS, 0)
+        logits = assembly.capacities.get(interface.STEP_LOGITS, 0)
         assembly.capacities[interface.LOGITS] = logits
         assembly.public_data_names.update((interface.TOKEN_IDS, interface.LOGITS, *top_k_lists))
         assembly.public_procedures.update((interface.PREFILL, interface.DECODE))
         _guard_generation_init(sprite)
-        _finish_generation_prepare(sprite, _RESET)
+        _finish_generation_prepare(sprite, interface.STATE_RESET)
 
     return edit
 
@@ -364,13 +364,13 @@ def transpile_recurrent_generation(
             program, vocabulary, compact_top_k=codegen.unrolling != "speed",
         ),
         _public_names={
-            f"cattorch {_ENTRY}": _COMPUTE,
-            f"cattorch {_ENTRY} token": _STEP_TOKEN,
-            f"cattorch {_ENTRY} logits": _STEP_LOGITS,
+            interface.entry_procedure(_ENTRY): _COMPUTE,
+            interface.entry_list(_ENTRY, "token"): interface.STEP_TOKEN,
+            interface.entry_list(_ENTRY, "logits"): interface.STEP_LOGITS,
         },
         _private_states=True,
         _hidden_outputs=(
-            frozenset({f"cattorch {_ENTRY} logits"}) if program.hidden_prefill else frozenset()
+            frozenset({interface.entry_list(_ENTRY, "logits")}) if program.hidden_prefill else frozenset()
         ),
         _calibration_resets=resets,
         _calibration_name="calibration",
