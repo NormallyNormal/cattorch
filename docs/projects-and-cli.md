@@ -172,7 +172,7 @@ The commands exit with one of these statuses:
 |---|---|
 | `0` | Success. |
 | `1` | The export failed: an unsupported model or operation, or a file that can't be read or written. |
-| `2` | Invalid arguments, found by the command's parser or by cattorch's checks of them. |
+| `2` | Invalid arguments, found by the command's parser or by cattorch's checks of them, including a `MODEL` that doesn't exist or can't be loaded. |
 | `3` | `export`'s check found that the sprite doesn't match PyTorch. |
 
 ## Examples
