@@ -43,7 +43,7 @@ from cattorch.util.scratch.dsl import (
     Program, Statement, add, append, argument, broadcast_and_wait, call, change_var, clear, eq,
     for_each, gt, if_, if_else, item, length, mod, mul, not_, repeat, set_var, var,
 )
-from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
+from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.interface import (
     rename_lists as _rename_lists, rename_variable as _rename_variable,
     rename_variables as _rename_variables, rename_procedure as _rename_procedure,
@@ -737,18 +737,8 @@ def transpile_program(
     sharded_names: set[str] = set()
     interface_capacities: dict[str, int] = {}
     payload_names: set[str] = set()
-    # Each entry point's sprite stays in memory; only the program is
-    # finalized and written.
-    entry_sprites: list[dict] = []
 
-    def keep_entry(sprite, output_path, **_options) -> FinalizedSprite:
-        entry_sprites.append(sprite)
-        return FinalizedSprite(
-            path=Path(output_path), archive_bytes=0, expanded_json_bytes=0, asset_id="",
-            warnings=(),
-        )
-
-    from cattorch.transpiler import _transpile
+    from cattorch.transpiler import _compile_sprite
 
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
@@ -769,34 +759,25 @@ def transpile_program(
             if entry_name == entrypoint.name and name in _hidden_outputs
         )
 
-        deferred_sizes: dict[str, int] = {}
-        # What the items of each input list must be.
-        item_kinds: dict = {}
-
         def capture(arguments, dynamic, edit=None):
-            deferred_sizes.clear()
-            return _transpile(
+            # Each entry point's sprite stays in memory; only the program is
+            # finalized and written.
+            return _compile_sprite(
                 wrapper,
                 tuple(arguments),
-                output_path,
                 sig_figs,
-                name=sprite_name,
                 optimization=optimization,
                 fast_config=fast_config,
                 storage=resolved_storage,
                 quantization=quantization,
-                calibration_inputs=None,
                 codegen=sub_codegen,
-                _registry=registry,
-                _prepared_model=True,
-                _prepared_quantization_report=quantization_report,
-                _dynamic_inputs=dynamic,
-                _defer_interface_sharding=True,
-                _edit_sprite=edit,
-                _finalize=keep_entry,
-                _hidden_outputs=hidden,
-                _deferred_sizes=deferred_sizes,
-                _item_kinds=item_kinds,
+                registry=registry,
+                prepared_model=True,
+                quantization_report=quantization_report,
+                dynamic_inputs=dynamic,
+                edit_sprite=edit,
+                entry_point=True,
+                hidden_outputs=hidden,
             )
 
         try:
@@ -815,7 +796,10 @@ def transpile_program(
                 f"entrypoint {entrypoint.name!r} captured an unexpected argument count"
             )
         validate_entry_outputs(program, entrypoint, sub_result.outputs)
-        sprite = entry_sprites.pop()
+        sprite = sub_result.sprite
+        # An interface list's peak size, when the compiler used it as scratch
+        # space for a larger intermediate first.
+        peak_sizes = sub_result.interface_sizes
 
         storage_names = _namespace_entry_storage(sprite, entrypoint.name)
         payload_names.update(new for old, new in storage_names.items() if not old.startswith("W_"))
@@ -856,13 +840,11 @@ def transpile_program(
                 # Run once per item: the entry's own output list became the
                 # private unit list, and the public one only collects items.
                 interface_capacities[private_unit] = max(
-                    interface_capacities.get(private_unit, 0), deferred_sizes.get(old, 0),
+                    interface_capacities.get(private_unit, 0), peak_sizes.get(old, 0),
                 )
                 capacity = sub_result.outputs[index].max_numel or 0
             else:
-                # The compiler may have used the output's list as scratch
-                # space for a larger intermediate first.
-                capacity = max(sub_result.outputs[index].max_numel or 0, deferred_sizes.get(old, 0))
+                capacity = max(sub_result.outputs[index].max_numel or 0, peak_sizes.get(old, 0))
             interface_renames[old] = temporary
             interface_capacities[temporary] = capacity
         _rename_lists(sprite, interface_renames)
@@ -873,7 +855,7 @@ def transpile_program(
             hidden=hidden, gate=interface.PROJECT_OUTPUT, guarded=_guard_overlaps, display=name_of,
             finish=all_initialized,
             finish_variables=(interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else (),
-            item_kinds=item_kinds if _check_items else {},
+            item_kinds=sub_result.item_kinds if _check_items else {},
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(

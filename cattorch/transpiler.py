@@ -29,6 +29,7 @@ from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.results import (
     GenerationResult,
     ProgramResult,
+    TensorSpec,
     TranspileResult,
     generation_result,
     _tensor_spec as boundary_spec,
@@ -49,6 +50,7 @@ from cattorch.kernel_api import (
 )
 from cattorch.quantization import (
     QuantizationConfig,
+    QuantizationReport,
     _StaticSourceRecorder,
     _storage_quantization_report,
     effective_group_size,
@@ -123,7 +125,7 @@ from cattorch.util.instruction.optimized_tensor import (
 from cattorch.util.scope import ScopeManager
 from cattorch.util.scratch.block_combiner import combine
 from cattorch.util.scratch.block_manager import BlockManager
-from cattorch.util.scratch.finalize_scratch import FinalizedSprite, finalize_sprite
+from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.ids import uniquify_data_ids
 from cattorch.util.scratch.interface import (
     rename_lists as _rename_lists,
@@ -135,7 +137,7 @@ from cattorch.util.scratch.dsl import (
     unroll_factor_limit,
     var,
 )
-from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, ListLayout, shard_sprite_lists
 from cattorch.util.scratch.tensor_adder import TensorAdder
 from cattorch.util.scratch.tensor_replacer import TensorReplacer
 
@@ -2684,23 +2686,126 @@ def _transpile(
     example_kwargs: dict[str, Any] | None = None,
     _registry: OperatorRegistry | None = None,
     _prepared_model: bool = False,
-    _prepared_quantization_report=None,
+    _prepared_quantization_report: QuantizationReport | None = None,
     _dynamic_inputs: dict[int, _DynamicBound] | None = None,
-    _defer_interface_sharding: bool = False,
     _edit_sprite: Callable[[dict], dict] | None = None,
-    _finalize: Callable[..., FinalizedSprite] = finalize_sprite,
-    _hidden_outputs: frozenset[int] = frozenset(),
-    _deferred_sizes: dict[str, int] | None = None,
-    _unit_inputs: dict | None = None,
-    _item_kinds: dict | None = None,
+    _unit_inputs: dict[int, _DynamicBound] | None = None,
 ) -> TranspileResult:
-    """Export one graph as a sprite. Private hooks, for the other export paths:
+    """Export one graph as a standalone sprite: ``_compile_sprite``, then
+    ``_finalize_sprite``.
 
-    ``_unit_inputs`` gives the bounds of the input an ``_edit_sprite`` runs
-    once per item, which ``cattorch forward`` checks. With
-    ``_defer_interface_sharding`` (a program's entry point), the inputs
-    aren't checked; ``_item_kinds`` is filled with what their items must
-    be, for the program to check them.
+    The private hooks, for the other export paths, are ``_compile_sprite``'s
+    (``_registry`` is its ``registry``, ``_prepared_model`` its
+    ``prepared_model``, and so on) and ``_unit_inputs``, which
+    ``_finalize_sprite`` takes.
+    """
+    output_path = Path(output_path)
+    if output_path.suffix.lower() != ".sprite3":
+        output_path = Path(f"{output_path}.sprite3")
+    sprite_name = output_path.stem if name is None else name
+    if not isinstance(sprite_name, str) or not sprite_name.strip():
+        raise ValueError("name must be a non-empty string")
+    codegen = codegen or CodegenConfig()
+    compiled = _compile_sprite(
+        model,
+        example_inputs,
+        sig_figs,
+        optimization=optimization,
+        fast_config=fast_config,
+        generation=generation,
+        storage=storage,
+        quantization=quantization,
+        calibration_inputs=calibration_inputs,
+        codegen=codegen,
+        example_kwargs=example_kwargs,
+        registry=_registry,
+        prepared_model=_prepared_model,
+        quantization_report=_prepared_quantization_report,
+        dynamic_inputs=_dynamic_inputs,
+        edit_sprite=_edit_sprite,
+    )
+    return _finalize_sprite(
+        compiled, output_path, sprite_name=sprite_name, codegen=codegen, unit_inputs=_unit_inputs,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompiledSprite:
+    """One graph compiled into a sprite that isn't finished or written yet.
+
+    ``sprite`` has its weights stored, its lists sharded as ``layouts``
+    says, and every block but the checks and guards around a standalone
+    sprite's public blocks. Its interface lists are still named ``input``,
+    ``input_1``, ... and ``output``, ... (``output_names``), except a
+    generation step's, and its internal names aren't marked yet.
+    ``_finalize_sprite`` finishes and writes a standalone sprite; a program
+    finishes its entry points' sprites itself.
+
+    ``inputs``, ``outputs``, ``procedures``, ``warnings``, ``quantization``
+    and the operation counts are those of the ``TranspileResult``, before
+    finalization adds its warnings. ``sharded_lists`` are named as built.
+
+    For a program's entry point (``entry_point``), the interface lists are
+    left whole: the program shards all its entry points' lists together and
+    checks their items itself. ``interface_sizes`` gives each interface
+    list's peak size, which can be more than its tensor's when the compiler
+    used the list as scratch space first, and ``item_kinds`` what each
+    input's items must be (``_kinds_of_items``).
+    """
+
+    sprite: dict
+    graph: _GraphInfo
+    flat_inputs: tuple[torch.Tensor, ...]
+    layouts: dict[str, ListLayout]
+    output_names: tuple[str, ...]
+    generation: bool
+    entry_point: bool
+    inputs: tuple[TensorSpec, ...]
+    outputs: tuple[TensorSpec, ...]
+    procedures: tuple[str, ...]
+    sharded_lists: tuple[str, ...]
+    warnings: tuple[str, ...]
+    quantization: QuantizationReport | None
+    fallback_operations: tuple[tuple[str, int], ...]
+    approximate_operations: tuple[tuple[str, int], ...]
+    interface_sizes: dict[str, int] = dataclasses.field(default_factory=dict)
+    item_kinds: dict[int, tuple[str | None, int | None]] = dataclasses.field(
+        default_factory=dict,
+    )
+
+
+def _compile_sprite(
+    model: torch.nn.Module,
+    example_inputs: torch.Tensor | tuple[torch.Tensor, ...],
+    sig_figs: int | None = None,
+    *,
+    optimization: Literal["exact", "fast"] = "exact",
+    fast_config: FastConfig | None = None,
+    generation: _GenerationSpec | None = None,
+    storage: StorageConfig | None = None,
+    quantization: QuantizationConfig | None = None,
+    calibration_inputs: Iterable[torch.Tensor | tuple[torch.Tensor, ...]] | None = None,
+    codegen: CodegenConfig | None = None,
+    example_kwargs: dict[str, Any] | None = None,
+    registry: OperatorRegistry | None = None,
+    prepared_model: bool = False,
+    quantization_report: QuantizationReport | None = None,
+    dynamic_inputs: dict[int, _DynamicBound] | None = None,
+    edit_sprite: Callable[[dict], dict] | None = None,
+    entry_point: bool = False,
+    hidden_outputs: frozenset[int] = frozenset(),
+) -> _CompiledSprite:
+    """Compile one graph of ``model`` into a sprite, up to finalization.
+
+    ``registry`` replaces the default operator registry. With
+    ``prepared_model`` the model is already adapted, transformed and
+    quantized, and ``quantization_report`` is its report. ``generation``
+    lowers it as a generation step. ``dynamic_inputs`` are its
+    variable-length inputs. ``edit_sprite`` makes a caller's last changes,
+    such as running the forward once per item, on the whole compiled
+    sprite. ``entry_point`` compiles a program's entry point (see
+    ``_CompiledSprite``), whose ``hidden_outputs`` are computed only while
+    ``cattorch project output`` is 1.
     """
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
@@ -2712,16 +2817,10 @@ def _transpile(
                 "values (such as an LSTM's (hidden, cell) state) through a "
                 "wrapper that takes them as separate tensors"
             )
-    output_path = Path(output_path)
-    if output_path.suffix.lower() != ".sprite3":
-        output_path = Path(f"{output_path}.sprite3")
-    sprite_name = output_path.stem if name is None else name
-    if not isinstance(sprite_name, str) or not sprite_name.strip():
-        raise ValueError("name must be a non-empty string")
     config = fast_config or FastConfig()
     storage = storage or StorageConfig()
     codegen = codegen or CodegenConfig()
-    registry = _registry or default_registry().clone()
+    registry = registry or default_registry().clone()
     if calibration_inputs is not None and (quantization is None or quantization.method != "gptq"):
         raise ValueError("calibration= is only used by GPTQ quantization")
     if (
@@ -2733,8 +2832,7 @@ def _transpile(
             "tensor-valued example_kwargs can't be combined with GPTQ, whose "
             "calibration= items are positional inputs; pass those tensors positionally"
         )
-    quantization_report = _prepared_quantization_report
-    if not _prepared_model:
+    if not prepared_model:
         model = registry.adapt_model(model)
         if optimization == "fast":
             model = prepare_fast_model(model, config)
@@ -2762,7 +2860,7 @@ def _transpile(
         fast_config=config,
         generation=generation,
         _registry=registry,
-        dynamic_inputs=_dynamic_inputs,
+        dynamic_inputs=dynamic_inputs,
         example_kwargs=example_kwargs,
     )
     if generation is not None and codegen.layer_sharing:
@@ -2898,8 +2996,8 @@ def _transpile(
     _merge_lists_by_name(sprite, cache_names)
     _merge_duplicate_lists(sprite)
     _wrap_optimized_lifecycle(sprite)
-    if _hidden_outputs:
-        _gate_hidden_outputs(sprite, graph, compiler, _hidden_outputs)
+    if hidden_outputs:
+        _gate_hidden_outputs(sprite, graph, compiler, hidden_outputs)
     if generation is not None:
         if generation.hidden_prefill:
             root_entries = compiler.emitted_roots
@@ -2981,9 +3079,10 @@ def _transpile(
         # The public logits are a copy of the step's.
         logical_sizes[interface.LOGITS] = logical_sizes.get(interface.STEP_LOGITS, 0)
 
+    # A program shards its entry points' interface lists together.
     deferred_names = (
         frozenset((*graph.input_names.values(), *output_names))
-        if _defer_interface_sharding
+        if entry_point
         else frozenset()
     )
     layouts = shard_sprite_lists(
@@ -2999,12 +3098,6 @@ def _transpile(
             source_numels=compiler.static_source_numels,
         ),
     )
-    if _deferred_sizes is not None:
-        # An output list can be a reused scratch list larger than the output;
-        # the caller shards it later and needs its peak size.
-        _deferred_sizes.update(
-            {name: layouts[name].logical_size for name in deferred_names if name in layouts}
-        )
     tied_copies = _apply_tied_static_aliases(
         sprite,
         layouts,
@@ -3094,41 +3187,17 @@ def _transpile(
 
     # A caller's last changes, such as running the forward once per item,
     # come before finalization, so it sees the sprite whole.
-    if _edit_sprite is not None:
-        sprite = _edit_sprite(sprite)
-    flat_inputs = flat_example_inputs(example_inputs, example_kwargs)
-    if generation is not None:
-        sprite = _guard_generation_init(sprite)
-    elif not _defer_interface_sharding:
-        _add_input_checks(sprite, _input_checks(
-            graph, layouts, flat_inputs, unit_spec=_unit_inputs,
-        ), _input_lists(layouts, flat_inputs))
-        sprite = _guard_plain_calls(sprite, [
-            shard
-            for name in dict.fromkeys(output_names)
-            for shard in (
-                [shard.name for shard in layouts[name].shards] if name in layouts else [name]
-            )
-        ])
-    elif _item_kinds is not None:
-        _item_kinds.update(_kinds_of_items(graph, flat_inputs))
-    finalized = _finalize(
-        sprite,
-        output_path,
-        sprite_name=sprite_name,
-        codegen=codegen,
-        # A program finishes its entry points' interface itself.
-        public_interface=not _defer_interface_sharding,
-    )
-
+    if edit_sprite is not None:
+        sprite = edit_sprite(sprite)
+    flat_inputs = tuple(flat_example_inputs(example_inputs, example_kwargs))
     input_specs = tuple(
         boundary_spec(
             interface.TOKEN_IDS if generation is not None else input_name(index),
             tuple(value.shape),
             value.dtype,
-            _public_dynamic_bound((_dynamic_inputs or {}).get(index)),
+            _public_dynamic_bound((dynamic_inputs or {}).get(index)),
         )
-        for index, value in enumerate(flat_example_inputs(example_inputs, example_kwargs))
+        for index, value in enumerate(flat_inputs)
     )
     procedures = [interface.INIT, interface.FORWARD, interface.PREPARE_FOR_SAVE]
     if generation is not None:
@@ -3136,18 +3205,14 @@ def _transpile(
             interface.INIT, interface.RESET, interface.PREFILL, interface.DECODE,
             interface.PREPARE_FOR_SAVE,
         ]
-    return TranspileResult(
-        path=finalized.path,
-        sprite_name=sprite_name,
-        archive_bytes=finalized.archive_bytes,
-        expanded_json_bytes=finalized.expanded_json_bytes,
-        block_count=len(sprite.get("blocks", {})),
-        list_count=len(sprite.get("lists", {})),
-        sharded_lists=tuple(
-            (layout.name if _defer_interface_sharding else final_data_name(layout.name))
-            for layout in layouts.values()
-            if len(layout.shards) > 1
-        ),
+    return _CompiledSprite(
+        sprite=sprite,
+        graph=graph,
+        flat_inputs=flat_inputs,
+        layouts=layouts,
+        output_names=output_names,
+        generation=generation is not None,
+        entry_point=entry_point,
         inputs=input_specs,
         outputs=tuple(
             boundary_spec(
@@ -3163,8 +3228,10 @@ def _transpile(
             for index, (node_name, shape, dtype) in enumerate(graph.outputs)
         ),
         procedures=tuple(procedures),
-        warnings=finalized.warnings
-        + tuple(
+        sharded_lists=tuple(
+            layout.name for layout in layouts.values() if len(layout.shards) > 1
+        ),
+        warnings=tuple(
             f"GPTQ fallback for {item.name}: {item.fallback_reason}"
             for item in (quantization_report.tensors if quantization_report else ())
             if item.method == "symmetric" and item.fallback_reason is not None
@@ -3178,4 +3245,60 @@ def _transpile(
         quantization=quantization_report,
         fallback_operations=graph.fallbacks(),
         approximate_operations=tuple(sorted(compiler.approximate.items())),
+        interface_sizes=(
+            {name: layouts[name].logical_size for name in deferred_names if name in layouts}
+            if entry_point else {}
+        ),
+        item_kinds=_kinds_of_items(graph, flat_inputs) if entry_point else {},
+    )
+
+
+def _finalize_sprite(
+    compiled: _CompiledSprite,
+    output_path: Path,
+    *,
+    sprite_name: str,
+    codegen: CodegenConfig,
+    unit_inputs: dict[int, _DynamicBound] | None = None,
+) -> TranspileResult:
+    """Finish a compiled standalone sprite, write it, and describe it.
+
+    A plain sprite's ``cattorch forward`` gets its input checks (which, with
+    ``unit_inputs``, check the bounds of an input the forward runs once per
+    item) and its guard against overlapping calls; a generation sprite gets
+    its guard on ``cattorch init``. Finalization then marks the internal
+    names and writes the file.
+    """
+    if compiled.entry_point:
+        raise ValueError("a program finishes its entry points' sprites itself")
+    sprite, layouts, output_names = compiled.sprite, compiled.layouts, compiled.output_names
+    if compiled.generation:
+        sprite = _guard_generation_init(sprite)
+    else:
+        _add_input_checks(sprite, _input_checks(
+            compiled.graph, layouts, compiled.flat_inputs, unit_spec=unit_inputs,
+        ), _input_lists(layouts, compiled.flat_inputs))
+        sprite = _guard_plain_calls(sprite, [
+            shard
+            for name in dict.fromkeys(output_names)
+            for shard in (
+                [shard.name for shard in layouts[name].shards] if name in layouts else [name]
+            )
+        ])
+    finalized = finalize_sprite(sprite, output_path, sprite_name=sprite_name, codegen=codegen)
+    return TranspileResult(
+        path=finalized.path,
+        sprite_name=sprite_name,
+        archive_bytes=finalized.archive_bytes,
+        expanded_json_bytes=finalized.expanded_json_bytes,
+        block_count=len(sprite.get("blocks", {})),
+        list_count=len(sprite.get("lists", {})),
+        sharded_lists=tuple(final_data_name(name) for name in compiled.sharded_lists),
+        inputs=compiled.inputs,
+        outputs=compiled.outputs,
+        procedures=compiled.procedures,
+        warnings=finalized.warnings + compiled.warnings,
+        quantization=compiled.quantization,
+        fallback_operations=compiled.fallback_operations,
+        approximate_operations=compiled.approximate_operations,
     )
