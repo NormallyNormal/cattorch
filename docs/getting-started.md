@@ -99,9 +99,11 @@ every status; they won't change within cattorch 1.x.
 
 ### Overlapping calls
 
-Call the sprite's blocks from one script at a time. What happens when calls
-from several scripts overlap, or a block is stopped part way, is the same for
-every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
+Call the sprite's blocks from one script at a time. A block that another
+call overlaps, or that is stopped part way, reports it in `cattorch status`,
+and a sprite with state can then refuse some blocks until it is reset, which
+ones depending on the kind of sprite; see
+[overlapping calls](scratch-interface.md#overlapping-calls).
 
 ## Connect another sprite
 
