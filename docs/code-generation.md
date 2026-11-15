@@ -74,7 +74,9 @@ them when:
   such as `x * 2`, when it is fused with the layer's last operation; a
   normalization or linear layer there is fine;
 - every layer computes the same operations, with the same shapes and
-  constants, and weights of the same sizes;
+  constants, and weights of the same sizes. Layers with a
+  [mixture of experts](programs-and-moe.md#mixture-of-experts) block aren't
+  shared, since each layer's experts are an expert family of their own;
 - for [cached generation](generation.md#layer-sharing), every attention block
   sits in its own layer and every layer's cache has the same width.
 
