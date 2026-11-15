@@ -69,8 +69,9 @@ for all fields.
 1. Open the target Scratch 3 project.
 2. Choose **Upload Sprite** from the sprite chooser and select the generated
    `.sprite3` file.
-3. Select the imported sprite. Its Code area has the `cattorch init` and
-   `cattorch forward` My Block definitions, plus a clickable block for each.
+3. Select the imported sprite. Its Code area has the `cattorch init`,
+   `cattorch forward` and `cattorch prepare for save` My Block definitions,
+   and a clickable `cattorch init` and `cattorch forward` block.
 4. Show the sprite-local `input` list and replace its contents with the model
    input values.
 5. Click the `cattorch forward` call stack.
@@ -147,14 +148,17 @@ so the saved project doesn't store both. Input and output lists and a
 program's state are kept. The next forward call initializes the
 sprite again.
 
-Don't edit the generated sprite's costumes: the sprite uses them to decode the
-compressed weights.
-See [preserve processor costumes](storage.md#preserve-processor-costumes).
+Don't edit the generated sprite's costumes. The weights are stored in lists,
+but the costumes are named after the characters of their encoding, and the
+sprite decodes the weights by looking characters up among them. See
+[preserve processor costumes](storage.md#preserve-processor-costumes).
 
 ## Add export options
 
+This continues the example above:
+
 ```python
-from cattorch import StorageConfig, transpile
+from cattorch import StorageConfig, transpile, verify
 
 artifact = transpile(
     model,
