@@ -9,8 +9,11 @@ Problems usually happen at one of three stages:
 2. **Conversion.** cattorch traced the model but can't convert an operation.
    The exception is an `UnsupportedOperationError` or `UnsupportedModelError`.
 3. **Running in Scratch.** The sprite exported but doesn't work in a project.
-   Check `result.warnings`, `expanded_json_bytes`, and `cattorch status`, then
-   try the sprite with the smallest possible surrounding script.
+   Check `result.warnings`, `expanded_json_bytes`, and `cattorch status`
+   (its values are in the [status table](scratch-interface.md#status-values)),
+   then try the sprite with the smallest possible surrounding script. Call
+   the sprite's blocks from one script at a time; see
+   [overlapping calls](scratch-interface.md#overlapping-calls).
 
 ## Put the model in evaluation mode
 
@@ -122,7 +125,7 @@ include:
 
 - The full exception, including any chained cause.
 - A minimal model definition and export call.
-- Your cattorch, PyTorch, and Python versions, and for Scratch problems, the
+- Your cattorch (`cattorch --version`), PyTorch, and Python versions, and for Scratch problems, the
   browser and Scratch client.
 - Example input shapes and dtypes, and for GPTQ, the calibration data shape and
   count.
