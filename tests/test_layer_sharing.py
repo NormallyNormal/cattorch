@@ -166,3 +166,118 @@ def test_program_without_any_layers_warns_once(tmp_path):
     (message,) = result.warnings
     assert emitted == [message]
     assert "none of its entry points has repeated layers" in message
+
+
+class Pair(nn.Module):
+    """A layer that takes and returns two tensors."""
+
+    def __init__(self):
+        super().__init__()
+        self.f = nn.Linear(8, 8)
+        self.g = nn.Linear(8, 8)
+
+    def forward(self, a, b):
+        return a + self.f(b), b + self.g(a)
+
+
+class Dataflow(nn.Module):
+    """Layers whose tensors are read in ways one carried tensor can't serve."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.blocks = nn.ModuleList(
+            (Pair() if kind in ("pairs", "embeddings") else Block()) for _ in range(3)
+        )
+
+    def forward(self, value):
+        if self.kind == "pairs":
+            # Each layer passes two tensors to the next.
+            a, b = value, value * 2
+            for block in self.blocks:
+                a, b = block(a, b)
+            return a + b
+        if self.kind == "embeddings":
+            # Every layer reads the model's input as well as the previous layer.
+            hidden = value
+            for block in self.blocks:
+                hidden, _ = block(hidden, value)
+            return hidden
+        outputs = []
+        for block in self.blocks:
+            value = block(value)
+            outputs.append(value)
+        if self.kind == "skip":
+            # Layer 0's output, read again after layer 1 overwrote it.
+            return value + outputs[0]
+        if self.kind == "all":
+            return tuple(outputs)
+        assert self.kind == "between"
+        return value
+
+
+class Between(Dataflow):
+    def forward(self, value):
+        for block in self.blocks:
+            value = block(value) * 0.9
+        return value
+
+
+class TwoLists(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.blocks = nn.ModuleList(Block() for _ in range(2))
+        self.decoder = nn.Module()
+        self.decoder.blocks = nn.ModuleList(Block() for _ in range(2))
+
+    def forward(self, value):
+        for block in (*self.encoder.blocks, *self.decoder.blocks):
+            value = block(value)
+        return value
+
+
+@pytest.mark.parametrize("model, reason", [
+    (Dataflow("pairs"), "more than one tensor of layer `blocks.0` is read outside it"),
+    (Dataflow("embeddings"), "layer `blocks.0` reads different tensors from the other layers"),
+    (Dataflow("skip"), "layer `blocks.0`'s output is read after the next layer"),
+    (Dataflow("all"), "layer `blocks.0`'s output is read after the next layer"),
+    (Between("between"), "code from outside the `blocks.N` layers runs between them"),
+    (TwoLists(), "more than one `blocks` list (`decoder.blocks`, `encoder.blocks`)"),
+], ids=["pairs", "embeddings", "skip", "all", "between", "two-lists"])
+def test_layers_whose_tensors_one_call_cant_carry_are_not_shared(tmp_path, model, reason):
+    # Shared, these computed wrong numbers: every call runs layer 0's code on
+    # layer 0's lists and carries only one tensor to the next call.
+    torch.manual_seed(6)
+    model.eval()
+    value = torch.randn(1, 4, 8)
+    result, emitted = export(model, value, tmp_path / "shared")
+    (message,) = result.warnings
+    assert emitted == [message] and reason in message
+    assert not shared_procedure(result)
+    assert verify(model, value, result).passed
+
+
+def test_cached_generation_with_a_skip_across_layers_is_not_shared(tmp_path):
+    from cattorch import GenerationProgram
+    from shared_models import CachedLM
+    from sprite_helpers import load_emulator, prefill_and_decode
+
+    class Skip(CachedLM):
+        def forward(self, tokens):
+            x = self.token(tokens) + self.position(torch.arange(tokens.shape[1]))
+            first = x = self.blocks[0](x)
+            for block in self.blocks[1:]:
+                x = block(x)
+            return self.head(self.norm(x + first))
+
+    torch.manual_seed(8)
+    model = Skip(context=8, layers=3).eval()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = transpile(model, GenerationProgram(max_context=8), tmp_path / "skip", codegen=SHARED)
+    emitted = [str(item.message) for item in caught if issubclass(item.category, CattorchWarning)]
+    (message,) = result.warnings
+    assert emitted == [message] and "read after the next layer" in message
+    assert not shared_procedure(result)
+    prefill_and_decode(load_emulator(result), model, [1, 3, 5], [2, 4])

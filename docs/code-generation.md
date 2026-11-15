@@ -62,8 +62,17 @@ Layer sharing looks for submodules named `blocks.0`, `blocks.1`, and so on,
 such as the items of an `nn.ModuleList` attribute called `blocks`. It shares
 them when:
 
-- they are numbered consecutively from `blocks.0`, and run one after another,
-  each reading the previous layer's output;
+- they are in one `blocks` list, numbered consecutively from `blocks.0`, and
+  run one after another, with no code between them;
+- each layer passes one tensor on: it reads the previous layer's output
+  (`blocks.0`: its input) and otherwise only the same tensors from before the
+  layers, such as a mask, and nothing reads its tensors but the next layer
+  (the last layer: the rest of the model). A layer that takes or returns two
+  tensors, a skip connection across layers, a layer reading the model's
+  input at every layer, or returning every layer's output keeps the model
+  unshared. So does an elementwise operation right after the last layer,
+  such as `x * 2`, when it is fused with the layer's last operation; a
+  normalization or linear layer there is fine;
 - every layer computes the same operations, with the same shapes and
   constants, and weights of the same sizes;
 - for [cached generation](generation.md#layer-sharing), every attention block

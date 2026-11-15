@@ -64,14 +64,20 @@ def layer_sharing_warning(reason: str, entry_point: str | None = None) -> str:
     )
 
 
-def _graph_layer(node) -> int | None:
+def _layer_path(node) -> tuple[str, int] | None:
+    """The ``blocks`` list a node's module sits in (its outermost), and its index."""
     for entry in reversed(tuple(node.meta.get("nn_module_stack", {}).values())):
         if not entry or not entry[0]:
             continue
         match = _LAYER_PATH.search(entry[0])
         if match:
-            return int(match.group(1))
+            return entry[0][:match.start(1) - 1].lstrip("."), int(match.group(1))
     return None
+
+
+def _graph_layer(node) -> int | None:
+    path = _layer_path(node)
+    return None if path is None else path[1]
 
 
 def _chain_until(blocks: dict, start: str, stop: str | None) -> list[str]:
@@ -171,6 +177,14 @@ def _share_repeated_transformer_layers(
     layers = sorted({layer for _, _, layer in emitted if layer is not None})
     if len(layers) < 2:
         return reject(NO_REPEATED_LAYERS)
+    lists = sorted({
+        path[0] for path in map(_layer_path, compiler.graph.nodes) if path is not None
+    })
+    if len(lists) > 1:
+        return reject(
+            "its layers are in more than one `blocks` list "
+            f"({', '.join(f'`{name}`' for name in lists)}), and only one can share"
+        )
     if layers != list(range(len(layers))):
         return reject(
             "its `blocks.N` layers aren't numbered consecutively from `blocks.0` "
@@ -309,73 +323,154 @@ def _share_repeated_transformer_layers(
                     "per-layer bank"
                 )
 
+    # Every call runs layer zero's code on layer zero's lists, and only one
+    # tensor is carried from call to call. So each layer must read the
+    # previous layer's output (layer zero: its input) and otherwise only
+    # tensors from before the layers, in the same places as every other
+    # layer, and only its output may be read outside it: by the next layer
+    # alone, or, for the last layer, by the rest of the model.
+    graph = compiler.graph
+
+    def root(name: str) -> str:
+        """The tensor whose list ``name`` is, through no-op aliases."""
+        seen = set()
+        while name in graph.aliases and name not in seen:
+            seen.add(name)
+            name = graph.aliases[name]
+        return name
+
+    def is_weight(name: str) -> bool:
+        return (
+            (name in nodes and nodes[name].op == "get_attr")
+            or name in graph.generated_weights
+            or graph.resolve_weight(name) is not None
+        )
+
+    position = {node.name: index for index, node in enumerate(graph.nodes)}
     layer_names = [
-        {node.name for node in compiler.graph.nodes if _graph_layer(node) == layer}
+        {node.name for node in graph.nodes if _graph_layer(node) == layer}
         for layer in layers
     ]
+    # Who reads each tensor; "" is the model's return.
+    readers: dict[str, set[str]] = {}
+    for node in graph.nodes:
+        if node.name in graph.aliases:
+            continue
+        for argument in node.all_input_nodes:
+            readers.setdefault(root(argument.name), set()).add(node.name)
+    for name, _, _ in graph.outputs:
+        readers.setdefault(root(name), set()).add("")
+
+    layers_end = max(position[name] for name in layer_names[-1])
     output_nodes = []
     for index, members in enumerate(layer_names):
-        consumers = layer_names[index + 1] if index + 1 < len(layer_names) else {
-            node.name for node in compiler.graph.nodes if _graph_layer(node) is None
-        }
-        used = {
-            arg.name
-            for consumer in compiler.graph.nodes if consumer.name in consumers
-            for arg in consumer.all_input_nodes
-            if arg.name in members and arg.name in compiler.scope.assignments
-        }
-        if not used:
-            return reject(
-                f"layer `blocks.{layers[index]}`'s output isn't read by the "
-                + ("next layer" if index + 1 < len(layer_names) else "rest of the model")
-            )
-        output_nodes.append(max(used, key=lambda name: next(
-            i for i, node in enumerate(compiler.graph.nodes) if node.name == name
-        )))
-    output_lists = [f"T{compiler.scope.assignments[name]}" for name in output_nodes]
-    first_inputs = [
-        arg.name
-        for node in compiler.graph.nodes if node.name in layer_names[0]
-        for arg in node.all_input_nodes
-        if arg.name not in layer_names[0]
-        and (
-            arg.name in compiler.scope.assignments
-            or arg.name in compiler.graph.input_names
+        layer = layers[index]
+        last = index + 1 == len(layers)
+        passed = sorted(
+            (
+                name for name in members
+                if not is_weight(name) and readers.get(name, set()) - members
+            ),
+            key=position.__getitem__,
         )
-    ]
-    if not first_inputs:
-        return reject("layer `blocks.0` doesn't read a tensor computed before it")
-    first_input = first_inputs[-1]
-    input_list = (
-        f"T{compiler.scope.assignments[first_input]}"
-        if first_input in compiler.scope.assignments
-        else compiler.graph.input_names[first_input]
-    )
+        if not passed:
+            return reject(
+                f"layer `blocks.{layer}`'s output isn't read by the "
+                + ("rest of the model" if last else "next layer")
+            )
+        if len(passed) > 1:
+            return reject(
+                f"more than one tensor of layer `blocks.{layer}` is read outside it "
+                "(a shared layer passes on only its output)"
+            )
+        (output,) = passed
+        # Who else reads it; the last layer's output is for the rest of the model.
+        elsewhere = set() if last else readers[output] - members - layer_names[index + 1]
+        if any(
+            reader in nodes and _graph_layer(nodes[reader]) is None
+            and position[reader] < layers_end
+            for reader in elsewhere
+        ):
+            return reject("code from outside the `blocks.N` layers runs between them")
+        if elsewhere:
+            return reject(
+                f"layer `blocks.{layer}`'s output is read after the next layer, "
+                "such as by a skip connection (a shared layer's output is "
+                "overwritten by the next call)"
+            )
+        if output not in compiler.scope.assignments:
+            return reject(
+                f"layer `blocks.{layer}`'s output is fused into the operation that "
+                "reads it, so there is no list to pass between the calls"
+            )
+        output_nodes.append(output)
+
+    def inputs_read(index: int, carried: str | None) -> list:
+        """What each operation of a layer reads, by role."""
+        own = {
+            node.name: place
+            for place, node in enumerate(node for node in graph.nodes
+                                          if node.op == "call_function"
+                                          and node.name in layer_names[index])
+        }
+        found: list = []
+        for node in graph.nodes:
+            if node.op != "call_function" or node.name not in layer_names[index]:
+                continue
+            for argument in node.all_input_nodes:
+                name = root(argument.name)
+                if is_weight(argument.name) or is_weight(name):
+                    found.append("weight")
+                elif name in own:
+                    found.append(own[name])
+                elif name == carried:
+                    found.append("carried")
+                else:
+                    found.append(("before", name))
+        return found
+
+    expected = inputs_read(1, output_nodes[0])
+    first_reads = inputs_read(0, None)
+    entering = {
+        role for role, wanted in zip(first_reads, expected) if wanted == "carried"
+    } if len(first_reads) == len(expected) else set()
+    first_input = None
+    if len(entering) == 1 and isinstance(role := next(iter(entering)), tuple):
+        first_input = role[1]
+    for index, layer in enumerate(layers):
+        carried_in = first_input if index == 0 else output_nodes[index - 1]
+        if carried_in is None or inputs_read(index, carried_in) != expected:
+            return reject(
+                f"layer `blocks.{layer}` reads different tensors from the other "
+                "layers (each layer may read only the previous layer's output, "
+                "and the same tensors from before the layers)"
+            )
+    assert first_input is not None
+
+    def list_of(name: str) -> str | None:
+        if name in compiler.scope.assignments:
+            return f"T{compiler.scope.assignments[name]}"
+        return graph.input_names.get(name)
+
+    for name in (first_input, *(role[1] for role in expected if isinstance(role, tuple))):
+        if list_of(name) is None and isinstance(nodes[name].meta.get("val"), torch.Tensor):
+            return reject(
+                "layer `blocks.0` reads a tensor from before the layers that is "
+                "fused into its code, so the other layers can't share that code"
+            )
+    input_list = list_of(first_input)
+    if input_list is None:
+        return reject("layer `blocks.0`'s input has no list of its own")
+    output_lists = [f"T{compiler.scope.assignments[name]}" for name in output_nodes]
     output_list = output_lists[0]
     # The calls copy each layer's output into the first layer's input list.
     # A public input list must keep the caller's values, and a value read
     # again after the layers must survive them: the first layer then reads
     # a private copy instead.
-    in_layers = set().union(*layer_names)
-    first_position = min(
-        index for index, node in enumerate(compiler.graph.nodes) if node.name in in_layers
-    )
-    def root(name: str) -> str:
-        seen = set()
-        while name in compiler.graph.aliases and name not in seen:
-            seen.add(name)
-            name = compiler.graph.aliases[name]
-        return name
-
-    copy_input = (
-        first_input in compiler.graph.input_names
-        or any(root(name) == first_input for name, _, _ in compiler.graph.outputs)
-        or any(
-            root(argument.name) == first_input
-            for node in compiler.graph.nodes[first_position:]
-            if node.name not in in_layers
-            for argument in node.all_input_nodes
-        )
+    first_position = min(position[name] for name in layer_names[0])
+    copy_input = first_input in graph.input_names or any(
+        reader == "" or (reader not in layer_names[0] and position[reader] > first_position)
+        for reader in readers.get(first_input, ())
     )
     # Without a predecessor the first layer starts the script, and the calls
     # take its place there.
