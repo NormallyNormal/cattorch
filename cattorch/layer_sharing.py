@@ -183,7 +183,7 @@ def _share_repeated_transformer_layers(
         # Cached K/V lists are statically named in Scratch. Until attention is
         # split into thin per-layer cache wrappers, sharing the whole slab
         # would incorrectly direct every call to layer zero's cache.
-        return reject(cache_reason or "its layers' key/value caches can't be shared")
+        return reject(cache_reason or "its layers' K/V caches can't be shared")
 
     grouped = [
         [(name, root) for name, root, found in emitted if found == layer]

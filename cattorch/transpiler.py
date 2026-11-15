@@ -2879,7 +2879,7 @@ def _compile_sprite(
         if not _layers_can_share_caches(graph):
             cache_reason = (
                 "its attention blocks aren't each in their own `blocks.N` layer, "
-                "numbered from `blocks.0`, so their key/value caches can't be shared"
+                "numbered from `blocks.0`, so their K/V caches can't be shared"
             )
             log.info("Banked generation caches skipped: %s", cache_reason)
         elif _bank_generation_caches(graph):
@@ -2888,7 +2888,7 @@ def _compile_sprite(
                 graph.generation.cache_layers,
             )
         else:
-            cache_reason = "its layers' key/value caches differ in width"
+            cache_reason = "its layers' K/V caches differ in width"
             log.info("Banked generation caches skipped: %s", cache_reason)
 
     # 2. Compile graph nodes into Scratch blocks
