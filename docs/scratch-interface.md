@@ -3,13 +3,15 @@
 [Documentation home](index.md)
 
 Scratch projects use an exported sprite through its blocks, lists, variables,
-and broadcasts. This page lists every one of them, and every value
-`cattorch status` can take. Together they're a versioned contract:
+and broadcasts. This page lists every one of them, the names that
+[projects](#projects) and [benchmark projects](#benchmark-projects) add, and
+every value `cattorch status` can take. Together they're a versioned
+contract:
 
-- A name is public when it starts with `cattorch ` (with the space), or is one
-  of a model's `input` and `output` lists (`input`, `input_1`, ...,
-  `output`, `output_1`, ...). Every other name in a sprite starts with `_` and
-  is internal: weights, working lists, helper blocks. Internal names can
+- In an exported sprite, a name is public when it starts with `cattorch `
+  (with the space), or is one of a model's `input` and `output` lists
+  (`input`, `input_1`, ..., `output`, `output_1`, ...). Every other name in a
+  sprite starts with `_` and is internal: weights, working lists, helper blocks. Internal names can
   change in any release, so don't use them in your scripts.
 - Within interface version 1, which covers cattorch 1.x, no public name or
   status value is renamed or removed, and its meaning doesn't change. New
@@ -21,12 +23,15 @@ and broadcasts. This page lists every one of them, and every value
 
 In the tables, a name in capitals stands for part of a name the export
 chooses: ENTRY for an entry point, INPUT and OUTPUT for its lists, STATE for
-a piece of state, NAME for a sprite in a project.
+a piece of state, NAME for a sprite in a project, CASE and VARIANT for a
+benchmark case and its variant.
 
 ## How every block behaves
 
 - Blocks take no arguments and run without screen refresh. A block reads
   its input lists and writes its output lists in the sprite.
+- Call a sprite's blocks from one script at a time; see
+  [overlapping calls](#overlapping-calls).
 - Every block sets `cattorch status` when it ends: `ok`, or why it failed,
   from the [status table](#status-values). It then does a
   `broadcast and wait` of its completion broadcast, `BLOCK complete` (for
@@ -38,12 +43,11 @@ a piece of state, NAME for a sprite in a project.
   never waits forever, and checks `cattorch status` before reading the
   outputs. A broadcast doesn't say which call sent it: a script that needs
   the result of its own call runs the block itself, which returns when the
-  block ends, and reads `cattorch status` right after. When another script's
-  call overlaps, that status can be the other call's, as the outputs then
-  are; see [overlapping calls](#overlapping-calls).
+  block ends, and reads `cattorch status` right after.
 - A block that fails writes none of its output lists and changes no state:
   the outputs keep the values of the last call that succeeded. A block never
-  changes its input lists.
+  changes its input lists. (A block taken over while it copies its results is
+  the exception; see [overlapping calls](#overlapping-calls).)
 - A block checks its input lists before it runs: the number of items, and
   each item. A list of floating-point values must hold numbers (`Infinity`
   and `-Infinity` count; text, an empty item and `NaN` don't); a list of
@@ -59,42 +63,6 @@ a piece of state, NAME for a sprite in a project.
   Public lists keep their values, except that a generation sprite also
   resets, as `cattorch reset` does: its cache can't be kept.
 
-### Overlapping calls
-
-Call a sprite's blocks from one script at a time. Scratch pauses a block that
-has run for half a second at a loop, and runs other scripts meanwhile, so
-another script can start one of the sprite's blocks while one is still
-running; calls share the sprite's working lists and decoded weights. When
-that happens:
-
-- The block that was running reports `another call ran during this one`
-  when it ends. It writes no output, so the newer call's outputs stay, and it
-  still sends its completion broadcast, and a listener of that broadcast
-  that checks `cattorch status` doesn't use its results. But while a block's
-  completion broadcast runs its listeners, Scratch can resume another
-  script, so a listener, or the script that ran the block, can read the
-  failure of a call that was taken over, or another call's status, instead
-  of its own. If a block it resumed
-  during is still running, that one fails the same way. Only a block taken
-  over while it copies its results to the output lists, which leaves them
-  mixed, empties them.
-- A generation sprite's `cattorch decode`, and a program entry point when
-  the program has state, refuses to run while a block that changes the
-  cache or states is still running, or after one was stopped or taken over
-  part way: it reports `an earlier call was stopped or is still running;
-  reset first` until `cattorch reset` (or, for generation,
-  `cattorch prefill`) runs. `cattorch reset` always recovers.
-- `cattorch init`, or a block decoding the weights, that another block
-  starts during leaves them for the next block to decode again.
-
-These guarantees have two known limits. If the block that was taken over
-resumes while the newer one is itself paused, and is still unfinished when
-the newer one ends, or is stopped after it resumed, the newer one can report
-`ok` with results from working lists the old one changed. And a block taken
-over while it decodes the weights carries on decoding them when it resumes:
-a block that runs meanwhile can report `ok` with weights the old block half
-overwrote; the next block after the old one ends decodes them again.
-
 ## Status values
 
 `cattorch status` starts empty, before any block has ended, and each block
@@ -108,9 +76,73 @@ sets it to one of these when it ends. LIST is the public list at fault.
 | `too many items: LIST` | A variable-length list holds more rows than its maximum, or `cattorch prefill` got more tokens than `cattorch max context`. |
 | `invalid item: LIST` | An item isn't a number, or isn't a whole number in range, such as a token ID outside the vocabulary. |
 | `state full: LIST` | An entry point's call would append past a state list's capacity. |
-| `context full` | `cattorch decode` found the cache holding `cattorch max context` tokens. |
+| `context full` | `cattorch decode` found `cattorch cache length` at `cattorch max context`. |
 | `another call ran during this one` | Another of the sprite's blocks started while this one ran; see [overlapping calls](#overlapping-calls). |
 | `an earlier call was stopped or is still running; reset first` | A block that changes the cache or states was stopped or taken over part way, or is still running. |
+
+## Overlapping calls
+
+Call a sprite's blocks from one script at a time, and let each block end
+before another script starts one of the same sprite's blocks.
+
+The blocks run without screen refresh, but scratch-vm doesn't let such a
+block run forever: once it has run for about 500 ms, scratch-vm can pause it
+at a loop repeat or a My Block call, redraw the screen, and run other scripts
+before it continues. If one of those scripts starts another block of the
+same sprite, the two calls overlap. They share the sprite's working lists,
+its decoded weights and its states, so each can spoil the other's results.
+The stop sign, or a `stop` block, can also stop a block part way.
+
+The sprite detects most of this and reports it in `cattorch status`:
+
+- **Taken over.** A block that another of the sprite's blocks started during
+  writes none of its outputs, reports `another call ran during this one`,
+  and still sends its completion broadcast. If it had itself started while
+  an older block was paused, that older block fails the same way when it
+  ends. A block taken over while it copies its results to its output lists
+  leaves them mixed: a model, program or generation sprite then empties them
+  (for a generator, `cattorch logits` and the top-k lists); a tokenizer
+  leaves them, so its status is the only sign.
+- **Weights.** A `cattorch init`, or a block decoding the weights itself,
+  that another block starts during leaves the weights marked undecoded
+  (`cattorch initialized` is `0`), and the next block decodes them again.
+  `cattorch prepare for save` makes a block running during it fail.
+- **Interrupted states.** A sprite with state (the cache of a generator, the
+  states of a recurrent generator or a program) can be left with its states
+  half written. Until it is cleared, some blocks are refused: they change
+  nothing and report `an earlier call was stopped or is still running;
+  reset first`. They are also refused while a block that writes the states
+  is running in another script. `cattorch init` doesn't clear the condition.
+
+|   | Model, tokenizer | Program | Generation, recurrent generation |
+|---|---|---|---|
+| Left interrupted by | Nothing: no states. | `cattorch reset`, or an entry point that updates state, stopped or taken over while it writes the states. | `cattorch reset`, `cattorch prefill` or `cattorch decode` stopped or taken over at any point. |
+| Refused | Nothing. | Every entry point, in a program with state. An entry point of a program without state is never refused. | `cattorch decode`. |
+| A refusal while another block runs | | Leaves the running block alone: it carries on and sets its own status when it ends. | Makes the running block fail: it skips the rest of its work and reports `another call ran during this one`. |
+| Cleared by | | `cattorch reset`, which is never refused. | `cattorch reset` or `cattorch prefill`, which are never refused. |
+
+Two cases are not detected, and are why the rule above matters:
+
+- If a block that was taken over resumes while the newer block is itself
+  paused, and hasn't ended when the newer one ends, or is stopped after it
+  resumed, the newer block can report `ok` with results computed from
+  working lists the old one changed.
+- A block taken over while it decodes the weights carries on decoding when
+  it resumes. A block that runs meanwhile can report `ok` with weights the
+  old block half overwrote. The next block after the old one ends decodes
+  them again.
+
+Also, while a completion broadcast runs its listeners, Scratch can resume
+another script, so a listener, or the script that ran the block, can read
+another call's status instead of its own.
+
+To recover, run the block again from one script. If the status is `an
+earlier call was stopped or is still running; reset first`, run
+`cattorch reset` first (in a generator, `cattorch prefill` also works): a
+program's states go back to their initial values, and a generator starts
+over from an empty cache or its initial states. To start clean after any overlap, run
+`cattorch init`, which decodes the weights again, and then `cattorch reset`
+in a sprite with state.
 
 ## Model sprites
 
@@ -248,6 +280,27 @@ sprite, `cattorch bridge MESSAGE`, which ends with a `broadcast and wait` of
 | `NAME temperature` | variable | The sampling temperature; 0 picks the likeliest token. |
 | `NAME text` | variable | A tokenizer's text. |
 
-The project's Demo sprite has only internal names.
+The project's Demo sprite has only internal names, such as the
+`_cattorch demo prompt tokens` block.
+
+## Benchmark projects
+
+A project from a [benchmark builder](verification-and-benchmarking.md#scratch-benchmark-projects)
+records how it ran and its timings on the stage, where
+[`analyze_benchmark`](api-reference.md#analyze_benchmark) reads them. These
+stage names are public:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `cattorch exact timings`, `cattorch fast timings` | list | `build_paired_benchmark`: the seconds each timed call of a variant took. |
+| `cattorch benchmark results` | list | The other builders: `CASE VARIANT: SECONDS` per case and variant, the time its timed calls took together (`CASE VARIANT init: SECONDS` and `CASE VARIANT forward: SECONDS` in a storage benchmark). |
+| `cattorch storage sizes` | list | `build_storage_benchmark_suite`: `CASE VARIANT: BYTES bytes`, the `.sprite3` size of each case and storage mode. |
+| `cattorch benchmark repeats`, `cattorch benchmark warmups` | variable | The timed and untimed calls per variant. |
+| `cattorch benchmark comparison` | variable | The variant compared with the baseline, such as `fast` or `cached`; not in a storage benchmark. |
+
+Everything else in a benchmark project is internal: the stage's scripts and
+messages, and the sprites, one per case and variant (`CASE VARIANT`, or
+`cattorch exact` and `cattorch fast` in a paired benchmark), whose own
+interface is that of their kind of sprite.
 
 Related: [getting started](getting-started.md), [glossary](glossary.md).
