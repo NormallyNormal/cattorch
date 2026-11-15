@@ -17,6 +17,7 @@ import hashlib
 import logging
 import math
 import weakref
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import numpy as np
@@ -25,7 +26,9 @@ import torch
 from cattorch.procedures import (
     _add_warp_procedure, _insert_init_call, _merge_lists_by_name, _merge_variables_by_name,
 )
-from cattorch.quantization import effective_group_size
+from cattorch.quantization import (
+    STORED_AS_VECTOR, STORED_BELOW_MINIMUM, STORED_OFF_GRID, effective_group_size,
+)
 from cattorch.storage import (
     EncodedList,
     StorageConfig,
@@ -47,11 +50,31 @@ from cattorch.util.scratch.tensor_adder import StaticValues, static_list_content
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class StoredList:
+    """How storage stored one logical static list, recorded as it stored it.
+
+    ``precision`` and ``group_size`` (of an integer encoding) are what its
+    payloads hold; ``values`` and ``shape`` are the list's. A list storage
+    shares with an identical one names that one as ``shared_with``, and is
+    stored as it is.
+    """
+
+    precision: str
+    group_size: int | None
+    values: int
+    shape: tuple[int, ...]
+    # Why integer storage kept it in float (see ``_static_storage_decision``).
+    reason: str | None = None
+    shared_with: str | None = None
+
+
 def _deduplicate_static_tensors(
     sprite: dict,
     static_tensors: dict[str, torch.Tensor | None],
     *,
     effective_ndims: dict[str, int] | None = None,
+    shared: dict[str, str] | None = None,
 ) -> dict[str, torch.Tensor | None]:
     """Share bit-identical flattened tensors before storage and sharding.
 
@@ -59,6 +82,8 @@ def _deduplicate_static_tensors(
     access the physical lists as flat arrays and have already compiled their
     shape-specific index arithmetic. Hash matches are confirmed byte-for-byte
     so this transform remains exact even for NaNs and signed zeroes.
+    ``shared`` receives each dropped tensor's key with the key of the
+    tensor that stands in for it.
     """
     winners: dict[tuple[str, int, int, bytes], tuple[str, torch.Tensor]] = {}
     aliases: dict[str, str] = {}
@@ -81,6 +106,8 @@ def _deduplicate_static_tensors(
         previous = winners.get(identity)
         if previous is not None and torch.equal(previous[1], raw):
             aliases[f"W_{key}"] = f"W_{previous[0]}"
+            if shared is not None:
+                shared[key] = previous[0]
             log.info("Sharing identical static tensor W_%s -> W_%s", key, previous[0])
         else:
             winners[identity] = (key, raw)
@@ -197,25 +224,42 @@ def _static_storage_precision(
     A row shard the compiler cut from a weight gives that weight's size as
     ``source_numel``, so it is kept like the rest of the weight.
     """
+    return _static_storage_decision(
+        tensor, storage, effective_ndim, interleave_segments, source_numel,
+    )[0]
+
+
+def _static_storage_decision(
+    tensor: torch.Tensor | None,
+    storage: StorageConfig,
+    effective_ndim: int | None = None,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
+    source_numel: int | None = None,
+) -> tuple[_StoragePrecision, str | None]:
+    """``_static_storage_precision``, and why integer storage keeps a
+    floating tensor in float: ``STORED_AS_VECTOR``, ``STORED_BELOW_MINIMUM``
+    or ``STORED_OFF_GRID``, when no integer encoding reproduces it."""
     if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
-        return "float32"
+        return "float32", None
     if storage.precision not in {"int8", "int6", "int4"}:
-        return storage.precision
+        return storage.precision, None
     ndim = tensor.ndim if effective_ndim is None else effective_ndim
     if ndim < 2:
-        return "float16"
+        return "float16", STORED_AS_VECTOR
     # Quantization leaves matrices below the threshold unquantized.
+    reason = STORED_BELOW_MINIMUM
     if (source_numel or tensor.numel()) >= storage.min_quantized_values:
         encoding = _integer_codec_encoding(tensor, storage, interleave_segments)
         if encoding is not None:
-            return cast(_StoragePrecision, encoding[0])
+            return cast(_StoragePrecision, encoding[0]), None
+        reason = STORED_OFF_GRID
     # QuantizationConfig decides which weights are lossy. Storage must not
     # quantize anything it did not reconstruct, such as buffers (RoPE
     # tables, masks) or values derived from weights by other arithmetic.
     finite = tensor.detach()[torch.isfinite(tensor.detach())]
     if finite.numel() and float(finite.abs().max()) > 65504:
-        return "float32"
-    return "float16"
+        return "float32", reason
+    return "float16", reason
 
 
 def _integer_encodings(
@@ -632,8 +676,14 @@ def _apply_static_storage(
     ] | None = None,
     effective_ndims: dict[str, int] | None = None,
     source_numels: dict[str, int] | None = None,
+    record: dict[str, StoredList] | None = None,
 ) -> set[str]:
-    """Encode static physical shards and install the one-time unpacker."""
+    """Encode static physical shards and install the one-time unpacker.
+
+    Each floating tensor's precision is decided once, here, and ``record``
+    receives that decision for every list stored, by key: what the
+    quantization report says was stored is read from it.
+    """
     source_numels = source_numels or {}
     static_names = {f"W_{key}" for key in static_tensors}
     interleaved_layouts = interleaved_layouts or {}
@@ -648,24 +698,36 @@ def _apply_static_storage(
     _validate_nonfloating_static_tensors(
         static_tensors, compressed=storage.compression,
     )
+    decisions: dict[str, tuple[_StoragePrecision, int]] = {}
+    for logical_name in sorted(static_names):
+        key = logical_name.removeprefix("W_")
+        tensor = static_tensors.get(key)
+        if logical_name not in layouts or not isinstance(tensor, torch.Tensor):
+            continue
+        precision, reason = _static_storage_decision(
+            tensor, storage, (effective_ndims or {}).get(key),
+            interleaved_layouts.get(key, ()), source_numels.get(key),
+        )
+        group_size = _static_storage_group_size(tensor, storage, interleaved_layouts.get(key, ()))
+        decisions[key] = (precision, group_size)
+        if record is not None and tensor.is_floating_point():
+            record[key] = StoredList(
+                precision=precision,
+                group_size=group_size if precision in ("int8", "int6", "int4") else None,
+                values=tensor.numel(),
+                shape=tuple(int(size) for size in tensor.shape),
+                reason=reason,
+            )
     if not storage.compression:
         if storage.precision in {"float16", "int8", "int6", "int4"}:
             for logical_name in static_names:
                 tensor = static_tensors.get(logical_name.removeprefix("W_"))
                 if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
                     continue
-                precision = _static_storage_precision(
-                    tensor, storage, (effective_ndims or {}).get(
-                        logical_name.removeprefix("W_"),
-                    ),
-                    interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
-                    source_numels.get(logical_name.removeprefix("W_")),
-                )
-                group_size = _static_storage_group_size(
-                    tensor, storage,
-                    interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
-                )
-                for shard in layouts.get(logical_name, ListLayout(logical_name, 0, ())).shards:
+                if logical_name.removeprefix("W_") not in decisions:
+                    continue
+                precision, group_size = decisions[logical_name.removeprefix("W_")]
+                for shard in layouts[logical_name].shards:
                     contents = sprite["lists"][shard.identifier][1]
                     segments = physical_interleaves.get(shard.name, ())
                     logical_contents = (
@@ -691,16 +753,8 @@ def _apply_static_storage(
         layout = layouts.get(logical_name)
         if layout is None:
             continue
-        tensor = static_tensors.get(logical_name.removeprefix("W_"))
-        precision = _static_storage_precision(
-            tensor, storage, (effective_ndims or {}).get(
-                logical_name.removeprefix("W_"),
-            ),
-            interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
-            source_numels.get(logical_name.removeprefix("W_")),
-        )
-        group_size = _static_storage_group_size(
-            tensor, storage, interleaved_layouts.get(logical_name.removeprefix("W_"), ()),
+        precision, group_size = decisions.get(
+            logical_name.removeprefix("W_"), ("float32", storage.group_size),
         )
         for position, shard in enumerate(layout.shards, 1):
             contents = sprite["lists"][shard.identifier][1]

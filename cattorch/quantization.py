@@ -303,10 +303,16 @@ class QuantizationReport:
     symmetric_values: int
     tensors: tuple[TensorQuantizationReport, ...]
     # Where each quantized entry's values sit in its parameter, for export to
-    # say how storage stored them, and what the exports that share this
-    # report found so far. Neither is part of the public report.
+    # say how storage stored them. Neither they nor the rest below are part
+    # of the public report.
     _regions: tuple[_Region, ...] = field(default=(), repr=False, compare=False)
-    _stored: dict = field(default_factory=dict, repr=False, compare=False)
+    # What storage stored of the parameters in the exports that produced
+    # this report (``_StorageFindings``), and the entries quantization made,
+    # which ``_regions`` number, before storage's findings changed them.
+    _stored: Any = field(default=None, repr=False, compare=False)
+    _entries: tuple[TensorQuantizationReport, ...] | None = field(
+        default=None, repr=False, compare=False,
+    )
     # Weights computed from parameters, by storage, which regions may sit in.
     _computed: dict = field(default_factory=dict, repr=False, compare=False)
     # Every (precision, maximum group size) the quantized weights use.
@@ -327,68 +333,178 @@ class _StoredFloat16:
     reason: str
 
 
+@dataclass
+class _StorageFindings:
+    """What storage stored of the parameters, over every export so far.
+
+    The entry points of one program are compiled one at a time, and each
+    stores its own lists: a region one stores in integers and another as a
+    float16 copy is stored both ways. Masks are of parameter storage
+    elements, by parameter storage; ``contributions`` are ``(masks, values
+    held, why storage kept it in float)`` of each float16 list (see
+    ``StoredList.reason``); ``derived`` are float16 weights computed from
+    parameters at export, by name.
+    """
+
+    float16: dict[int, torch.Tensor] = field(default_factory=dict)
+    integer: dict[int, torch.Tensor] = field(default_factory=dict)
+    contributions: list[tuple[dict[int, torch.Tensor], int, str | None]] = field(
+        default_factory=list,
+    )
+    derived: dict[str, TensorQuantizationReport] = field(default_factory=dict)
+    derived_warnings: dict[str, str] = field(default_factory=dict)
+
+    def merged(self, other: _StorageFindings) -> _StorageFindings:
+        def union(first, second):
+            result = dict(first)
+            for pointer, mask in second.items():
+                previous = result.get(pointer)
+                result[pointer] = mask if previous is None else previous | mask
+            return result
+
+        return _StorageFindings(
+            float16=union(self.float16, other.float16),
+            integer=union(self.integer, other.integer),
+            contributions=[*self.contributions, *other.contributions],
+            derived={**other.derived, **self.derived},
+            derived_warnings={**other.derived_warnings, **self.derived_warnings},
+        )
+
+
+# Why integer storage keeps a floating list in float (``StoredList.reason``,
+# decided by ``static_storage._static_storage_decision``).
+STORED_AS_VECTOR = "vector"
+STORED_BELOW_MINIMUM = "below minimum"
+STORED_OFF_GRID = "off grid"
+# What that means for quantized values the list holds.
+_FLOAT_STORAGE_REASONS: dict[str | None, str] = {
+    STORED_OFF_GRID: (
+        "storage reads the values in groups along a different axis than they were "
+        "quantized in"
+    ),
+    STORED_BELOW_MINIMUM: (
+        "storage reads them from a list of fewer than min_quantized_values={minimum} "
+        "values, which it keeps in float16"
+    ),
+    STORED_AS_VECTOR: "storage reads them as a vector, which it keeps in float16",
+    None: "storage keeps the list that holds them in float16",
+}
+
+
 def _stored_quantization_report(
     report: QuantizationReport,
-    stored: dict[int, _StoredFloat16],
-    derived: Iterable[TensorQuantizationReport] = (),
-) -> QuantizationReport:
-    """``report`` saying what storage stored, not only the rounding applied.
+    findings: _StorageFindings | None = None,
+    *,
+    storage_precision: str = "",
+    min_quantized_values: int = 0,
+) -> tuple[tuple[str, ...], QuantizationReport]:
+    """Warnings, and ``report`` saying what storage stored.
 
-    ``stored`` holds, by entry, the values storage keeps in float16;
-    ``derived`` describes weights computed from parameters at export. They
-    add to what earlier exports sharing ``report`` found, as the entry points
-    of one program do, and the result has no storage details of its own.
+    ``findings`` are this export's; they add to those of the exports that
+    produced ``report``, as the entry points of one program do. Every entry
+    quantization made then says how its values are stored, from the
+    findings together, and weights computed from parameters at export that
+    storage keeps in float16 are added.
     """
-    accumulated = report._stored
-    for entry, finding in stored.items():
-        previous = accumulated.get(entry)
-        if previous is None or (finding.only, finding.copies) > (previous.only, previous.copies):
-            accumulated[entry] = finding
-    for item in derived:
-        accumulated.setdefault(("derived", item.name), item)
+    base = report.tensors if report._entries is None else report._entries
+    previous = report._stored if isinstance(report._stored, _StorageFindings) else None
+    if findings is None:
+        accumulated = previous
+    else:
+        accumulated = findings if previous is None else previous.merged(findings)
+    found: dict[int, _StoredFloat16] = {}
+    warnings_found: list[str] = []
+    if accumulated is not None and accumulated.float16:
+        regions = report._regions
+        masks = _region_masks(
+            region for region in regions if region.pointer in accumulated.float16
+        )
+        for region in regions:
+            if region.entry not in masks or base[region.entry].method == "float16":
+                continue
+            mask = masks[region.entry]
+            float16 = accumulated.float16[region.pointer] & mask
+            if not bool(float16.any()):
+                continue
+            integer = accumulated.integer.get(region.pointer)
+            copies = int((float16 & integer).sum()) if integer is not None else 0
+            only = int(float16.sum()) - copies
+            # A list holds no more values than it has: a float16 shard of a
+            # weight stores that many of the weight's values.
+            capacity = 0.0
+            why: dict[str | None, int] = {}
+            for held, count, stored_reason in accumulated.contributions:
+                if region.pointer not in held:
+                    continue
+                overlap = int((held[region.pointer] & mask).sum())
+                if overlap:
+                    share = sum(int(value.sum()) for value in held.values())
+                    capacity += count * overlap / share
+                    why[stored_reason] = why.get(stored_reason, 0) + overlap
+            if only + copies > capacity:
+                scale = capacity / (only + copies)
+                only, copies = round(only * scale), round(copies * scale)
+            if not only + copies:
+                continue
+            # Storage's own reason for most of the values.
+            reason = _FLOAT_STORAGE_REASONS.get(
+                max(why, key=lambda key: why[key]) if why else None,
+                _FLOAT_STORAGE_REASONS[None],
+            ).format(minimum=min_quantized_values)
+            found[region.entry] = _StoredFloat16(only=only, copies=copies, reason=reason)
+            item = base[region.entry]
+            if only >= item.values:
+                warnings_found.append(
+                    f"quantized weight {item.name!r} is stored as float16, not "
+                    f"{storage_precision}: {reason}"
+                )
+            else:
+                warnings_found.append(
+                    f"quantized weight {item.name!r}: {only + copies} of its values are "
+                    f"stored as float16, not {storage_precision}"
+                    + (" (a second copy)" if copies else "") + f": {reason}"
+                )
     tensors: list[TensorQuantizationReport] = []
-    for entry, item in enumerate(report.tensors):
-        found: _StoredFloat16 | None = accumulated.get(entry)
-        if found is None or item.method == "float16" or not (found.only or found.copies):
+    for entry, item in enumerate(base):
+        stored: _StoredFloat16 | None = found.get(entry)
+        if stored is None:
             tensors.append(item)
             continue
         stored_as = (
-            f"{item.method} int{item.bits} values are stored as float16: {found.reason}"
+            f"{item.method} int{item.bits} values are stored as float16: {stored.reason}"
         )
-        if found.only >= item.values:
+        if stored.only >= item.values:
             tensors.append(replace(
                 item, method="float16", bits=None, effective_group_size=None,
                 fallback_reason=stored_as,
             ))
             continue
-        tensors.append(replace(item, values=item.values - found.only))
+        tensors.append(replace(item, values=item.values - stored.only))
         tensors.append(TensorQuantizationReport(
             name=f"{item.name}[float16]",
             method="float16",
             bits=None,
-            values=found.only + found.copies,
+            values=stored.only + stored.copies,
             calibration_rows=0,
             effective_group_size=None,
             fallback_reason=(
-                f"{found.copies} of these values are also stored in integers; {stored_as}"
-                if found.copies else stored_as
+                f"{stored.copies} of these values are also stored in integers; {stored_as}"
+                if stored.copies else stored_as
             ),
         ))
-    tensors.extend(
-        item for key, item in accumulated.items()
-        if isinstance(key, tuple) and key[0] == "derived"
-    )
+    if accumulated is not None:
+        tensors.extend(accumulated.derived.values())
+        warnings_found.extend(accumulated.derived_warnings.values())
     gptq_values = sum(item.values for item in tensors if item.method == "gptq")
     symmetric_values = sum(item.values for item in tensors if item.method == "symmetric")
-    return QuantizationReport(
-        method=report.method,
-        bits=report.bits,
-        calibration_batches=report.calibration_batches,
-        calibration_rows=report.calibration_rows,
+    return tuple(warnings_found), replace(
+        report,
         quantized_values=gptq_values + symmetric_values,
         gptq_values=gptq_values,
         symmetric_values=symmetric_values,
         tensors=tuple(tensors),
+        _stored=accumulated,
+        _entries=base,
     )
 
 
@@ -2204,65 +2320,28 @@ _UNFOLLOWED_COMPUTATION = (
 )
 
 
-def _stored_precisions(
-    static_tensors, storage, *, sprite, layouts, effective_ndims, interleaved_layouts,
-):
-    """``(float16 values, all values, tensor-level precision)`` by stored list."""
-    from cattorch.static_storage import _static_storage_precision
-
-    stored = {}
-    for key, tensor in static_tensors.items():
-        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
-            continue
-        precision = _static_storage_precision(
-            tensor, storage, effective_ndims.get(key), interleaved_layouts.get(key, ()),
-        )
-        float16 = tensor.numel() if not precision.startswith("int") else 0
-        layout = layouts.get(f"W_{key}")
-        if precision.startswith("int") and layout is not None and sprite is not None:
-            # Storage keeps a shard too small to be worth decoding in float16.
-            for shard in layout.shards:
-                size = len(sprite["lists"][shard.identifier][1])
-                if 0 < size < storage.min_quantized_values:
-                    float16 += size
-        stored[key] = (float16, tensor.numel(), precision)
-    return stored
-
-
 def _storage_quantization_report(
     report: QuantizationReport,
     *,
-    static_tensors: dict,
-    deduplicated: dict,
+    stored: dict,
     storage,
-    sprite: dict,
-    layouts: dict,
     effective_ndims: dict[str, int],
-    interleaved_layouts: dict,
     recorder: _StaticSourceRecorder,
     model: torch.nn.Module,
 ) -> tuple[tuple[str, ...], QuantizationReport]:
-    """Warnings and the report for what storage stores of quantized weights.
+    """Warnings and the report for what storage stored of quantized weights.
 
-    Storage keeps a list in integers only when it is on the integer grid
-    along its own last dimension, so quantized values it reads grouped
-    another way, or a weight computed from parameters at export, are kept in
-    float16. Each stored list is traced back through the graph to the
-    parameter elements it holds, and every report entry then says how its
-    values are stored. ``deduplicated`` are lists storage shares with an
-    identical one; they are stored as that one is.
+    ``stored`` is storage's own record of every list it stored
+    (``StoredList``, by key), made as it stored them: the report says what
+    it holds, not what storage would be expected to choose. Storage keeps a
+    list in integers only when it is on the integer grid along its own last
+    dimension, so quantized values it reads grouped another way, or a weight
+    computed from parameters at export, are kept in float16. Each stored
+    list is traced back through the graph to the parameter elements it
+    holds, and every report entry then says how its values are stored.
     """
     if storage.precision not in {"int8", "int6", "int4"}:
-        return (), _stored_quantization_report(report, {})
-    stored = _stored_precisions(
-        static_tensors, storage, sprite=sprite, layouts=layouts,
-        effective_ndims=effective_ndims, interleaved_layouts=interleaved_layouts,
-    )
-    stored.update(_stored_precisions(
-        deduplicated, storage, sprite=None, layouts={},
-        effective_ndims=effective_ndims, interleaved_layouts=interleaved_layouts,
-    ))
-    tensors = {**deduplicated, **static_tensors}
+        return _stored_quantization_report(report)
     names_module = _unwrapped(model)
     parameter_names: dict[int, str] = {}
     parameters: dict[int, torch.Tensor] = {}
@@ -2274,113 +2353,60 @@ def _storage_quantization_report(
     for pointer, tensor in report._computed.items():
         parameters.setdefault(pointer, tensor)
     provenance = _GraphProvenance(recorder.graph, parameters, recorder.resolve)
-    regions = report._regions
-    region_pointers = {region.pointer for region in regions}
+    region_pointers = {region.pointer for region in report._regions}
 
-    float16_masks: dict[int, torch.Tensor] = {}
-    contributions: list[tuple[str, dict[int, torch.Tensor], int]] = []
+    findings = _StorageFindings()
     derived: dict[tuple, list] = {}
-    for key, (float16, total, precision) in stored.items():
-        if not float16:
+    for key, item in stored.items():
+        if item.values == 0:
             continue
-        tensor = tensors[key]
-        sources = recorder.graph_values(key, tensor)
+        shape = torch.empty(item.shape, device="meta")
+        sources = recorder.graph_values(key, shape)
         masks, from_parameters = provenance.elements(sources)
+        # Traced values are of this list alone.
+        provenance.traced.clear()
         masks = {pointer: mask for pointer, mask in masks.items() if pointer in region_pointers}
+        integer = item.precision in ("int8", "int6", "int4")
+        target = findings.integer if integer else findings.float16
         for pointer, mask in masks.items():
-            previous = float16_masks.get(pointer)
-            float16_masks[pointer] = mask.clone() if previous is None else previous | mask
+            previous = target.get(pointer)
+            target[pointer] = mask.clone() if previous is None else previous | mask
+        if integer:
+            continue
         if masks:
-            contributions.append((key, masks, float16))
-        ndim = effective_ndims.get(key, tensor.ndim)
+            findings.contributions.append((masks, item.values, item.reason))
+        ndim = effective_ndims.get(key, len(item.shape))
         if (
-            from_parameters and not masks and float16 == total
-            and total >= storage.min_quantized_values
-            and _is_weight_matrix(tensor, min(ndim, tensor.ndim))
+            from_parameters and not masks
+            and item.values >= storage.min_quantized_values
+            and _is_weight_matrix(shape, min(ndim, len(item.shape)))
         ):
             names = tuple(sorted(parameter_names[pointer] for pointer in from_parameters))
-            entry = derived.setdefault((names, sources), [0, tuple(tensor.shape)])
-            entry[0] += total
+            entry = derived.setdefault((names, sources), [0, item.shape])
+            entry[0] += item.values
 
-    integer_masks: dict[int, torch.Tensor] = {}
-    if float16_masks:
-        for key, (float16, total, precision) in stored.items():
-            if float16 == total:
-                continue
-            masks, _ = provenance.elements(recorder.graph_values(key, tensors[key]))
-            for pointer, mask in masks.items():
-                if pointer in float16_masks:
-                    previous = integer_masks.get(pointer)
-                    integer_masks[pointer] = mask.clone() if previous is None else previous | mask
-
-    warnings_found: list[str] = []
-    found: dict[int, _StoredFloat16] = {}
-    if float16_masks:
-        masks = _region_masks(region for region in regions if region.pointer in float16_masks)
-        for region in regions:
-            if region.entry not in masks or report.tensors[region.entry].method == "float16":
-                continue
-            mask = masks[region.entry]
-            float16 = float16_masks[region.pointer] & mask
-            if not bool(float16.any()):
-                continue
-            integer = integer_masks.get(region.pointer)
-            copies = int((float16 & integer).sum()) if integer is not None else 0
-            only = int(float16.sum()) - copies
-            # A list holds no more values than it has: a float16 shard of a
-            # weight stores that many of the weight's values.
-            capacity = 0.0
-            whole_list = False
-            for key, held, count in contributions:
-                if region.pointer not in held:
-                    continue
-                overlap = int((held[region.pointer] & mask).sum())
-                if overlap:
-                    share = sum(int(value.sum()) for value in held.values())
-                    capacity += count * overlap / share
-                    whole_list = whole_list or stored[key][2] == "float16"
-            if only + copies > capacity:
-                scale = capacity / (only + copies)
-                only, copies = round(only * scale), round(copies * scale)
-            if not only + copies:
-                continue
-            reason = (
-                "storage reads the values in groups along a different axis than they were "
-                "quantized in" if whole_list else
-                f"a shard of fewer than min_quantized_values={storage.min_quantized_values} "
-                "values is stored as float16"
-            )
-            found[region.entry] = _StoredFloat16(only=only, copies=copies, reason=reason)
-            item = report.tensors[region.entry]
-            if only >= item.values:
-                warnings_found.append(
-                    f"quantized weight {item.name!r} is stored as float16, not "
-                    f"{storage.precision}: {reason}"
-                )
-            else:
-                warnings_found.append(
-                    f"quantized weight {item.name!r}: {only + copies} of its values are "
-                    f"stored as float16, not {storage.precision}"
-                    + (" (a second copy)" if copies else "") + f": {reason}"
-                )
-    derived_items = []
     for (names, _), (values, shape) in derived.items():
         description = f"weight computed from {', '.join(names)}"
-        derived_items.append(TensorQuantizationReport(
+        previous_item = findings.derived.get(description)
+        findings.derived[description] = TensorQuantizationReport(
             name=description,
             method="float16",
             bits=None,
-            values=values,
+            values=values + (previous_item.values if previous_item is not None else 0),
             calibration_rows=0,
             effective_group_size=None,
             fallback_reason=_UNFOLLOWED_COMPUTATION,
             sources=names,
-        ))
-        warnings_found.append(
+        )
+        findings.derived_warnings[description] = (
             f"{description} {shape} is stored as float16, not {storage.precision}: "
             f"{_UNFOLLOWED_COMPUTATION}"
         )
-    return tuple(warnings_found), _stored_quantization_report(report, found, derived_items)
+    return _stored_quantization_report(
+        report, findings,
+        storage_precision=storage.precision,
+        min_quantized_values=storage.min_quantized_values,
+    )
 
 
 __all__ = [

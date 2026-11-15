@@ -735,6 +735,7 @@ def transpile_program(
     sharded_names: set[str] = set()
     interface_capacities: dict[str, int] = {}
     payload_names: set[str] = set()
+    storage_warnings: list[str] = []
 
     from cattorch.transpiler import _compile_sprite
 
@@ -911,10 +912,14 @@ def transpile_program(
         ))
         sub_warnings.extend(
             warning for warning in sub_result.warnings
-            if warning.startswith((
-                "GPTQ fallback", "tied weight", "quantized weight", "weight computed from",
-            ))
+            if warning.startswith(("GPTQ fallback", "tied weight"))
         )
+        # Each entry point's report adds what it stored to the earlier ones',
+        # so the last one's warnings say how the program stores each weight.
+        storage_warnings = [
+            warning for warning in sub_result.warnings
+            if warning.startswith(("quantized weight", "weight computed from"))
+        ]
         if codegen.layer_sharing:
             unshared_layers[entrypoint.name] = sub_result.unshared_layers
         fallbacks.update(dict(sub_result.fallback_operations))
@@ -923,6 +928,7 @@ def transpile_program(
         quantization_report = sub_result.quantization
 
     assert combined is not None
+    sub_warnings.extend(storage_warnings)
     _deduplicate_program_payloads(combined, payload_names)
     for state in program.states:
         if state.name in empty_on_load:

@@ -81,6 +81,7 @@ from cattorch.sprite import (
     _wrap_optimized_lifecycle,
 )
 from cattorch.static_storage import (
+    StoredList,
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
@@ -2907,11 +2908,13 @@ def _compile_sprite(
     if static_sources is not None:
         static_sources.finish()
     before_sharing = dict(compiler.static_lists)
-    lists_before_sharing = {entry[0] for entry in sprite.get("lists", {}).values()}
+    # Lists storage shares with an identical one: key -> that one's key.
+    shared_lists: dict[str, str] = {}
     compiler.static_lists = _deduplicate_static_tensors(
         sprite,
         compiler.static_lists,
         effective_ndims=compiler.static_effective_ndims,
+        shared=shared_lists,
     )
 
     # Layout-specialized kernels may replace an original static tensor with
@@ -3127,23 +3130,8 @@ def _compile_sprite(
         for table, reason in compiler.tied_storage_copies.items()
         if table in layouts
     )
-    misgrouped: tuple[str, ...] = ()
-    if quantization_report is not None and static_sources is not None:
-        misgrouped, quantization_report = _storage_quantization_report(
-            quantization_report,
-            static_tensors=compiler.static_lists,
-            deduplicated={
-                key: tensor for key, tensor in before_sharing.items()
-                if key not in compiler.static_lists and f"W_{key}" in lists_before_sharing
-            },
-            storage=storage,
-            sprite=sprite,
-            layouts=layouts,
-            effective_ndims=compiler.static_effective_ndims,
-            interleaved_layouts=compiler.interleaved_static_layouts,
-            recorder=static_sources,
-            model=model,
-        )
+    # Storage records what it stores of each list as it stores it.
+    stored_lists: dict[str, StoredList] = {}
     static_names = _apply_static_storage(
         sprite,
         layouts,
@@ -3152,7 +3140,25 @@ def _compile_sprite(
         interleaved_layouts=compiler.interleaved_static_layouts,
         effective_ndims=compiler.static_effective_ndims,
         source_numels=compiler.static_source_numels,
+        record=stored_lists,
     )
+    misgrouped: tuple[str, ...] = ()
+    if quantization_report is not None and static_sources is not None:
+        for key, winner in shared_lists.items():
+            tensor = before_sharing.get(key)
+            if winner in stored_lists and isinstance(tensor, torch.Tensor):
+                stored_lists[key] = replace(
+                    stored_lists[winner], values=tensor.numel(),
+                    shape=tuple(int(size) for size in tensor.shape), shared_with=winner,
+                )
+        misgrouped, quantization_report = _storage_quantization_report(
+            quantization_report,
+            stored=stored_lists,
+            storage=storage,
+            effective_ndims=compiler.static_effective_ndims,
+            recorder=static_sources,
+            model=model,
+        )
     # Public lists keep their values; a generation sprite's prepare for save
     # also resets it, since its cache is internal data it can't keep.
     _add_prepare_for_save(

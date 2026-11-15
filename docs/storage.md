@@ -133,7 +133,12 @@ a quantized value read in another layout is kept in float16. Each stored list is
 back to the parameter values it holds: an entry whose values are all stored
 in float16 is reported with `method` `"float16"` and the reason, and
 values also or only stored in float16 elsewhere get a `name[float16]` entry.
-`result.warnings` names the parameter each time.
+`result.warnings` names the parameter each time. A weight split into
+several lists is stored at one precision, however short its last list. The
+entry points of an `ExportProgram` each store the lists they read, and the
+report describes them together: a weight one entry point reads as a linear
+weight and another on the right of a matrix product has an integer entry
+and a `name[float16]` entry, whichever entry point comes first.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set
