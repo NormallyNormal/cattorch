@@ -310,6 +310,14 @@ Python:
 
 - Combined-QKV attention gave wrong output with a batch of more than one, or
   when Q, K or V was also used elsewhere.
+- Layer sharing gave wrong output when the layers did more than pass one
+  tensor along: a skip connection across layers, two tensors passed between
+  layers, every layer reading the model's input, or a tensor entering the
+  first layer that was also used later. These models are now exported
+  unshared, with a warning; see
+  [layer sharing](docs/code-generation.md#layer-sharing).
+- `masked_fill` on an integer or boolean tensor wrote a fractional fill
+  value as it was instead of casting it to the tensor's type.
 - A Linear followed by two residual additions added the first one twice, and
   a residual add that broadcasts the Linear's output gave too few values.
 - A Linear followed by BatchNorm1d was folded even when the BatchNorm
