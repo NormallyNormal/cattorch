@@ -281,8 +281,9 @@ def test_a_hidden_step_still_commits_its_states(tmp_path):
 
 def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
     model = recurrent_model("ssm")
-    # Its layers can't share one procedure, and the export says why.
-    with pytest.warns(CattorchWarning, match="distinct weight tensors"):
+    # Its layers can't share one procedure, and the export says why: each
+    # layer passes on its own states as well as its output.
+    with pytest.warns(CattorchWarning, match="more than one tensor of layer `blocks.0`"):
         emulator, result = export(
             model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True),
         )

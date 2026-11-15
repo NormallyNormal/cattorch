@@ -70,9 +70,9 @@ them when:
   (the last layer: the rest of the model). A layer that takes or returns two
   tensors, a skip connection across layers, a layer reading the model's
   input at every layer, or returning every layer's output keeps the model
-  unshared. So does an elementwise operation right after the last layer,
-  such as `x * 2`, when it is fused with the layer's last operation; a
-  normalization or linear layer there is fine;
+  unshared. So does an elementwise operation fused with a layer's last
+  operation, such as `x * 2` right after the last layer or at the start of
+  each layer; a normalization or linear layer there is fine;
 - every layer computes the same operations, with the same shapes and
   constants, and weights of the same sizes. Layers with a
   [mixture of experts](programs-and-moe.md#mixture-of-experts) block aren't

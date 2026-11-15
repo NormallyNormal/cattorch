@@ -236,93 +236,6 @@ def _share_repeated_transformer_layers(
                 "`blocks.0` (its shapes, constants or operations differ)"
             )
 
-    blocks = sprite["blocks"]
-    starts = [group[0][1] for group in grouped]
-    emitted_roots = [root for _, root in compiler.emitted_roots]
-    last_position = max(emitted_roots.index(root) for _, root in grouped[-1])
-    successor = emitted_roots[last_position + 1] if last_position + 1 < len(emitted_roots) else None
-    try:
-        command_groups = [
-            _chain_until(blocks, start, starts[index + 1] if index + 1 < len(starts) else successor)
-            for index, start in enumerate(starts)
-        ]
-    except ValueError:
-        return reject("code from outside the `blocks.N` layers runs between them")
-    main_root = next(
-        identifier for identifier, block in blocks.items()
-        if block.get("topLevel") and block.get("parent") is None
-        and block.get("opcode") != "procedures_definition"
-    )
-    all_commands = set(_chain_until(blocks, main_root, None))
-    owned_groups = [
-        _descendants(blocks, set(commands), all_commands)
-        for commands in command_groups
-    ]
-
-    static_names = {f"W_{name}" for name in compiler.static_lists}
-    list_ids = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
-    role_names = []
-    for owned in owned_groups:
-        found = []
-        for identifier, block in blocks.items():
-            if identifier not in owned:
-                continue
-            field = block.get("fields", {}).get("LIST")
-            if field and field[0] in static_names and field[0] not in found:
-                found.append(field[0])
-        role_names.append(found)
-    if not role_names[0]:
-        return reject("its layers have no weights")
-    if any(len(names) != len(role_names[0]) for names in role_names):
-        log.info("Repeated layer static roles: %s", role_names)
-        return reject(
-            "its layers don't read the same number of distinct weight tensors "
-            "(weights with identical values are stored once, so a layer whose "
-            "weights repeat each other or another layer's reads fewer)"
-        )
-
-    bank_roles = []
-    for role, names in enumerate(zip(*role_names)):
-        if len(set(names)) == 1:
-            continue
-        entries = [sprite["lists"][list_ids[name]] for name in names]
-        sizes = [len(entry[1]) for entry in entries]
-        if len(set(sizes)) != 1:
-            return reject("a weight tensor's stored size differs between layers")
-        # Logical layer banks may exceed one physical Scratch list. The
-        # ordinary precision-aware sharder runs after this transform and
-        # rewrites indexed reads across row-aligned physical shards.
-        bank_roles.append((role, names, sizes[0]))
-    if not bank_roles:
-        return reject("its layers have identical weights, so they have no per-layer weights to bank")
-    banked = [name for _, names, _ in bank_roles for name in names]
-    if len(set(banked)) != len(banked):
-        # A deduplicated tensor read by only some layers, or in a different
-        # role per layer, can't become one row of a bank.
-        return reject(
-            "a weight tensor with the same values is used by some layers but "
-            "not others, or in a different place in different layers"
-        )
-    log.info("Repeated layer bank roles: %s", bank_roles)
-
-    layer_zero_owned = owned_groups[0]
-
-    # Finish every fallible structural check before changing the sprite or the
-    # compiler's static tensors.  A rejected candidate must be a true no-op:
-    # leaving a half-built bank behind makes later layers silently read layer
-    # zero's weights even though no shared procedure was installed.
-    for _, names, _ in bank_roles:
-        winner_id = list_ids[names[0]]
-        for identifier in layer_zero_owned:
-            block = blocks.get(identifier)
-            field = block.get("fields", {}).get("LIST") if block else None
-            if field and field[1] == winner_id and block["opcode"] != "data_itemoflist":
-                return reject(
-                    "an operation in the layers uses a weight in a way other than "
-                    "reading it item by item, so it can't read the weight from a "
-                    "per-layer bank"
-                )
-
     # Every call runs layer zero's code on layer zero's lists, and only one
     # tensor is carried from call to call. So each layer must read the
     # previous layer's output (layer zero: its input) and otherwise only
@@ -472,6 +385,93 @@ def _share_repeated_transformer_layers(
         reader == "" or (reader not in layer_names[0] and position[reader] > first_position)
         for reader in readers.get(first_input, ())
     )
+    blocks = sprite["blocks"]
+    starts = [group[0][1] for group in grouped]
+    emitted_roots = [root for _, root in compiler.emitted_roots]
+    last_position = max(emitted_roots.index(root) for _, root in grouped[-1])
+    successor = emitted_roots[last_position + 1] if last_position + 1 < len(emitted_roots) else None
+    try:
+        command_groups = [
+            _chain_until(blocks, start, starts[index + 1] if index + 1 < len(starts) else successor)
+            for index, start in enumerate(starts)
+        ]
+    except ValueError:
+        return reject("code from outside the `blocks.N` layers runs between them")
+    main_root = next(
+        identifier for identifier, block in blocks.items()
+        if block.get("topLevel") and block.get("parent") is None
+        and block.get("opcode") != "procedures_definition"
+    )
+    all_commands = set(_chain_until(blocks, main_root, None))
+    owned_groups = [
+        _descendants(blocks, set(commands), all_commands)
+        for commands in command_groups
+    ]
+
+    static_names = {f"W_{name}" for name in compiler.static_lists}
+    list_ids = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
+    role_names = []
+    for owned in owned_groups:
+        found = []
+        for identifier, block in blocks.items():
+            if identifier not in owned:
+                continue
+            field = block.get("fields", {}).get("LIST")
+            if field and field[0] in static_names and field[0] not in found:
+                found.append(field[0])
+        role_names.append(found)
+    if not role_names[0]:
+        return reject("its layers have no weights")
+    if any(len(names) != len(role_names[0]) for names in role_names):
+        log.info("Repeated layer static roles: %s", role_names)
+        return reject(
+            "its layers don't read the same number of distinct weight tensors "
+            "(weights with identical values are stored once, so a layer whose "
+            "weights repeat each other or another layer's reads fewer)"
+        )
+
+    bank_roles = []
+    for role, names in enumerate(zip(*role_names)):
+        if len(set(names)) == 1:
+            continue
+        entries = [sprite["lists"][list_ids[name]] for name in names]
+        sizes = [len(entry[1]) for entry in entries]
+        if len(set(sizes)) != 1:
+            return reject("a weight tensor's stored size differs between layers")
+        # Logical layer banks may exceed one physical Scratch list. The
+        # ordinary precision-aware sharder runs after this transform and
+        # rewrites indexed reads across row-aligned physical shards.
+        bank_roles.append((role, names, sizes[0]))
+    if not bank_roles:
+        return reject("its layers have identical weights, so they have no per-layer weights to bank")
+    banked = [name for _, names, _ in bank_roles for name in names]
+    if len(set(banked)) != len(banked):
+        # A deduplicated tensor read by only some layers, or in a different
+        # role per layer, can't become one row of a bank.
+        return reject(
+            "a weight tensor with the same values is used by some layers but "
+            "not others, or in a different place in different layers"
+        )
+    log.info("Repeated layer bank roles: %s", bank_roles)
+
+    layer_zero_owned = owned_groups[0]
+
+    # Finish every fallible structural check before changing the sprite or the
+    # compiler's static tensors.  A rejected candidate must be a true no-op:
+    # leaving a half-built bank behind makes later layers silently read layer
+    # zero's weights even though no shared procedure was installed.
+    for _, names, _ in bank_roles:
+        winner_id = list_ids[names[0]]
+        for identifier in layer_zero_owned:
+            block = blocks.get(identifier)
+            field = block.get("fields", {}).get("LIST") if block else None
+            if field and field[1] == winner_id and block["opcode"] != "data_itemoflist":
+                return reject(
+                    "an operation in the layers uses a weight in a way other than "
+                    "reading it item by item, so it can't read the weight from a "
+                    "per-layer bank"
+                )
+
     # Without a predecessor the first layer starts the script, and the calls
     # take its place there.
     predecessor = next(
