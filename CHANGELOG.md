@@ -397,6 +397,12 @@ Python:
 - A model returning tensors inside a dataclass failed with "requires at
   least one tensor output", or lost them with a warning; the error now names
   the container and the supported ones.
+- Tokenizer exports accepted a falsy `codegen` of another type, such as
+  `{}`, and any truthy `scratch_casefold`, such as `"no"`; they raise
+  `TypeError` as `transpile` does. `CodegenConfig`'s `layer_sharing` and
+  `unrolling`, which a tokenizer ignored, raise `ValueError` for one.
+  `CharTokenizer` and `BPETokenizer` given a SentencePiece model point to
+  `SentencePieceBPETokenizer` instead of saying they take one.
 - An `output_path` that names no file (empty, ending in a separator, or an
   existing directory) raises `ValueError` instead of writing a hidden
   `..sprite3` or a file beside the directory, and so does such a `-o`. The

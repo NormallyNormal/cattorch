@@ -370,6 +370,8 @@ class Kernel:
         object.__setattr__(self, "target", target)
         if not callable(self.emit):
             raise TypeError("kernel emit must be callable")
+        if not isinstance(self.approximate, bool):
+            raise TypeError(f"kernel approximate must be True or False, not {self.approximate!r}")
         if self.validator is not None and not callable(self.validator):
             raise TypeError("kernel validator must be callable or None")
         if not self.target_name:

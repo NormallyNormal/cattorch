@@ -143,7 +143,10 @@ SentencePiece BPE) and export it with `CharTokenizer`, `BPETokenizer` or
 SentencePiece Unigram model, raises `ValueError`; see
 [tokenizers](tokenizers.md). `scratch_casefold=True` is for a SentencePiece
 model trained with case-folding normalization; with any other tokenizer it
-raises `ValueError`.
+raises `ValueError`, and a value other than `True` or `False` raises
+`TypeError`. `name` and `codegen` are checked as `transpile` checks them;
+`CodegenConfig`'s `layer_sharing` and `unrolling` apply only to models, so
+setting them for a tokenizer raises `ValueError`.
 
 ### `CharTokenizer`, `BPETokenizer` and `SentencePieceBPETokenizer`
 

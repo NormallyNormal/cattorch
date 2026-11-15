@@ -361,3 +361,83 @@ def test_interface_names_reject_control_characters():
         EntryPoint("a\tb", returns=(Output("y"),))
     with pytest.raises(ValueError, match="control characters"):
         Output("y\nz")
+
+
+def _sentencepiece_processor():
+    import io
+
+    spm = pytest.importorskip("sentencepiece")
+    model = io.BytesIO()
+    spm.SentencePieceTrainer.train(
+        sentence_iterator=iter(["the cat sat"] * 10), model_writer=model, vocab_size=20,
+        add_dummy_prefix=False, remove_extra_whitespaces=False,
+        normalization_rule_name="identity", minloglevel=3, hard_vocab_limit=False,
+        model_type="bpe",
+    )
+    return spm.SentencePieceProcessor(model_proto=model.getvalue())
+
+
+def test_tokenizer_classes_name_the_kind_they_take():
+    from cattorch import BPETokenizer, CharTokenizer
+
+    processor = _sentencepiece_processor()
+    for exporter in (CharTokenizer, BPETokenizer):
+        with pytest.raises(TypeError) as raised:
+            exporter(processor)
+        message = str(raised.value)
+        assert "needs a Hugging Face tokenizer" in message
+        assert "or a sentencepiece" not in message
+        assert "use SentencePieceBPETokenizer" in message or (
+            "with SentencePieceBPETokenizer" in message
+        )
+
+
+@pytest.mark.parametrize("codegen", [{}, [], 0, "compact"])
+def test_tokenizer_exports_check_codegen_as_transpile_does(tmp_path, codegen):
+    from cattorch import CharTokenizer, transpile_tokenizer
+
+    tokenizer = _char_tokenizer()
+    with pytest.raises(TypeError, match="codegen must be a CodegenConfig"):
+        transpile(nn.Linear(2, 2).eval(), torch.zeros(1, 2), tmp_path / "m", codegen=codegen)
+    with pytest.raises(TypeError, match="codegen must be a CodegenConfig"):
+        CharTokenizer(tokenizer).save(tmp_path / "a", codegen=codegen)
+    with pytest.raises(TypeError, match="codegen must be a CodegenConfig"):
+        transpile_tokenizer(tokenizer, tmp_path / "b", codegen=codegen)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("option", [{"layer_sharing": True}, {"unrolling": "speed"}])
+def test_codegen_options_for_models_are_rejected_for_tokenizers(tmp_path, option):
+    from cattorch import CharTokenizer, CodegenConfig, transpile_tokenizer
+
+    field = next(iter(option))
+    with pytest.raises(ValueError, match=f"CodegenConfig.{field} applies to model exports"):
+        CharTokenizer(_char_tokenizer()).save(tmp_path / "a", codegen=CodegenConfig(**option))
+    with pytest.raises(ValueError, match=f"CodegenConfig.{field} applies to model exports"):
+        transpile_tokenizer(_char_tokenizer(), tmp_path / "b", codegen=CodegenConfig(**option))
+    result = CharTokenizer(_char_tokenizer()).save(
+        tmp_path / "c", codegen=CodegenConfig(compact_internal_names=True, id_namespace="abc"),
+    )
+    assert result.path.exists()
+
+
+@pytest.mark.parametrize("value", ["no", 1, 0, None])
+def test_scratch_casefold_must_be_a_bool(tmp_path, value):
+    from cattorch import SentencePieceBPETokenizer, transpile_tokenizer
+
+    processor = _sentencepiece_processor()
+    with pytest.raises(TypeError, match="scratch_casefold must be True or False"):
+        SentencePieceBPETokenizer(processor, scratch_casefold=value)
+    with pytest.raises(TypeError, match="scratch_casefold must be True or False"):
+        transpile_tokenizer(processor, tmp_path / "t", scratch_casefold=value)
+    with pytest.raises(TypeError, match="scratch_casefold must be True or False"):
+        transpile_tokenizer(_char_tokenizer(), tmp_path / "t", scratch_casefold=value)
+
+
+def test_other_flags_reject_values_that_are_only_truthy():
+    from cattorch import moe
+
+    with pytest.raises(TypeError, match="normalize must be True or False"):
+        moe(router="router", experts="experts", top_k=1, normalize="yes")
+    with pytest.raises(TypeError, match="approximate must be True or False"):
+        Kernel(torch.ops.aten.mish.default, lambda ctx: (), approximate=1)

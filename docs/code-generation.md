@@ -108,6 +108,8 @@ don't collide. `id_namespace=""` makes IDs shorter, but only use it when the
 sprite is the only generated sprite in the project.
 
 `transpile_tokenizer` and the tokenizer `.save()` methods accept the same
-`codegen=` argument.
+`codegen=` argument. A tokenizer has no layers or loops, so `layer_sharing`
+and `unrolling` raise `ValueError` there; the size target, IDs and compaction
+apply.
 
 Related: [`CodegenConfig` reference](api-reference.md#codegenconfig).

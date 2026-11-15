@@ -175,12 +175,14 @@ def moe(
     replaced by an equivalent ``SparseMoE``, checked against ``forward`` on
     probe inputs, so wrong options fail the export.
     """
+    if not isinstance(normalize, bool):
+        raise TypeError(f"normalize must be True or False, not {normalize!r}")
     if scoring not in {"softmax", "sigmoid", "raw"}:
         raise ValueError("scoring must be 'softmax', 'sigmoid', or 'raw'")
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
         raise ValueError("top_k must be a positive integer")
     options = {
-        "router": router, "experts": experts, "top_k": top_k, "normalize": bool(normalize),
+        "router": router, "experts": experts, "top_k": top_k, "normalize": normalize,
         "scoring": scoring, "shared": shared, "scale": float(scale),
     }
 

@@ -157,18 +157,50 @@ def _scratch_cased(character: str) -> bool:
     return character in _LOWERCASE_TARGETS
 
 
-_SUPPORTED_TYPES = (
+_HUGGING_FACE_TYPES = (
     "a Hugging Face tokenizer (transformers' PreTrainedTokenizerFast or "
-    "PreTrainedTokenizer, or a tokenizers.Tokenizer) or a "
-    "sentencepiece.SentencePieceProcessor"
+    "PreTrainedTokenizer, or a tokenizers.Tokenizer)"
 )
+_SUPPORTED_TYPES = f"{_HUGGING_FACE_TYPES} or a sentencepiece.SentencePieceProcessor"
 
 
 def _require_vocabulary(tokenizer, exporter: str) -> None:
-    if not callable(getattr(tokenizer, "get_vocab", None)):
-        raise TypeError(
-            f"{exporter} needs {_SUPPORTED_TYPES}, not {type(tokenizer).__name__}"
-        )
+    """``tokenizer`` must be one ``exporter`` takes: any supported kind for
+    ``transpile_tokenizer``, a Hugging Face tokenizer for the others."""
+    if callable(getattr(tokenizer, "get_vocab", None)):
+        return
+    if exporter == "transpile_tokenizer":
+        raise TypeError(f"{exporter} needs {_SUPPORTED_TYPES}, not {type(tokenizer).__name__}")
+    hint = (
+        "; export a SentencePiece model with SentencePieceBPETokenizer"
+        if _is_sentencepiece(getattr(tokenizer, "processor", tokenizer)) else ""
+    )
+    raise TypeError(
+        f"{exporter} needs {_HUGGING_FACE_TYPES}, not {type(tokenizer).__name__}{hint}"
+    )
+
+
+def _check_scratch_casefold(value) -> None:
+    if not isinstance(value, bool):
+        raise TypeError(f"scratch_casefold must be True or False, not {value!r}")
+
+
+def _check_codegen(name, codegen) -> None:
+    """Check a tokenizer export's ``name`` and ``codegen`` as ``transpile`` does.
+
+    A tokenizer has no layers or loops to generate, so ``CodegenConfig``'s
+    ``layer_sharing`` and ``unrolling`` can't apply and raise when set.
+    """
+    from cattorch.export_options import validate_export_options
+
+    validate_export_options(name=name, codegen=codegen)
+    if codegen is not None:
+        for field, default in (("layer_sharing", False), ("unrolling", "auto")):
+            if getattr(codegen, field) != default:
+                raise ValueError(
+                    f"CodegenConfig.{field} applies to model exports; a tokenizer has no "
+                    "layers or loops for it to change"
+                )
 
 
 def _is_sentencepiece(processor) -> bool:
@@ -355,10 +387,12 @@ class _TokenizerBase(ABC):
         name : str, optional
             Display name inside Scratch. Defaults to the output path stem.
         codegen : CodegenConfig, optional
-            JSON-size, loop-unrolling, and compact-ID controls.
+            JSON-size and compact-ID controls; ``layer_sharing`` and
+            ``unrolling`` apply only to models, and raise ``ValueError``.
 
         Its warnings are also emitted as ``CattorchWarning``.
         """
+        _check_codegen(name, codegen)
         with collect_warnings() as collected:
             result = self._save(output_path, name=name, codegen=codegen)
         return with_warnings(result, collected)
@@ -897,7 +931,8 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                 "SentencePieceBPETokenizer requires a SentencePiece processor; "
                 f"missing: {', '.join(missing)}"
             )
-        self.scratch_casefold = bool(scratch_casefold)
+        _check_scratch_casefold(scratch_casefold)
+        self.scratch_casefold = scratch_casefold
         self._validate_processor_configuration()
         self._special_ids = {
             token_id
@@ -1359,13 +1394,16 @@ def transpile_tokenizer(
         as ``SentencePieceBPETokenizer(scratch_casefold=True)``. Other kinds
         of tokenizer raise ``ValueError`` when it is set.
     codegen : CodegenConfig, optional
-        JSON-size, loop-unrolling, and compact-ID controls.
+        JSON-size and compact-ID controls; ``layer_sharing`` and
+        ``unrolling`` apply only to models, and raise ``ValueError``.
 
     Returns
     -------
     TokenizerResult
         Its ``tokenizer_type`` says which kind was exported.
     """
+    _check_scratch_casefold(scratch_casefold)
+    _check_codegen(name, codegen)
     processor = getattr(tokenizer, "processor", tokenizer)
     if scratch_casefold and not _is_sentencepiece(processor):
         raise ValueError(
