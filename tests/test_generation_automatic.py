@@ -542,9 +542,11 @@ def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
-    assert "_cattorch K cache 1" in result.sharded_lists
-    assert "_cattorch V cache 1" in result.sharded_lists
     emulator = ScratchEmulator(load_sprite(result.path))
+    # The caches are internal: split, but not listed in sharded_lists.
+    assert "_cattorch K cache 1 shard 2" in emulator.lists
+    assert "_cattorch V cache 1 shard 2" in emulator.lists
+    assert not any("cache" in name for name in result.sharded_lists)
     prefill_and_decode(emulator, model, [3, 1, 4], [1])
     assert len(emulator.lists["_cattorch K cache 1"]) == 4 * 64
 

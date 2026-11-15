@@ -327,10 +327,11 @@ an output, a state or `cattorch logits`, is split like this:
   it may start with.
 - The generated blocks read and write every shard.
 
-If your own scripts copy a sharded input or output, copy every shard in order,
-not only the first; `verify` handles shards for you. Weights are split too,
-into internal lists: a compressed weight into smaller pieces, since each
-piece's decoded bytes must also fit in one list.
+The result's `sharded_lists` names the public lists that were split. If your
+own scripts copy a sharded input or output, copy every shard in order, not
+only the first; `verify` handles shards for you. Weights are split too, into
+internal lists that `sharded_lists` leaves out: a compressed weight into
+smaller pieces, since each piece's decoded bytes must also fit in one list.
 
 A token embedding tied to the output head, as in GPT-2 and Mamba, is stored
 once even when it spans several lists: the embedding reads the head's shards.

@@ -31,7 +31,7 @@ from cattorch.results import (
 )
 from cattorch.quantization import quantize_model
 from cattorch import interface
-from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
+from cattorch.interface import STATUS_VARIABLE, input_name, is_public_data, output_name
 from cattorch.layer_sharing import (
     NO_REPEATED_LAYERS, NO_REPEATED_LAYERS_IN_PROGRAM, layer_sharing_warning,
 )
@@ -1213,7 +1213,8 @@ def transpile_program(
         block_count=len(combined.get("blocks", {})),
         list_count=len(combined.get("lists", {})),
         sharded_lists=tuple(sorted(
-            final_data_name(name, frozenset(public_data_names)) for name in sharded_names
+            name for name in sharded_names
+            if is_public_data(name, frozenset(public_data_names))
         )),
         warnings=tuple(dict.fromkeys((
             *sub_warnings, *_layer_sharing_warnings(unshared_layers), *finalized.warnings,

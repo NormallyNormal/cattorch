@@ -84,10 +84,12 @@ class ArtifactResult:
     Scratch. Size fields are bytes: ``archive_bytes`` measures the
     compressed file and ``expanded_json_bytes`` its uncompressed Scratch
     JSON. ``block_count`` and ``list_count`` count the sprite's blocks and
-    lists, and ``sharded_lists`` names the public lists split into shards
-    because they hold more than a Scratch list can. ``warnings`` are the
-    export's warnings (size, fallbacks, anything that changed what was
-    exported), each also emitted as a ``CattorchWarning``.
+    lists, and ``sharded_lists`` names the public lists (inputs, outputs,
+    states, ``cattorch logits``, ...) split into shards because they hold
+    more than a Scratch list can; internal lists, such as weights, are split
+    too but not listed. ``warnings`` are the export's warnings (size,
+    fallbacks, anything that changed what was exported), each also emitted
+    as a ``CattorchWarning``.
     """
 
     path: Path

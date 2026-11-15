@@ -413,7 +413,7 @@ Fields shared by every sprite result:
 | `archive_bytes` | Size of the `.sprite3` file. |
 | `expanded_json_bytes` | Size of the uncompressed `sprite.json`. |
 | `block_count`, `list_count` | Number of generated blocks and lists. |
-| `sharded_lists` | Names of lists split into [shards](storage.md#list-sharding). |
+| `sharded_lists` | Names of the public lists (inputs, outputs, states, `cattorch logits`, ...) split into [shards](storage.md#list-sharding). Internal lists, such as weights, can be split too and aren't listed. |
 | `warnings` | Every warning of the export: size, compatibility, fallbacks, and anything that changed what was exported. Each is also emitted as a `CattorchWarning`. Check these before sharing the sprite. |
 
 ### `TranspileResult`

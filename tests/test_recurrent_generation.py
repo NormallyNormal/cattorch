@@ -669,7 +669,9 @@ def test_a_state_longer_than_a_list_is_sharded(tmp_path, small_list_limit):
     torch.manual_seed(4)
     model = Memory().eval()
     emulator, result = export(model, tmp_path / "memory", reference="forward")
-    assert "_cattorch state memory" in result.sharded_lists
+    # The state is private: split, but not listed in sharded_lists.
+    assert "_cattorch state memory shard 2" in emulator.lists
+    assert not any("state" in name for name in result.sharded_lists)
     run(emulator, "cattorch prefill", [1, 2, 3])
     run(emulator, "cattorch decode", [4])
     torch.testing.assert_close(

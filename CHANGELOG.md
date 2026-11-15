@@ -318,6 +318,9 @@ Python:
   such list returned zeros past the first 200,000.
 - Program inputs, states and outputs longer than a Scratch list could give
   wrong values with status `ok`.
+- A result's `sharded_lists` also named internal lists, such as weights and
+  K/V caches; it names only the public lists, whose shards your scripts read
+  and write.
 - `x @ W` with a large stored weight could fail with an internal error.
 - Crashes: `MaxPool1d(1)`, `Conv2d(stride=(2,))`, pooling without an
   explicit stride, softmax and `transpose` of 0-d tensors, `mean(dim=())`,

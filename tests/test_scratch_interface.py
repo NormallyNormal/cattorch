@@ -380,6 +380,15 @@ def test_a_split_output_keeps_its_public_names(tmp_path):
     assert {"output", "output shard 2", *interface.shard_variables("output")} <= names
 
 
+def test_sharded_lists_names_only_public_lists(tmp_path):
+    # The weight is split in four, but it is internal.
+    model = nn.Linear(1000, 250, bias=False).eval()
+    result = transpile(model, torch.randn(1, 1000), tmp_path / "weights")
+    names = sprite_names(load_sprite(result.path))["data"]
+    assert any(name.startswith("_W_") and name.endswith(" shard 2") for name in names)
+    assert result.sharded_lists == ()
+
+
 def test_a_reduced_output_adds_no_variable_named_like_a_list(tmp_path):
     # The reduction kernel named a working variable "output", which sat
     # beside the public list.

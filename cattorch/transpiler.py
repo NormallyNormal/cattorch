@@ -88,7 +88,7 @@ from cattorch.static_storage import (
 )
 from cattorch import interface
 from cattorch.interface import (
-    NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, final_data_name, input_name,
+    NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, input_name, is_public_data,
     item_checks, length_checks, output_name,
 )
 from cattorch.storage import StorageConfig, quantized_storage
@@ -3316,7 +3316,7 @@ def _finalize_sprite(
         expanded_json_bytes=finalized.expanded_json_bytes,
         block_count=len(sprite.get("blocks", {})),
         list_count=len(sprite.get("lists", {})),
-        sharded_lists=tuple(final_data_name(name) for name in compiled.sharded_lists),
+        sharded_lists=tuple(name for name in compiled.sharded_lists if is_public_data(name)),
         inputs=compiled.inputs,
         outputs=compiled.outputs,
         procedures=compiled.procedures,
