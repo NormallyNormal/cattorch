@@ -74,9 +74,9 @@ its input should give (see [generation](generation.md#verify-a-generator)).
 
 `verify` uses cattorch's emulator, not Scratch itself. cattorch's own tests
 also run a set of exported sprites in the official `@scratch/scratch-vm`: an
-MLP, a CNN, a transformer layer, each weight storage format, a
-variable-length input, a stateful program, and cached generation with its
-tokenizer. To check your own project the same way, use
+MLP, a CNN, a transformer layer (all with the default compressed float32
+weights), float16, int8, int4 and uncompressed weights, a variable-length input, a stateful program, and cached generation
+with its tokenizer. To check your own project the same way, use
 `benchmarks/run_project_vm.cjs` (see the
 [benchmarks README](../benchmarks/README.md)).
 
@@ -116,9 +116,6 @@ decode with a stateless forward. A generation case takes the program
 `transpile` would, and a prompt:
 
 ```python
-import sys
-from pathlib import Path
-
 from cattorch import (
     GenerationProgram, build_generation_benchmark_suite, build_storage_benchmark_suite,
 )
@@ -160,8 +157,8 @@ cattorch analyze-benchmark downloaded-project.sb3
 ```
 
 Each `BenchmarkCase` gives the seconds one call of each variant took and the
-speedup. Scratch's timer is coarse (about 0.033-second steps in browser runs
-so far), so raise `repeats` until each result is many times longer than
+speedup. Scratch's timer is coarse (about 0.033-second steps in browser
+runs), so raise `repeats` until each result is many times longer than
 that. Repeat runs, and compare results only from the same browser, machine,
 and Scratch settings.
 
