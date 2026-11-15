@@ -15,7 +15,6 @@ have it switched on.
 
 from __future__ import annotations
 
-
 import pytest
 import torch
 
@@ -27,27 +26,14 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 import test_generation_init_overlap as generation
 import test_plain_overlap as plain
 import test_program_overlap as program
+from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from test_generation_automatic import load_sprite
-from test_generation_overlap import Script, Scripts
+from sprite_helpers import load_sprite
 from test_optimization import CachedLM
 from test_recurrent_generation import make
 
 INT8 = {"quantization": QuantizationConfig(bits=8, min_quantized_values=1)}
 STORAGES = {"compressed": {}, "int8": INT8}
-
-
-def pause_points(emulator, public):
-    """Every internal procedure's start and every loop repeat."""
-    points = {
-        start for name, start in emulator._procedures.items()
-        if name not in public and start is not None
-    }
-    points.update(
-        block["inputs"]["SUBSTACK"][1] for block in emulator.blocks.values()
-        if block["opcode"] in program.LOOPS and block["inputs"].get("SUBSTACK") is not None
-    )
-    return points
 
 
 class Kind:
@@ -69,28 +55,14 @@ class Kind:
 
     def pauses(self, calls):
         """How many times ``calls``, run on their own after the setup, can pause."""
-        count = [0]
-
-        def prepare(emulator):
-            for start in pause_points(emulator, self.public):
-                emulator._chains[start] = counting(emulator, start)
-
-        def counting(emulator, start):
-            chain = None
-
-            def run():
-                nonlocal chain
-                count[0] += 1
-                if chain is None:
-                    chain = emulator._compile_chain(start)
-                chain()
-            return run
-
-        emulator = self.start(prepare)
-        count[0] = 0
+        hits: list = []
+        emulator = self.start(
+            lambda emulator: record_pauses(emulator, pause_points(emulator, self.public), hits),
+        )
+        hits.clear()
         for call in calls:
             self.run_call(emulator, call)
-        return count[0]
+        return len(hits)
 
     def interleave(self, calls, schedule):
         """Run a script per list of ``calls`` as ``schedule`` says, then check them.
@@ -108,10 +80,7 @@ class Kind:
 
         emulator = self.start(prepare)
         scripts = [Script(chr(ord("A") + index), each) for index, each in enumerate(calls)]
-        for index, pauses in schedule:
-            holder["scripts"].run(scripts[index], pauses)
-        for script in scripts:
-            holder["scripts"].run(script)
+        holder["scripts"].play(scripts, schedule)
         self.check(emulator, finished, scripts)
         return finished
 
@@ -268,7 +237,7 @@ def test_an_init_resumed_after_the_call_that_took_over_writes_no_weights(kind):
     # weights and ended, and wrote some of them again before it paused once
     # more; a call that then ran, and found them decoded, reported ok with them.
     first, second, third = kind.calls
-    for pause in plain.spread(kind.pauses([kind.init]), 12)[:-1]:
+    for pause in spread(kind.pauses([kind.init]), 12)[:-1]:
         for resumed in (1, 10, 100):
             for taking_over in (second, kind.init):
                 kind.interleave(
@@ -283,8 +252,8 @@ def test_a_decode_resumed_while_another_decodes_writes_nothing(kind):
     # the second script's call then reported ok with what that init wrote.
     first, second, third = kind.calls
     count = kind.pauses([kind.init])
-    for pause in plain.spread(count, 5)[:-1]:
-        for other in plain.spread(count, 5)[1:-1]:
+    for pause in spread(count, 5)[:-1]:
+        for other in spread(count, 5)[1:-1]:
             for resumed in (1, 10):
                 kind.interleave(
                     [[kind.init], [kind.init, second]],
@@ -304,7 +273,7 @@ def test_a_call_taken_over_before_it_decodes_decodes_nothing(tmp_path, storage):
     sprite.setup = []
     first, second, _ = sprite.calls
     count = sprite.pauses([second])
-    for other in plain.spread(count, 12)[1:-1]:
+    for other in spread(count, 12)[1:-1]:
         for resumed in (1, 10, 40):
             sprite.interleave(
                 [[first], [second]], [(0, 0), (1, other), (0, resumed), (1, None), (0, None)],

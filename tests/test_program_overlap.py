@@ -21,13 +21,12 @@ from cattorch import (
 from cattorch.program_runtime import ProgramReplay
 from cattorch.util.scratch.emulator import ScratchEmulator
 
+from overlap_harness import LOOPS, Script, Scripts, record_pauses
 from scratch_status import INTERRUPTED, OVERTAKEN
-from test_generation_automatic import load_sprite
-from test_generation_overlap import Script, Scripts
+from sprite_helpers import load_sprite
 
 TOLERANCE = 1e-5
 LIFECYCLE = ("cattorch init", "cattorch reset", "cattorch prepare for save")
-LOOPS = ("control_repeat", "control_for_each", "control_repeat_until")
 
 
 class Machine(nn.Module):
@@ -82,7 +81,9 @@ STATELESS = ExportProgram(entrypoints=(
 def pause_points(emulator, public):
     """Where Scratch can pause a script, and whether each is a loop.
 
-    A script calling a public block isn't paused before it runs.
+    A script calling a public block isn't paused before it runs. Unlike
+    ``overlap_harness.pause_points``, only the loops of the program's own
+    blocks, which commit and restore the states, are pause points.
     """
     blocks = emulator.blocks
     points = {
@@ -203,14 +204,7 @@ class Sprite:
         emulator, replay, scripts = self.start(setup, lambda emulator: Scripts(
             emulator, finished, self.run_call, pause_points(emulator, self.public),
         ))
-        pair = (Script("first", first), Script("second", second))
-        for index, pauses in schedule:
-            if pauses == "stop":
-                scripts.stop(pair[index])
-            else:
-                scripts.run(pair[index], pauses)
-        for script in pair:
-            scripts.run(script)
+        scripts.play((Script("first", first), Script("second", second)), schedule)
         for result in finished:
             self.check(replay, result)
         return emulator, replay, finished
@@ -238,28 +232,18 @@ class Sprite:
 
     def pauses(self, setup, calls):
         """Whether each place ``calls`` can pause, run on their own after ``setup``, is a loop."""
-        kinds: list[bool] = []
+        hits: list = []
 
-        def count(emulator):
-            for start, loop in pause_points(emulator, self.public).items():
-                emulator._chains[start] = counting(emulator, start, loop)
+        def record(emulator):
+            points = pause_points(emulator, self.public)
+            record_pauses(emulator, points, hits)
+            return points
 
-        def counting(emulator, start, loop):
-            chain = None
-
-            def run():
-                nonlocal chain
-                kinds.append(loop)
-                if chain is None:
-                    chain = emulator._compile_chain(start)
-                chain()
-            return run
-
-        emulator, _, _ = self.start(setup, count)
-        kinds.clear()
+        emulator, _, points = self.start(setup, record)
+        hits.clear()
         for call in calls:
             self.run_call(emulator, call)
-        return kinds
+        return [points[start] for start in hits]
 
 
 def commit_start(kinds):

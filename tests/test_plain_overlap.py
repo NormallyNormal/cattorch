@@ -17,32 +17,15 @@ from torch import nn
 from cattorch import QuantizationConfig, StorageConfig, interface, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_generation_automatic import load_sprite
-from test_generation_overlap import Script, Scripts, spread
+from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import OVERTAKEN
-from test_program_overlap import LOOPS
+from sprite_helpers import load_sprite
 
 TOLERANCE = 1e-5
 FORWARD, INIT, PREPARE = "cattorch forward", "cattorch init", "cattorch prepare for save"
 PUBLIC = (FORWARD, INIT, PREPARE)
 # Pause places tried per case, spread over the call.
 SAMPLES = 24
-
-
-def pause_points(emulator):
-    """Where Scratch can pause a script: internal procedure calls and loop repeats.
-
-    A script calling a public block isn't paused before it runs.
-    """
-    points = {
-        start for name, start in emulator._procedures.items()
-        if name not in PUBLIC and start is not None
-    }
-    points.update(
-        block["inputs"]["SUBSTACK"][1] for block in emulator.blocks.values()
-        if block["opcode"] in LOOPS and block["inputs"].get("SUBSTACK") is not None
-    )
-    return points
 
 
 class Plain:
@@ -141,28 +124,14 @@ class Plain:
 
     def pauses(self, setup, calls):
         """How many times ``calls``, run on their own after ``setup``, can pause."""
-        count = [0]
-
-        def counting(emulator, start):
-            chain = None
-
-            def run():
-                nonlocal chain
-                count[0] += 1
-                if chain is None:
-                    chain = emulator._compile_chain(start)
-                chain()
-            return run
-
-        def prepare(emulator):
-            for start in pause_points(emulator):
-                emulator._chains[start] = counting(emulator, start)
-
-        emulator, _ = self.start(setup, prepare)
-        count[0] = 0
+        hits: list = []
+        emulator, _ = self.start(
+            setup, lambda emulator: record_pauses(emulator, pause_points(emulator, PUBLIC), hits),
+        )
+        hits.clear()
         for call in calls:
             self.run_call(emulator, call)
-        return count[0]
+        return len(hits)
 
     def interleave(self, setup, first, second, schedule):
         """Run two scripts after ``setup``, as ``schedule`` says, and check their calls.
@@ -172,16 +141,9 @@ class Plain:
         """
         finished: list[tuple] = []
         emulator, scripts = self.start(setup, lambda emulator: Scripts(
-            emulator, finished, self.run_call, pause_points(emulator),
+            emulator, finished, self.run_call, pause_points(emulator, PUBLIC),
         ))
-        pair = (Script("first", first), Script("second", second))
-        for index, pauses in schedule:
-            if pauses == "stop":
-                scripts.stop(pair[index])
-            else:
-                scripts.run(pair[index], pauses)
-        for script in pair:
-            scripts.run(script)
+        scripts.play((Script("first", first), Script("second", second)), schedule)
         previous = emulator.previous
         for result in finished:
             self.check(result, previous=previous)

@@ -9,16 +9,16 @@ logits and that a later reset or prefill always recovers.
 
 from __future__ import annotations
 
-import threading
-
 import pytest
 import torch
 
 from cattorch import CodegenConfig, GenerationProgram, RecurrentGenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
+from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from test_generation_automatic import load_sprite, logits_of
+from sprite_helpers import load_sprite
+from test_generation_automatic import logits_of
 from test_optimization import CachedLM
 from test_recurrent_generation import make, reference_rows
 from cattorch.interface import TOKEN_IDS
@@ -27,30 +27,8 @@ TOLERANCE = 1e-4
 # Pause places tried per case, spread over the call.
 SAMPLES = 8
 SETUP = [1, 2, 3, 4]
-
-
-def spread(count, samples=SAMPLES):
-    """Up to ``samples`` of ``range(count)``, first and last included."""
-    if count <= samples:
-        return list(range(count))
-    return sorted({round(index * (count - 1) / (samples - 1)) for index in range(samples)})
-
-
-class Stopped(Exception):
-    """A script stopped where it was paused."""
-
-
+# Scripts pause only at calls inside the warp blocks, not before these run.
 PUBLIC = ("cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode")
-
-
-def paused_procedures(emulator):
-    """Where Scratch can pause a script: calls inside the warp blocks.
-
-    A script calling a public block isn't paused before it runs.
-    """
-    return {
-        start for name, start in emulator._procedures.items() if name not in PUBLIC
-    }
 
 
 def run_generation_call(emulator, call):
@@ -65,107 +43,6 @@ def run_generation_call(emulator, call):
         list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"]),
         emulator.variables["cattorch cache length"], before,
     )
-
-
-class Script:
-    """A Scratch script making calls, by default generation calls ``(procedure, tokens)``."""
-
-    def __init__(self, name, calls):
-        self.name = name
-        self.calls = calls
-        self.results: list[tuple] = []
-        self.pauses = 0
-        self.budget = 0
-        self.stop = False
-        self.done = False
-        self.error: BaseException | None = None
-        self.thread: threading.Thread | None = None
-
-
-class Scripts:
-    """Run scripts on one sprite, switching between them where a procedure is called.
-
-    ``run_call(emulator, call)`` runs each call and returns what to record of
-    it; the chains starting at ``pauses`` are where scripts can pause.
-    """
-
-    def __init__(self, emulator, finished, run_call=run_generation_call, pauses=None):
-        self.emulator = emulator
-        self.finished = finished
-        self.run_call = run_call
-        self.condition = threading.Condition()
-        self.running: Script | None = None
-        self.local = threading.local()
-        for start in paused_procedures(emulator) if pauses is None else pauses:
-            emulator._chains[start] = self._pausing(start)
-
-    def _pausing(self, start):
-        # Compiled when it first runs, so that it runs the pausing chains
-        # nested in it.
-        chain = None
-
-        def run():
-            nonlocal chain
-            script = getattr(self.local, "script", None)
-            if script is not None:
-                script.pauses += 1
-                if script.pauses > script.budget:
-                    self._pause(script)
-            if chain is None:
-                chain = self.emulator._compile_chain(start)
-            chain()
-        return run
-
-    def _pause(self, script):
-        # Each script has its own procedure arguments in Scratch.
-        frames = self.emulator._arguments
-        saved = frames[:]
-        frames.clear()
-        with self.condition:
-            self.running = None
-            self.condition.notify_all()
-            self.condition.wait_for(lambda: self.running is script)
-        frames[:] = saved
-        if script.stop:
-            raise Stopped
-
-    def _body(self, script):
-        self.local.script = script
-        with self.condition:
-            self.condition.wait_for(lambda: self.running is script)
-        try:
-            for call in script.calls:
-                result = (script.name, *self.run_call(self.emulator, call))
-                script.results.append(result)
-                self.finished.append(result)
-        except Stopped:
-            pass
-        except BaseException as error:  # noqa: BLE001 - reraised in the main thread
-            script.error = error
-        with self.condition:
-            script.done = True
-            self.running = None
-            self.condition.notify_all()
-
-    def run(self, script, pauses=None):
-        """Let ``script`` run until it pauses ``pauses`` more times, or to its end."""
-        if script.done:
-            return
-        script.budget = script.pauses + pauses if pauses is not None else float("inf")
-        if script.thread is None:
-            script.thread = threading.Thread(target=self._body, args=(script,), daemon=True)
-            script.thread.start()
-        with self.condition:
-            self.running = script
-            self.condition.notify_all()
-            self.condition.wait_for(lambda: self.running is None)
-        if script.error is not None:
-            raise script.error
-
-    def stop(self, script):
-        """Stop ``script`` where it is paused."""
-        script.stop = True
-        self.run(script)
 
 
 class Generator:
@@ -204,15 +81,10 @@ class Generator:
         """
         emulator = self.start(fresh)
         finished: list[tuple] = []
-        scripts = Scripts(emulator, finished)
-        pair = (Script("first", first), Script("second", second))
-        for index, pauses in schedule:
-            if pauses == "stop":
-                scripts.stop(pair[index])
-            else:
-                scripts.run(pair[index], pauses)
-        for script in pair:
-            scripts.run(script)
+        scripts = Scripts(
+            emulator, finished, run_generation_call, pause_points(emulator, PUBLIC, loops=False),
+        )
+        scripts.play((Script("first", first), Script("second", second)), schedule)
         self.prefix: list | None = [] if fresh else list(SETUP)
         # A call that fails writes no output: the logits stay as the last ok
         # call left them, or are empty if one was taken over while it copied.
@@ -279,20 +151,14 @@ class Generator:
 
     def pauses(self, calls, fresh=False):
         """How many procedure calls ``calls`` make, run on their own after the setup."""
-        counter = {"calls": 0}
+        hits: list = []
         emulator = self.start(fresh)
-        for start in paused_procedures(emulator):
-            chain = emulator._chain_runner(start)
-
-            def counted(chain=chain):
-                counter["calls"] += 1
-                chain()
-            emulator._chains[start] = counted
+        record_pauses(emulator, pause_points(emulator, PUBLIC, loops=False), hits)
         for procedure, tokens in calls:
             if tokens is not None:
                 emulator.lists[TOKEN_IDS] = list(tokens)
             emulator.run_procedure(procedure)
-        return counter["calls"]
+        return len(hits)
 
 
 def kv_generator(tmp_path, sharing, hidden_prefill=True):
@@ -342,7 +208,7 @@ OVERLAPS = {
 @pytest.mark.parametrize("overlap", sorted(OVERLAPS))
 def test_a_call_paused_while_another_runs_never_reports_wrong_logits(generator, overlap):
     first, second = OVERLAPS[overlap]
-    for pause in spread(generator.pauses(first)):
+    for pause in spread(generator.pauses(first), SAMPLES):
         # The second script runs to its end while the first is paused, then
         # the first resumes; or the first is stopped where it was paused.
         for resume in (None, "stop"):
@@ -357,7 +223,7 @@ def test_a_call_taken_over_while_it_decodes_the_weights_leaves_them_to_decode_ag
     # In a freshly loaded project the first call decodes the weights; one that
     # resumes doing so after another call decoded them leaves them wrong.
     first, second = OVERLAPS[overlap]
-    for pause in spread(generator.pauses(first, fresh=True)):
+    for pause in spread(generator.pauses(first, fresh=True), SAMPLES):
         for resume in (None, "stop"):
             state = generator.interleave(
                 first, second, [(0, pause), (1, None), (0, resume)], fresh=True,
