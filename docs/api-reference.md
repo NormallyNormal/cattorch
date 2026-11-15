@@ -12,9 +12,9 @@ Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
 described in [programs and sparse MoE](programs-and-moe.md) and
 [markers](markers.md). [Experimental](stability.md) APIs are imported from
 `cattorch.experimental`: the explicit MoE classes, `analyze`, and the kernel
-interface (`Kernel`, `op`, `check_kernel`, `build_kernel_benchmark`, and
-`cattorch.scratch`), described in
-[custom kernels and operations](custom-kernels.md).
+interface (`Kernel`, `KernelContext`, `TensorInfo`, `op`, `Operation`,
+`check_kernel`, `build_kernel_benchmark`, and `cattorch.scratch`), described
+in [custom kernels and operations](custom-kernels.md).
 
 ## Model export
 
@@ -118,9 +118,6 @@ The classes markers compile to can also be used directly:
 | `ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate` | Declare entry points and state by hand; see [programs](programs-and-moe.md#named-entrypoints-and-state). |
 | `ProgramCall` | One block call: in `verify(..., calls=...)`, and in an `ExportProgram`'s `calibration=`. |
 | `ModuleAdapter`, `AdapterContext` | Replace a module type during export; the factory gets the module and an `AdapterContext` with its `module_path` and the program's `state_names`. See [adapters](programs-and-moe.md#scoped-module-adapters). |
-| `CattorchWarning` | Base class of every warning cattorch emits. |
-| `CustomMoEWarning` | A `CattorchWarning` warned when a hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
-| `INTERFACE_VERSION` | The version of the [Scratch interface](scratch-interface.md) exported sprites implement, `1`. |
 
 `op`, for declaring a new operation, is [experimental](stability.md); see
 [custom kernels and operations](custom-kernels.md).
@@ -276,7 +273,7 @@ error when the object is created.
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `activations` | `True` | Use fast activation approximations (currently QuickGELU for exact and tanh GELU). |
+| `activations` | `True` | Use QuickGELU in place of exact and tanh GELU. |
 | `layer_norm` | `True` | Compute LayerNorm variance in one pass. |
 | `softmax` | `True` | Skip max subtraction in softmax. |
 | `neuron_pruning` | `0.0` | Fraction in `[0, 1)` of hidden units to remove from Linear → activation → Linear paths and `StackedSwiGLUMoE` experts. Finding the paths needs a model `torch.fx` can trace symbolically; one it can't raises `UnsupportedModelError`. |
@@ -378,7 +375,7 @@ GPTQ needs at least one calibration example, passed as `transpile`'s
 | `id_namespace` | `None` | Three characters from `A-Z a-z 0-9 - _` included in block IDs. `None` picks a random one. `""` gives shorter IDs for a sprite that is the only generated sprite in its project. |
 | `compact_internal_names` | `False` | Shorten internal variable, list, and custom block names. |
 | `compact_schema` | `False` | Leave redundant fields out of the saved block data. |
-| `layer_sharing` | `False` | Share one copy of the code across repeated transformer layers where the layout allows it, falling back with a warning where it doesn't. |
+| `layer_sharing` | `False` | Share one copy of the code across repeated transformer layers. Sharing is all or nothing: if any layer doesn't fit, the whole model is exported without sharing, with a warning. |
 
 See [code generation](code-generation.md) before turning on `compact_schema` or
 `layer_sharing`.
@@ -534,14 +531,15 @@ number of `values`, `calibration_rows` seen, `effective_group_size`,
 computed from parameters is computed from (empty otherwise), and
 `override`, the `QuantizationConfig.overrides` key whose settings it used,
 if any, or `"head_bits"` for a generation export's output head whose
-settings `QuantizationConfig.head_bits` chose. A weight computed from parameters is named by its attribute, such
-as a parametrized `fc.weight`, or `weight computed from <parameters>`. A
-`method` of `"float16"` means the values are stored in float16, and
-`fallback_reason` says why: the tensor was smaller than
-`min_quantized_values`, integer storage wouldn't be smaller, an override
-or `head_bits=None` keeps it float16, storage reads it grouped along a different axis than it
-was quantized in, or it is a weight computed from parameters where
-quantization couldn't compute it from quantized values instead.
+settings `QuantizationConfig.head_bits` chose. A weight computed from
+parameters is named by its attribute, such as a parametrized `fc.weight`,
+or `weight computed from <parameters>`. A `method` of `"float16"` means the
+values are stored in float16, and `fallback_reason` says why: the tensor
+was smaller than `min_quantized_values`, integer storage wouldn't be
+smaller, an override or `head_bits=None` keeps it float16, storage reads it
+grouped along a different axis than it was quantized in, or it is a weight
+computed from parameters where quantization couldn't compute it from
+quantized values instead.
 Values of a quantized entry that are also, or only, stored in float16, such
 as the copy a second use reads in another layout, are reported in a
 `name[float16]` entry. `name[remaining]` holds a parameter's values that no
@@ -654,6 +652,14 @@ comparing their outputs, and, for a paired benchmark, every run's
 | `UnsupportedModelError` | `ValueError` | The model can't be exported as it is; see [`transpile`](#transpile). |
 | `UnsupportedOperationError` | `NotImplementedError` | The model uses an operation cattorch can't convert. The message names the operation and module. |
 | `CattorchWarning` | `UserWarning` | Base class of every warning cattorch emits. |
+| `CustomMoEWarning` | `CattorchWarning` | A hand-written block was detected and exported as a sparse mixture of experts. Filter it with `warnings` if that's intended. |
 
 Invalid arguments raise ordinary `TypeError` or `ValueError`. See
 [troubleshooting](troubleshooting.md).
+
+## Versions
+
+| Name | Value |
+|---|---|
+| `cattorch.__version__` | The installed package's version, as a string. |
+| `INTERFACE_VERSION` | The version of the [Scratch interface](scratch-interface.md) exported sprites implement, `1`. A sprite stores it in its `cattorch interface version` variable. |
