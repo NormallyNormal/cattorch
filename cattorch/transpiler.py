@@ -60,16 +60,15 @@ from cattorch.quantization import (
 from cattorch.sprite import (
     _add_input_checks,
     _add_prepare_for_save,
-    _finish_generation_prepare,
     _gate_chain,
     _logical_list_sizes,
     _merge_duplicate_lists,
     _graph_layer,
     _remove_unused,
     _share_repeated_transformer_layers,
-    _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
+from cattorch.generation_blocks import _finish_generation_prepare, _wrap_generation_lifecycle
 from cattorch.static_storage import (
     _apply_static_storage,
     _apply_tied_static_aliases,

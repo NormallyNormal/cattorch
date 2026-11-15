@@ -40,7 +40,7 @@ from cattorch.program_export import ProgramAssembly, transpile_program
 from cattorch.program_runtime import MethodModule
 from cattorch.quantization import QuantizationConfig
 from cattorch.results import GenerationResult, generation_result
-from cattorch.sprite import _add_generation_blocks, _finish_generation_prepare
+from cattorch.generation_blocks import _add_generation_blocks, _finish_generation_prepare
 from cattorch.guards import _guard_generation_init
 from cattorch.procedures import _add_warp_procedure, _remove_completion_broadcast
 from cattorch.storage import StorageConfig

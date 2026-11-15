@@ -6,7 +6,8 @@ import pytest
 
 from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE
-from cattorch.sprite import _add_generation_blocks, _wrap_optimized_lifecycle
+from cattorch.generation_blocks import _add_generation_blocks
+from cattorch.sprite import _wrap_optimized_lifecycle
 from cattorch.util.scratch.dsl import (
     Program, add, append, clear, eq, if_, item, length, replace, set_var, sub,
 )
@@ -59,7 +60,7 @@ def test_top_k_matches_torch_with_infinite_nan_and_tied_logits(compact):
 
     import torch
 
-    from cattorch.sprite import _build_compact_top_k_program, _build_top_k_program
+    from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
 
     build = _build_compact_top_k_program if compact else _build_top_k_program
     emulator = ScratchEmulator(build(5, logits="output").compile())

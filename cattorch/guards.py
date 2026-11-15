@@ -61,16 +61,17 @@ save                                                     resets the states,
 A plain export and a tokenizer have no states, so their calls are never
 refused: an overlapping call only makes the earlier one report that it was
 overtaken. A program's entry points are refused only while busy, and only
-in a program with states; an entry point that updates no
-state never sets busy, so stateless calls may overlap each other. A
-generation sprite's states are the cache or recurrent states that every
-call reads and writes, so each call holds busy throughout.
+in a program with states; an entry point that updates no state never sets
+busy, so stateless calls may overlap each other. A generation sprite's
+states are the cache or recurrent states that every call reads and writes,
+so each call holds busy throughout.
 
 Where each policy is written: ``_guard_plain_calls`` (plain);
 ``program_export._build_entry_wrapper`` and the lifecycle blocks in
 ``transpile_program`` (programs; a ``RecurrentGenerationProgram`` turns them
 off with ``_guard_overlaps=False`` and gets the generation guards instead);
-``sprite._add_generation_blocks``, ``sprite._finish_generation_prepare`` and
+``generation_blocks._add_generation_blocks`` and
+``generation_blocks._finish_generation_prepare``, with
 ``_guard_generation_init`` (generation); ``tokenizer._add_tokenizer_interface``.
 """
 

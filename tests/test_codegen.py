@@ -13,7 +13,7 @@ from cattorch.util.scratch.ids import (
     compact_sprite_ids,
 )
 from cattorch.util.scratch.remap import remap_ids
-from cattorch.sprite import _build_compact_top_k_program, _build_top_k_program
+from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
 from sprite_helpers import load_sprite
 
 
