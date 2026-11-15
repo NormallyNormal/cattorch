@@ -3,7 +3,9 @@
 [Documentation home](index.md)
 
 `ExportProgram` puts several model methods, and state that persists between
-calls, into one sprite. Programs and adapters are stable; the
+calls, into one sprite. Any model can keep state this way, not only a
+language model: a running total, a memory of past inputs, or the hidden
+state of a recurrent network fed one reading per call. Programs and adapters are stable; the
 [mixture-of-experts classes](#mixture-of-experts) and `analyze` are
 [experimental](stability.md). For a model with just a `forward` method and no state, use the
 [ordinary export](getting-started.md) instead.
@@ -50,47 +52,65 @@ state. `returns` maps each returned tensor to an output list or a state update.
 Here, each call adds `value` to the stored counter and outputs the new total.
 
 The sprite gets `cattorch step`, `cattorch init`, `cattorch reset`, and
-`cattorch prepare for save` blocks. Lists are named after the entrypoint and
+`cattorch prepare for save` blocks. Lists are named after the entry point and
 state, such as `cattorch step value`, `cattorch step result`, and
 `cattorch state counter`. When a call ends, the sprite sets `cattorch status`
 to `ok`, or to why it failed, such as an input list with the wrong number of
-items, and broadcasts `cattorch step complete`.
+items, and broadcasts `cattorch step complete`. The
+[Scratch interface](scratch-interface.md#program-sprites) lists every name.
 
 Rules:
 
-- A call can update each state at most once.
-- `init`, `reset`, and `prepare for save` can't be used as entrypoint names.
-- List names must be unique across entrypoints and states, and can't end in
+- `init`, `reset`, and `prepare for save` can't be used as entry point names.
+- List names must be unique across entry points and states, and can't end in
   `shard N`, which is used for [sharding](storage.md#list-sharding).
-- An input and an output of the same entrypoint can share a name only if they
-  have the same shape. The output then replaces the input in place.
+- An input and an output of the same entry point can share a name only if
+  they have the same shape. The output then replaces the input in place.
 
-`State(mode="replace")` has a fixed shape, and each update replaces it.
-`State(mode="append")` grows along its first dimension with each update, up to
-its `capacity`. A call that fails leaves the outputs and state as they were.
-`cattorch reset` restores every state to its initial value.
+### State
 
-### Stopped and overlapping calls
+A `State(name, initial)` is a tensor the sprite keeps between calls, in the
+list `cattorch state NAME`. An entry point reads it with `StateInput(name)`
+among its `arguments`, and writes it with `StateUpdate(name)` among its
+`returns`. Every entry point can read every state.
 
-Call the sprite's blocks from one script at a time. What happens when calls
-from several scripts overlap, or a block is stopped part way, is the same for
-every sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
+| | `mode="replace"` (the default) | `mode="append"` |
+|---|---|---|
+| Shape | Fixed: the shape of `initial`. | The first dimension grows, from `initial`'s rows up to `capacity` rows; the others are fixed. `capacity=` is required. |
+| An update | The returned tensor, with the state's shape, replaces it. | The returned rows are added at the end. |
+| When full | | The call is refused with `state full: cattorch state NAME` and changes nothing. |
 
-A call changes the states at its end, all of them together. One stopped while
-it changes them, or taken over then, leaves them partly changed: every entry
-point call then reports `an earlier call was stopped or is still running;
-reset first` and changes nothing, until `cattorch reset`. A sprite without
-state has nothing to reset; its next call simply runs.
+- A call can update each state at most once. It writes its updates at its
+  end, all together, and only if it succeeds: a call that fails leaves the
+  outputs and states as they were.
+- `cattorch reset` restores every state to its `initial` value, so a learned
+  start state works.
+- Each entry point method is traced once, like any export, so it follows one
+  path: it can't branch on tensor values, and every shape is fixed when you
+  export, except an append state's first dimension.
 
-Because an append state's first dimension changes at runtime, it is the one
-exception to fixed shapes. This variable-length dimension is called a runtime
-extent. Elementwise, linear, normalization, matrix, and reshaping operations
-can use it, with these limits, all checked at export:
+That growing dimension is called a runtime extent. Elementwise, linear,
+normalization, matrix, and reshaping operations can use it, with these
+limits, all checked at export:
 
 - A tensor can have only one runtime extent, and it can't be multiplied by
   another.
 - It can't be partly sliced, and output shapes can't depend on tensor values.
 - Convolution and pooling accept it only as the batch dimension.
+
+With [markers](markers.md#entry-points-and-state), each buffer an
+`@entrypoint` method changes becomes a state: a replace state, or an append
+state if it grows along its first dimension, with the `capacity=` you give.
+
+### Stopped and overlapping calls
+
+Call the sprite's blocks from one script at a time. What the sprite detects
+when calls overlap, and how to recover, is in
+[overlapping calls](scratch-interface.md#overlapping-calls). A call stopped,
+or taken over, while it writes the states leaves them partly written: every
+entry point then reports `an earlier call was stopped or is still running;
+reset first` and changes nothing, until `cattorch reset`. A program without
+state has nothing to reset; its next call simply runs.
 
 To test a sequence of calls, pass `ProgramCall` values to `verify()`:
 
