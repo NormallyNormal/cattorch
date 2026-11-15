@@ -405,3 +405,39 @@ def test_a_reduced_output_adds_no_variable_named_like_a_list(tmp_path):
         torch.tensor([float(value) for value in emulator.lists["output"]]),
         example.sum().reshape(1),
     )
+
+
+def test_benchmark_project_names(tmp_path):
+    """Each builder's stage names are the documented public ones."""
+    from cattorch import (
+        benchmark, build_benchmark_suite, build_paired_benchmark, build_storage_benchmark_suite,
+    )
+
+    names = documented("Benchmark projects")["data"]
+    assert names == {
+        benchmark.EXACT_TIMINGS, benchmark.FAST_TIMINGS, benchmark.SUITE_RESULTS,
+        benchmark.STORAGE_SIZES, benchmark.REPEATS, benchmark.WARMUPS, benchmark.COMPARISON,
+    }
+    model, example = nn.Linear(3, 2).eval(), torch.randn(1, 3)
+    projects = {
+        "paired": build_paired_benchmark(model, example, tmp_path / "paired", repeats=1),
+        "suite": build_benchmark_suite([("one", model, example)], tmp_path / "suite", repeats=1),
+        "storage": build_storage_benchmark_suite(
+            [("one", model, example)], tmp_path / "storage", repeats=1,
+        ),
+    }
+    settings = {benchmark.REPEATS, benchmark.WARMUPS}
+    expected = {
+        "paired": {benchmark.EXACT_TIMINGS, benchmark.FAST_TIMINGS, *settings, benchmark.COMPARISON},
+        "suite": {benchmark.SUITE_RESULTS, *settings, benchmark.COMPARISON},
+        "storage": {benchmark.SUITE_RESULTS, benchmark.STORAGE_SIZES, *settings},
+    }
+    for kind, path in projects.items():
+        stage = next(
+            target for target in read_archive(path, PROJECT_JSON)[0]["targets"] if target["isStage"]
+        )
+        public = {
+            entry[0] for section in ("variables", "lists") for entry in stage[section].values()
+            if not entry[0].startswith(interface.INTERNAL_PREFIX)
+        }
+        assert public == expected[kind], kind

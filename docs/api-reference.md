@@ -553,10 +553,13 @@ results with `analyze_benchmark`. Every builder takes `repeats` (the timed
 calls per variant), `warmups` (untimed calls first), and the export options
 of `transpile`: `fast_config`, `storage`, `quantization`, `calibration` (a
 list, since every variant is exported), `sig_figs`, `codegen`, `adapters` and
-`kernels`. A project's public names are its results lists, such as
-`cattorch benchmark results`, and the stage variables
-`cattorch benchmark repeats`, `cattorch benchmark warmups` and
-`cattorch benchmark comparison`; everything else is internal.
+`kernels`. A project's public names are its results lists
+(`cattorch exact timings`, `cattorch fast timings`,
+`cattorch benchmark results` and `cattorch storage sizes`) and the stage
+variables `cattorch benchmark repeats`, `cattorch benchmark warmups` and
+`cattorch benchmark comparison`; everything else is internal. See
+[benchmark projects](scratch-interface.md#benchmark-projects) for which
+builder writes each.
 
 ### `build_paired_benchmark`
 

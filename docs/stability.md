@@ -23,7 +23,8 @@ changed on the way to 1.0.
 - **The Scratch interface:** every block, list, variable, and broadcast in the
   [Scratch interface](scratch-interface.md), including the names
   [`build_project`](projects-and-cli.md#bridges) adds to a project, and a
-  benchmark project's results lists and settings variables.
+  [benchmark project's](scratch-interface.md#benchmark-projects) results
+  lists and settings variables.
 - **The command line:** the `cattorch` commands, options, exit statuses and
   JSON summary keys in
   [projects and the command line](projects-and-cli.md#the-command-line).
