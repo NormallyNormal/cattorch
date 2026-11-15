@@ -82,6 +82,18 @@ def _procedure_mutation(
     return mutation
 
 
+def _add_argument_reporters(blocks: dict, prototype: str, arguments: Sequence[str]) -> None:
+    """Give the procedure prototype ``prototype`` a reporter for each of ``arguments``."""
+    for argument in arguments:
+        reporter = f"{prototype}_{argument_id(argument)}"
+        blocks[prototype]["inputs"][argument_id(argument)] = [1, reporter]
+        blocks[reporter] = {
+            "opcode": "argument_reporter_string_number", "next": None,
+            "parent": prototype, "inputs": {}, "fields": {"VALUE": [argument, None]},
+            "shadow": True, "topLevel": False,
+        }
+
+
 def _add_warp_procedure(
     sprite: dict, name: str, program, *, x: int, y: int, arguments: Sequence[str] = (),
 ) -> dict:
@@ -114,14 +126,7 @@ def _add_warp_procedure(
         "inputs": {}, "fields": {}, "shadow": True, "topLevel": False,
         "mutation": _procedure_mutation(name, warp=True, arguments=arguments),
     }
-    for argument in arguments:
-        reporter = f"{prototype}_{argument_id(argument)}"
-        data["blocks"][prototype]["inputs"][argument_id(argument)] = [1, reporter]
-        data["blocks"][reporter] = {
-            "opcode": "argument_reporter_string_number", "next": None,
-            "parent": prototype, "inputs": {}, "fields": {"VALUE": [argument, None]},
-            "shadow": True, "topLevel": False,
-        }
+    _add_argument_reporters(data["blocks"], prototype, arguments)
     # Lifecycle wrapping gives the sprite several legitimate top-level roots,
     # whereas the ordinary block combiner expects one computation chain.  A
     # procedure is independent, so merge it directly after uniquifying every

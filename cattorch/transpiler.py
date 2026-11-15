@@ -65,8 +65,6 @@ from cattorch.sprite import (
     _deduplicate_static_tensors,
     _finish_generation_prepare,
     _gate_chain,
-    _guard_generation_init,
-    _guard_plain_calls,
     _logical_list_sizes,
     _merge_duplicate_lists,
     _graph_layer,
@@ -76,6 +74,7 @@ from cattorch.sprite import (
     _wrap_generation_lifecycle,
     _wrap_optimized_lifecycle,
 )
+from cattorch.guards import _guard_generation_init, _guard_plain_calls
 from cattorch.procedures import (
     _find_procedure_definition,
     _remove_canvas_calls,

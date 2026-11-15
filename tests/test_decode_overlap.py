@@ -9,7 +9,7 @@ resumed after that call ended, or while it was decoding the weights itself,
 left them half overwritten, and later calls reported ok with them.
 
 That guard is switched off by default, for its cost in blocks and init
-time (see ``cattorch.sprite._GUARD_DECODERS``); the sprites of ``kind``
+time (see ``cattorch.guards._GUARD_DECODERS``); the sprites of ``kind``
 have it switched on.
 """
 
@@ -223,7 +223,7 @@ def kind(request, tmp_path_factory):
     name, storage = request.param.split()
     path = tmp_path_factory.mktemp(request.param.replace(" ", "_"))
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr("cattorch.sprite._GUARD_DECODERS", True)
+        patch.setattr("cattorch.guards._GUARD_DECODERS", True)
         if name == "plain":
             return Plain(path, STORAGES[storage])
         if name == "program":

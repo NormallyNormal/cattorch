@@ -33,8 +33,9 @@ from cattorch.quantization import quantize_model
 from cattorch import interface
 from cattorch.interface import STATUS_VARIABLE, final_data_name, input_name, output_name
 from cattorch.storage import StorageConfig, quantized_storage
-from cattorch.sprite import (
-    _BUSY, _EPOCH, _add_epoch_procedure, _epoch_current, _stop_overtaken_decoding,
+from cattorch.guards import (
+    _BUSY, _EPOCH, _add_epoch_procedure, _epoch_current, _init_outcome, _overtaken,
+    _stop_overtaken_decoding,
 )
 from cattorch.procedures import (
     _add_warp_procedure, _merge_lists_by_name, _merge_variables_by_name, _remove_canvas_calls,
@@ -237,15 +238,6 @@ _ENSURE_STATES = "_cattorch ensure states"
 # With the calling block's epoch.
 _ENSURE_STATES_IN_EPOCH = "_cattorch ensure states %s"
 _STATES_FILLED = "_cattorch states filled"
-
-
-def _overtaken() -> tuple[Statement, ...]:
-    """What a call does on finding that another one started during it.
-
-    It changes the epoch too: a call it resumed during, still running, may
-    have read what it wrote meanwhile, and fails as well.
-    """
-    return (change_var(_EPOCH, 1), set_var(STATUS_VARIABLE, interface.OVERTAKEN))
 
 
 def _all_initialized(flags) -> tuple[Statement, ...]:
@@ -995,11 +987,7 @@ def transpile_program(
             init_body.append(set_var(flag, 0))
         init_body.append(call(f"_cattorch {entry.name} init"))
     if _guard_overlaps:
-        # A call that ran meanwhile may have left the weights half decoded.
-        init_body.append(if_else(_epoch_current(), (set_var(STATUS_VARIABLE, interface.OK),), (
-            *(set_var(flag, 0) for flag in flags), change_var(_EPOCH, 1),
-            set_var(STATUS_VARIABLE, interface.OVERTAKEN),
-        )))
+        init_body.append(_init_outcome(flags))
         init_body.extend(all_initialized)
     else:
         init_body.extend((*all_initialized, set_var(STATUS_VARIABLE, interface.OK)))
@@ -1279,3 +1267,4 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
 
 
 __all__ = ["transpile_program"]
+

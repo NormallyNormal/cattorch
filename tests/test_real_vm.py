@@ -636,7 +636,7 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     # rather than write the weights again, where a block running meanwhile
     # could read them, and leave them for the next block to decode. The
     # guard is off by default, for its cost.
-    monkeypatch.setattr("cattorch.sprite._GUARD_DECODERS", True)
+    monkeypatch.setattr("cattorch.guards._GUARD_DECODERS", True)
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
         append, call, change_var, clear, eq, for_each, item, length, repeat_until, set_var, var,

@@ -26,7 +26,7 @@ from cattorch import interface
 from cattorch.codegen import CodegenConfig
 from cattorch.errors import collect_warnings, with_warnings
 from cattorch.results import TokenizerResult
-from cattorch.sprite import _EPOCH, _add_epoch_procedure, _epoch_current
+from cattorch.guards import _EPOCH, _add_epoch_procedure, _epoch_current, _overtaken
 from cattorch.procedures import _add_warp_procedure, _merge_variables_by_name, _procedure_mutation
 from cattorch.util.scratch.dsl import (
     Expr,
@@ -422,9 +422,7 @@ def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
                 block["mutation"] = _procedure_mutation(public)
     # A call it resumed during may have read what it wrote meanwhile, and
     # fails too.
-    overtaken = (if_(not_(current), (
-        change_var(_EPOCH, 1), set_var(status, interface.OVERTAKEN),
-    )),)
+    overtaken = (if_(not_(current), _overtaken()),)
     tokenize = Program(
         "tokenize_in_epoch",
         variables=(status, _EPOCH, copy),
