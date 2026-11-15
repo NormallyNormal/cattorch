@@ -21,6 +21,7 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder
 from test_optimization import CachedLM
 from cattorch.interface import TOKEN_IDS
+from scratch_status import INTERRUPTED
 
 TOLERANCE = 1e-4
 
@@ -262,7 +263,6 @@ def stop_on_call(emulator, procedure, call):
     return lambda: emulator._chains.__setitem__(start, chain)
 
 
-INTERRUPTED = interface.INTERRUPTED
 
 
 def stop_during(emulator, public, procedure, call, tokens=None):

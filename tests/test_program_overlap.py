@@ -21,12 +21,11 @@ from cattorch import (
 from cattorch.program_runtime import ProgramReplay
 from cattorch.util.scratch.emulator import ScratchEmulator
 
+from scratch_status import INTERRUPTED, OVERTAKEN
 from test_generation_automatic import load_sprite
 from test_generation_overlap import Script, Scripts
 
 TOLERANCE = 1e-5
-INTERRUPTED = interface.INTERRUPTED
-OVERTAKEN = interface.OVERTAKEN
 LIFECYCLE = ("cattorch init", "cattorch reset", "cattorch prepare for save")
 LOOPS = ("control_repeat", "control_for_each", "control_repeat_until")
 

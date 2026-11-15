@@ -9,8 +9,10 @@ name or status value may be renamed or removed: if a check fails because one
 disappeared, that breaks Scratch projects, so restore it. A new name is
 added to the page.
 
-The status values, and the public names below, are written out only here;
-other tests take them from ``cattorch.interface``.
+The public names below, and the status values other tests don't check,
+are written out only here; the status values they do check are written out
+once in ``scratch_status``. Other tests take the names from
+``cattorch.interface``.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from cattorch import (
 )
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive
 from cattorch.util.scratch.emulator import ScratchEmulator
+from scratch_status import INTERRUPTED, OVERTAKEN
 
 PAGE = Path(__file__).parents[1] / "docs" / "scratch-interface.md"
 
@@ -43,8 +46,8 @@ STATUSES = {
     "invalid item: LIST": interface.invalid_item("LIST"),
     "state full: LIST": interface.state_full("LIST"),
     "context full": interface.CONTEXT_FULL,
-    "another call ran during this one": interface.OVERTAKEN,
-    "an earlier call was stopped or is still running; reset first": interface.INTERRUPTED,
+    OVERTAKEN: interface.OVERTAKEN,
+    INTERRUPTED: interface.INTERRUPTED,
 }
 # Names whose meaning other tests rely on, written out once.
 NAMES = {

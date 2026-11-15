@@ -9,7 +9,6 @@ logits and that a later reset or prefill always recovers.
 
 from __future__ import annotations
 
-from cattorch import interface
 import threading
 
 import pytest
@@ -18,7 +17,8 @@ import torch
 from cattorch import CodegenConfig, GenerationProgram, RecurrentGenerationProgram, transpile
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_generation_automatic import INTERRUPTED, load_sprite, logits_of
+from scratch_status import INTERRUPTED, OVERTAKEN
+from test_generation_automatic import load_sprite, logits_of
 from test_optimization import CachedLM
 from test_recurrent_generation import make, reference_rows
 from cattorch.interface import TOKEN_IDS
@@ -26,7 +26,6 @@ from cattorch.interface import TOKEN_IDS
 TOLERANCE = 1e-4
 # Pause places tried per case, spread over the call.
 SAMPLES = 8
-OVERTAKEN = interface.OVERTAKEN
 SETUP = [1, 2, 3, 4]
 
 

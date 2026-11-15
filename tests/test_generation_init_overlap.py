@@ -19,8 +19,9 @@ from cattorch import (
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
-from test_generation_automatic import INTERRUPTED, load_sprite
-from test_generation_overlap import OVERTAKEN, SETUP, Script, Scripts
+from scratch_status import INTERRUPTED, OVERTAKEN
+from test_generation_automatic import load_sprite
+from test_generation_overlap import SETUP, Script, Scripts
 from test_optimization import CachedLM
 from test_plain_overlap import spread
 from test_program_overlap import LOOPS

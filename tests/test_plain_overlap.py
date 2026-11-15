@@ -19,7 +19,8 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 
 from test_generation_automatic import load_sprite
 from test_generation_overlap import Script, Scripts, spread
-from test_program_overlap import LOOPS, OVERTAKEN
+from scratch_status import OVERTAKEN
+from test_program_overlap import LOOPS
 
 TOLERANCE = 1e-5
 FORWARD, INIT, PREPARE = "cattorch forward", "cattorch init", "cattorch prepare for save"

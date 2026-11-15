@@ -310,7 +310,8 @@ def test_invalid_tokens_leave_every_state_untouched(exported):
 def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
     tmp_path, public, procedure, call, tokens,
 ):
-    from test_generation_automatic import INTERRUPTED, stop_during
+    from scratch_status import INTERRUPTED
+    from test_generation_automatic import stop_during
 
     model = make("lstm")
     emulator, _ = export(model, tmp_path / "lstm", top_k=2)

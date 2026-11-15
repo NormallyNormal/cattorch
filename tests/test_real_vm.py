@@ -364,8 +364,8 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
         set_var, var,
     )
     from test_autoregressive import NanoGPT
-    from test_generation_automatic import INTERRUPTED, logits_of
-    from test_generation_overlap import OVERTAKEN
+    from scratch_status import INTERRUPTED, OVERTAKEN
+    from test_generation_automatic import logits_of
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()
@@ -427,7 +427,7 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
         append, call, change_var, div, eq, for_each, item, length, mod, mul, repeat_until,
         set_var, sub, var,
     )
-    from test_program_overlap import OVERTAKEN
+    from scratch_status import OVERTAKEN
 
     class Slow(nn.Module):
         def __init__(self):
@@ -504,7 +504,7 @@ def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
         append, call, change_var, clear, div, eq, for_each, item, length, mod, mul,
         repeat_until, set_var, sub, var,
     )
-    from test_program_overlap import OVERTAKEN
+    from scratch_status import OVERTAKEN
 
     class Deep(nn.Module):
         def __init__(self):
@@ -581,8 +581,8 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
         set_var, var,
     )
     from test_autoregressive import NanoGPT
+    from scratch_status import OVERTAKEN
     from test_generation_automatic import logits_of
-    from test_generation_overlap import OVERTAKEN
 
     torch.manual_seed(4)
     model = NanoGPT(layers=4, width=96, heads=4, context=32).eval()

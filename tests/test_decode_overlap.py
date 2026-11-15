@@ -27,9 +27,8 @@ from cattorch.util.scratch.emulator import ScratchEmulator
 import test_generation_init_overlap as generation
 import test_plain_overlap as plain
 import test_program_overlap as program
-from test_generation_automatic import INTERRUPTED as GENERATION_INTERRUPTED
+from scratch_status import INTERRUPTED, OVERTAKEN
 from test_generation_automatic import load_sprite
-from test_generation_overlap import OVERTAKEN as GENERATION_OVERTAKEN
 from test_generation_overlap import Script, Scripts
 from test_optimization import CachedLM
 from test_recurrent_generation import make
@@ -176,7 +175,7 @@ class Program(Kind):
         if procedure in program.LIFECYCLE:
             return
         if status != "ok":
-            assert status in {program.INTERRUPTED, program.OVERTAKEN}, result
+            assert status in {INTERRUPTED, OVERTAKEN}, result
             return
         for name, values in self.expected((procedure, inputs)).items():
             torch.testing.assert_close(
@@ -226,7 +225,7 @@ class Generator(Kind):
             if procedure == "cattorch init":
                 continue
             if status != "ok":
-                assert status in {GENERATION_OVERTAKEN, GENERATION_INTERRUPTED}, result[:4]
+                assert status in {OVERTAKEN, INTERRUPTED}, result[:4]
                 assert logits == [], result[:4]
                 prefix = None
                 continue
