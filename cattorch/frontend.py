@@ -958,7 +958,7 @@ def _replace_intermediate_copies(graph: Graph) -> None:
             value = source
             bound = base.meta.get(INDEX_BOUND_META) if base.op == "placeholder" else None
             reached = _inputs_reached(source) if bound is not None else []
-            if reached:
+            if bound is not None and reached:
                 # The input is an index, whose items the input check keeps in
                 # range; values written into it from the inputs are checked
                 # as the sprite runs (``decompositions._mark_index``).
