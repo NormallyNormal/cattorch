@@ -427,9 +427,11 @@ def _build_entry_wrapper(
             # items are rows of the other dimensions' values.
             trailing = math.prod(extent for extent in spec.shape if isinstance(extent, int))
             rows = next(extent for extent in spec.shape if isinstance(extent, BoundedDimension))
-            minimum = rows.minimum
-            # An append state can be empty.
-            minimum = max(minimum, 1) if isinstance(binding, Input) else 0
+            # An append state only grows from its initial rows.
+            minimum = (
+                max(rows.minimum, 1) if isinstance(binding, Input)
+                else states[binding.name].initial.shape[0]
+            )
             length_options: dict = dict(
                 width=trailing, min_items=trailing * minimum, max_items=spec.max_numel,
             )

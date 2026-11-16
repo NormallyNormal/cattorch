@@ -85,6 +85,14 @@ among its `arguments`, and writes it with `StateUpdate(name)` among its
   outputs and states as they were.
 - `cattorch reset` restores every state to its `initial` value, so a learned
   start state works.
+- A state list belongs to the sprite. A project may read it, and may save
+  and restore it, with values the sprite wrote. Each call checks its length:
+  a replace state must hold its number of items, and an append state whole
+  rows, from `initial`'s rows up to `capacity`; otherwise the call fails with
+  `wrong number of items`, `too few items` or `too many items` naming it.
+  Its items aren't checked, since the sprite rewrites the state every call
+  and checking 200,000 items each time would cost more than the call, and
+  writing anything else into it gives undefined results.
 - Each entry point method is traced once, like any export, so it follows one
   path: it can't branch on tensor values, and every shape is fixed when you
   export, except an append state's first dimension.

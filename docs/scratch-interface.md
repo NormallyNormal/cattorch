@@ -49,7 +49,8 @@ benchmark case and its variant.
   changes its input lists. (A block taken over while it copies its results is
   the exception; see [overlapping calls](#overlapping-calls).)
 - A block checks its input lists before it runs: the number of items, and
-  each item. A list of floating-point values must hold numbers (`Infinity`
+  each item. A program checks only the number of items of its
+  [state lists](#program-sprites). A list of floating-point values must hold numbers (`Infinity`
   and `-Infinity` count; text, an empty item and `NaN` don't); a list of
   integers must hold whole numbers from -2^53 to 2^53, the ones a Scratch
   number holds exactly (`Infinity` doesn't count). Token IDs must be from 0 to the
@@ -210,7 +211,7 @@ after it:
 | `cattorch reset` | block | Restores every state to its initial value. |
 | `cattorch prepare for save` | block | Clears the decoded weights and working lists before saving the project. |
 | `cattorch ENTRY INPUT`, `cattorch ENTRY OUTPUT` | list | An entry point's inputs and outputs, named after its parameters and outputs. |
-| `cattorch state STATE` | list | A piece of persistent state. |
+| `cattorch state STATE` | list | A piece of persistent state. It belongs to the sprite: read it, or save and restore values the sprite wrote. A block checks its length, not its items, so writing anything else gives undefined results. |
 | `cattorch status` | variable | How the last block ended; see [status values](#status-values). |
 | `cattorch initialized` | variable | `1` once every entry point's weights are decoded, by `cattorch init` or by calls; `0` before and after `cattorch prepare for save`. |
 | `cattorch ENTRY complete`, `cattorch init complete`, `cattorch reset complete`, `cattorch prepare for save complete` | broadcast | Sent when each block ends. |

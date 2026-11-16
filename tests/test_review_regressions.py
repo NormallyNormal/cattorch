@@ -202,7 +202,12 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
         ),
     )
     em = load_emulator(transpile(Model().eval(), program, tmp_path / "append"))
-    for rows, expected in (([], [0.0]), ([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
+    # An append state holds at least its initial row.
+    em.lists["cattorch state source"] = []
+    em.run_procedure("cattorch copy")
+    assert em.variables["cattorch status"] == interface.too_few_items("cattorch state source")
+    assert em.lists["cattorch state destination"] == [0.0]
+    for rows, expected in (([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
         em.lists["cattorch state source"] = rows
         em.run_procedure("cattorch copy")
         assert em.variables["cattorch status"] == "ok"

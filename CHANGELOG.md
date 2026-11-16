@@ -125,6 +125,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
   A generator can't index with an index computed from the token IDs. See
   [index inputs](docs/supported-models.md#index-inputs).
+- A program checks the length of its state lists, not their items: an
+  append state must hold from its initial rows up to its capacity. State
+  lists belong to the sprite; see
+  [state](docs/programs-and-moe.md#state).
 - An input or state list split into shards is checked shard by shard: each
   must hold its part, every shard but the last holding items holding exactly
   200,000, or the block fails with `wrong number of items: LIST`; a

@@ -650,6 +650,23 @@ def test_every_kind_checks_items_by_the_documented_rules(tmp_path, program):
             assert status == expected, (name, value)
 
 
+def test_an_append_state_holds_at_least_its_initial_rows(tmp_path):
+    result = transpile(Memory().eval(), None, tmp_path / "memory")
+    sprite = load_sprite(result.path)
+    state = "cattorch state seen"
+    for rows, status in (
+        ([], interface.too_few_items(state)), ([1, 2, 3], interface.OK),
+        ([1, 2, 3] * 8, interface.OK), ([1, 2, 3] * 9, interface.too_many_items(state)),
+        ([1, 2], interface.too_few_items(state)), ([1, 2, 3, 4], interface.wrong_number_of_items(state)),
+    ):
+        emulator = ScratchEmulator(sprite)
+        emulator.run_procedure(interface.RESET)
+        emulator.lists[state] = list(rows)
+        emulator.lists["cattorch latest rows"] = [1.0, 2.0, 3.0]
+        emulator.run_procedure("cattorch latest")
+        assert emulator.variables[interface.STATUS_VARIABLE] == status, rows
+
+
 # ── Long lists (docs/scratch-interface.md#long-lists) ───────────────────────
 
 def fill_split(emulator, name, values, sizes):
