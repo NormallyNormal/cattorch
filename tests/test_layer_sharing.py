@@ -381,12 +381,12 @@ def test_code_between_layers_that_reads_no_layer_output_is_not_shared(tmp_path, 
 
 
 class FusedLayer(nn.Module):
-    """``blocks.0`` is only an activation, which the Linear before it absorbs."""
+    """Each layer is only an activation; the Linear before ``blocks.0`` absorbs its."""
 
     def __init__(self):
         super().__init__()
         self.inp = nn.Linear(8, 8)
-        self.blocks = nn.ModuleList([nn.ReLU(), nn.Linear(8, 8), nn.Linear(8, 8)])
+        self.blocks = nn.ModuleList(nn.Tanh() for _ in range(3))
 
     def forward(self, value):
         value = self.inp(value)
@@ -401,7 +401,7 @@ def test_a_layer_fused_into_outside_code_gets_an_accurate_reason(tmp_path):
     result, emitted = export(model, value, tmp_path / "fused")
     assert len(emitted) == 1
     assert "aren't numbered consecutively" not in emitted[0]
-    assert "`blocks.0` is compiled together with code from outside the layers" in emitted[0]
+    assert "fused into its code" in emitted[0]
     assert verify(model, value, result).passed
 
 

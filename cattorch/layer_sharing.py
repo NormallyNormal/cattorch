@@ -212,6 +212,9 @@ def _share_repeated_transformer_layers(
         record.key.name: record.covered for record in compiler.graph.fusion_records
     }
     emitted: list[tuple[str, str, int | None]] = []
+    # Why the layers' code can't be cut out of the script, reported after the
+    # dataflow checks, whose reasons say more.
+    structure: str | None = None
     for name, root_id in compiler.emitted_roots[:compiler.node_roots]:
         if name not in nodes:
             continue
@@ -229,13 +232,14 @@ def _share_repeated_transformer_layers(
                 _graph_layer(node) is None and min(spans) < order[node.name] < max(spans)
                 for node in covered.get(name, ())
             ):
-                return reject("code from outside the `blocks.N` layers runs between them")
-            return reject(
+                structure = structure or "code from outside the `blocks.N` layers runs between them"
+            structure = structure or (
                 f"an operation of layer `blocks.{max(item for item in owners if item is not None)}` "
                 + ("is compiled together with code from outside the layers"
                    if None in owners else "is compiled together with another layer's")
                 + ", so the layers' code can't be separated"
             )
+            owners = {None}
         emitted.append((name, root_id, owners.pop() if owners else None))
     # Every layer, including one whose operations all run in another's code.
     layers = sorted({
@@ -261,17 +265,18 @@ def _share_repeated_transformer_layers(
     coded = {layer for _, _, layer in emitted}
     for layer in layers:
         if layer not in coded:
-            return reject(f"layer `blocks.{layer}` has no code of its own to share")
-    # Each layer's code must run as one stretch, layer after layer, with no
-    # code from outside the layers in between.
-    sequence = [layer for _, _, layer in emitted]
-    first = sequence.index(layers[0])
-    last = len(sequence) - 1 - sequence[::-1].index(layers[-1])
-    stretch = sequence[first:last + 1]
-    if None in stretch:
-        return reject("code from outside the `blocks.N` layers runs between them")
-    if stretch != sorted(layer for layer in stretch if layer is not None):
-        return reject("the layers' code doesn't run one layer after another")
+            structure = structure or f"layer `blocks.{layer}` has no code of its own to share"
+    if structure is None:
+        # Each layer's code must run as one stretch, layer after layer, with
+        # no code from outside the layers in between.
+        sequence = [layer for _, _, layer in emitted]
+        first = sequence.index(layers[0])
+        last = len(sequence) - 1 - sequence[::-1].index(layers[-1])
+        stretch = sequence[first:last + 1]
+        if None in stretch:
+            structure = "code from outside the `blocks.N` layers runs between them"
+        elif stretch != sorted(layer for layer in stretch if layer is not None):
+            structure = "the layers' code doesn't run one layer after another"
     if (
         compiler.graph.generation.first_cache is not None
         and not compiler.graph.generation.banked_caches
@@ -467,6 +472,8 @@ def _share_repeated_transformer_layers(
         reader == "" or (reader not in layer_names[0] and position[reader] > first_position)
         for reader in readers.get(first_input, ())
     )
+    if structure is not None:
+        return reject(structure)
     blocks = sprite["blocks"]
     starts = [group[0][1] for group in grouped]
     emitted_roots = [root for _, root in compiler.emitted_roots]
