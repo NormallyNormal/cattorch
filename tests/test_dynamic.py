@@ -154,6 +154,25 @@ def test_a_model_using_the_length_itself_is_rejected(tmp_path):
         transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
 
 
+def _first_row_written(value):
+    written = value * 1.0
+    written[:, 0, :] = 5.0
+    return written
+
+
+@pytest.mark.parametrize("function", [
+    _first_row_written,
+    lambda value: torch.cat([value[:, :1] * 3, value[:, 1:]], 1),
+])
+def test_a_slice_empty_in_the_one_item_trace_is_named_as_the_cause(tmp_path, function):
+    with pytest.raises(UnsupportedModelError, match="holds nothing with one item") as caught:
+        transpile(
+            Lambda(function).eval(), torch.randn(1, 3, 4), tmp_path / "rest",
+            dynamic={0: {1: (1, 6)}},
+        )
+    assert "uses the length itself" not in str(caught.value)
+
+
 def test_the_length_check_compares_with_the_stored_weights(tmp_path):
     # Quantization changes the weights, so the sprite and the model differ
     # by more at some lengths than at one row; the check compares with a

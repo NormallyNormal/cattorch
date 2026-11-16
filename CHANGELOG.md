@@ -445,6 +445,10 @@ Python:
   ("neither is x.put(...)", "an in-place update through a view"). Every
   in-place method now runs as its out-of-place form, whether or not PyTorch
   has a decomposition for it.
+- A `dynamic=` export that writes the first item of the variable-length
+  dimension, or joins `x[:, :1]` and `x[:, 1:]` with `cat`, was refused
+  saying the model might use the length itself. It names the cause now:
+  such a slice holds nothing in the one-item trace.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the
   example's values as constants; it is rejected, like `.item()`.
 - `sig_figs` rounded integer buffers.
