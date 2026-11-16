@@ -208,3 +208,107 @@ def test_stop_this_script_returns_from_the_procedure_running_it():
     assert emulator.lists["seen"] == [1, 3]
     emulator.run_procedure("inner")
     assert emulator.lists["seen"] == [1, 3, 1]
+
+
+# Expected values below are scratch-vm's, from
+# test_real_vm.py::test_the_emulator_casts_compares_and_formats_values_as_scratch_vm_does.
+
+@pytest.mark.parametrize(("text", "expected"), [
+    # JavaScript's Number reads ASCII digits only, and trims its own whitespace.
+    ("１", 1), ("٣", 1), ("﻿3", 4), ("　4", 5), ("\x1c5", 1), ("\x855", 1),
+    ("0x" + "f" * 300, math.inf),
+])
+def test_number_casts_follow_javascript(text, expected):
+    assert _reporter("operator_add", {"NUM1": text, "NUM2": 1}) == expected
+
+
+@pytest.mark.parametrize(("left", "right", "equal"), [
+    ("1", "１", False), ("+5", "\x1c5", False), ("3", "﻿3", True), ("İ", "i̇", True),
+    ("ΑΣ", "ας", True), ("K", "k", True), ("ß", "SS", False),
+])
+def test_equality_follows_scratch(left, right, equal):
+    assert _reporter("operator_equals", {"OPERAND1": left, "OPERAND2": right}) is equal
+
+
+def test_text_orders_by_utf16_code_units():
+    # U+FFFD is one unit above the high surrogate that starts an emoji.
+    assert _reporter("operator_gt", {"OPERAND1": "�", "OPERAND2": "😀"}) is True
+    assert _reporter("operator_gt", {"OPERAND1": "a😀b", "OPERAND2": "abc"}) is True
+
+
+@pytest.mark.parametrize(("value", "text"), [
+    (0.5, "0.5"), (1e-7, "1e-7"), (1.5e-7, "1.5e-7"), (1e16, "10000000000000000"),
+    (1e-5, "0.00001"), (1e21, "1e+21"), (12345678901234567890, "12345678901234567000"),
+    ("1.0", "1.0"),
+])
+def test_numbers_join_as_javascript_writes_them(value, text):
+    assert _reporter("operator_join", {"STRING1": "", "STRING2": value}) == text
+
+
+def test_letters_and_lengths_count_utf16_units():
+    assert _reporter("operator_length", {"STRING": "a😀b"}) == 4
+    assert _reporter("operator_letter_of", {"LETTER": 2, "STRING": "😀"}) == "\ude00"
+    assert _reporter("operator_letter_of", {"LETTER": "", "STRING": "abc"}) == ""
+    assert _reporter("operator_letter_of", {"LETTER": 1.5, "STRING": "abc"}) == "a"
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("0", False), ("false", False), ("False", False), ("", False), ("true", True), ("x", True),
+])
+def test_not_reads_values_as_scratch_booleans(value, expected):
+    assert _reporter("operator_not", {"OPERAND": value}) is not expected
+
+
+@pytest.mark.parametrize(("left", "right", "expected"), [
+    (-5, math.inf, -5), (5, -math.inf, 5), (math.inf, 3, math.nan), (-7, 3, 2),
+    (7.5, -2, -0.5),
+])
+def test_mod_follows_scratch_with_infinities(left, right, expected):
+    result = _reporter("operator_mod", {"NUM1": left, "NUM2": right})
+    assert (math.isnan(result) and math.isnan(expected)) or result == expected
+
+
+def _list_emulator(blocks, values):
+    return ScratchEmulator({
+        "blocks": blocks, "lists": {"list": ["letters", list(values)]},
+        "costumes": [{"name": name} for name in ("a", "3", "Five", "x y", "b")],
+    })
+
+
+@pytest.mark.parametrize(("index", "expected"), [
+    ("last", "e"), ("all", ""), (" 2 ", "b"), ("0x2", "b"), ("Infinity", ""), (2.9, "b"),
+    ("0b101", "e"), ("１", ""),
+])
+def test_list_indices_follow_cast_to_list_index(index, expected):
+    emulator = _list_emulator({
+        "reporter": {
+            "opcode": "data_itemoflist", "next": None, "parent": None,
+            "inputs": {"INDEX": _literal(index)}, "fields": {"LIST": ["letters", "list"]},
+            "shadow": False, "topLevel": True,
+        },
+    }, "abcde")
+    assert emulator._eval_reporter("reporter") == expected
+
+
+@pytest.mark.parametrize(("requested", "costume"), [
+    ("3", 2), ("2", 2), ("0", 5), ("-1", 4), ("1.5", 2), ("0x2", 2), ("next costume", 1),
+    ("previous costume", 4), ("five", 5), ("", 5), (3.0, 3), ("１", 5),
+])
+def test_switch_costume_follows_scratch_vm(requested, costume):
+    emulator = _list_emulator({}, "")
+    emulator._current_costume = 4
+    emulator._switch_costume(requested)
+    assert emulator._current_costume + 1 == costume
+
+
+def test_for_each_reads_its_count_before_every_iteration():
+    from cattorch.util.scratch.dsl import Program, append, for_each, if_else, length, lt
+
+    program = Program("grow", lists=("grow",), variables=("k",), list_values={"grow": [1, 2]},
+                      body=(for_each("k", length("grow"), (
+                          if_else(lt(length("grow"), 5), (append("grow", 0),), ()),
+                      )),))
+    emulator = ScratchEmulator(program.compile())
+    emulator.run()
+    assert len(emulator.lists["grow"]) == 5
+    assert emulator.variables["k"] == 5

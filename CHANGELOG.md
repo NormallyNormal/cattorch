@@ -383,7 +383,14 @@ Python:
   the tensors separately, and a wrongly shaped one reports the model's own
   error.
 - The emulator behind `verify` kept NaN through arithmetic, where Scratch
-  reads it as 0, and read numbers from text differently from Scratch.
+  reads it as 0, and read numbers from text differently from Scratch: it
+  read non-ASCII digits such as `１` and trimmed Python's whitespace instead
+  of JavaScript's. It now follows scratch-vm, checked against it value by
+  value, in its casts, comparisons (by UTF-16 code units), number-to-text
+  forms (`1e-7`, `0.00001`, `true`), text lengths and letters (in UTF-16
+  units), booleans (`"0"` and `"false"` are false), list positions (`last`,
+  `all`, `0x2`), `mod` with infinities, `pick random` bounds, costume
+  switching by number, and `for each` counts read before every iteration.
 - Mistakes that ended in an internal exception raise one naming the
   problem: a `model` that isn't a module or `example_inputs` that are a dict
   or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a

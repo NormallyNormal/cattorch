@@ -837,3 +837,145 @@ def test_the_demo_stops_and_says_a_tokenizer_failure(tmp_path):
     run = run_vm(project, tmp_path, answers=["zz", ""])
     said = demo_said(run)
     assert said == ["zz...", f"small prefill: {interface.invalid_item(interface.TOKEN_IDS)}"]
+
+
+# Values whose casts, comparisons and string forms differ between JavaScript
+# and Python: whitespace JavaScript's trim keeps or removes, number forms
+# JavaScript's Number reads or refuses (non-ASCII digits, radix prefixes,
+# Infinity), case-insensitive text (dotted I, sharp s, final sigma, the
+# Kelvin sign), characters outside the BMP, and numbers whose JavaScript
+# string form differs from Python's.
+SEMANTICS_VALUES = [
+    "", " ", "0", "1", "-0", "+5", ".5", "5.", "1e3", "1E3", "1e+3", "1e-3", "1e", "e3",
+    "0x10", "0X1f", "-0x10", "0o17", "0b101", "0b2", "0x", "Infinity", "-Infinity",
+    "+Infinity", "infinity", "inf", "NaN", "nan", "true", "false", "TRUE", "False",
+    " 12 ", "\t7\n", " 5 ", "﻿3", " 3", "　4", "\x1c5", "\x855",
+    "᠎5", "​5", "１", "٣", "1_000", "1,5", "12abc", "abc", "ABC", "İ", "i̇", "ß", "SS",
+    "ẞ", "Σ", "σ", "ς", "ΑΣ", "ας", "ασ", "K", "k", "K", "ı", "I", "i", "ǅ", "ǆ", "Ǆ",
+    "😀", "�", "a😀b", "1.0", "01", "00", "1.50", "9007199254740993", "1e400",
+    "-1e400", "2.5", "-2.5", "0.1", "0x1fffffffffffff1", "0x" + "f" * 300,
+    0, 1, -1, 2.5, -2.5, 0.5, 1.5, 1e21, 1e-7, 1.5e-7, 123456789012, 0.1, 3, 1e300, 1e16,
+    1e-5, 0.000001, 100, 12345678901234567890, True, False,
+]
+# Costume requests and loop counts (finite ones: a for each of Infinity never ends).
+SEMANTICS_SMALL = [
+    "", " ", "0", "1", "2", "3", "4", "5", "-1", "1.5", "2.5", "0.5", "-0.5", "a", "3 ",
+    " 2", "0x2", "Five", "five", "x y", "1e0", "NaN", "true", "next costume",
+    "previous costume", "１", 2, 3.0, 2.5, -1, 0, 7, True, False,
+]
+
+
+def _same_value(vm_value, emulated) -> bool:
+    """Equal as the VM's JSON output can show: strings and booleans exactly,
+    numbers as doubles (JSON writes -0 as 0 and rounds integers past 2**53)."""
+    def normal(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+        return value
+
+    vm_value, emulated = normal(vm_value), normal(emulated)
+    if type(vm_value) is bool or type(emulated) is bool:
+        return vm_value is emulated
+    if isinstance(vm_value, str) or isinstance(emulated, str):
+        return vm_value == emulated and type(vm_value) is type(emulated)
+    return float(vm_value) == float(emulated)
+
+
+def test_the_emulator_casts_compares_and_formats_values_as_scratch_vm_does(tmp_path):
+    import copy
+
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        add, append, change_var, clear, costume_number, delete, eq, for_each, gt, if_else,
+        index_of, item, join, length, letter, lt, mod, not_, round_, set_var, string_length,
+        switch_costume, var,
+    )
+
+    builder = _Builder()
+    sprite = builder.add_demo_sprite("Probe")
+    costume = sprite["costumes"][0]
+    sprite["costumes"] = [
+        dict(copy.deepcopy(costume), name=name) for name in ("a", "3", "Five", "x y", "b")
+    ]
+    values = builder.global_list("values", SEMANTICS_VALUES)
+    small = builder.global_list("small", SEMANTICS_SMALL)
+    letters = builder.global_list("letters", ["a", "b", "c", "d", "e"])
+    grow = builder.global_list("grow", ["x", "y", "z"])
+    names = [
+        "number", "join", "length", "letter 1", "letter 2", "letter of", "item", "item num",
+        "bool", "not", "mod 3", "mod neg", "round", "eq", "lt", "gt", "costume", "for each",
+        "misc",
+    ]
+    out = {name: builder.global_list(f"out {name}") for name in names}
+    v, w, s = item(values, var("i")), item(values, var("j")), item(small, var("i"))
+    pair = join(letter("a😀", 2), letter("a😀", 3))
+    body = [clear(target) for target in out.values()]
+    body += [
+        for_each("i", length(values), (
+            append(out["number"], add(v, 0)),
+            append(out["join"], join("", v)),
+            append(out["length"], string_length(v)),
+            append(out["letter 1"], letter(v, 1)),
+            append(out["letter 2"], letter(v, 2)),
+            append(out["letter of"], letter("abcdef", v)),
+            append(out["item"], item(letters, v)),
+            append(out["item num"], index_of(values, v)),
+            if_else(v, (append(out["bool"], "T"),), (append(out["bool"], "F"),)),
+            append(out["not"], not_(v)),
+            append(out["mod 3"], mod(v, 3)),
+            append(out["mod neg"], mod(-5, v)),
+            append(out["round"], round_(v)),
+        )),
+        for_each("i", length(values), (
+            for_each("j", length(values), (
+                append(out["eq"], eq(v, w)),
+                append(out["lt"], lt(v, w)),
+                append(out["gt"], gt(v, w)),
+            )),
+        )),
+        for_each("i", length(small), (
+            switch_costume("b"),
+            switch_costume(s),
+            append(out["costume"], costume_number()),
+            set_var("count", 0),
+            for_each("k", s, (change_var("count", 1),)),
+            append(out["for each"], var("count")),
+        )),
+        # for each reads its count again before every iteration.
+        for_each("k", length(grow), (if_else(lt(length(grow), 10), (append(grow, "w"),), ()),)),
+        append(out["misc"], length(grow)),
+        append(out["misc"], var("k")),
+        # Two halves of a surrogate pair join into one character.
+        append(out["misc"], pair),
+        append(out["misc"], string_length(pair)),
+        append(out["misc"], eq(pair, "😀")),
+        *(append(out["misc"], item(letters, index))
+          for index in ("last", "all", " 2 ", "0x2", "Infinity", 2.9)),
+        delete(grow, "all"),
+        append(out["misc"], length(grow)),
+        append(out["misc"], add("1", "2")),
+        append(out["misc"], join(0.1 + 0.2, "")),
+        append(out["misc"], join(1e21, "")),
+        append(out["misc"], join(-1e-7, "")),
+    ]
+    builder.script(
+        sprite, {"opcode": "event_whenflagclicked", "fields": {}}, tuple(body),
+        lists=(values, small, letters, grow, *out.values()),
+        variables=("i", "j", "k", "count"),
+    )
+    path = tmp_path / "semantics.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    emulator = ProjectEmulator(path)
+    emulator.green_flag()
+    differences = []
+    for name, list_name in out.items():
+        expected, actual = stage[list_name], emulator.stage.lists[list_name]
+        assert len(expected) == len(actual), name
+        differences += [
+            (name, index, wanted, got)
+            for index, (wanted, got) in enumerate(zip(expected, actual))
+            if not _same_value(wanted, got)
+        ]
+    assert not differences, differences[:20]
+    assert len(stage["out eq"]) == len(SEMANTICS_VALUES) ** 2
