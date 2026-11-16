@@ -281,15 +281,17 @@ def _apply_pruning(module: nn.Module, fraction: float) -> None:
         child.weight = nn.Parameter(pruned, requires_grad=child.weight.requires_grad)
 
 
-def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
-    """Remove neurons from dataflow-connected Linear/activation/Linear MLPs."""
-    if not fraction:
-        return
-    activations = (
-        nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh, nn.Sigmoid,
-        nn.ELU, nn.LeakyReLU, nn.Identity,
-    )
-    try:
+class _ModelUses:
+    """How the exported methods use a model's modules, from ``torch.fx`` traces.
+
+    ``calls`` lists each module's calls; ``foreign`` holds the modules whose
+    parameters or buffers some code other than the module's own forward
+    reads directly (``x @ self.up.weight.T``), in any exported method. A
+    transform that rewrites a module's parameters would change those reads
+    too, so it leaves such a module alone.
+    """
+
+    def __init__(self, model: nn.Module, methods: tuple[str, ...]):
         from cattorch.experts import _BankedSparseMoE
 
         class _FastTransformTracer(Tracer):
@@ -298,23 +300,60 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
                     return True
                 return super().is_leaf_module(module, qualified_name)
 
-        tracer = _FastTransformTracer()
-        traced = GraphModule(model, tracer.trace(model))
+        self.calls: dict[str, list] = {}
+        self.foreign: set[str] = set()
+        owners = {name for name, _ in model.named_modules()}
+        for method in dict.fromkeys(methods):
+            tracer = _FastTransformTracer()
+            tracer.traced_func_name = method
+            graph = GraphModule(model, tracer.trace(model)).graph
+            for node in graph.nodes:
+                if node.op == "call_module":
+                    self.calls.setdefault(str(node.target), []).append(node)
+                elif node.op == "get_attr":
+                    owner = str(node.target).rpartition(".")[0]
+                    if owner not in owners:
+                        continue
+                    stack = tuple(node.meta.get("nn_module_stack", {}).values())
+                    reader = stack[-1][0] if stack and stack[-1] else ""
+                    if reader != owner:
+                        self.foreign.add(owner)
+
+    def read_elsewhere(self, *paths: str) -> bool:
+        return any(path in self.foreign for path in paths)
+
+
+def _model_uses(model: nn.Module, methods: tuple[str, ...]) -> tuple[_ModelUses | None, str]:
+    """``_ModelUses``, or ``None`` and why ``torch.fx`` couldn't trace the model."""
+    try:
+        return _ModelUses(model, methods), ""
     except Exception as error:
-        from cattorch.errors import UnsupportedModelError
-
         reason = str(error).splitlines()[0] if str(error) else ""
-        raise UnsupportedModelError(
-            "FastConfig(neuron_pruning=...) finds Linear, activation, Linear chains "
-            "with torch.fx symbolic tracing, which can't trace this model "
-            f"({type(error).__name__}: {reason}); export it with neuron_pruning=0"
-        ) from None
+        return None, f"{type(error).__name__}: {reason}"
 
+
+def _skipped_warning(transform: str, paths: tuple[str, ...]) -> str:
+    names = " and ".join(f"{path!r}" for path in paths)
+    return (
+        f"fast mode left {names} without {transform}: the model also reads "
+        f"{'their' if len(paths) > 1 else 'its'} parameters directly, outside "
+        f"{'those modules' if len(paths) > 1 else 'the module'}, and those reads "
+        "must keep the original values"
+    )
+
+
+def _prune_sequential_neurons(model: nn.Module, fraction: float, uses: _ModelUses) -> None:
+    """Remove neurons from dataflow-connected Linear/activation/Linear MLPs."""
+    if not fraction:
+        return
+    from cattorch.errors import warn
+
+    activations = (
+        nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh, nn.Sigmoid,
+        nn.ELU, nn.LeakyReLU, nn.Identity,
+    )
     modules = dict(model.named_modules())
-    calls_by_target: dict[str, list] = {}
-    for node in traced.graph.nodes:
-        if node.op == "call_module":
-            calls_by_target.setdefault(str(node.target), []).append(node)
+    calls_by_target = uses.calls
 
     triples = []
     claimed: set[str] = set()
@@ -347,6 +386,10 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
             or up.out_features != down.in_features
             or up.out_features < 2
         ):
+            continue
+        if uses.read_elsewhere(up_path, down_path):
+            warn(_skipped_warning("neuron pruning", (up_path, down_path)))
+            claimed.update(paths)
             continue
         triples.append((up_path, down_path))
         claimed.update(paths)
@@ -391,7 +434,9 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
         )
 
 
-def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
+def _prune_stacked_swiglu_neurons(
+    model: nn.Module, fraction: float, uses: _ModelUses | None,
+) -> None:
     """Remove shared hidden channels from banked SwiGLU experts.
 
     Every expert retains the same channel IDs, so the stacked bank geometry and
@@ -403,6 +448,11 @@ def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
 
     for name, module in model.named_modules():
         if not isinstance(module, StackedSwiGLUMoE):
+            continue
+        if uses is not None and uses.read_elsewhere(name):
+            from cattorch.errors import warn
+
+            warn(_skipped_warning("neuron pruning", (name,)))
             continue
         hidden = module.gate_weight.shape[1]
         keep_count = max(1, hidden - math.floor(hidden * fraction))
@@ -434,10 +484,18 @@ def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
         )
 
 
-def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
-    """Return an independently transformed model for fast export."""
+def prepare_fast_model(
+    model: nn.Module, config: FastConfig, *, methods: tuple[str, ...] = ("forward",),
+) -> nn.Module:
+    """Return an independently transformed model for fast export.
+
+    ``methods`` are the methods the export runs, such as a program's entry
+    points: a module whose parameters any of them reads directly is left
+    untransformed, with a warning.
+    """
     if not config.has_weight_transforms:
         return model
+    from cattorch.errors import UnsupportedModelError, warn
 
     # Generic expert templates are compiled once against fixed bank geometry.
     # Kernel-level approximations remain valid, but changing hidden widths or
@@ -458,8 +516,18 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
         )
 
     transformed = copy.deepcopy(model)
-    _prune_sequential_neurons(transformed, config.neuron_pruning)
-    _prune_stacked_swiglu_neurons(transformed, config.neuron_pruning)
+    uses, untraceable = _model_uses(transformed, methods)
+    if config.neuron_pruning:
+        if uses is None:
+            raise UnsupportedModelError(
+                "FastConfig(neuron_pruning=...) finds Linear, activation, Linear chains "
+                "with torch.fx symbolic tracing, which can't trace this model "
+                f"({untraceable}); export it with neuron_pruning=0"
+            )
+        _prune_sequential_neurons(transformed, config.neuron_pruning, uses)
+        _prune_stacked_swiglu_neurons(transformed, config.neuron_pruning, uses)
+        # The hidden widths changed: trace the pruned model again.
+        uses, untraceable = _model_uses(transformed, methods)
     if isinstance(transformed, (nn.Linear, nn.Conv1d, nn.Conv2d)):
         unknown = sorted(set(config.overrides) - {"<root>"})
         if unknown:
@@ -499,9 +567,16 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     # Modules replaced by their low-rank factors, which keep their paths;
     # quantization overrides name the model's own parameters through them.
     factorized: list[str] = []
+    unchecked = []
     for name, module in eligible:
         policy = config.policy_for(name)
         if not policy.enabled:
+            continue
+        if uses is None:
+            if policy.block_pruning:
+                unchecked.append(name)
+        elif uses.read_elsewhere(name):
+            warn(_skipped_warning("its low-rank factorization and block pruning", (name,)))
             continue
         rank = _selected_rank(module.weight, policy, repr(name))
         replacement = None
@@ -534,4 +609,11 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
             **getattr(transformed, "_cattorch_replaced_modules", {}),
             **{name: ("factorized", None) for name in factorized},
         }
+    if unchecked:
+        warn(
+            "fast mode couldn't check whether the model reads the weights of "
+            f"{', '.join(repr(name) for name in unchecked)} directly, outside those "
+            f"modules, because torch.fx can't trace it ({untraceable}); any such "
+            "read uses the block-pruned weights too"
+        )
     return transformed

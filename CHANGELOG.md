@@ -400,6 +400,11 @@ Python:
 - Layer sharing gave wrong output when the tensor entering the first shared
   layer was also returned or used after the layers, and dropped an output
   copied after the last layer, such as a returned input.
+- `FastConfig(neuron_pruning=...)` also pruned parameters the model reads
+  directly elsewhere, such as `x @ self.up.weight.T`, changing those outputs'
+  values and shapes, and low-rank factorization and block pruning changed
+  such reads too. A module whose parameters are read outside it, in any
+  exported method, is now left untransformed, with a warning.
 - A tied embedding was read in the wrong layout in fast mode with weight
   transforms, and fast weight pruning of `x @ W` changed `W` for other uses.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the

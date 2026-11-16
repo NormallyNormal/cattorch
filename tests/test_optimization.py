@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cattorch import (
+    CattorchWarning,
     CodegenConfig,
     FastConfig,
     FastLayerConfig,
@@ -1680,3 +1681,73 @@ def test_unsupported_operation_error_names_the_operation_and_module(tmp_path):
     assert "aten.digamma.default" in message
     assert "in module 'features'" in message
     assert "node" not in message
+
+
+class _MLPReadElsewhere(nn.Module):
+    """A Linear -> ReLU -> Linear path whose parameters ``read`` also uses directly."""
+
+    def __init__(self, read):
+        super().__init__()
+        self.read = read
+        self.up = nn.Linear(4, 16)
+        self.activation = nn.ReLU()
+        self.down = nn.Linear(16, 4)
+        self.lin = nn.Linear(4, 4)
+
+    def forward(self, value):
+        mlp = self.down(self.activation(self.up(value)))
+        if self.read == "up_weight":
+            return mlp, value @ self.up.weight.T
+        if self.read == "down_sum":
+            return mlp + self.down.weight.sum()
+        if self.read == "bias_mean":
+            return mlp + self.up.bias.mean()
+        return mlp, self.lin(value) + self.lin.weight.sum()
+
+
+@pytest.mark.parametrize("read", ["up_weight", "down_sum", "bias_mean"])
+def test_neuron_pruning_leaves_mlps_whose_parameters_are_read_elsewhere(tmp_path, read):
+    torch.manual_seed(0)
+    model = _MLPReadElsewhere(read).eval()
+    value = torch.randn(2, 4)
+    config = FastConfig(activations=False, layer_norm=False, softmax=False, neuron_pruning=0.5)
+    with pytest.warns(CattorchWarning, match="left 'up' and 'down' without neuron pruning"):
+        result = transpile(model, value, tmp_path / read, optimization="fast", fast_config=config)
+    assert any("without neuron pruning" in message for message in result.warnings)
+    expected = model(value)
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    assert [tuple(spec.shape) for spec in result.outputs] == [tuple(item.shape) for item in expected]
+    assert verify(model, value, result).passed
+
+
+def test_weight_transforms_leave_modules_whose_parameters_are_read_elsewhere(tmp_path):
+    torch.manual_seed(0)
+    model = _MLPReadElsewhere("lin").eval()
+    config = FastConfig(layers=FastLayerConfig(rank=1, block_pruning=0.5))
+    with pytest.warns(CattorchWarning, match="left 'lin' without its low-rank"):
+        transformed = prepare_fast_model(model, config)
+    assert isinstance(transformed.lin, nn.Linear)
+    assert torch.equal(transformed.lin.weight, model.lin.weight)
+    assert isinstance(transformed.up, nn.Sequential)
+
+
+def test_weight_transforms_check_every_program_method():
+    class TwoMethods(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up = nn.Linear(4, 16)
+            self.activation = nn.ReLU()
+            self.down = nn.Linear(16, 4)
+
+        def forward(self, value):
+            return self.down(self.activation(self.up(value)))
+
+        def weights(self, value):
+            return value @ self.up.weight.T
+
+    model = TwoMethods().eval()
+    config = FastConfig(neuron_pruning=0.5)
+    assert prepare_fast_model(model, config).up.out_features == 8
+    with pytest.warns(CattorchWarning, match="without neuron pruning"):
+        transformed = prepare_fast_model(model, config, methods=("forward", "weights"))
+    assert transformed.up.out_features == 16

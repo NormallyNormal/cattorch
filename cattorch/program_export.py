@@ -746,7 +746,9 @@ def transpile_program(
     )
     config = fast_config or FastConfig()
     if optimization == "fast":
-        prepared_model = prepare_fast_model(prepared_model, config)
+        prepared_model = prepare_fast_model(
+            prepared_model, config, methods=tuple(entry.method for entry in program.entrypoints),
+        )
     prepared_model = fold_eval_batch_norms(
         prepared_model, methods=tuple(entry.method for entry in program.entrypoints),
     )

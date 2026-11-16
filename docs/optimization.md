@@ -89,6 +89,14 @@ An `overrides` entry replaces the whole policy for the named module. A
 `x @ weight` product with a stored weight uses the global policy. Products of
 two runtime tensors, such as attention scores, stay exact.
 
+A transform only changes the module it applies to. When the model also
+reads that module's parameters directly, outside the module, such as
+`x @ self.up.weight.T` (in any method a program exports), the module is left
+untransformed, so those reads keep the original values, and the export warns
+which modules were left. If `torch.fx` can't trace the model, that can't be
+checked, and the export warns that a direct read of a block-pruned weight
+would read the pruned values.
+
 Transforms are applied to a copy; your model is not modified.
 
 ## Measuring the tradeoff
