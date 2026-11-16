@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import uuid
 from collections import Counter
@@ -24,7 +25,7 @@ from cattorch.program import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, StateInput, StateUpdate,
 )
 from cattorch.program_runtime import (
-    MethodModule, ProgramReplay, default_program_calls, entry_examples,
+    MethodModule, ModuleState, ProgramReplay, default_program_calls, entry_examples,
     validate_entry_outputs,
 )
 from cattorch.results import (
@@ -84,9 +85,13 @@ class _ProgramCalibrationModule(nn.Module):
         # run under inference mode, and a buffer they replaced would stay an
         # inference tensor that later in-place updates can't touch.
         buffers = [(module, dict(module._buffers)) for module in self.model.modules()]
+        # Nor may a call's changes to the modules' own attributes, such as
+        # self.scale = 2.0, reach the next call or the traces after.
+        attributes = ModuleState(self.model, user_only=True)
         try:
             return self.replay.run(invocation)
         finally:
+            attributes.restore()
             for module, saved in buffers:
                 module._buffers.clear()
                 module._buffers.update(saved)
@@ -804,12 +809,22 @@ def transpile_program(
     )
 
     split_checks: list = []
+    # Every entry point is traced from the model as prepared, whatever the
+    # ones traced before it changed on the modules (self.scale = 2.0), so
+    # each sprite runs as its first call from the initial values.
+    module_state = ModuleState(prepared_model)
+    gptq_reference = None
+    if quantization is not None and quantization.method == "gptq" and _has_lengths(program):
+        # The length checks compare with the weights GPTQ chose, which
+        # can't be found again without the calibration calls.
+        gptq_reference = copy.deepcopy(prepared_model)
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
             raise ValueError(
                 f"model has no callable method {entrypoint.method!r} for "
                 f"entry point {entrypoint.name!r}"
             )
+        module_state.restore()
         args, dynamic_inputs = entry_examples(program, entrypoint)
         wrapper = MethodModule(prepared_model, entrypoint.method)
         sub_codegen = replace(
@@ -849,6 +864,10 @@ def transpile_program(
         except JointLengthError as error:
             raise UnsupportedModelError(f"entry point {entrypoint.name!r} {error}") from None
         except UnsupportedModelError as error:
+            one_row = _one_row_failure(entrypoint, wrapper, args, dynamic_inputs)
+            if one_row is not None:
+                raise one_row from None
+            module_state.restore()
             sub_result = _entry_by_item(
                 error, entrypoint, wrapper, args, dynamic_inputs, capture,
             )
@@ -1325,18 +1344,53 @@ def transpile_program(
         fallback_operations=tuple(sorted(fallbacks.items())),
         approximate_operations=tuple(sorted(approximations.items())),
     )
-    if any(
-        (isinstance(binding, Input) and binding.dynamic is not None)
-        or (isinstance(binding, StateInput) and states[binding.name].mode == "append")
-        for entry in program.entrypoints for binding in entry.arguments
-    ):
+    if _has_lengths(program):
         from cattorch.dynamic import check_entry_lengths
 
         check_entry_lengths(
             model, program, result, adapters=adapters, optimization=optimization,
             storage=storage, quantization=quantization, sig_figs=sig_figs,
+            fast_config=fast_config, kernels=kernels,
+            gptq_reference=gptq_reference,
         )
     return result
+
+
+def _has_lengths(program: ExportProgram) -> bool:
+    """Whether an entry point has a ``dynamic=`` input or reads an append state."""
+    states = {state.name: state for state in program.states}
+    return any(
+        (isinstance(binding, Input) and binding.dynamic is not None)
+        or (isinstance(binding, StateInput) and states[binding.name].mode == "append")
+        for entry in program.entrypoints for binding in entry.arguments
+    )
+
+
+def _one_row_failure(entrypoint, wrapper, args, dynamic_inputs) -> UnsupportedModelError | None:
+    """The error for a method that can't run on the one row it is traced with.
+
+    A variable-length input or append state is traced with one row whatever
+    its minimum, so a method reading ``xs[-2]`` can't be exported, even with
+    ``dynamic={"xs": (2, 8)}`` or a state that starts with two rows.
+    """
+    if not dynamic_inputs:
+        return None
+    try:
+        with torch.no_grad():
+            copy.deepcopy(wrapper)(*copy.deepcopy(tuple(args)))
+    except Exception as reason:  # noqa: BLE001 - reported to the user
+        names = " and ".join(
+            f"{'input' if isinstance(entrypoint.arguments[index], Input) else 'append state'} "
+            f"{name!r}"
+            for index, (name, _, _, _) in sorted(dynamic_inputs.items())
+        )
+        return UnsupportedModelError(
+            f"entry point {entrypoint.name!r} is traced with one row of {names}, "
+            "whatever the least length it takes, and its method can't run on one "
+            f"({type(reason).__name__}: {str(reason).strip().splitlines()[0] if str(reason).strip() else ''}). "
+            "A variable-length input or append state must work with one row"
+        )
+    return None
 
 
 def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
@@ -1361,7 +1415,7 @@ def _entry_by_item(error, entrypoint, wrapper, args, dynamic_inputs, capture):
     examples[index] = entrypoint.arguments[index].example
     try:
         axes = unit_output_axes(wrapper, examples, [], spec, None)
-    except UnsupportedModelError:
+    except Exception:  # noqa: BLE001 - the method may not run on one item at all
         raise error from None
     input_shapes = [tuple(value.shape) for value in args]
     result = capture(

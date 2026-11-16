@@ -462,6 +462,52 @@ Python:
   two lengths together is rejected, and export checks every entry point at
   several lengths of each append state it reads, rejecting what the sprite
   can't follow.
+- Program entry points were traced one after another on one copy of the
+  model, so what one changed outside its states, such as `self.scale = 2.0`,
+  reached the sprites of those traced after it, from their first call. Each
+  entry point is now traced, and GPTQ calibration calls run, from the model
+  as given. `verify`'s default calls run the entry points again in reverse
+  order, from a fresh sprite, which a single order could hide this behind.
+- `@entrypoint`: a buffer registered as `None` that a method set to a
+  tensor, or one a method set to `None`, became no state, with no warning
+  and wrong numbers from the second call. Both fail the export now. A
+  method that returns nothing and changes no buffer says so, rather than
+  naming `returns=`.
+- `@entrypoint`: a tensor in a dictionary, or an attribute that started as
+  `None`, set from the inputs on every call was reported as changed "on its
+  first call only", with wrong numbers. The second call that tells them
+  apart now uses other inputs, and any change made again fails the export,
+  as the docs said. A change on the first call only is allowed if later
+  calls of every entry point give what they would from the initial values,
+  and fails otherwise, as `self.scale = 2.0` read by another entry point
+  does. Old-style `nn.utils.spectral_norm`, refused as a tensor attribute
+  change, exports with a warning.
+- `@entrypoint`: a submodule registered under two names whose buffer was a
+  state made every entry point not using it fail, saying it read the
+  buffer.
+- Two states that are interleaved columns of one tensor (`base[:, 0]` and
+  `base[:, 1]`) were refused as views of each other; only tensors sharing an
+  element are.
+- An in-place update of a tensor that isn't a state could be blamed on an
+  unrelated parameter with the same values.
+- GPTQ programs skipped the entry point length checks, so a method that
+  depended on an append state's length exported wrong numbers that the same
+  export without GPTQ refused. They are checked against the export's own
+  quantized weights.
+- The length check never compared the entry point that grows an append
+  state past four rows, so a dependence on the length starting there
+  exported wrong numbers. It checks the state as long as the call can take
+  it, and halfway there.
+- The length checks refused valid models: large values (rows near 3e4, whose
+  float32 rounding PyTorch's own result carries) and fast mode, whose
+  QuickGELU error grows with the number of items summed. The tolerance now
+  allows the float32 error measured against a float64 run, and fast mode is
+  compared with a model computing GELU as QuickGELU; what the check can't
+  reproduce is allowed an error that grows with the length.
+- An entry point whose method can't run on the one row it is traced with,
+  as `xs[-2]` with `dynamic={"xs": (2, 8)}` or an append state starting
+  with two rows does, raised a bare `IndexError` or blamed the example
+  inputs; it says the input or state is traced with one row.
 - Quantization: the report could claim int8 or int4 for weights storage
   kept in float16, a weight with small values or groups of one could be
   stored in float16 without a warning, `min_quantized_values` was applied to

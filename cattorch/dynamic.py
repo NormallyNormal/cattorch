@@ -99,54 +99,176 @@ def varied_at_length(value: torch.Tensor, axis: int, length: int, seed: int = 0)
 _LONGEST_CHECKED = 1024
 
 
-def reproducible_export(*, optimization, quantization) -> bool:
+def reproducible_export(*, optimization, quantization, fast_config=None, registry=None) -> bool:
     """Whether a length check can reproduce the export's numbers exactly.
 
     Storage precision, ``sig_figs`` and symmetric quantization change only
-    the stored values, which the reference model can hold too. Fast kernels'
-    approximations and GPTQ's calibration over inputs it has consumed can't
-    be reproduced.
+    the stored values, which the reference model can hold too. Fast mode's
+    built-in approximations are reproduced by running the reference under
+    ``fast_reference`` (see there); its weight transforms, approximate
+    kernels from ``register_kernel``, and GPTQ's calibration over inputs it
+    has consumed can't be.
     """
-    return optimization == "exact" and (
-        quantization is None or quantization.method == "symmetric"
+    if quantization is not None and quantization.method != "symmetric":
+        return False
+    if optimization == "exact":
+        return True
+    from cattorch.fast import FastConfig
+    from cattorch.operator_registry import default_registry
+
+    config = fast_config or FastConfig()
+    # The built-in approximate kernels are among those ``_FastReference``
+    # reproduces; only ones passed to the export aren't.
+    passed = set() if registry is None else (
+        registry._approximate_targets - default_registry()._approximate_targets
     )
+    return not config.has_weight_transforms and not passed
 
 
-# Tolerances for a sprite compared with a model holding its stored values, a
-# little looser than ``verify``'s because a long sum accumulates float32
-# rounding. That rounding grows with the values summed, so the absolute
-# tolerance grows with the output's largest magnitude too: an output near
-# zero among others near 1e5 differs by float32 noise of their size.
+class _FastReference:
+    """Run PyTorch as fast mode's built-in kernels compute.
+
+    Fast mode replaces GELU with QuickGELU, ``x * sigmoid(1.702 x)``. Its
+    one-pass LayerNorm variance and its softmax without the maximum are the
+    same numbers in exact arithmetic, which a sprite's doubles come close
+    to, so only GELU changes here.
+    """
+
+    def __init__(self, fast_config):
+        self.active = fast_config.activations
+        self.mode = None
+
+    def __enter__(self):
+        if self.active:
+            from torch.utils._python_dispatch import TorchDispatchMode
+
+            class QuickGelu(TorchDispatchMode):
+                def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                    if func is torch.ops.aten.gelu.default:
+                        value = args[0]
+                        return value * torch.sigmoid(1.702 * value)
+                    return func(*args, **(kwargs or {}))
+
+            self.mode = QuickGelu()
+            self.mode.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        if self.mode is not None:
+            self.mode.__exit__(*exc)
+            self.mode = None
+        return False
+
+
+def fast_reference(optimization, fast_config):
+    """A context in which PyTorch computes as the export's kernels do."""
+    import contextlib
+
+    from cattorch.fast import FastConfig
+
+    if optimization != "fast":
+        return contextlib.nullcontext()
+    return _FastReference(fast_config or FastConfig())
+
+
+# Tolerances for a sprite compared with a model holding its stored values,
+# in ``verify``'s form (``atol + rtol * |expected|`` for each value), a
+# little looser than its defaults because a long sum accumulates rounding.
+# The absolute tolerance grows with the largest value compared: an output
+# near zero among others near 1e5 differs by float32 noise of their size.
+# The sprite computes in doubles, so the float32 reference's own error,
+# which grows with the values it went through rather than those it
+# returns (``h[-1] - h.mean(0)`` over rows near 3e4), is measured against a
+# float64 run of the reference and allowed for too.
 _EXACT_TOLERANCE = {"atol": 1e-3, "rtol": 1e-4}
 _EXACT_MAGNITUDE_TOLERANCE = 1e-5
 
 
+def _magnitude(leaves) -> float:
+    return max(
+        (
+            float(leaf.detach().abs().nan_to_num(posinf=0.0, neginf=0.0).max())
+            for leaf in leaves
+            if isinstance(leaf, torch.Tensor) and leaf.numel() and leaf.is_floating_point()
+        ),
+        default=0.0,
+    )
+
+
+def _float32_error(leaves, precise_leaves) -> float:
+    """The largest difference between float32 results and their float64 run."""
+    if precise_leaves is None or len(leaves) != len(precise_leaves):
+        return 0.0
+    found = 0.0
+    for leaf, precise in zip(leaves, precise_leaves):
+        if (
+            not isinstance(leaf, torch.Tensor) or not isinstance(precise, torch.Tensor)
+            or not leaf.is_floating_point() or leaf.shape != precise.shape or not leaf.numel()
+        ):
+            continue
+        difference = (leaf.double() - precise.double()).abs()
+        difference = difference[torch.isfinite(difference)]
+        if difference.numel():
+            found = max(found, float(difference.max()))
+    return found
+
+
+def tolerance_for(leaves, precise_leaves=None) -> dict[str, float]:
+    """``_EXACT_TOLERANCE`` for comparing a sprite with ``leaves``.
+
+    ``atol`` is at least ``_EXACT_MAGNITUDE_TOLERANCE`` of their largest
+    magnitude, plus twice the error of the float32 ``leaves`` measured
+    against ``precise_leaves``, the same results computed in float64.
+    """
+    return {
+        **_EXACT_TOLERANCE,
+        "atol": max(_EXACT_TOLERANCE["atol"], _EXACT_MAGNITUDE_TOLERANCE * _magnitude(leaves))
+        + 2 * _float32_error(leaves, precise_leaves),
+    }
+
+
+def _float64(value):
+    """``value`` with its floating tensors in float64, at any depth."""
+    from torch.utils import _pytree as pytree
+
+    return pytree.tree_map(
+        lambda leaf: leaf.double()
+        if isinstance(leaf, torch.Tensor) and leaf.is_floating_point() else leaf,
+        value,
+    )
+
+
+def float64_copy(model):
+    """A float64 copy of ``model``, or ``None`` if it can't be made."""
+    try:
+        return copy.deepcopy(model).double()
+    except Exception:  # noqa: BLE001 - the float32 tolerance applies then
+        return None
+
+
 def _exact_tolerance(reference, positional, keywords) -> dict[str, float]:
-    """``_EXACT_TOLERANCE``, with ``atol`` at least ``_EXACT_MAGNITUDE_TOLERANCE``
-    of the reference output's largest magnitude."""
+    """``tolerance_for`` the reference's output on these inputs."""
     from cattorch.frontend import tensor_output_leaves
     from cattorch.verify import _reading_stored_uses
 
+    def run(model, values, named):
+        with torch.no_grad(), _reading_stored_uses(model):
+            return tensor_output_leaves(model(*values, **named), warn=False)
+
     try:
-        with torch.no_grad(), _reading_stored_uses(reference):
-            leaves = tensor_output_leaves(
-                copy.deepcopy(reference)(*positional, **keywords), warn=False,
-            )
+        leaves = run(copy.deepcopy(reference), positional, keywords)
     except Exception:
         # A model that fails at this length is reported by verify, which
         # runs it next and says so in the user's terms.
         return dict(_EXACT_TOLERANCE)
-    magnitude = max(
-        (
-            float(leaf.detach().abs().nan_to_num(posinf=0.0, neginf=0.0).max())
-            for leaf in leaves if leaf.numel() and leaf.is_floating_point()
-        ),
-        default=0.0,
-    )
-    return {
-        **_EXACT_TOLERANCE,
-        "atol": max(_EXACT_TOLERANCE["atol"], _EXACT_MAGNITUDE_TOLERANCE * magnitude),
-    }
+    precise = None
+    double = float64_copy(reference)
+    if double is not None:
+        try:
+            precise = run(double, _float64(tuple(positional)), _float64(dict(keywords)))
+        except Exception:  # noqa: BLE001 - not every model runs in float64
+            precise = None
+    return tolerance_for(leaves, precise)
 
 
 def _stored_values_model(
@@ -192,10 +314,20 @@ _USES_LENGTH = (
 )
 
 
+def _beyond_baseline(found: float, baseline: float, length: int, base_length: int) -> bool:
+    """Whether an export the check can't reproduce differs too much at ``length``.
+
+    Its error at ``base_length`` items is the baseline. An approximation's
+    error in each item adds up over a sum of them, so the baseline grows in
+    proportion to the length.
+    """
+    return found > 10 * baseline * max(1.0, length / max(base_length, 1)) + 1e-4
+
+
 def check_lengths(
     model, flat_inputs, kwarg_names, spec, result, verify, example_kwargs, *,
     optimization="exact", storage=None, quantization=None, sig_figs=None,
-    adapters=(), kernels=(),
+    adapters=(), kernels=(), fast_config=None,
 ) -> None:
     """Compare the sprite with PyTorch at lengths other than the traced one.
 
@@ -203,23 +335,27 @@ def check_lengths(
     itself (``torch.arange(n)``, a position table, a reshape over it) is
     exported for one row only. Comparing at other lengths finds that. The
     sprite is compared with a copy of the model holding the values the
-    sprite stores (see ``reproducible_export``), and must match it at every
-    length. An export the check can't reproduce is compared with the model,
-    taking the error at the shortest length as the baseline, so approximate
-    kernels and GPTQ don't trip the check.
+    sprite stores, run as fast mode's kernels compute (see
+    ``reproducible_export``), and must match it at every length. An export
+    the check can't reproduce is compared with the model, taking the error
+    at the shortest length as the baseline (see ``_beyond_baseline``), so
+    weight transforms, approximate kernels and GPTQ don't trip the check.
     """
     from cattorch.operator_registry import default_registry
 
     ((index, (_, minimum, maximum, axis)),) = spec.items()
     lengths = _lengths(minimum, flat_inputs[index].shape[axis], maximum)
     positional = len(flat_inputs) - len(kwarg_names)
-    exact = reproducible_export(optimization=optimization, quantization=quantization)
+    registry = default_registry().for_export(adapters=adapters, kernels=kernels)
+    exact = reproducible_export(
+        optimization=optimization, quantization=quantization, fast_config=fast_config,
+        registry=registry,
+    )
     reference = model
     if exact:
         reference = _stored_values_model(
             model, flat_inputs[:positional], example_kwargs, storage=storage,
-            quantization=quantization, sig_figs=sig_figs,
-            registry=default_registry().for_export(adapters=adapters, kernels=kernels),
+            quantization=quantization, sig_figs=sig_figs, registry=registry,
         )
 
     def report(length):
@@ -227,22 +363,24 @@ def check_lengths(
         values[index] = varied_at_length(values[index], axis, length)
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
-        tolerance = (
-            _exact_tolerance(reference, tuple(values[:positional]), keywords)
-            if exact else {"atol": math.inf, "rtol": math.inf}
-        )
-        # verify runs the model; a fresh copy each time keeps a forward that
-        # changes module state away from the caller's model and later runs.
-        try:
-            return verify(
-                copy.deepcopy(reference), tuple(values[:positional]), result,
-                example_kwargs=keywords or None, **tolerance,
+        with fast_reference(optimization if exact else "exact", fast_config):
+            tolerance = (
+                _exact_tolerance(reference, tuple(values[:positional]), keywords)
+                if exact else {"atol": math.inf, "rtol": math.inf}
             )
-        except UnsupportedModelError as error:
-            raise UnsupportedModelError(
-                f"the export is checked at several lengths within the dynamic bounds, and "
-                f"with {length} items along the dynamic dimension: {error}"
-            ) from error
+            # verify runs the model; a fresh copy each time keeps a forward
+            # that changes module state away from the caller's model and
+            # later runs.
+            try:
+                return verify(
+                    copy.deepcopy(reference), tuple(values[:positional]), result,
+                    example_kwargs=keywords or None, **tolerance,
+                )
+            except UnsupportedModelError as error:
+                raise UnsupportedModelError(
+                    f"the export is checked at several lengths within the dynamic bounds, "
+                    f"and with {length} items along the dynamic dimension: {error}"
+                ) from error
 
     def error(outcome):
         """The largest difference, and whether it is within tolerance."""
@@ -259,7 +397,7 @@ def check_lengths(
         )
     for length in lengths[1:]:
         found, matches = error(report(length))
-        if not matches or (not exact and found > 10 * baseline + 1e-4):
+        if not matches or (not exact and _beyond_baseline(found, baseline, length, lengths[0])):
             cause = (
                 _CHANGES_OPERATIONS
                 if _operations_change(model, flat_inputs, kwarg_names, spec, example_kwargs)
@@ -328,45 +466,129 @@ def _state_at_length(state, length: int) -> torch.Tensor:
     return varied_at_length(initial, 0, length, seed=7)
 
 
+def _entry_reference(
+    model, program, registry, *, optimization, fast_config, quantization, storage, sig_figs,
+    gptq_reference, gptq_report,
+):
+    """``(reference model, whether the check reproduces the export)``."""
+    from cattorch.storage import StorageConfig
+    from cattorch.verify import _program_reference, round_as_stored
+
+    exact = reproducible_export(
+        optimization=optimization, quantization=quantization, fast_config=fast_config,
+        registry=registry,
+    )
+    if gptq_reference is not None:
+        # The export's own copy, holding the weights GPTQ chose, rounded as
+        # storage keeps them, as symmetric quantization's reference is.
+        reference = copy.deepcopy(gptq_reference)
+        round_as_stored(
+            reference, storage or StorageConfig(), quantization=quantization,
+            sig_figs=sig_figs, report=gptq_report,
+        )
+        return reference, reproducible_export(
+            optimization=optimization, quantization=None, fast_config=fast_config,
+            registry=registry,
+        )
+    if quantization is not None and quantization.method != "symmetric":
+        # Without the export's weights, the float model as storage keeps it.
+        quantization = None
+    return _program_reference(
+        model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
+    ), exact
+
+
 def check_entry_lengths(
     model, program, result, *, adapters=(), optimization="exact", storage=None,
-    quantization=None, sig_figs=None,
+    quantization=None, sig_figs=None, fast_config=None, kernels=(),
+    gptq_reference=None, gptq_report=None,
 ) -> None:
     """Compare a program's entry points with PyTorch at lengths other than the traced one.
 
     Every variable-length input of an entry point, a ``dynamic=`` input or
     an append state it reads, is checked at several lengths on its own, the
-    others at their examples and initial values, and then all together.
-    Each check calls the entry point once in the emulator, with its state
-    lists set to the values being checked, and compares its outputs and
-    updated states with the method's. The model gets the values the sprite
-    stores.
+    others at their examples and initial values, and then all together. An
+    append state that the entry point grows is also checked as long as it
+    can be before that call fills it. Each check calls the entry point once
+    in the emulator, with its state lists set to the values being checked,
+    and compares its outputs and updated states with the method's, run on a
+    fresh copy of a model holding the values the sprite stores. A GPTQ
+    export gives its own quantized copy of the model as ``gptq_reference``,
+    with the ``QuantizationReport`` its quantization gave as ``gptq_report``.
     """
     from cattorch.experts import _expert_family_context
     from cattorch.interface import OK, STATUS_VARIABLE
     from cattorch.operator_registry import default_registry
-    from cattorch.program import Input, Output, ProgramCall, StateInput
+    from cattorch.program import Input, Output, ProgramCall, StateInput, StateUpdate
     from cattorch.program_runtime import program_replay
     from cattorch.util.scratch.archive import read_json
     from cattorch.util.scratch.emulator import ScratchEmulator
-    from cattorch.verify import _compare_values, _get_logical_list, _program_reference, _set_logical_list
-
-    if quantization is not None and quantization.method != "symmetric":
-        return  # verify can't reproduce other quantization methods
-    exact = reproducible_export(optimization=optimization, quantization=quantization)
-    tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
-    registry = default_registry().for_export(adapters=adapters)
-    reference = _program_reference(
-        model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
+    from cattorch.verify import (
+        _compare_values, _get_logical_list, _reading_stored_uses, _set_logical_list,
     )
+
+    registry = default_registry().for_export(adapters=adapters, kernels=kernels)
+    reference, exact = _entry_reference(
+        model, program, registry, optimization=optimization, fast_config=fast_config,
+        quantization=quantization, storage=storage, sig_figs=sig_figs,
+        gptq_reference=gptq_reference, gptq_report=gptq_report,
+    )
+    double = float64_copy(reference) if exact else None
+    computing = fast_reference(optimization if exact else "exact", fast_config)
     emulator = ScratchEmulator(read_json(result.path))
     states = {state.name: state for state in program.states}
 
+    def replayed(model, entry, inputs, overrides, *, in_float64=False):
+        """``(results, states after)`` of one call on a fresh copy of ``model``."""
+        replay = program_replay(copy.deepcopy(model), program)
+        starting = {
+            state.name: state.initial.detach().clone() for state in program.states
+        }
+        starting.update(overrides)
+        if in_float64:
+            # The inputs are checked against their contract as given, then
+            # computed with in float64.
+            checked = replay.checked_inputs
+            replay.checked_inputs = (  # type: ignore[method-assign]
+                lambda entry, values: _float64(checked(entry, values))
+            )
+            starting = _float64(starting)
+        replay.states = starting
+        with (
+            _expert_family_context(registry.expert_families),
+            _reading_stored_uses(replay.model, registry),
+            computing,
+        ):
+            leaves = replay.run(ProgramCall(entry.name, tuple(inputs)))
+        return leaves, dict(replay.states)
+
+    def precise(entry, inputs, overrides):
+        """The same call in float64, or ``None``."""
+        if double is None:
+            return None
+        try:
+            return replayed(double, entry, inputs, overrides, in_float64=True)
+        except Exception:  # noqa: BLE001 - not every model runs in float64
+            return None
+
+    def appended(entry, inputs) -> dict[str, int]:
+        """The rows the entry point adds to each append state, from its initial value."""
+        try:
+            _, after = replayed(reference, entry, inputs, {})
+        except ValueError:
+            return {}
+        return {
+            name: int(after[name].shape[0] - state.initial.shape[0])
+            for name, state in states.items() if state.mode == "append"
+        }
+
     def error(entry, inputs, overrides):
         """The largest difference of one call, whether it matches, and whether it ran."""
-        replay = program_replay(reference, program)
-        replay.states = {**replay.states, **overrides}
-        for name, value in replay.states.items():
+        replay_states = {
+            state.name: state.initial.detach().clone() for state in program.states
+        }
+        replay_states.update(overrides)
+        for name, value in replay_states.items():
             _set_logical_list(emulator, f"cattorch state {name}", value.flatten().tolist())
         bindings = [binding for binding in entry.arguments if isinstance(binding, Input)]
         for binding, value in zip(bindings, inputs):
@@ -374,8 +596,7 @@ def check_entry_lengths(
         emulator.run_procedure(f"cattorch {entry.name}")
         status = str(emulator.variables.get(STATUS_VARIABLE, ""))
         try:
-            with _expert_family_context(registry.expert_families):
-                leaves = replay.run(ProgramCall(entry.name, tuple(inputs)))
+            leaves, after = replayed(reference, entry, inputs, overrides)
         except ValueError as refused:
             if "capacity exceeded" not in str(refused):
                 raise
@@ -384,19 +605,26 @@ def check_entry_lengths(
             return (0.0, True, False) if status != OK else (math.inf, False, True)
         if status != OK:
             return math.inf, False, True
+        exactly = precise(entry, inputs, overrides)
+        expected = [
+            (leaf, None if exactly is None else exactly[0][position],
+             f"cattorch {entry.name} {binding.name}")
+            for position, (binding, leaf) in enumerate(zip(entry.returns, leaves))
+            if isinstance(binding, Output)
+        ]
+        expected += [
+            (after[name], None if exactly is None else exactly[1][name], f"cattorch state {name}")
+            for name in states
+        ]
         reports = [
             _compare_values(
-                expected, _get_logical_list(emulator, f"cattorch {entry.name} {binding.name}"),
-                **tolerance,
+                leaf, _get_logical_list(emulator, list_name),
+                **(
+                    tolerance_for([leaf], None if accurate is None else [accurate])
+                    if exact else {"atol": math.inf, "rtol": math.inf}
+                ),
             )
-            for binding, expected in zip(entry.returns, leaves) if isinstance(binding, Output)
-        ]
-        reports += [
-            _compare_values(
-                replay.states[name], _get_logical_list(emulator, f"cattorch state {name}"),
-                **tolerance,
-            )
-            for name in states
+            for leaf, accurate, list_name in expected
         ]
         if any(report.values_compared != report.actual_values for report in reports):
             return math.inf, False, True
@@ -405,7 +633,12 @@ def check_entry_lengths(
 
     for entry in program.entrypoints:
         inputs = [binding for binding in entry.arguments if isinstance(binding, Input)]
-        # ``(what it is, how to set it to a length, lengths to check)``.
+        grows = {
+            binding.name for binding in entry.returns
+            if isinstance(binding, StateUpdate) and states[binding.name].mode == "append"
+        }
+        examples_given = [binding.example for binding in inputs]
+        added = appended(entry, examples_given) if grows else {}
         # ``(what it is, its key, lengths to check)``: an input's position,
         # or an append state's name.
         varying: list[tuple[str, int | str, list[int]]] = []
@@ -420,16 +653,24 @@ def check_entry_lengths(
             state = states.get(binding.name) if isinstance(binding, StateInput) else None
             if state is not None and state.mode == "append":
                 rows = int(state.initial.shape[0])
-                varying.append((
-                    f"state {state.name!r}", state.name,
-                    _lengths(rows, rows, int(state.capacity or rows)),
-                ))
+                capacity = int(state.capacity or rows)
+                lengths = set(_lengths(rows, rows, capacity))
+                if state.name in grows:
+                    # At the capacity the call that grows the state is
+                    # refused and compares nothing, so also check the
+                    # longest it can be before the call, and halfway there.
+                    fullest = capacity - added.get(state.name, 0)
+                    lengths.update(
+                        length for length in (fullest, (rows + fullest) // 2)
+                        if rows <= length <= capacity
+                    )
+                varying.append((f"state {state.name!r}", state.name, sorted(lengths)))
         if not varying:
             continue
 
-        def run(settings):
-            """One call with each ``(key, length)`` in ``settings`` at that length."""
-            values = [binding.example for binding in inputs]
+        def setting(settings):
+            """The inputs and states for each ``(key, length)`` in ``settings``."""
+            values = list(examples_given)
             overrides = {}
             for key, length in settings:
                 if isinstance(key, str):
@@ -437,7 +678,25 @@ def check_entry_lengths(
                 else:
                     ((axis, _),) = inputs[key].dynamic.items()
                     values[key] = varied_at_length(inputs[key].example, axis, length)
+            return values, overrides
+
+        def run(settings):
+            """One call with each ``(key, length)`` in ``settings`` at that length."""
+            values, overrides = setting(settings)
             return error(entry, values, overrides)
+
+        def fitted(settings):
+            """``settings`` with each state the call grows short enough to grow."""
+            values, _ = setting([(key, length) for key, length in settings if not isinstance(key, str)])
+            growth = appended(entry, values)
+            return [
+                (key, max(
+                    int(states[key].initial.shape[0]),
+                    min(length, int(states[key].capacity) - growth.get(key, 0)),
+                ))
+                if isinstance(key, str) and key in grows else (key, length)
+                for key, length in settings
+            ]
 
         def described(parts):
             return " and ".join(
@@ -458,6 +717,11 @@ def check_entry_lengths(
                 f"length of {names}, which the export traces with one row, that the "
                 f"sprite can't follow, {examples}"
             )
+        base_length = max(
+            [int(states[key].initial.shape[0]) if isinstance(key, str) else int(
+                inputs[key].example.shape[next(iter(inputs[key].dynamic))]
+            ) for _, key, _ in varying] + [1]
+        )
         checks = [
             [(what, key, length)] for what, key, lengths in varying for length in lengths
         ]
@@ -467,9 +731,18 @@ def check_entry_lengths(
                 [(what, key, pick(lengths)) for what, key, lengths in varying]
                 for pick in (lambda lengths: min(lengths, key=lambda value: abs(value - 3)), max)
             ]
+            if grows:
+                # And at the longest, with the states it grows short enough
+                # for the call to be compared.
+                longest = [(key, max(lengths)) for _, key, lengths in varying]
+                whats = [what for what, _, _ in varying]
+                checks.append([
+                    (what, key, length) for what, (key, length) in zip(whats, fitted(longest))
+                ])
         for check in checks:
             found, matches, _ = run([(key, length) for _, key, length in check])
-            if not matches or (not exact and found > 10 * baseline + 1e-4):
+            length = max(length for _, _, length in check)
+            if not matches or (not exact and _beyond_baseline(found, baseline, length, base_length)):
                 raise UnsupportedModelError(
                     f"entry point {entry.name!r} with {described((what, length) for what, _, length in check)} "
                     f"gives different numbers in the sprite from the method (largest "

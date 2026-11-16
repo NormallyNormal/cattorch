@@ -453,21 +453,67 @@ def _verify_program(
     atol: float,
     rtol: float,
 ) -> ProgramVerifyResult:
-    emulator = ScratchEmulator(_sprite_json(sprite, ProgramResult, "an ExportProgram's"))
+    project = _sprite_json(sprite, ProgramResult, "an ExportProgram's")
     registry = default_registry().for_export(adapters=adapters)
     owned = _program_reference(
         model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
     )
-    # For a marked model, the user's own methods on live buffers.
-    replay = program_replay(owned, program)
-    if calls is None:
+    if calls is not None:
+        passes = [(owned, calls)]
+    else:
         from cattorch.program_runtime import default_program_calls
         calls = default_program_calls(program)
+        passes = [(owned, calls)]
+        if len(calls) > 1:
+            # Then again in reverse order, from a fresh sprite and model, so
+            # an entry point is called both before and after each other one:
+            # one order alone can't show one's sprite depending on another
+            # having run.
+            passes.append((copy.deepcopy(owned), tuple(reversed(calls))))
     call_results = []
+    for position, (reference, sequence) in enumerate(passes):
+        call_results.extend(_program_calls(
+            ScratchEmulator(copy.deepcopy(project)), reference, program, sequence, registry,
+            atol=atol, rtol=rtol, tentative=position > 0,
+        ))
+    return ProgramVerifyResult(
+        passed=all(value.passed for value in call_results),
+        calls=tuple(call_results),
+    )
+
+
+def _program_calls(
+    emulator: ScratchEmulator, owned: torch.nn.Module, program: ExportProgram,
+    calls, registry, *, atol: float, rtol: float, tentative: bool = False,
+) -> list[ProgramCallVerifyResult]:
+    """Run ``calls`` in the emulator and on ``owned``, comparing each.
+
+    ``tentative`` calls, which the user didn't ask for, stop where the model
+    itself can't take the next one, as a read of a state still empty can't.
+    """
+    from cattorch.experts import _expert_family_context
+
+    # For a marked model, the user's own methods on live buffers.
+    replay = program_replay(owned, program)
+    call_results = []
+
+    def run(invocation):
+        with (
+            _expert_family_context(registry.expert_families),
+            _reading_stored_uses(owned, registry),
+        ):
+            return replay.run(invocation)
+
     for invocation in calls:
         if not isinstance(invocation, ProgramCall):
             raise TypeError(f"calls must contain ProgramCall values, not {type(invocation).__name__}")
         entry = replay.entry(invocation)
+        ran = None
+        if tentative:
+            try:
+                ran = run(invocation)
+            except Exception:  # noqa: BLE001 - the model can't take this order
+                break
         for binding, value in zip(
             (binding for binding in entry.arguments if isinstance(binding, Input)),
             invocation.inputs,
@@ -480,12 +526,7 @@ def _verify_program(
         status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
         output_results = []
         if status == OK:
-            from cattorch.experts import _expert_family_context
-            with (
-                _expert_family_context(registry.expert_families),
-                _reading_stored_uses(owned, registry),
-            ):
-                leaves = replay.run(invocation)
+            leaves = ran if ran is not None else run(invocation)
             for binding, expected in zip(entry.returns, leaves):
                 if isinstance(binding, Output):
                     output_results.append(_compare_values(
@@ -513,10 +554,10 @@ def _verify_program(
             states=state_results,
             status=status,
         ))
-    return ProgramVerifyResult(
-        passed=all(value.passed for value in call_results),
-        calls=tuple(call_results),
-    )
+        if tentative and status != OK:
+            # The states in PyTorch have moved on without the sprite's.
+            break
+    return call_results
 
 
 class _GenerationReference:
@@ -965,9 +1006,11 @@ def verify(
     mismatch is a failed result with infinite error metrics.
 
     For an ``ExportProgram`` (or ``@entrypoint`` markers), ``calls`` runs a
-    sequence of ``ProgramCall``s with state carried between them, each entry
-    point once with its example inputs by default, comparing outputs and states
-    after every call; with markers, PyTorch runs the model's own methods on a
+    sequence of ``ProgramCall``s with state carried between them, comparing
+    outputs and states after every call. By default each entry point runs
+    once with its example inputs, then, with several entry points, again in
+    reverse order from a fresh sprite and model, so each runs both before
+    and after every other one. With markers, PyTorch runs the model's own methods on a
     copy whose buffers hold the state. For a ``GenerationProgram``
     or ``RecurrentGenerationProgram``, ``calls`` names the blocks
     ``"prefill"``, ``"decode"`` and ``"reset"`` with their token IDs, such as
