@@ -129,6 +129,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   append state must hold from its initial rows up to its capacity. State
   lists belong to the sprite; see
   [state](docs/programs-and-moe.md#state).
+- `ExportProgram` refuses entry point names whose broadcasts Scratch would
+  match as one, since it matches them ignoring case: names that differ only
+  in case, a name like another's completion (`x complete` beside `x`), and
+  `init`, `reset` and `prepare for save` in any case.
 - An input or state list split into shards is checked shard by shard: each
   must hold its part, every shard but the last holding items holding exactly
   200,000, or the block fails with `wrong number of items: LIST`; a

@@ -667,6 +667,33 @@ def test_an_append_state_holds_at_least_its_initial_rows(tmp_path):
         assert emulator.variables[interface.STATUS_VARIABLE] == status, rows
 
 
+# ── Names Scratch can't tell apart ───────────────────────────────────────────
+
+def entry(name: str) -> EntryPoint:
+    return EntryPoint(name, arguments=(Input("x", torch.ones(1)),), returns=(Output("y"),))
+
+
+@pytest.mark.parametrize("names, message", [
+    # Broadcasts are matched ignoring case.
+    (("step", "Step"), "differ only in case"),
+    (("STEP", "step"), "differ only in case"),
+    # A project's bridge for x ends with ``NAME x complete``.
+    (("x", "x complete"), "completion"),
+    (("x complete", "X"), "completion"),
+    # The program's own blocks and broadcasts.
+    (("init",), "reserved"), (("Reset",), "reserved"), (("PREPARE FOR SAVE",), "reserved"),
+])
+def test_entry_point_names_scratch_cant_tell_apart_are_refused(names, message):
+    with pytest.raises(ValueError, match=message):
+        ExportProgram(entrypoints=tuple(entry(name) for name in names))
+
+
+def test_entry_point_names_scratch_tells_apart_are_taken():
+    # Block names are matched exactly, and a model's block names aren't a
+    # program's.
+    ExportProgram(entrypoints=(entry("step"), entry("steps"), entry("forward"), entry("x done")))
+
+
 # ── Long lists (docs/scratch-interface.md#long-lists) ───────────────────────
 
 def fill_split(emulator, name, values, sizes):

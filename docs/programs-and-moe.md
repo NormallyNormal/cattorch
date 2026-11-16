@@ -61,7 +61,14 @@ items, and broadcasts `cattorch step complete`. The
 
 Rules:
 
-- `init`, `reset`, and `prepare for save` can't be used as entry point names.
+- `init`, `reset`, and `prepare for save` can't be used as entry point names,
+  in any case: Scratch matches broadcasts ignoring case, so `Init` would
+  share `cattorch init complete`.
+- For the same reason, two entry point names can't differ only in case, such
+  as `step` and `Step`, and an entry point can't be named like another's
+  completion, such as `x complete` beside `x`, whose
+  [project bridge](projects-and-cli.md#bridges) ends by broadcasting
+  `NAME x complete`.
 - List names must be unique across entry points and states, and can't end in
   `shard N`, which is used for [sharding](storage.md#list-sharding).
 - An input and an output of the same entry point can share a name only if

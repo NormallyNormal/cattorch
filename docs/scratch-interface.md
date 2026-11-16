@@ -202,7 +202,10 @@ initial state, `cattorch cache length` counts the tokens read since then, and
 
 A sprite from an [`ExportProgram`](programs-and-moe.md#named-entry-points-and-state)
 or [`@entrypoint` markers](markers.md) has a block per entry point, named
-after it:
+after it. Scratch matches broadcast names ignoring case, and block, list and
+variable names exactly, so no two entry points' broadcasts, or project
+bridges, are the same message ignoring case; see the
+[rules](programs-and-moe.md#named-entry-points-and-state).
 
 | Name | Kind | Meaning |
 |---|---|---|

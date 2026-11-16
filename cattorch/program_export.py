@@ -1181,7 +1181,7 @@ def transpile_program(
         public_data_names.update(value.list_name for value in entry_result.outputs)
     if not _private_states:
         public_data_names.update(_state_list(state.name) for state in program.states)
-    lifecycle_procedures = (interface.INIT, interface.RESET, interface.PREPARE_FOR_SAVE)
+    lifecycle_procedures = interface.PROGRAM_LIFECYCLE
     entry_procedures = tuple(
         name_of(interface.entry_procedure(entry.name)) for entry in program.entrypoints
     )

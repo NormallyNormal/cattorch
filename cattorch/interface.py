@@ -149,6 +149,16 @@ PUBLIC_DATA = frozenset({
     *STORAGE_VARIABLES,
 })
 PUBLIC_BROADCASTS = frozenset(completion(block) for block in PUBLIC_PROCEDURES)
+# A program sprite's blocks besides its entry points'.
+PROGRAM_LIFECYCLE = (INIT, RESET, PREPARE_FOR_SAVE)
+
+
+def broadcast_key(message: str) -> str:
+    """What Scratch tells broadcasts apart by: it matches them ignoring case.
+
+    Variable, list and block names, by contrast, are matched exactly.
+    """
+    return message.lower()
 
 
 def shard_variables(list_name: str) -> tuple[str, str]:

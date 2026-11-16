@@ -16,6 +16,8 @@ from typing import Literal
 
 import torch
 
+from cattorch import interface
+
 
 def _name(value: str, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -173,8 +175,18 @@ class EntryPoint:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "entry point name"))
-        if self.name in {"init", "reset", "prepare for save"}:
-            raise ValueError(f"entry point name {self.name!r} is reserved for lifecycle procedures")
+        block = interface.entry_procedure(self.name)
+        for lifecycle in interface.PROGRAM_LIFECYCLE:
+            # Scratch matches blocks exactly and broadcasts ignoring case.
+            if block == lifecycle or interface.broadcast_key(
+                interface.completion(block),
+            ) == interface.broadcast_key(interface.completion(lifecycle)):
+                raise ValueError(
+                    f"entry point name {self.name!r} is reserved: its block {block!r} or "
+                    f"broadcast {interface.completion(block)!r} would be the program's own "
+                    f"{lifecycle!r} or {interface.completion(lifecycle)!r}, which Scratch "
+                    "matches ignoring case"
+                )
         if re.search(r"%[snb]", self.name):
             raise ValueError("entry point names can't contain Scratch argument placeholders")
         object.__setattr__(self, "method", _name(self.method, "entry point method"))
@@ -200,6 +212,37 @@ class EntryPoint:
             raise ValueError(f"entry point {self.name!r} has duplicate state updates")
 
 
+def _check_messages(entry_names: list[str]) -> None:
+    """Refuse entry points whose broadcasts Scratch can't tell apart.
+
+    Scratch matches broadcasts ignoring case, so ``step`` and ``Step`` would
+    share ``cattorch step complete``. A project's bridge for entry point E
+    is the message ``NAME E``, and it ends with ``NAME E complete``, so an
+    entry point named ``E complete`` would also run when E's bridge ends.
+    Block, variable and list names are matched exactly, and the exact
+    checks elsewhere cover them.
+    """
+    seen: dict[str, str] = {}
+    for name in entry_names:
+        key = interface.broadcast_key(name)
+        if key in seen:
+            raise ValueError(
+                f"entry points {seen[key]!r} and {name!r} differ only in case, and Scratch "
+                f"matches their broadcasts ({interface.completion(interface.entry_procedure(name))!r}) "
+                "ignoring case; rename one"
+            )
+        seen[key] = name
+    for name in entry_names:
+        key = interface.broadcast_key(interface.completion(name))
+        if key in seen:
+            raise ValueError(
+                f"entry point {seen[key]!r} is named like entry point {name!r}'s completion: "
+                f"in a project, {name!r}'s bridge ends by broadcasting "
+                f"'NAME {interface.completion(name)}', which would also run "
+                f"{seen[key]!r}'s bridge; rename one"
+            )
+
+
 @dataclass(frozen=True)
 class ExportProgram:
     """Complete callable and persistent-state interface for one sprite."""
@@ -220,6 +263,7 @@ class ExportProgram:
         state_names = [value.name for value in self.states]
         if len(entry_names) != len(set(entry_names)):
             raise ValueError("entry point names must be unique")
+        _check_messages(entry_names)
         if len(state_names) != len(set(state_names)):
             raise ValueError("state names must be unique")
         states = {value.name: value for value in self.states}
