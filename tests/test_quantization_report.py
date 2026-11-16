@@ -6,10 +6,12 @@ import pytest
 
 import torch
 import torch.nn.functional as F
+from sprite_helpers import load_sprite
 
 from cattorch import (
     EntryPoint, ExportProgram, Input, Output, QuantizationConfig, transpile, verify,
 )
+from cattorch.util.scratch.emulator import ScratchEmulator
 
 
 def _transpile(*args, **kwargs):
@@ -163,3 +165,53 @@ def test_generation_position_table_is_reported_once(tmp_path):
             if item.name == "transformer.wpe.weight"
         ]
         assert [(item.method, item.values) for item in entries] == [("float16", 8 * 32)]
+
+
+class _TiedCopy(torch.nn.Module):
+    """A table gathered directly and read as the head through a copy."""
+
+    def __init__(self):
+        super().__init__()
+        self.emb = torch.nn.Embedding(128, 32)
+        self.mix = torch.nn.Linear(32, 32)
+
+    def forward(self, tokens):
+        hidden = torch.tanh(self.mix(self.emb(tokens)))
+        return hidden @ self.emb.weight.t().contiguous()
+
+
+class _LinearAndCopy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(128, 32) * 0.1)
+
+    def forward(self, value):
+        return F.linear(value, self.w) + F.linear(value, self.w.clone())
+
+
+@pytest.mark.parametrize("method", ["symmetric", "gptq"])
+@pytest.mark.parametrize("kind", ["tied", "clone"])
+def test_weight_read_directly_and_through_a_copy_is_rounded_once(tmp_path, method, kind):
+    torch.manual_seed(0)
+    model = (_TiedCopy() if kind == "tied" else _LinearAndCopy()).eval()
+    name = "emb.weight" if kind == "tied" else "w"
+    example = torch.randint(0, 128, (1, 8)) if kind == "tied" else torch.randn(1, 32)
+    calibration = (
+        [torch.randint(0, 128, (1, 8)) for _ in range(20)] if kind == "tied"
+        else [torch.randn(16, 32) for _ in range(10)]
+    ) if method == "gptq" else None
+    config = QuantizationConfig(
+        bits=4, method=method, min_quantized_values=1024, min_calibration_rows=8,
+    )
+    result, caught = _transpile(
+        model, example, tmp_path / "copy", quantization=config, calibration=calibration,
+    )
+    entries = [item for item in result.quantization.tensors if item.name == name]
+    assert [(item.method, item.values) for item in entries] == [(method, 4096)]
+    assert not [item for item in caught if name in item]
+    # The parameter is stored in one list.
+    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator.run_procedure("cattorch init")
+    assert sum(len(values) == 4096 for values in emulator.lists._by_id.values()) == 1
+    if method == "symmetric":
+        assert verify(model, example, result, quantization=config).passed

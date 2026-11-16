@@ -318,6 +318,9 @@ class QuantizationReport:
     # Matrices quantization left as they are because export computes with
     # them before any input arrives, by storage, with their names.
     _unquantized: dict = field(default_factory=dict, repr=False, compare=False)
+    # Copies of parameters, by storage: (the parameter, the element of its
+    # storage at each of theirs). See ``_storage_sources``.
+    _copies: dict = field(default_factory=dict, repr=False, compare=False)
     # Every (precision, maximum group size) the quantized weights use.
     _integer_formats: tuple = field(default=(), repr=False, compare=False)
 
@@ -1721,6 +1724,105 @@ def _parameter_aliases(model: torch.nn.Module) -> list[str]:
     return aliases
 
 
+# Conversions a copy may make; positions don't convert.
+_RECIPE_CONVERSIONS = frozenset({"to", "type", "float", "double", "half", "bfloat16"})
+
+
+def _replay_recipe(recipe, leaves: dict[str, torch.Tensor]):
+    """Evaluate ``recipe`` with ``leaves`` for the model's tensors."""
+    if isinstance(recipe, tuple) and len(recipe) == 2 and recipe[0] == "leaf":
+        return leaves[recipe[1]]
+    if isinstance(recipe, tuple) and len(recipe) == 3 and callable(recipe[0]):
+        func, arguments, keywords = recipe
+        args = _replay_argument(arguments, leaves)
+        kwargs = dict(_replay_argument(keywords, leaves))
+        if getattr(func, "__name__", "") in _RECIPE_CONVERSIONS:
+            return args[0]
+        return func(*args, **kwargs)
+    if (
+        isinstance(recipe, tuple) and len(recipe) == 2 and isinstance(recipe[0], tuple)
+        and isinstance(recipe[1], int)
+    ):
+        return _replay_recipe(recipe[0], leaves)[recipe[1]]
+    raise ValueError("not a recipe")
+
+
+def _replay_argument(value, leaves: dict[str, torch.Tensor]):
+    if isinstance(value, tuple) and value:
+        tag = value[0]
+        if tag == "leaf" or callable(tag) or (
+            len(value) == 2 and isinstance(tag, tuple) and isinstance(value[1], int)
+        ):
+            return _replay_recipe(value, leaves)
+        if tag in {"tuple", "list"} and len(value) == 2 and isinstance(value[1], tuple):
+            items = [_replay_argument(item, leaves) for item in value[1]]
+            return tuple(items) if tag == "tuple" else items
+        if tag == "slice":
+            return slice(*value[1:])
+        if tag == "object":
+            raise ValueError("an argument recipes can't rebuild")
+    if isinstance(value, str) and value == "...":
+        return Ellipsis
+    return value
+
+
+def _copy_positions(
+    weight: _DerivedWeight, leaves: dict[str, torch.Tensor], parameters: dict[int, tuple],
+) -> tuple[int, torch.Tensor] | None:
+    """``(parameter storage, the parameter element at each storage element
+    of the copy)`` of a weight copied from one parameter, as
+    ``w.t().contiguous()`` or ``w.clone()`` copies it, or ``None``."""
+    if not weight.copy or len(weight.sources) != 1:
+        return None
+    (source,) = weight.sources
+    if source not in parameters:
+        return None
+    positions: dict[str, torch.Tensor] = {}
+    for name in _recipe_leaves(weight.recipe):
+        tensor = leaves.get(name)
+        if tensor is None or tensor.untyped_storage().data_ptr() != source:
+            return None
+        base = torch.arange(_storage_numel(tensor), dtype=torch.float64)
+        positions[name] = base.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
+    copy = weight.tensor
+    try:
+        ids = _replay_recipe(weight.recipe, positions)
+        if not isinstance(ids, torch.Tensor) or ids.shape != copy.shape:
+            return None
+        found = torch.full((_storage_numel(copy),), -1, dtype=torch.long)
+        found.as_strided(copy.shape, copy.stride(), copy.storage_offset()).copy_(ids.long())
+    except (RuntimeError, TypeError, ValueError, IndexError, KeyError):
+        return None
+    return source, found
+
+
+def _strided_view(ids: torch.Tensor) -> tuple[int, tuple[int, ...], tuple[int, ...]] | None:
+    """``(offset, shape, strides)`` of the storage view whose elements are
+    ``ids``, if one is."""
+    if not ids.numel() or bool((ids < 0).any()):
+        return None
+    flat = ids.reshape(-1)
+    offset = int(flat[0])
+    strides = []
+    for dim, size in enumerate(ids.shape):
+        if size > 1:
+            index = [0] * ids.ndim
+            index[dim] = 1
+            strides.append(int(ids[tuple(index)]) - offset)
+        else:
+            strides.append(0)
+    numel = int(ids.max()) + 1
+    try:
+        rebuilt = torch.arange(numel, dtype=torch.long).as_strided(
+            tuple(ids.shape), tuple(strides), offset,
+        )
+    except RuntimeError:
+        return None
+    if not torch.equal(rebuilt, ids):
+        return None
+    return offset, tuple(int(size) for size in ids.shape), tuple(strides)
+
+
 def quantize_model(
     model: torch.nn.Module,
     config: QuantizationConfig,
@@ -1867,6 +1969,41 @@ def quantize_model(
         )
         for pointer in base_parameters
     }
+    # A copy of one parameter, as ``F.linear(x, w.t().contiguous())`` or
+    # ``x @ w.clone()`` reads, is the parameter read in another layout: its
+    # uses are uses of the parameter, so the parameter is quantized once for
+    # all of them, and the copy then holds the parameter's quantized values.
+    leaves = dict(_module_leaves(model))
+    copies: dict[int, tuple[_DerivedWeight, int, torch.Tensor]] = {}
+    for pointer, (weight, _, _) in list(computed.items()):
+        found = _copy_positions(weight, leaves, base_parameters)
+        if found is not None:
+            copies[pointer] = (weight, *found)
+            del computed[pointer]
+    if copies:
+        stats = {}
+        for key, stat in capture.stats.items():
+            copied = copies.get(stat.weight.untyped_storage().data_ptr())
+            view = None if copied is None else _strided_view(copied[2].as_strided(
+                stat.weight.shape, stat.weight.stride(), stat.weight.storage_offset(),
+            ))
+            if copied is not None and view is not None:
+                name, parameter = base_parameters[copied[1]]
+                offset, shape, strides = view
+                weight = parameter.detach().as_strided(shape, strides, offset)
+                suffix = ""
+                if offset or weight.numel() != _storage_numel(parameter):
+                    suffix = f"[offset={offset},shape={shape}]"
+                stat = replace(stat, name=f"{name}{suffix}", weight=weight)
+                key = (*_storage_key(weight), stat.orientation)
+                previous = stats.get(key)
+                if previous is not None:
+                    if previous.hessian.numel():
+                        previous.hessian = previous.hessian + stat.hessian
+                    previous.rows += stat.rows
+                    continue
+            stats[key] = stat
+        capture.stats = stats
     # A computed weight read as a matrix is quantized like a parameter, and
     # takes the settings of the parameters it is computed from.
     read = {stat.weight.untyped_storage().data_ptr() for stat in capture.stats.values()}
@@ -2074,7 +2211,17 @@ def quantize_model(
 
         # The model now computes each computed weight as its tensor, quantized
         # where a use reads it, and so does every copy of the model.
-        _install_computed_weights(weight for weight, _, _ in computed.values())
+        for weight, source, positions in copies.values():
+            parameter = base_parameters[source][1]
+            flat = parameter.detach().as_strided((_storage_numel(parameter),), (1,), 0)
+            copy = weight.tensor
+            copy.copy_(flat[positions.as_strided(
+                copy.shape, copy.stride(), copy.storage_offset(),
+            )])
+        _install_computed_weights([
+            *(weight for weight, _, _ in computed.values()),
+            *(weight for weight, _, _ in copies.values()),
+        ])
 
         reported_names = {item.name.split("[", 1)[0] for item in reports}
         used_storage = {
@@ -2116,6 +2263,10 @@ def quantize_model(
         tensors=tuple(reports),
         _regions=tuple(regions),
         _unquantized=unquantized,
+        _copies={
+            pointer: (base_parameters[source][1], positions)
+            for pointer, (_, source, positions) in copies.items()
+        },
         _computed={pointer: weight.tensor for pointer, (weight, _, _) in computed.items()},
         _integer_formats=tuple(formats),
     )
@@ -2456,7 +2607,7 @@ def _storage_quantization_report(
     # A computed weight is stored as the tensor quantization made of it.
     for pointer, tensor in report._computed.items():
         parameters.setdefault(pointer, tensor)
-    sources_of = _storage_sources(model)
+    sources_of = {**report._copies, **_storage_sources(model)}
     for parameter, _ in sources_of.values():
         parameters.setdefault(parameter.untyped_storage().data_ptr(), parameter)
     provenance = _GraphProvenance(

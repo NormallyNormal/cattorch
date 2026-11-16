@@ -104,8 +104,13 @@ When two uses read the same values grouped along different axes, as
 integers: the larger use's, or the first one's.
 
 A weight the model copies before using it, such as
-`F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is quantized
-and calibrated as the copy is used, and the copy is stored in integers.
+`F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is the
+parameter read in another layout: the parameter is quantized once, for its
+direct uses and its copies' together, GPTQ calibrates it with all of them,
+and each copy holds the same quantized values. The report has one entry
+for it, and a table read directly and through a copy, such as an embedding
+gathered by token and used as the head through `weight.t().contiguous()`,
+is stored once.
 
 A weight computed from parameters before any input arrives, such as a
 `weight_norm` or `spectral_norm` weight (`torch.nn.utils.parametrizations` or
