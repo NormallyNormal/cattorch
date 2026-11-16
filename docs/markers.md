@@ -78,7 +78,8 @@ interface from the markers. Each entry point becomes a block named
   point takes, and checks, only the states it reads or writes; the others
   aren't part of its interface.
 - A buffer that grows along its first dimension, like `seen`, needs its
-  largest length in `capacity=`. Another entry point can read it, as `score`
+  largest length in `capacity=`, the same on every entry point that grows
+  it. Another entry point can read it, as `score`
   does, and so can the method that grows it, after appending, with the
   [operations that follow a variable length](supported-models.md#variable-length-inputs).
 - A buffer that changes shape without a capacity, or a capacity for a buffer

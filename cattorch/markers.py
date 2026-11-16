@@ -709,7 +709,14 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                 continue
             if name in options["capacity"]:
                 mode = "append"
-                capacities[name] = max(capacities.get(name, 0), options["capacity"][name])
+                capacity = options["capacity"][name]
+                if capacities.setdefault(name, capacity) != capacity:
+                    raise UnsupportedModelError(
+                        f"entry points give {name!r} different capacities "
+                        f"({capacities[name]} and {capacity} in @entrypoint {method_name}); "
+                        "a buffer has one largest length, so give the same capacity= "
+                        "on every entry point that grows it"
+                    )
             elif new.shape == old.shape:
                 mode = "replace"
             else:

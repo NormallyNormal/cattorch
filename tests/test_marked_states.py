@@ -308,3 +308,24 @@ def test_states_written_in_place(tmp_path, kind):
 def test_state_writes_that_fail_say_what_to_write(tmp_path, kind, error, message):
     with pytest.raises(error, match=message):
         transpile(Writes(kind).eval(), None, tmp_path / "writes")
+
+
+class TwoCapacities(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("seen", torch.zeros(0, 3))
+
+    @entrypoint(example_inputs=EXAMPLE, capacity={"seen": 4})
+    def remember(self, x):
+        self.seen = torch.cat([self.seen, x.reshape(1, 3)])
+        return x * 1
+
+    @entrypoint(example_inputs=EXAMPLE, capacity={"seen": 6})
+    def remember_twice(self, x):
+        self.seen = torch.cat([self.seen, x.reshape(1, 3), x.reshape(1, 3)])
+        return x * 1
+
+
+def test_a_buffer_given_two_capacities_is_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match=r"different capacities \(4 and 6 in @entrypoint remember_twice\)"):
+        transpile(TwoCapacities().eval(), None, tmp_path / "capacities")
