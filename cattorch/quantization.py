@@ -686,11 +686,14 @@ class _GPTQCaptureMode(TorchDispatchMode):
         outputs = [
             item for item in pytree.tree_leaves(result) if isinstance(item, torch.Tensor)
         ]
+        if target in _LITERALS:
+            # ``torch.tensor(0.5)``: a literal, as constant as a factory's.
+            inputs = []
         entries = [self._static_entry(item) for item in inputs]
         input_storages = {item.untyped_storage().data_ptr() for item in inputs}
         mutable = bool(func._schema.is_mutable)
         known = [entry for entry in entries if entry is not None]
-        if len(known) == len(entries):
+        if len(known) == len(entries) and (entries or not _random_function(target)):
             parameters = frozenset().union(*(entry[1] for entry in known))
             aliasing = any(
                 item.untyped_storage().data_ptr() in input_storages for item in outputs
@@ -1360,8 +1363,8 @@ class _RecipeTracker:
 
     ``leaves`` maps the model's own tensors, by object, to their names.
     Every result of a function whose tensor arguments are all known is known
-    too; a function without tensor arguments makes nothing known, since it
-    may be random. A function that writes to a known tensor with an unknown
+    too, and so is the result of a function without tensor arguments that
+    isn't random (``_random_function``), such as ``torch.ones``. A function that writes to a known tensor with an unknown
     one makes it unknown. A known tensor is computed when some function on
     the way changed values rather than rearranged or copied them.
     """
@@ -1401,6 +1404,14 @@ class _RecipeTracker:
         entries = [self._entry(item) for item in tensors]
         name = getattr(func, "__name__", "")
         writes = _writes(func, kwargs)
+        if not tensors and not writes and not _random_function(name):
+            # A factory of constants, such as ``torch.ones`` or ``torch.eye``,
+            # is known by its arguments, as export folds it.
+            arguments = _argument_recipe(args, self.recipe_of)
+            keywords = _argument_recipe(tuple(sorted(kwargs.items())), self.recipe_of)
+            if arguments is _UNKNOWN or keywords is _UNKNOWN:
+                return None
+            return (func, arguments, keywords), True
         if not tensors or any(entry is None for entry in entries):
             if writes:
                 # A known tensor written with unknown values is no longer known.
@@ -1491,10 +1502,45 @@ def _relative_recipe(recipe, prefix: str):
 
 
 def _module_leaves(module: torch.nn.Module) -> list[tuple[str, torch.Tensor]]:
+    """The tensors a module holds, by name: its parameters, its buffers, and
+    tensors held as plain attributes, which export takes as constants too."""
     return [
         *module.named_parameters(remove_duplicate=False),
         *module.named_buffers(remove_duplicate=False),
+        *_plain_tensors(module),
     ]
+
+
+def _plain_tensors(module: torch.nn.Module) -> list[tuple[str, torch.Tensor]]:
+    """Tensors held as plain attributes, not as parameters or buffers, such
+    as ``self.mask = torch.tril(...)``, by name."""
+    found = []
+    for path, child in module.named_modules(remove_duplicate=False):
+        for attribute, value in vars(child).items():
+            if isinstance(value, torch.Tensor) and not isinstance(value, torch.nn.Parameter):
+                found.append((f"{path}.{attribute}" if path else attribute, value))
+    return found
+
+
+# Operations that make a tensor of a literal written in the model's code.
+_LITERALS = frozenset({"aten.lift_fresh.default", "aten.lift_fresh_copy.default"})
+
+
+def _random_function(name: str) -> bool:
+    """Whether a function of this name (a torch function's or an ATen
+    operation's) makes random values: without tensor arguments, every other
+    function makes the same tensor each call, which export takes as a
+    constant."""
+    base = name.removeprefix("aten.").split(".")[0]
+    return base.removesuffix("_") in _RANDOM_FUNCTIONS
+
+
+_RANDOM_FUNCTIONS = frozenset({
+    "rand", "randn", "randint", "randperm", "rand_like", "randn_like", "randint_like",
+    "normal", "bernoulli", "multinomial", "poisson", "uniform", "exponential",
+    "geometric", "log_normal", "cauchy", "random", "empty", "empty_like",
+    "empty_strided", "native_dropout", "dropout",
+})
 
 
 @dataclass
@@ -1578,7 +1624,10 @@ class _ComputedWeightCapture(TorchFunctionMode):
         if found is None:
             return result
         recipe, computed_values = found
-        if isinstance(result, torch.Tensor) and result.is_floating_point():
+        if (
+            isinstance(result, torch.Tensor) and result.is_floating_point()
+            and _recipe_leaves(recipe)
+        ):
             computed = self.computed.get(recipe)
             if computed is not None:
                 result = computed.tensor
@@ -1892,7 +1941,8 @@ def quantize_model(
         parameters_by_storage, registry,
         collect_hessian=config.method == "gptq",
         static_storages=[
-            buffer.untyped_storage().data_ptr() for buffer in model.buffers()
+            tensor.untyped_storage().data_ptr()
+            for tensor in (*model.buffers(), *(value for _, value in _plain_tensors(model)))
         ],
         follow_products=_logits_of is not None and observing,
     )

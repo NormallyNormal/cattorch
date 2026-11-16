@@ -215,3 +215,39 @@ def test_weight_read_directly_and_through_a_copy_is_rounded_once(tmp_path, metho
     assert sum(len(values) == 4096 for values in emulator.lists._by_id.values()) == 1
     if method == "symmetric":
         assert verify(model, example, result, quantization=config).passed
+
+
+class _PlainMask(torch.nn.Module):
+    """A mask held as a plain attribute, not a buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(64, 32) * 0.1)
+        self.mask = (torch.rand(64, 32) > 0.3).float()
+
+    def forward(self, value):
+        return F.linear(value, self.w * self.mask)
+
+
+class _MaskInForward(torch.nn.Module):
+    """A mask built in forward from constants alone."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(64, 32) * 0.1)
+
+    def forward(self, value):
+        return F.linear(value, self.w * torch.tril(torch.ones(64, 32)))
+
+
+@pytest.mark.parametrize("model_type", [_PlainMask, _MaskInForward])
+def test_weight_masked_by_a_known_constant_is_quantized_as_computed(tmp_path, model_type):
+    torch.manual_seed(0)
+    model = model_type().eval()
+    example = torch.randn(1, 32)
+    config = QuantizationConfig(bits=4, min_quantized_values=1024)
+    result, caught = _transpile(model, example, tmp_path / "mask", quantization=config)
+    # w itself is not rounded: the masked weight is, once, as it is read.
+    assert _entries(result.quantization) == [("weight computed from w", "symmetric", 4, 2048)]
+    assert not [item for item in caught if "float16" in item]
+    assert verify(model, example, result, quantization=config).passed

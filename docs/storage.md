@@ -118,7 +118,10 @@ the older `torch.nn.utils.spectral_norm`), `F.linear(x, w * g)`, a LoRA sum
 `w + b @ a`, `w.clamp(...)`, a masked `w * mask`, a scaled tied embedding or
 an average of a weight and a buffer, is quantized as computed: grouped as
 the matrix product reads it and calibrated by GPTQ like a parameter, while
-the parameters it is computed from stay unrounded. The model then computes
+the parameters it is computed from stay unrounded. What it is computed
+with may be a buffer, a tensor held as a plain attribute, or one built in
+`forward` from constants alone, such as `torch.tril(torch.ones(n, m))`.
+The model then computes
 with the quantized weight in place of the computation, both in the sprite
 and in every PyTorch comparison cattorch makes (`verify` with an
 `ExportProgram`, the length check of `dynamic=`). The report names a
