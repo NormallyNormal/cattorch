@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 from torch import nn
 from torch.utils._pytree import tree_flatten
@@ -21,6 +23,74 @@ class MethodModule(nn.Module):
 
     def forward(self, *args):
         return getattr(self.model, self.method)(*args)
+
+
+_CONTAINERS = (list, tuple, dict, OrderedDict, set)
+
+
+def _copied_containers(value, memo: dict):
+    """``value`` with its lists, tuples, dicts and sets copied, at any depth.
+
+    Everything else, tensors and modules included, is kept as it is.
+    ``memo`` keeps containers shared between attributes shared in the copy.
+    """
+    kind = type(value)
+    if kind not in _CONTAINERS:
+        return value
+    if id(value) in memo:
+        return memo[id(value)]
+    if kind is tuple:
+        copied = tuple(_copied_containers(item, memo) for item in value)
+        memo[id(value)] = copied
+        return copied
+    result = kind()
+    memo[id(value)] = result
+    if kind is list:
+        result.extend(_copied_containers(item, memo) for item in value)
+    elif kind is set:
+        result.update(value)
+    else:
+        for key, item in value.items():
+            result[key] = _copied_containers(item, memo)
+    return result
+
+
+class ModuleState:
+    """The Python attributes of a model's modules, to put back later.
+
+    A method can change its module as it runs: set ``self.scale = 2.0``,
+    fill a dict, reassign a buffer. Tracing or calling entry points one
+    after another on one model would let one's changes reach the next.
+    :meth:`restore` puts every module's attributes back as they were when
+    this was made, with fresh copies of their containers each time.
+    Tensors themselves aren't copied; an in-place update of a tensor that
+    isn't a state fails the export anyway. ``user_only`` leaves the
+    attributes every module has (parameters, buffers, submodules, hooks)
+    alone, keeping only those the module's own code sets.
+    """
+
+    def __init__(self, model: nn.Module, *, user_only: bool = False):
+        internals = frozenset(nn.Module().__dict__) if user_only else frozenset()
+        memo: dict = {}
+        # Each attribute is copied on its own: ``memo`` is keyed by ``id``,
+        # which a temporary dict of them would hand on to the next one.
+        self.saved = [
+            (module, {
+                key: _copied_containers(value, memo)
+                for key, value in vars(module).items() if key not in internals
+            }, internals)
+            for module in model.modules()
+        ]
+
+    def restore(self) -> None:
+        memo: dict = {}
+        for module, saved, internals in self.saved:
+            kept = {key: value for key, value in vars(module).items() if key in internals}
+            module.__dict__.clear()
+            module.__dict__.update(
+                (key, _copied_containers(value, memo)) for key, value in saved.items()
+            )
+            module.__dict__.update(kept)
 
 
 def entry_examples(program, entrypoint):

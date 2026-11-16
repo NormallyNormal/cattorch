@@ -20,7 +20,9 @@ from cattorch.experts import (
 )
 from cattorch.operator_registry import default_registry
 from cattorch.program import ExportProgram, Output
-from cattorch.program_runtime import MethodModule, entry_examples, validate_entry_outputs
+from cattorch.program_runtime import (
+    MethodModule, ModuleState, entry_examples, validate_entry_outputs,
+)
 from cattorch.results import TensorSpec, fallback_warning
 from cattorch.storage import StorageConfig
 
@@ -181,7 +183,10 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
                 f"ExpertFamily at {path!r}: {error}" if path else f"the top-level ExpertFamily: {error}"
             )
     entries = []
+    # Each entry point from the model as given, as the export traces it.
+    module_state = ModuleState(owned)
     for entrypoint in program.entrypoints:
+        module_state.restore()
         args, dynamic_inputs = entry_examples(program, entrypoint)
         wrapper = MethodModule(owned, entrypoint.method)
         with _expert_family_context(registry.expert_families):
