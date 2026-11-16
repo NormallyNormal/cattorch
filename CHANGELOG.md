@@ -124,7 +124,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   embedding or an embedding bag's offsets, must hold indices valid for every
   operation that uses it, and an index computed from the inputs, such as
   `x[ids + 1]` or a loss's targets, is checked as the block runs; either
-  fails with `invalid item: LIST` naming the input. `index_select`,
+  fails with `invalid item: LIST` naming the input. Only the values an
+  operation reads are checked: an item the model writes over first, as
+  `ids[0] = 0` does, can hold anything, and a float written into an index
+  input is checked once converted to an integer. `index_select`,
   `index_add`, `index_copy`, `index_reduce` and `take_along_dim` refuse
   negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
   A generator can't index with an index computed from the token IDs. See
@@ -132,7 +135,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 - A program checks the length of its state lists, not their items: an
   append state must hold from its initial rows up to its capacity. State
   lists belong to the sprite; see
-  [state](docs/programs-and-moe.md#state).
+  [state](docs/programs-and-moe.md#state). A state the model uses as an
+  index is checked like an index input, so an entry point whose model moved
+  a counter past a table's rows fails with `invalid item: cattorch state
+  STATE` and keeps the state, instead of reporting `ok` with zeros. A
+  `RecurrentGenerationProgram` that uses a state as an index is refused.
 - `ExportProgram` refuses entry point names whose broadcasts Scratch would
   match as one, since it matches them ignoring case: names that differ only
   in case, a name like another's completion (`x complete` beside `x`), and

@@ -24,7 +24,7 @@ from torch.utils._pytree import tree_flatten
 from torch._decomp import core_aten_decompositions, get_decompositions
 
 from cattorch.decompositions import (
-    INDEX_BOUND_META, POINTWISE_DECOMPOSITIONS, traced_from_input,
+    POINTWISE_DECOMPOSITIONS, fold_input_index_checks, traced_from_input,
 )
 from cattorch.errors import UnsupportedModelError
 from cattorch.errors import warn as warn_export
@@ -853,20 +853,6 @@ def _region_view(node: Node) -> tuple[int, int, int] | None:
     return None
 
 
-def _inputs_reached(value: Node) -> list[Node]:
-    """The placeholders ``value`` is computed from, in graph order."""
-    seen, stack, reached = set(), [value], set()
-    while stack:
-        current = stack.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        if current.op == "placeholder":
-            reached.add(current)
-        stack.extend(current.all_input_nodes)
-    return [node for node in value.graph.nodes if node in reached]
-
-
 def _replace_intermediate_copies(graph: Graph) -> None:
     """Rewrite in-place updates of intermediate tensors as ordinary dataflow.
 
@@ -956,17 +942,6 @@ def _replace_intermediate_copies(graph: Graph) -> None:
         with graph.inserting_before(copy):
             # ``copy_`` casts and broadcasts its source to the target.
             value = source
-            bound = base.meta.get(INDEX_BOUND_META) if base.op == "placeholder" else None
-            reached = _inputs_reached(source) if bound is not None else []
-            if bound is not None and reached:
-                # The input is an index, whose items the input check keeps in
-                # range; values written into it from the inputs are checked
-                # as the sprite runs (``decompositions._mark_index``).
-                placeholders = [node for node in graph.nodes if node.op == "placeholder"]
-                value = call(
-                    torch.ops.cattorch.check_index.default,
-                    (value, bound[0], bound[1], placeholders.index(reached[0])), actual,
-                )
             if actual.dtype != expected.dtype:
                 value = call(torch.ops.aten.to.dtype, (value, expected.dtype),
                              actual.to(expected.dtype))
@@ -1133,6 +1108,9 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
 
     _erase_mode_switches(graph_module.graph)
     _replace_intermediate_copies(graph_module.graph)
+    # Index operations now read what the model wrote into an input, if
+    # anything: the checks of an input's own values move before the call.
+    fold_input_index_checks(graph_module.graph)
     _slice_cat_pieces(graph_module.graph)
     # Unused results, such as pooling indices nobody reads, would otherwise
     # still run in Scratch. Mutations are kept.

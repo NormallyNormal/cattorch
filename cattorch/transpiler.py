@@ -334,13 +334,14 @@ def _checked_index_inputs(graph: _GraphInfo) -> frozenset[int]:
     )
 
 
-def refuse_runtime_index_checks(nodes, kind: str) -> None:
+def refuse_runtime_index_checks(nodes, kind: str, sources=None) -> None:
     """Refuse a generator whose step computes an index from its inputs.
 
     A generation step can't fail part way: its cache or states would keep
     part of the call. So an index the step computes from the token, such as
     ``table[token // 2]``, which only the running sprite could check
-    (``cattorch::check_index``), isn't supported there.
+    (``cattorch::check_index``), isn't supported there. ``sources`` names
+    the step's inputs by position, the token IDs by default.
     """
     from cattorch.autoregressive import _module_path
 
@@ -348,8 +349,9 @@ def refuse_runtime_index_checks(nodes, kind: str) -> None:
         if node.op == "call_function" and str(node.target) == "cattorch.check_index.default":
             path = _module_path(node)
             where = f" in module {path!r}" if path else ""
+            source = (sources or {}).get(int(node.args[3]), "the token IDs")
             raise UnsupportedModelError(
-                f"a {kind} can't use an index its model computes from the token IDs{where}: "
+                f"a {kind} can't use an index its model computes from {source}{where}: "
                 "the sprite would have to check it part way through a step, which "
                 "would leave the cache half updated. Index tables with the token IDs "
                 "themselves, as an embedding does, or export the model with transpile"

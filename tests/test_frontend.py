@@ -706,8 +706,95 @@ class _IndexWrittenFrom(nn.Module):
         return self.table[ids.view(-1)]
 
 
+class _IndexWritten(nn.Module):
+    """Writes over part of an index input, as a model sanitizing its ids does."""
+
+    def __init__(self, write):
+        super().__init__()
+        self.write = write
+        self.table = nn.Parameter(torch.arange(10.0).reshape(5, 2))
+
+    def forward(self, ids):
+        self.write(ids)
+        return self.table[ids]
+
+
+SANITIZED = {
+    # How the model writes, a valid input, and inputs PyTorch accepts only
+    # because the items written over don't matter.
+    "clamp_ through a slice": (lambda ids: ids[0:1].clamp_(0, 4), [1, 2, 3], ([99, 2, 3], [-7, 0, 4])),
+    "a start token": (lambda ids: ids.__setitem__(0, 0), [1, 2, 3], ([-1, 2, 3], [5, 0, 1])),
+    "a column remainder": (
+        lambda ids: ids.__setitem__((slice(None), 0), ids[:, 0] % 5),
+        [[1, 2], [3, 4]], ([[17, 2], [-3, 4]],),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SANITIZED))
+def test_an_index_input_is_checked_only_where_the_model_reads_it(tmp_path, name):
+    from cattorch import interface
+    from cattorch.util.scratch.emulator import ScratchEmulator
+    from sprite_helpers import load_sprite
+
+    write, example, accepted = SANITIZED[name]
+    model = _IndexWritten(write).eval()
+    result = transpile(model, torch.tensor(example), tmp_path / "ids")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    for ids in (example, *accepted):
+        emulator.lists["input"] = torch.tensor(ids).flatten().tolist()
+        emulator.run_procedure(interface.FORWARD)
+        assert emulator.variables[interface.STATUS_VARIABLE] == interface.OK, ids
+        torch.testing.assert_close(
+            torch.tensor([float(item) for item in emulator.lists["output"]]),
+            model(torch.tensor(ids)).detach().flatten(),
+        )
+    # An item the model reads as it was is still checked.
+    refused = torch.tensor(example).flatten().tolist()
+    refused[-1] = 5
+    emulator.lists["input"] = refused
+    emulator.run_procedure(interface.FORWARD)
+    assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("input")
+
+
+def test_a_float_written_into_an_index_input_is_checked_as_an_integer(tmp_path):
+    # PyTorch truncates the float toward zero when it writes it: 5.5 is row
+    # 5 and -6.5 is row -6, both valid for six rows.
+    from cattorch import interface
+    from cattorch.util.scratch.emulator import ScratchEmulator
+    from sprite_helpers import load_sprite
+
+    class FloatWrite(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("table", torch.arange(18.0).reshape(6, 3))
+
+        def forward(self, ids, other):
+            ids[0] = other[0]
+            return self.table[ids]
+
+    model = FloatWrite().eval()
+    example = (torch.tensor([1, 2, 3]), torch.tensor([2.0, 0.0]))
+    result = transpile(model, tuple(value.clone() for value in example), tmp_path / "float")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    for first in (2.0, 5.5, 5.9, -6.5, -0.5, 6.0, -7.0):
+        emulator.lists["input"], emulator.lists["input_1"] = [1, 2, 3], [first, 0.0]
+        emulator.run_procedure(interface.FORWARD)
+        status = emulator.variables[interface.STATUS_VARIABLE]
+        try:
+            expected = model(torch.tensor([1, 2, 3]), torch.tensor([first, 0.0]))
+        except IndexError:
+            assert status == interface.invalid_item("input_1"), first
+            continue
+        assert status == interface.OK, first
+        torch.testing.assert_close(
+            torch.tensor([float(item) for item in emulator.lists["output"]]),
+            expected.flatten(),
+        )
+
+
 @pytest.mark.parametrize("kind", ["other", "constant"])
-def test_an_index_input_written_through_a_view_checks_every_value_it_uses(tmp_path, kind):
+def test_an_index_input_written_through_a_view_checks_the_values_it_uses(tmp_path, kind):
     from cattorch import interface
     from cattorch.util.scratch.emulator import ScratchEmulator
     from sprite_helpers import load_sprite
@@ -724,8 +811,16 @@ def test_an_index_input_written_through_a_view_checks_every_value_it_uses(tmp_pa
         return emulator.variables[interface.STATUS_VARIABLE]
 
     assert status([1, 2, 3], [5, 0, 0]) == interface.OK
-    # The input's own items are checked before the call.
-    assert status([1, 9, 3], [5, 0, 0]) == interface.invalid_item("input")
+    written, kept = (0, 1) if kind == "other" else (1, 0)
+    # The item the model writes over before the lookup isn't used, so any
+    # value is accepted there, as PyTorch accepts it.
+    ids = [1, 2, 3]
+    ids[written] = 9
+    assert status(ids, [5, 0, 0]) == interface.OK
+    # The items it does use are checked.
+    ids = [1, 2, 3]
+    ids[kept] = 9
+    assert status(ids, [5, 0, 0]) == interface.invalid_item("input")
     # A value written into it from another input is checked as it runs.
     expected = interface.invalid_item("input_1") if kind == "other" else interface.OK
     assert status([1, 2, 3], [9, 0, 0]) == expected

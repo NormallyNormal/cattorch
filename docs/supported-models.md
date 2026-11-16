@@ -193,10 +193,22 @@ writes no output. The valid indices are PyTorch's:
   dimensions, must be valid for each of them.
 - The check follows the input through reshapes, views, copies and integer
   casts, such as `table[ids.long().view(-1, 1)]`.
+- Only the values an operation reads are checked. An item the model writes
+  over before the operation uses it, as `ids[0] = 0` or `ids[:, 0] %= 5`
+  does, can hold anything, as in PyTorch.
 - An index the model computes from its inputs in another way, such as
-  `x[ids + 1]` or a loss's targets, is checked as the block runs: one out of
-  range fails the block with `invalid item: LIST`, LIST being the input it
-  comes from (the first one, if several), and it writes no output.
+  `x[ids + 1]`, a loss's targets, or a value written into an index input,
+  is checked as the block runs, after PyTorch's conversion to an integer:
+  one out of range fails the block with `invalid item: LIST`, LIST being
+  the input it comes from (the first one, if several), and it writes no
+  output.
+- In a [program](programs-and-moe.md#named-entry-points-and-state), a state
+  the model uses as an index is checked the same way: an entry point whose
+  model moved it out of range, as a counter past a table's rows, fails with
+  `invalid item: cattorch state STATE` and changes no state. A
+  `RecurrentGenerationProgram` can't use a state as an index, as a prefill
+  could take it out of range part way through its tokens; the export
+  refuses it.
 - Indices in range by construction aren't checked: those that come from
   constants, `argmax`, `argmin`, `topk` or `sort` over a dimension no larger
   than the one indexed, `clamp` into range, or `% size`.
