@@ -124,6 +124,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
   A generator can't index with an index computed from the token IDs. See
   [index inputs](docs/supported-models.md#index-inputs).
+- An input or state list split into shards is checked shard by shard: each
+  must hold its part, every shard but the last holding items holding exactly
+  200,000, or the block fails with `wrong number of items: LIST`; a
+  program's split lists check every shard's items. See
+  [long lists](docs/scratch-interface.md#long-lists).
 - `cattorch prepare for save` keeps the public lists. It used to empty a
   model's input and output lists and a program's input and state lists.
 - Every internal block, list and variable starts with `_`, including the

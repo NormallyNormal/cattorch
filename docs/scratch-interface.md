@@ -78,7 +78,7 @@ sets it to one of these when it ends. LIST is the public list at fault.
 | Status | Meaning |
 |---|---|
 | `ok` | The block succeeded. |
-| `wrong number of items: LIST` | A fixed-size list doesn't hold its number of items, a variable-length list doesn't hold a whole number of rows, or `cattorch decode` didn't get exactly one token. |
+| `wrong number of items: LIST` | A fixed-size list doesn't hold its number of items, a variable-length list doesn't hold a whole number of rows, a [long list](#long-lists)'s shards don't each hold their part, or `cattorch decode` didn't get exactly one token. |
 | `too few items: LIST` | A variable-length list holds fewer rows than its minimum, or `cattorch prefill` got no tokens. |
 | `too many items: LIST` | A variable-length list holds more rows than its maximum, or `cattorch prefill` got more tokens than `cattorch max context`. |
 | `invalid item: LIST` | An item isn't a number, or isn't a whole number in range, such as a token ID outside the vocabulary. |
@@ -253,6 +253,13 @@ variables describe it: `cattorch BASE shard count` and
 `cattorch ` it may start with. So `output` has `cattorch output shard count`,
 and `cattorch logits` has `cattorch logits shard count`. See
 [list sharding](storage.md#list-sharding).
+
+The items run in order through the shards: every shard but the last one
+holding items holds exactly 200,000, so a fixed-size list of 200,010 items
+is 200,000 in `LIST` and 10 in `LIST shard 2`. A block checks each shard of
+an input or state list it reads, and reports one laid out otherwise as
+`wrong number of items: LIST`, and an invalid item in any shard as
+`invalid item: LIST`, LIST being the first list's name.
 
 Token IDs and indices are zero-based, as in PyTorch, though Scratch list
 positions start at 1.

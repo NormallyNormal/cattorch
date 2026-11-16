@@ -91,7 +91,7 @@ from cattorch.static_storage import (
 from cattorch import interface
 from cattorch.interface import (
     NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, input_name, is_public_data,
-    item_checks, length_checks, output_name,
+    item_checks, length_checks, output_name, shard_checks,
 )
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
@@ -259,6 +259,11 @@ def _input_checks(graph: _GraphInfo, layouts, flat_inputs, *, unit_spec=None) ->
             )
         else:
             statements += length_checks(name, numel=example.numel(), lists=shards)
+        if len(shards) > 1:
+            # Each shard's own length, after the total's.
+            statements.append(if_(eq(var(STATUS_VARIABLE), OK), shard_checks(
+                name, shards, layouts[name].shards[0].capacity,
+            )))
         items = item_checks(name, *kinds[index], lists=shards)
         if items:
             statements.append(if_(eq(var(STATUS_VARIABLE), OK), items))

@@ -311,3 +311,27 @@ def length_checks(
     if not checks:
         return (if_(lt(count, min_items), too_few),)
     return (if_else(lt(count, min_items), too_few, checks),)
+
+
+def shard_checks(list_name: str, shards, size: int, *, status=None):
+    """Statements that set the status when a split list's items aren't laid out in order.
+
+    A list split into ``shards`` (``shard_name``) holds its items in order:
+    each shard holds at most ``size``, and every shard before one that holds
+    any holds exactly ``size``. With ``length_checks`` on the total, that is
+    each shard's own length: for a fixed list, every shard full but the last,
+    which holds the rest. A list laid out otherwise reports
+    ``wrong_number_of_items(list_name)``.
+    """
+    from cattorch.util.scratch.dsl import eq, gt, if_, length, not_, set_var
+
+    status = status or STATUS_VARIABLE
+    wrong = (set_var(status, wrong_number_of_items(list_name)),)
+    checks: list = []
+    for position, shard in enumerate(shards):
+        checks.append(if_(gt(length(shard), size), wrong))
+        if position + 1 < len(shards):
+            checks.append(if_(gt(length(shards[position + 1]), 0), (
+                if_(not_(eq(length(shard), size)), wrong),
+            )))
+    return tuple(checks)

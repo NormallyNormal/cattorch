@@ -341,6 +341,32 @@ def _rename_broadcasts(sprite: dict, renames: dict[str, str]) -> None:
     refresh_data_display_names(sprite.get("blocks", {}), names)
 
 
+def _add_split_checks(sprite: dict, split_checks, layouts, name_of) -> dict:
+    """Add the procedures that check the input and state lists the program split.
+
+    Each checks a list's total length, each shard's own length
+    (``interface.shard_checks``), and then the items in every shard.
+    """
+    for position, (procedure, name, shown, length_options, kind) in enumerate(split_checks):
+        layout = layouts[name_of(name)]
+        shards = [shard.name for shard in layout.shards]
+        ok = eq(var(STATUS_VARIABLE), interface.OK)
+        body: list[Statement] = list(
+            interface.length_checks(shown, lists=shards, **length_options),
+        )
+        if len(shards) > 1:
+            body.append(if_(ok, interface.shard_checks(shown, shards, layout.shards[0].capacity)))
+        if kind is not None:
+            items = interface.item_checks(shown, *kind, lists=shards)
+            if items:
+                body.append(if_(ok, items))
+        sprite = _add_warp_procedure(sprite, procedure, Program(
+            f"program_split_check_{position}",
+            variables=(STATUS_VARIABLE, "_cattorch check index"), lists=shards, body=body,
+        ), x=2240, y=160 + 160 * position)
+    return sprite
+
+
 def _build_entry_wrapper(
     entrypoint: EntryPoint,
     result,
@@ -354,6 +380,7 @@ def _build_entry_wrapper(
     finish_variables: tuple[str, ...] = (),
     item_kinds: Mapping[int, tuple] = {},
     index_checked: frozenset[int] = frozenset(),
+    split_checks: list | None = None,
 ) -> tuple[Program, tuple[TensorSpec, ...]]:
     """The procedure body that checks, computes and commits one entry point.
 
@@ -369,6 +396,10 @@ def _build_entry_wrapper(
     ``index_checked`` inputs, by position, are those indices the entry point
     computes come from: an index out of range fails the call naming the
     input as the compiled entry point knows it, ``input_name(position)``.
+    An input or state list longer than a Scratch list is checked by a
+    procedure the body calls; its ``(procedure, list, shown name, length
+    options, item kind)`` is added to ``split_checks``, for
+    ``_add_split_checks`` to build once the lists are split.
     """
     states = {state.name: state for state in program.states}
     status = STATUS_VARIABLE
@@ -399,15 +430,23 @@ def _build_entry_wrapper(
             minimum = rows.minimum
             # An append state can be empty.
             minimum = max(minimum, 1) if isinstance(binding, Input) else 0
-            checks = interface.length_checks(
-                display(name), width=trailing, min_items=trailing * minimum,
-                max_items=spec.max_numel, lists=(name,),
+            length_options: dict = dict(
+                width=trailing, min_items=trailing * minimum, max_items=spec.max_numel,
             )
         else:
-            checks = interface.length_checks(display(name), numel=spec.numel, lists=(name,))
-        body.append(if_(ok, checks))
-        if isinstance(binding, Input) and index in item_kinds:
-            items = interface.item_checks(display(name), *item_kinds[index], lists=(name,))
+            length_options = dict(numel=spec.numel)
+        kind = item_kinds.get(index) if isinstance(binding, Input) else None
+        capacity = spec.numel if spec.numel is not None else spec.max_numel
+        if split_checks is not None and capacity is not None and capacity > SCRATCH_LIST_LIMIT:
+            # The list will be split: its shards are checked one by one, in
+            # a procedure built once the program knows them.
+            procedure = f"_cattorch check {name}"
+            split_checks.append((procedure, name, display(name), length_options, kind))
+            body.append(if_(ok, (call(procedure),)))
+            continue
+        body.append(if_(ok, interface.length_checks(display(name), lists=(name,), **length_options)))
+        if kind is not None:
+            items = interface.item_checks(display(name), *kind, lists=(name,))
             if items:
                 variables.add("_cattorch check index")
                 body.append(if_(ok, items))
@@ -754,6 +793,7 @@ def transpile_program(
         _checked_index_inputs, _compile_sprite, refuse_runtime_index_checks,
     )
 
+    split_checks: list = []
     for position, entrypoint in enumerate(program.entrypoints):
         if not hasattr(model, entrypoint.method) or not callable(getattr(model, entrypoint.method)):
             raise ValueError(
@@ -876,6 +916,7 @@ def transpile_program(
             finish_variables=(interface.INITIALIZED_VARIABLE, *flags) if _initialized_flag else (),
             item_kinds=sub_result.item_kinds if _check_items else {},
             index_checked=_checked_index_inputs(sub_result.graph),
+            split_checks=split_checks,
         )
         for spec in output_specs:
             interface_capacities[spec.list_name] = max(
@@ -1177,6 +1218,7 @@ def transpile_program(
     program_layouts = shard_sprite_lists(
         combined, program_capacities, deferred_names=fixed_tables,
     )
+    combined = _add_split_checks(combined, split_checks, program_layouts, name_of)
     sharded_names = {name_of(name) for name in sharded_names}
     sharded_names.update(
         layout.name for layout in program_layouts.values()

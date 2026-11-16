@@ -360,8 +360,10 @@ an output, a state or `cattorch logits`, is split like this:
 - The generated blocks read and write every shard.
 
 The result's `sharded_lists` names the public lists that were split. If your
-own scripts copy a sharded input or output, copy every shard in order, not
-only the first; `verify` handles shards for you. Weights are split too, into
+own scripts fill a sharded input, fill every shard in order, each but the
+last up to 200,000 items: a block refuses an input laid out otherwise (see
+[long lists](scratch-interface.md#long-lists)). Copy a sharded output the
+same way, every shard in order; `verify` handles shards for you. Weights are split too, into
 internal lists that `sharded_lists` leaves out: a compressed weight into
 smaller pieces, since each piece's decoded bytes must also fit in one list.
 

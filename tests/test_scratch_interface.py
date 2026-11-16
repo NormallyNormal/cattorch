@@ -605,3 +605,80 @@ def test_a_generator_refuses_an_index_computed_from_the_token_ids(tmp_path):
 
     with pytest.raises(UnsupportedModelError, match="index its model computes from the token IDs"):
         transpile(Halves().eval(), GenerationProgram(max_context=8), tmp_path / "lm")
+
+
+# ── Long lists (docs/scratch-interface.md#long-lists) ───────────────────────
+
+def fill_split(emulator, name, values, sizes):
+    """Lay ``values`` out over ``name``'s shards, ``sizes`` items in each."""
+    start = 0
+    for position, size in enumerate(sizes):
+        emulator.lists[interface.shard_name(name, position)] = list(values[start:start + size])
+        start += size
+
+
+# A list of 11 split at 8: valid only as 8 + 3.
+SPLITS = {(8, 3): True, (7, 4): False, (0, 11): False, (11, 0): False, (8, 2): False}
+
+
+def test_a_split_input_checks_each_shard(tmp_path, small_list_limit):
+    small_list_limit(8)
+
+    class Double(nn.Module):
+        def forward(self, value):
+            return value * 2
+
+    model = Double().eval()
+    result = transpile(model, torch.randn(11, 1), tmp_path / "split")
+    assert "input" in result.sharded_lists
+    sprite = load_sprite(result.path)
+    values = [float(value) for value in range(11)]
+    for sizes, valid in SPLITS.items():
+        emulator = ScratchEmulator(sprite)
+        fill_split(emulator, "input", values, sizes)
+        emulator.run_procedure(interface.FORWARD)
+        status = emulator.variables[interface.STATUS_VARIABLE]
+        assert status == (interface.OK if valid else interface.wrong_number_of_items("input")), sizes
+    emulator = ScratchEmulator(sprite)
+    fill_split(emulator, "input", [*values[:9], "x", values[10]], (8, 3))
+    emulator.run_procedure(interface.FORWARD)
+    assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("input")
+
+
+def test_a_programs_split_lists_check_each_shard(tmp_path, small_list_limit):
+    small_list_limit(8)
+
+    class Total(nn.Module):
+        def step(self, value, ids, total):
+            total = total + value + ids.float()
+            return total * 2, total
+
+    program = ExportProgram(
+        states=(State("total", torch.zeros(11)),),
+        entrypoints=(EntryPoint("step", method="step", arguments=(
+            Input("value", torch.ones(11)), Input("ids", torch.ones(11, dtype=torch.long)),
+            StateInput("total"),
+        ), returns=(Output("doubled"), StateUpdate("total"))),),
+    )
+    result = transpile(Total().eval(), program, tmp_path / "program")
+    sprite = load_sprite(result.path)
+    lists = ("cattorch step value", "cattorch step ids", "cattorch state total")
+    assert set(lists) <= set(result.sharded_lists)
+
+    def run(sizes=(8, 3), at=lists[0], items=None):
+        emulator = ScratchEmulator(sprite)
+        emulator.run_procedure(interface.RESET)
+        for name in lists:
+            values = [0 if name == lists[2] else 1] * 11
+            fill_split(emulator, name, values if name != at or items is None else items,
+                       sizes if name == at else (8, 3))
+        emulator.run_procedure("cattorch step")
+        return emulator.variables[interface.STATUS_VARIABLE]
+
+    for name in lists:
+        for sizes, valid in SPLITS.items():
+            expected = interface.OK if valid else interface.wrong_number_of_items(name)
+            assert run(sizes, name) == expected, (name, sizes)
+    # Items in the second shard are checked as numbers, not added to the first's.
+    assert run(at=lists[0], items=[1] * 9 + ["abc", 1]) == interface.invalid_item(lists[0])
+    assert run(at=lists[1], items=[1] * 9 + [1.5, 1]) == interface.invalid_item(lists[1])
