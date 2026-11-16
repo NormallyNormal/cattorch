@@ -352,6 +352,23 @@ def _available_decompositions() -> dict:
     return table
 
 
+@functools.lru_cache(maxsize=1)
+def _in_place_operators() -> tuple:
+    """Every ATen in-place operator overload, ``x.op_(...)``, by schema."""
+    found = []
+    for name in torch._C._dispatch_get_all_op_names():
+        packet = name.partition(".")[0].removeprefix("aten::")
+        if (
+            not name.startswith("aten::") or not packet.endswith("_")
+            or packet.startswith("_")
+        ):
+            continue
+        operator = _resolve_operator(name)
+        if operator is not None:
+            found.append(operator)
+    return tuple(found)
+
+
 class _TensorView:
     """Minimal ``fx.Node`` stand-in so validators can inspect live arguments."""
 
@@ -617,6 +634,16 @@ def _fx_decompositions() -> dict:
             table[operator] = _recorded_fallback(name, _decompose_when_rejected(
                 operator, rule.validator, decomposition,
             ))
+    # In-place operations PyTorch has no decomposition for, such as
+    # ``x.put_()``, take their out-of-place form's route too.
+    for operator in _in_place_operators():
+        if operator in table or registry.operation(str(operator)) is not None:
+            continue
+        if str(operator) in kept:
+            continue
+        in_place = _in_place_as_copy(operator, operator, registry, kept)
+        if in_place is not None:
+            table[operator] = in_place
     table.update(get_decompositions((torch.ops.aten.stack.default,)))
     table.update(own_decompositions())
     for name, decomposition in primitives.items():
@@ -784,11 +811,33 @@ def _erase_mode_switches(graph: Graph) -> None:
 
 
 def _returns_alias(node: Node) -> bool:
-    """Whether ``node``'s result may share storage with one of its inputs."""
+    """Whether ``node``'s result may share storage with one of its inputs.
+
+    ``x.to(dtype)`` returns ``x`` itself when the dtype doesn't change, and a
+    copy otherwise, as PyTorch's type promotion around a decomposition
+    inserts it.
+    """
     schema = getattr(node.target, "_schema", None)
     if schema is None:
         return True
+    if getattr(getattr(node.target, "overloadpacket", None), "__name__", "") == "to":
+        return _same_dtype_cast(node)
     return any(value.alias_info is not None for value in schema.returns)
+
+
+def _same_dtype_cast(node: Node) -> bool:
+    """Whether ``node`` is an ``x.to(...)`` that returns ``x`` itself."""
+    if getattr(getattr(node.target, "overloadpacket", None), "__name__", "") != "to":
+        return False
+    parent = node.args[0] if node.args else None
+    before = parent.meta.get("val") if isinstance(parent, Node) else None
+    after = node.meta.get("val")
+    return (
+        isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)
+        and before.dtype == after.dtype and before.device == after.device
+        and not node.kwargs.get("copy", False)
+        and node.kwargs.get("memory_format") in {None, torch.preserve_format}
+    )
 
 
 _VIEW_SLICE = torch.ops.aten.slice.Tensor
@@ -806,6 +855,8 @@ _REBUILDABLE_VIEWS = _SHAPE_VIEWS | {
     _VIEW_SLICE, _VIEW_SELECT, torch.ops.aten.transpose.int, torch.ops.aten.permute.default,
     torch.ops.aten.t.default, torch.ops.aten.expand.default, torch.ops.aten.alias.default,
     torch.ops.aten.unfold.default, torch.ops.aten.diagonal.default,
+    # Only one that keeps the dtype is a view (``_returns_alias``).
+    torch.ops.aten.to.dtype, torch.ops.aten.to.dtype_layout,
 }
 # Uninitialized buffers that a model fills by slice assignment. They become
 # zeros, so no unspecified values are stored in the sprite.
@@ -825,6 +876,8 @@ def _region_view(node: Node) -> tuple[int, int, int] | None:
     shape = parent.meta.get("val").shape if isinstance(parent, Node) else None
     if shape is None:
         return None
+    if _same_dtype_cast(node):
+        return -1, 0, 0
     if node.target in _SHAPE_VIEWS:
         value = node.meta.get("val")
         if isinstance(value, torch.Tensor) and value.numel() == math.prod(shape):

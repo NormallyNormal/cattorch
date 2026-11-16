@@ -440,6 +440,11 @@ Python:
   "check that example_inputs match" error. Such layers now keep their
   weights, with a warning; neuron pruning skips layers with forward hooks
   the same way.
+- `x.put_()`, `x.addr_()`, `x.addmm_()` and `x.addmv_()` were refused
+  although their out-of-place forms export, with reasons that didn't apply
+  ("neither is x.put(...)", "an in-place update through a view"). Every
+  in-place method now runs as its out-of-place form, whether or not PyTorch
+  has a decomposition for it.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the
   example's values as constants; it is rejected, like `.item()`.
 - `sig_figs` rounded integer buffers.

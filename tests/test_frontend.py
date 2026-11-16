@@ -351,6 +351,24 @@ IN_PLACE_FORMS = {
     "ldexp": (lambda y: y.ldexp_(torch.ones_like(y)), lambda y: y.ldexp(torch.ones_like(y))),
     "logical_or": (lambda y: y.logical_or_(y - 0.5), lambda y: y.logical_or(y - 0.5)),
     "conj_physical": (lambda y: y.conj_physical_(), lambda y: y.conj_physical()),
+    # No PyTorch decomposition of the in-place form.
+    "put": (
+        lambda y: y.put_(torch.tensor([1, 5]), torch.tensor([0.5, 0.25])),
+        lambda y: y.put(torch.tensor([1, 5]), torch.tensor([0.5, 0.25])),
+    ),
+    "addr": (
+        lambda y: y.addr_(torch.ones(3), torch.arange(4.0)),
+        lambda y: y.addr(torch.ones(3), torch.arange(4.0)),
+    ),
+    # Type promotion around the decomposition casts y to its own dtype.
+    "addmm": (
+        lambda y: y.addmm_(torch.ones(3, 2), torch.ones(2, 4)),
+        lambda y: y.addmm(torch.ones(3, 2), torch.ones(2, 4)),
+    ),
+    "addmv through a view": (
+        lambda y: y[0].addmv_(torch.eye(4), torch.arange(4.0)),
+        lambda y: torch.cat([y[0].addmv(torch.eye(4), torch.arange(4.0)).unsqueeze(0), y[1:]]),
+    ),
 }
 
 
