@@ -2485,6 +2485,10 @@ def _match_embedding_adds(fusions, nodes):
         ):
             continue
         first, second = node.args[:2]
+        if first is second:
+            # ``e + e``: the one lookup is read twice; computed once, it is
+            # added to itself by the ordinary kernel.
+            continue
         if not all(
             hasattr(value, "name")
             and value.op == "call_function"

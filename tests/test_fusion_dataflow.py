@@ -190,3 +190,30 @@ def test_list_check_accepts_stored_public_and_non_tensor_lists():
     }
     lists = {"w": ["W_weight", [1.0]], "i": ["input", []], "m": ["merge_ids", []]}
     check_list_dataflow(_sprite(blocks, lists))
+
+
+class EmbeddingSums(nn.Module):
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.tokens = nn.Embedding(10, 8)
+        self.positions = nn.Embedding(10, 8)
+
+    def forward(self, index):
+        if self.kind == "same lookup":
+            value = self.tokens(index)
+            return value + value
+        if self.kind == "same table":
+            return self.tokens(index) + self.tokens(index)
+        return self.tokens(index) + self.positions(index)
+
+
+@pytest.mark.parametrize("kind", ["same lookup", "same table", "two tables"])
+def test_embedding_sums_reading_one_lookup_twice_are_exact(tmp_path, kind):
+    model = EmbeddingSums(kind).eval()
+    index = torch.tensor([[1, 2, 3]])
+    graph = _prepare_graph(model, (index,))
+    for first, second in graph.embedding_add_fusions.values():
+        assert first is not second
+    result = transpile(model, index, tmp_path / kind.replace(" ", "_"))
+    assert verify(model, index, result).passed
