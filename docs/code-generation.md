@@ -76,7 +76,10 @@ them when:
   operation, such as `x * 2` right after the last layer or at the start of
   each layer; a normalization or linear layer there is fine;
 - every layer computes the same operations, with the same shapes and
-  constants, and weights of the same sizes. Layers with a
+  constants, and weights of the same sizes, stored the same way: a layer
+  whose weights are quantized differently (another `QuantizationConfig`
+  override, group size, or none) keeps the model unshared, since one bank
+  holds every layer's weights in one format. Layers with a
   [mixture of experts](programs-and-moe.md#mixture-of-experts) block aren't
   shared, since each layer's experts are an expert family of their own;
 - for [cached generation](generation.md#layer-sharing), every attention block
@@ -86,7 +89,8 @@ The layers can be anywhere in the model, including at its start, where they
 read the input list; the input list keeps the values you put in it. Code
 outside the layers may read a layer's weight, such as an output head tied to
 a layer's weight or a tensor with the same values: it reads that layer's
-rows of the bank.
+rows of the bank. The quantization report lists every layer's weights with
+the storage the bank gives them.
 
 Sharing is all or nothing: if any layer doesn't fit, the model is exported
 without sharing. Whenever `layer_sharing=True` shares nothing, the export

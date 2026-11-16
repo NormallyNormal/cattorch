@@ -8,8 +8,9 @@ from torch import nn
 
 from cattorch import (
     CattorchWarning, CodegenConfig, EntryPoint, ExportProgram, Input, Output,
-    QuantizationConfig, transpile, verify,
+    QuantizationConfig, QuantizationOverride, transpile, verify,
 )
+from cattorch.quantization import _StaticSourceRecorder
 from sprite_helpers import load_emulator, load_sprite
 
 SHARED = CodegenConfig(layer_sharing=True)
@@ -402,3 +403,59 @@ def test_a_layer_fused_into_outside_code_gets_an_accurate_reason(tmp_path):
     assert "aren't numbered consecutively" not in emitted[0]
     assert "`blocks.0` is compiled together with code from outside the layers" in emitted[0]
     assert verify(model, value, result).passed
+
+
+class MLPBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(16, 64)
+        self.fc2 = nn.Linear(64, 16)
+
+    def forward(self, value):
+        return value + self.fc2(torch.relu(self.fc(value)))
+
+
+class MLPStack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList(MLPBlock() for _ in range(4))
+
+    def forward(self, value):
+        for block in self.blocks:
+            value = block(value)
+        return value
+
+
+@pytest.mark.parametrize("overrides", [
+    {"blocks.3.fc2": 8},
+    {"blocks.1": None},
+    {"blocks.2.fc2": QuantizationOverride(bits=4, group_size=32)},
+], ids=["bits", "unquantized", "group"])
+def test_layers_quantized_differently_are_not_banked_together(tmp_path, overrides):
+    torch.manual_seed(0)
+    model = MLPStack().eval()
+    value = torch.randn(1, 3, 16)
+    quantization = QuantizationConfig(bits=4, min_quantized_values=16, overrides=overrides)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = transpile(
+            model, value, tmp_path / "override", codegen=SHARED, quantization=quantization,
+        )
+    emitted = [str(item.message) for item in caught if issubclass(item.category, CattorchWarning)]
+    assert not shared_procedure(result)
+    assert len(emitted) == 1 and "is stored differently from" in emitted[0], emitted
+    # Every layer keeps the storage the configuration asks for.
+    assert not any(item.name.endswith("[float16]") for item in result.quantization.tensors)
+    assert verify(model, value, result, quantization=quantization).passed
+
+
+def test_a_shared_bank_is_traced_to_every_layer():
+    """The bank is stored under layer 0's key but holds every layer's weights."""
+    recorder = object.__new__(_StaticSourceRecorder)
+    weights = {f"w{index}": torch.randn(4, 4) for index in range(3)}
+    recorder.resolve = weights.get
+    recorder.sources = {}
+    recorder.banks = {"w0": tuple(weights.items())}
+    bank = torch.cat(list(weights.values()))
+    assert recorder.graph_values("w0", bank) == ("w0", "w1", "w2")
+    assert recorder.graph_values("w1", weights["w1"]) == ("w1",)

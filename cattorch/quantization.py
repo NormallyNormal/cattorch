@@ -2465,6 +2465,9 @@ class _StaticSourceRecorder:
         self.resolve = compiler.graph.resolve_weight
         self.resolved: dict[str | None, set[str]] = {}
         self.sources: dict[str, frozenset[str]] = {}
+        # A shared layers' bank, stored under its first layer's key, holds the
+        # lists of every layer: (key, tensor) of each, in order.
+        self.banks: dict[str, tuple[tuple[str, torch.Tensor], ...]] = {}
 
         def resolve_weight(name):
             value = self.resolve(name)
@@ -2480,6 +2483,14 @@ class _StaticSourceRecorder:
 
     def graph_values(self, key: str, tensor: torch.Tensor) -> tuple[str, ...]:
         """The graph values whose elements list ``key`` holds."""
+        bank = self.banks.get(key)
+        if bank is not None:
+            return tuple(dict.fromkeys(
+                name for member, held in bank for name in self._list_values(member, held)
+            ))
+        return self._list_values(key, tensor)
+
+    def _list_values(self, key: str, tensor: torch.Tensor) -> tuple[str, ...]:
         if isinstance(self.resolve(key), torch.Tensor):
             return (key,)
         names = sorted(self.sources.get(key, ()))

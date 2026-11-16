@@ -371,6 +371,11 @@ Python:
   model unshared, with a warning that says so (it used to blame weight
   deduplication, and a layer whose operations were all fused into code
   outside it was said to be misnumbered).
+- Layer sharing with one layer quantized differently, such as
+  `overrides={"blocks.3.fc2": 8}`, stored every layer's weights in float16,
+  while the report and warning blamed `blocks.0` alone. Such layers are now
+  exported unshared with a warning, each keeping the storage it asked for,
+  and the report of a shared bank names every layer's weights.
 - `masked_fill` on an integer or boolean tensor wrote a fractional fill
   value as it was instead of casting it to the tensor's type.
 - A SiLU multiplied by itself (`s * s`) or by another SiLU

@@ -3019,6 +3019,7 @@ def _compile_sprite(
             storage,
             layer_tail=(_LAYER_TAIL, PROJECT_OUTPUT) if hidden_layers else None,
             cache_reason=cache_reason,
+            recorder=static_sources,
         )
         if unshared_layers is None:
             log.info("Factored repeated transformer layers into one shared procedure")

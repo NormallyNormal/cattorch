@@ -111,6 +111,11 @@ def _weight_label(nodes: dict, list_name: str, layer: int) -> str:
     return f"a weight of layer `blocks.{layer}`"
 
 
+def _format_label(found: tuple[str, int]) -> str:
+    precision, group_size = found
+    return f"{precision} in groups of {group_size}" if precision.startswith("int") else precision
+
+
 def _chain_until(blocks: dict, start: str, stop: str | None) -> list[str]:
     chain = []
     current = start
@@ -179,6 +184,7 @@ def _share_repeated_transformer_layers(
     sprite: dict, compiler, storage: StorageConfig, *,
     layer_tail: tuple[str, str] | None = None,
     cache_reason: str | None = None,
+    recorder=None,
 ) -> str | None:
     """Factor structurally identical ``blocks.N`` slabs into one warp block.
 
@@ -191,7 +197,9 @@ def _share_repeated_transformer_layers(
     Returns ``None`` when the layers were shared, and otherwise why not, as
     a clause for a user-facing warning (``NO_REPEATED_LAYERS`` when there is
     nothing to share); the sprite is then unchanged. ``cache_reason`` is why
-    a generation step's K/V caches couldn't be banked.
+    a generation step's K/V caches couldn't be banked. ``recorder`` (the
+    quantization report's ``_StaticSourceRecorder``) learns which layers'
+    weights each bank holds.
     """
     def reject(reason: str) -> str:
         log.info("Shared transformer layer skipped: %s", reason)
@@ -551,6 +559,36 @@ def _share_repeated_transformer_layers(
                     "per-layer bank"
                 )
 
+    # Storage keeps a bank in one format. If the layers' weights in one role
+    # are stored differently (another quantization override, group size, or
+    # none), no format reproduces them all, and the bank would hold every
+    # layer's weights in float16.
+    from cattorch.static_storage import _static_storage_group_size, _static_storage_precision
+
+    def stored_as(name: str) -> tuple[str, int]:
+        key = name.removeprefix("W_")
+        tensor = compiler.static_lists[key]
+        layout = compiler.interleaved_static_layouts.get(key, ())
+        return (
+            _static_storage_precision(
+                tensor, storage, compiler.static_effective_ndims.get(key), layout,
+                compiler.static_source_numels.get(key),
+            ),
+            _static_storage_group_size(tensor, storage, layout),
+        )
+
+    for _, names, _ in bank_roles:
+        formats = [stored_as(name) for name in names]
+        for index, found in enumerate(formats):
+            if found != formats[0]:
+                return reject(
+                    f"{_weight_label(nodes, names[index], layers[index])} is stored "
+                    f"differently from {_weight_label(nodes, names[0], layers[0])} "
+                    f"({_format_label(found)} instead of {_format_label(formats[0])}), "
+                    "for example because it is quantized differently, and one bank "
+                    "of layer weights is stored in one format"
+                )
+
     # Code outside the layers that reads a banked weight (a tied output head,
     # or a tensor deduplicated with a layer's weight) keeps reading the same
     # values: item by item from the bank, at that layer's offset, or else
@@ -639,6 +677,11 @@ def _share_repeated_transformer_layers(
             else:
                 bank_tensor = bank_tensor.reshape(len(names), -1)
         compiler.static_lists[names[0].removeprefix("W_")] = bank_tensor
+        if recorder is not None:
+            # The report traces the bank to every layer's weight, not layer 0's.
+            recorder.banks[names[0].removeprefix("W_")] = tuple(
+                (name.removeprefix("W_"), tensor) for name, tensor in zip(names, tensors)
+            )
         sources = [
             take(compiler.static_source_numels, name, name.removeprefix("W_"), 0)
             for name in names
