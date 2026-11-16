@@ -687,3 +687,45 @@ def test_one_tensor_passed_as_several_arguments_traces_one_input_each(tmp_path):
         model, distinct, result, example_kwargs={"scale": torch.tensor([3.0, 0.0, 1.0])},
     )
     assert check.passed, check
+
+
+class _IndexWrittenFrom(nn.Module):
+    """An index input that the model also writes through a view of it."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.register_buffer("table", torch.arange(18.0).reshape(6, 3))
+
+    def forward(self, ids, other):
+        row = ids[0]
+        if self.kind == "other":
+            row[0] = other[0, 0]
+        else:
+            row[1] = 4
+        return self.table[ids.view(-1)]
+
+
+@pytest.mark.parametrize("kind", ["other", "constant"])
+def test_an_index_input_written_through_a_view_checks_every_value_it_uses(tmp_path, kind):
+    from cattorch import interface
+    from cattorch.util.scratch.emulator import ScratchEmulator
+    from sprite_helpers import load_sprite
+
+    model = _IndexWrittenFrom(kind).eval()
+    example = (torch.tensor([[1, 2, 3]]), torch.tensor([[5, 0, 0]]))
+    result = transpile(model, tuple(value.clone() for value in example), tmp_path / kind)
+    assert verify(model, tuple(value.clone() for value in example), result).passed
+    emulator = ScratchEmulator(load_sprite(result.path))
+
+    def status(ids, other):
+        emulator.lists["input"], emulator.lists["input_1"] = ids, other
+        emulator.run_procedure(interface.FORWARD)
+        return emulator.variables[interface.STATUS_VARIABLE]
+
+    assert status([1, 2, 3], [5, 0, 0]) == interface.OK
+    # The input's own items are checked before the call.
+    assert status([1, 9, 3], [5, 0, 0]) == interface.invalid_item("input")
+    # A value written into it from another input is checked as it runs.
+    expected = interface.invalid_item("input_1") if kind == "other" else interface.OK
+    assert status([1, 2, 3], [9, 0, 0]) == expected
