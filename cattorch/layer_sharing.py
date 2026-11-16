@@ -37,6 +37,8 @@ _LAYER_CACHE_BASE = "cattorch layer cache base"
 # overwritten between layers: a public input, or a value still read after
 # the layers.
 _LAYER_INPUT_COPY = "cattorch shared layer input"
+# The custom block holding layer 0's code, which every layer calls.
+SHARED_LAYER_PROCEDURE = "cattorch shared transformer layer"
 
 # Why a graph's layers weren't shared, when it has nothing to share. A
 # program warns about this only when none of its entry points has layers.
@@ -78,6 +80,35 @@ def _layer_path(node) -> tuple[str, int] | None:
 def _graph_layer(node) -> int | None:
     path = _layer_path(node)
     return None if path is None else path[1]
+
+
+def _offset_index(blocks: dict, identifier: str, offset: list) -> None:
+    """Make an ``item of list`` block read ``offset`` items further on."""
+    block = blocks[identifier]
+    add_id = f"cattorch_layer_bank_index_{uuid.uuid4().hex}"
+    old_index = block["inputs"]["INDEX"]
+    blocks[add_id] = {
+        "opcode": "operator_add", "next": None, "parent": identifier,
+        "inputs": {"NUM1": old_index, "NUM2": offset},
+        "fields": {}, "shadow": False, "topLevel": False,
+    }
+    if (
+        isinstance(old_index, list) and len(old_index) > 1
+        and old_index[0] == 3 and isinstance(old_index[1], str)
+        and old_index[1] in blocks
+    ):
+        blocks[old_index[1]]["parent"] = add_id
+    block["inputs"]["INDEX"] = [3, add_id, [4, 0]]
+
+
+def _weight_label(nodes: dict, list_name: str, layer: int) -> str:
+    """The weight a list holds, named after the module of ``layer`` that reads it."""
+    node = nodes.get(list_name.removeprefix("W_"))
+    for user in () if node is None else node.users:
+        stack = tuple(user.meta.get("nn_module_stack", {}).values())
+        if stack and stack[-1] and stack[-1][0] and _graph_layer(user) == layer:
+            return f"a weight of `{stack[-1][0].lstrip('.')}`"
+    return f"a weight of layer `blocks.{layer}`"
 
 
 def _chain_until(blocks: dict, start: str, stop: str | None) -> list[str]:
@@ -167,14 +198,43 @@ def _share_repeated_transformer_layers(
         return reason
 
     nodes = {node.name: node for node in compiler.graph.nodes}
-    # Output copies follow the roots that compute nodes, under the last
-    # node's name; they belong to no layer.
-    emitted = [
-        (name, root, _graph_layer(nodes[name]))
-        for name, root in compiler.emitted_roots[:compiler.node_roots]
-        if name in nodes
-    ]
-    layers = sorted({layer for _, _, layer in emitted if layer is not None})
+    # Each root's code computes its node, or for a fusion every node the
+    # fusion covers; it belongs to their layer, or to none (outside code).
+    covered = {
+        record.key.name: record.covered for record in compiler.graph.fusion_records
+    }
+    emitted = []
+    for name, root in compiler.emitted_roots[:compiler.node_roots]:
+        if name not in nodes:
+            continue
+        found = {
+            _graph_layer(node) for node in covered.get(name, (nodes[name],))
+            if node.op == "call_function"
+        }
+        if len(found) > 1:
+            order = {node.name: index for index, node in enumerate(compiler.graph.nodes)}
+            spans = [
+                order[node.name] for node in compiler.graph.nodes
+                if node.op == "call_function" and _graph_layer(node) is not None
+            ]
+            if any(
+                _graph_layer(node) is None and min(spans) < order[node.name] < max(spans)
+                for node in covered.get(name, ())
+            ):
+                return reject("code from outside the `blocks.N` layers runs between them")
+            return reject(
+                f"an operation of layer `blocks.{max(item for item in found if item is not None)}` "
+                + ("is compiled together with code from outside the layers"
+                   if None in found else "is compiled together with another layer's")
+                + ", so the layers' code can't be separated"
+            )
+        emitted.append((name, root, found.pop() if found else None))
+    # Every layer, including one whose operations all run in another's code.
+    layers = sorted({
+        layer for layer in (
+            _graph_layer(node) for node in compiler.graph.nodes if node.op == "call_function"
+        ) if layer is not None
+    })
     if len(layers) < 2:
         return reject(NO_REPEATED_LAYERS)
     lists = sorted({
@@ -190,6 +250,20 @@ def _share_repeated_transformer_layers(
             "its `blocks.N` layers aren't numbered consecutively from `blocks.0` "
             f"(found {', '.join(f'`blocks.{layer}`' for layer in layers)})"
         )
+    coded = {layer for _, _, layer in emitted}
+    for layer in layers:
+        if layer not in coded:
+            return reject(f"layer `blocks.{layer}` has no code of its own to share")
+    # Each layer's code must run as one stretch, layer after layer, with no
+    # code from outside the layers in between.
+    sequence = [layer for _, _, layer in emitted]
+    first = sequence.index(layers[0])
+    last = len(sequence) - 1 - sequence[::-1].index(layers[-1])
+    stretch = sequence[first:last + 1]
+    if None in stretch:
+        return reject("code from outside the `blocks.N` layers runs between them")
+    if stretch != sorted(stretch):
+        return reject("the layers' code doesn't run one layer after another")
     if (
         compiler.graph.generation.first_cache is not None
         and not compiler.graph.generation.banked_caches
@@ -397,6 +471,11 @@ def _share_repeated_transformer_layers(
         ]
     except ValueError:
         return reject("code from outside the `blocks.N` layers runs between them")
+    # Every root in a layer's stretch of the script is one of that layer's.
+    root_layer = {root: layer for _, root, layer in emitted}
+    for layer, commands in zip(layers, command_groups):
+        if any(root_layer.get(command, layer) != layer for command in commands):
+            return reject("code from outside the `blocks.N` layers runs between them")
     main_root = next(
         identifier for identifier, block in blocks.items()
         if block.get("topLevel") and block.get("parent") is None
@@ -472,6 +551,45 @@ def _share_repeated_transformer_layers(
                     "per-layer bank"
                 )
 
+    # Code outside the layers that reads a banked weight (a tied output head,
+    # or a tensor deduplicated with a layer's weight) keeps reading the same
+    # values: item by item from the bank, at that layer's offset, or else
+    # from its own list.
+    all_owned = set().union(*owned_groups)
+    outside_reads: dict[str, list[str]] = {}
+    other_uses: set[str] = set()
+
+    def note_reporters(value):
+        if isinstance(value, list):
+            if len(value) >= 3 and value[0] == 13:
+                other_uses.add(value[2])
+            for part in value:
+                note_reporters(part)
+
+    for identifier, block in blocks.items():
+        if identifier in all_owned or not isinstance(block, dict):
+            continue
+        field = block.get("fields", {}).get("LIST")
+        if field and len(field) >= 2:
+            if block.get("opcode") == "data_itemoflist":
+                outside_reads.setdefault(field[1], []).append(identifier)
+            else:
+                other_uses.add(field[1])
+        for value in block.get("inputs", {}).values():
+            note_reporters(value)
+    standalone: set[str] = set()
+    for _, names, _ in bank_roles:
+        for index, name in enumerate(names):
+            if list_ids[name] not in other_uses:
+                continue
+            if index == 0:
+                return reject(
+                    f"code outside the layers uses "
+                    f"{_weight_label(nodes, name, layers[0])} in a way other than "
+                    "reading it item by item, so it can't read it from a bank"
+                )
+            standalone.add(name)
+
     # Without a predecessor the first layer starts the script, and the calls
     # take its place there.
     predecessor = next(
@@ -491,16 +609,21 @@ def _share_repeated_transformer_layers(
         else:
             winner[1] = [value for part in parts for value in part]
         for name in names[1:]:
-            sprite["lists"].pop(list_ids[name], None)
+            if name not in standalone:
+                sprite["lists"].pop(list_ids[name], None)
 
-        tensors = [compiler.static_lists.pop(name.removeprefix("W_")) for name in names]
+        def take(table: dict, name: str, key, default=None):
+            # A weight that keeps its own list keeps its own storage too.
+            return table.get(key, default) if name in standalone else table.pop(key, default)
+
+        tensors = [take(compiler.static_lists, name, name.removeprefix("W_")) for name in names]
         combined_layouts = []
         layout_offset = 0
         shard_alignments = []
         for name, tensor in zip(names, tensors):
             key = name.removeprefix("W_")
-            shard_alignments.append(compiler.static_shard_alignments.pop(name, 1))
-            for start, rows, inner in compiler.interleaved_static_layouts.pop(key, ()):
+            shard_alignments.append(take(compiler.static_shard_alignments, name, name, 1))
+            for start, rows, inner in take(compiler.interleaved_static_layouts, name, key, ()):
                 combined_layouts.append((layout_offset + start, rows, inner))
             layout_offset += tensor.numel()
         all_matrix = all(isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 for tensor in tensors)
@@ -516,7 +639,10 @@ def _share_repeated_transformer_layers(
             else:
                 bank_tensor = bank_tensor.reshape(len(names), -1)
         compiler.static_lists[names[0].removeprefix("W_")] = bank_tensor
-        sources = [compiler.static_source_numels.pop(name.removeprefix("W_"), 0) for name in names]
+        sources = [
+            take(compiler.static_source_numels, name, name.removeprefix("W_"), 0)
+            for name in names
+        ]
         if any(sources):
             # Row shards of weights: kept like those weights.
             compiler.static_source_numels[names[0].removeprefix("W_")] = max(
@@ -543,23 +669,14 @@ def _share_repeated_transformer_layers(
             if not field or field[1] != winner_id:
                 continue
             field[0] = winner[0]
-            add_id = f"cattorch_layer_bank_index_{uuid.uuid4().hex}"
-            old_index = block["inputs"]["INDEX"]
-            blocks[add_id] = {
-                "opcode": "operator_add", "next": None, "parent": identifier,
-                "inputs": {
-                    "NUM1": old_index,
-                    "NUM2": [3, [12, base_name, base_id], [10, ""]],
-                },
-                "fields": {}, "shadow": False, "topLevel": False,
-            }
-            if (
-                isinstance(old_index, list) and len(old_index) > 1
-                and old_index[0] == 3 and isinstance(old_index[1], str)
-                and old_index[1] in blocks
-            ):
-                blocks[old_index[1]]["parent"] = add_id
-            block["inputs"]["INDEX"] = [3, add_id, [4, 0]]
+            _offset_index(blocks, identifier, [3, [12, base_name, base_id], [10, ""]])
+        # Outside reads of a later layer's weight read its rows of the bank.
+        for index, name in enumerate(names[1:], 1):
+            if name in standalone:
+                continue
+            for identifier in outside_reads.get(list_ids[name], ()):
+                blocks[identifier]["fields"]["LIST"][0:2] = [winner[0], winner_id]
+                _offset_index(blocks, identifier, [1, [4, str(index * size)]])
 
     carried = input_list
     if copy_input:
@@ -603,7 +720,7 @@ def _share_repeated_transformer_layers(
         key: blocks[starts[0]][key] for key in ("x", "y") if key in blocks[starts[0]]
     }
     blocks[first_end]["next"] = None
-    procedure_name = "cattorch shared transformer layer"
+    procedure_name = SHARED_LAYER_PROCEDURE
     definition = f"cattorch_shared_layer_definition_{uuid.uuid4().hex[:8]}"
     prototype = f"cattorch_shared_layer_prototype_{uuid.uuid4().hex[:8]}"
     blocks[definition] = {

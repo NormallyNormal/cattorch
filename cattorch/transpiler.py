@@ -62,6 +62,7 @@ from cattorch.quantization import (
 from cattorch.generation_blocks import _finish_generation_prepare, _wrap_generation_lifecycle
 from cattorch.guards import _guard_generation_init, _guard_plain_calls
 from cattorch.layer_sharing import (
+    SHARED_LAYER_PROCEDURE,
     _LAYER_CACHE_BASE,
     _graph_layer,
     _share_repeated_transformer_layers,
@@ -3354,17 +3355,38 @@ def _check_compiled_plan(sprite: dict, compiler, *, shared: bool) -> None:
     """Check that the code left in ``sprite`` computes each value before reading it.
 
     Runs after every rewrite of the compiled roots (layer sharing deletes the
-    roots of layers 1..N, whose values the shared layer's calls compute).
+    roots of layers 1..N, whose values the shared layer's calls compute, and
+    moves layer 0's into the shared block, where no other code may be).
     """
     roots = compiler.emitted_roots[:compiler.node_roots]
     blocks = sprite.get("blocks", {})
+    layer_nodes = frozenset(
+        node.name for node in compiler.graph.nodes if _graph_layer(node) is not None
+    )
+    if shared:
+        for name, root in roots:
+            if name in layer_nodes or root not in blocks:
+                continue
+            top, seen = root, set()
+            while blocks[top].get("parent") in blocks and top not in seen:
+                seen.add(top)
+                top = blocks[top]["parent"]
+            prototype = blocks.get(blocks[top].get("inputs", {}).get("custom_block", [None, None])[1])
+            if (
+                blocks[top].get("opcode") == "procedures_definition"
+                and isinstance(prototype, dict)
+                and prototype.get("mutation", {}).get("proccode") == SHARED_LAYER_PROCEDURE
+            ):
+                raise RuntimeError(
+                    f"cattorch internal error: the code for {name!r}, which is outside "
+                    "the shared layers, ended up in the shared layer block; please "
+                    "report this model"
+                )
     _check_emission_plan(
         compiler.graph,
         coded=(name for name, _ in roots),
         order=[name for name, root in roots if root in blocks],
-        shared=frozenset(
-            node.name for node in compiler.graph.nodes if _graph_layer(node) is not None
-        ) if shared else frozenset(),
+        shared=layer_nodes if shared else frozenset(),
     )
 
 

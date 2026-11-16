@@ -363,6 +363,14 @@ Python:
   first layer that was also used later. These models are now exported
   unshared, with a warning; see
   [layer sharing](docs/code-generation.md#layer-sharing).
+- Layer sharing gave wrong output when code outside the layers read a
+  layer's weight other than `blocks.0`'s, such as an output head tied to a
+  layer's weight or a tensor with the same values, and when the model's loop
+  ran code between two layers that read no layer's output. That code reads
+  the layer's rows of the shared bank now, and code between layers keeps the
+  model unshared, with a warning that says so (it used to blame weight
+  deduplication, and a layer whose operations were all fused into code
+  outside it was said to be misnumbered).
 - `masked_fill` on an integer or boolean tensor wrote a fractional fill
   value as it was instead of casting it to the tensor's type.
 - A SiLU multiplied by itself (`s * s`) or by another SiLU

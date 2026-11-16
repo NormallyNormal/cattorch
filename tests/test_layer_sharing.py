@@ -7,9 +7,10 @@ import torch
 from torch import nn
 
 from cattorch import (
-    CattorchWarning, CodegenConfig, EntryPoint, ExportProgram, Input, Output, transpile, verify,
+    CattorchWarning, CodegenConfig, EntryPoint, ExportProgram, Input, Output,
+    QuantizationConfig, transpile, verify,
 )
-from sprite_helpers import load_sprite
+from sprite_helpers import load_emulator, load_sprite
 
 SHARED = CodegenConfig(layer_sharing=True)
 PROCEDURE = "cattorch shared transformer layer"
@@ -281,3 +282,123 @@ def test_cached_generation_with_a_skip_across_layers_is_not_shared(tmp_path):
     assert emitted == [message] and "read after the next layer" in message
     assert not shared_procedure(result)
     prefill_and_decode(load_emulator(result), model, [1, 3, 5], [2, 4])
+
+
+class OutsideReader(nn.Module):
+    """Three layers, and code outside them reading one layer's weight.
+
+    ``where`` is ``"head"`` (after the layers) or ``"before"``; ``how`` is
+    ``"tied"`` (the same parameter) or ``"equal"`` (another parameter with
+    the same values, which storage keeps once).
+    """
+
+    def __init__(self, layer, where="head", how="tied"):
+        super().__init__()
+        self.where = where
+        self.blocks = nn.ModuleList(Block() for _ in range(3))
+        self.head = nn.Linear(8, 16, bias=False)
+        if how == "tied":
+            self.head.weight = self.blocks[layer].up.weight
+        else:
+            with torch.no_grad():
+                self.head.weight.copy_(self.blocks[layer].up.weight)
+
+    def forward(self, value):
+        before = self.head(value) if self.where == "before" else None
+        for block in self.blocks:
+            value = block(value)
+        out = self.head(value) if self.where == "head" else value
+        return (out, before) if before is not None else out
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+@pytest.mark.parametrize("where,how", [("head", "tied"), ("head", "equal"), ("before", "tied")])
+def test_code_outside_the_layers_reading_a_layer_weight_reads_its_values(
+    tmp_path, layer, where, how,
+):
+    torch.manual_seed(layer)
+    model = OutsideReader(layer, where, how).eval()
+    value = torch.randn(2, 8)
+    result, emitted = export(model, value, tmp_path / f"{where}{how}{layer}")
+    assert emitted == []
+    assert shared_procedure(result)
+    assert verify(model, value, result).passed
+
+
+@pytest.mark.parametrize("layer", [1, 2])
+def test_a_quantized_tied_head_reads_the_same_stored_values_as_unshared(tmp_path, layer):
+    torch.manual_seed(layer)
+    model = OutsideReader(layer).eval()
+    value = torch.randn(2, 8)
+    quantization = QuantizationConfig(bits=8, min_quantized_values=16)
+    outputs = []
+    for codegen in (CodegenConfig(), SHARED):
+        result = transpile(
+            model, value, tmp_path / f"q{codegen.layer_sharing}", codegen=codegen,
+            quantization=quantization,
+        )
+        emulator = load_emulator(result)
+        emulator.lists["input"] = value.flatten().tolist()
+        emulator.run_procedure("cattorch forward")
+        outputs.append([float(item) for item in emulator.lists["output"]])
+    assert shared_procedure(result)
+    assert outputs[0] == outputs[1]
+
+
+class CodeBetween(nn.Module):
+    """``side`` is computed in the layer loop after ``blocks.where``, from no layer output."""
+
+    def __init__(self, where, weight=False):
+        super().__init__()
+        self.where = where
+        self.inp = nn.Linear(8, 8)
+        self.side = nn.Linear(8, 8) if weight else None
+        self.blocks = nn.ModuleList(Block() for _ in range(3))
+
+    def forward(self, value):
+        start = self.inp(value)
+        hidden = start
+        side = None
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden)
+            if index == self.where:
+                side = self.side(value) if self.side is not None else torch.tanh(start)
+        return hidden + side
+
+
+@pytest.mark.parametrize("where", [0, 1])
+@pytest.mark.parametrize("weight", [False, True])
+def test_code_between_layers_that_reads_no_layer_output_is_not_shared(tmp_path, where, weight):
+    torch.manual_seed(where)
+    model = CodeBetween(where, weight).eval()
+    value = torch.randn(1, 8)
+    result, emitted = export(model, value, tmp_path / f"between{where}{weight}")
+    assert not shared_procedure(result)
+    assert len(emitted) == 1
+    assert "code from outside the `blocks.N` layers runs between them" in emitted[0]
+    assert verify(model, value, result).passed
+
+
+class FusedLayer(nn.Module):
+    """``blocks.0`` is only an activation, which the Linear before it absorbs."""
+
+    def __init__(self):
+        super().__init__()
+        self.inp = nn.Linear(8, 8)
+        self.blocks = nn.ModuleList([nn.ReLU(), nn.Linear(8, 8), nn.Linear(8, 8)])
+
+    def forward(self, value):
+        value = self.inp(value)
+        for block in self.blocks:
+            value = block(value)
+        return value
+
+
+def test_a_layer_fused_into_outside_code_gets_an_accurate_reason(tmp_path):
+    model = FusedLayer().eval()
+    value = torch.randn(1, 8)
+    result, emitted = export(model, value, tmp_path / "fused")
+    assert len(emitted) == 1
+    assert "aren't numbered consecutively" not in emitted[0]
+    assert "`blocks.0` is compiled together with code from outside the layers" in emitted[0]
+    assert verify(model, value, result).passed

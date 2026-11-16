@@ -63,7 +63,9 @@ such as the items of an `nn.ModuleList` attribute called `blocks`. It shares
 them when:
 
 - they are in one `blocks` list, numbered consecutively from `blocks.0`, and
-  run one after another, with no code between them;
+  run one after another, with no code between them: code that the model's
+  loop runs between two layers, such as `y = side(x)` after `blocks[0]`,
+  keeps the model unshared even when it reads no layer's output;
 - each layer passes one tensor on: it reads the previous layer's output
   (`blocks.0`: its input) and otherwise only the same tensors from before the
   layers, such as a mask, and nothing reads its tensors but the next layer
@@ -81,7 +83,10 @@ them when:
   sits in its own layer and every layer's cache has the same width.
 
 The layers can be anywhere in the model, including at its start, where they
-read the input list; the input list keeps the values you put in it.
+read the input list; the input list keeps the values you put in it. Code
+outside the layers may read a layer's weight, such as an output head tied to
+a layer's weight or a tensor with the same values: it reads that layer's
+rows of the bank.
 
 Sharing is all or nothing: if any layer doesn't fit, the model is exported
 without sharing. Whenever `layer_sharing=True` shares nothing, the export
