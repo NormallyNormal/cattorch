@@ -922,3 +922,18 @@ def test_a_bool_list_holds_booleans_or_ones_and_zeros(tmp_path, flags, valid):
         assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("flags input")
     # The input list is never changed.
     assert emulator.lists["input"] == list(flags)
+
+
+def test_broadcasts_and_globals_of_two_sprites_scratch_cant_tell_apart_are_refused():
+    # Sprite "a b"'s entry point "c" and sprite "a"'s "b c" are one message.
+    with pytest.raises(ValueError, match="sprite 'a b'.*sprite 'a'|sprite 'a'.*sprite 'a b'"):
+        interface.check_messages([("sprite 'a b'", "a b c"), ("sprite 'a'", "A B C")])
+    # A NAME whose prepare for save is the message every sprite answers.
+    with pytest.raises(ValueError, match="every exported sprite answers"):
+        interface.check_export("CATTORCH", interface.PROGRAM_LIFECYCLE)
+    with pytest.raises(ValueError, match="both use the global 'a b c'"):
+        interface.check_global_names([("sprite 'a b'", "a b c"), ("sprite 'a'", "a b c")])
+    # One sprite may repeat its own message, as its calls and hats do.
+    interface.check_messages([("sprite 'a'", "a go"), ("sprite 'a'", "a go")])
+    with pytest.raises(ValueError, match="reserved"):
+        interface.check_export_name("_stage_")
