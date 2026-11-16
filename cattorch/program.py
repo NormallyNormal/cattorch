@@ -286,8 +286,12 @@ class GenerationProgram:
                 "GenerationProgram.max_context must be an integer; the other "
                 "fields are keyword-only, as in GenerationProgram(64, method=...)"
             )
-        if self.max_context < 1:
-            raise ValueError("GenerationProgram.max_context must be positive")
+        if self.max_context < 3:
+            raise ValueError(
+                f"GenerationProgram.max_context must be at least 3, not {self.max_context}: "
+                "cattorch traces the model at max_context and max_context - 1 tokens "
+                "to find what depends on the length"
+            )
         if self.method is not None:
             object.__setattr__(self, "method", _name(self.method, "generation method"))
         if not isinstance(self.hidden_prefill, bool):

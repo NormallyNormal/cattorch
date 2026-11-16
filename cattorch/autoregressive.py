@@ -1649,14 +1649,18 @@ def check_step_equivalence(
 ) -> None:
     """Run the step module token by token against the stateless model.
 
-    Every output row must match ``adapted(tokens)`` within ``rtol`` (relative to
-    the largest value in the row). Raises :class:`UnsupportedModelError`
-    otherwise. The step module is reset before and after.
+    Every output row of the first ``min(max_context, 32)`` tokens must match
+    ``adapted(tokens)`` within ``rtol`` (relative to the largest value in the
+    row). The model's answer for a token must also not change with the
+    prompt's length: it is compared at a spread of lengths up to
+    ``max_context`` with its answer for the full ``max_context`` tokens. Raises
+    :class:`UnsupportedModelError` otherwise. The step module is reset before
+    and after.
     """
     length = min(plan.max_context, 32)
     generator = torch.Generator().manual_seed(seed)
     vocabulary = _vocabulary_size(plan)
-    tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
+    tokens = torch.randint(0, vocabulary, (1, plan.max_context), generator=generator)
     names = plan.long.user_output_names
     with torch.no_grad():
         reference = tensor_output_leaves(adapted(tokens), warn=False)
@@ -1664,7 +1668,7 @@ def check_step_equivalence(
         # length, such as dynamic NTK RoPE, matches only at the full length.
         prefixes = {
             count: tensor_output_leaves(adapted(tokens[:, :count]), warn=False)
-            for count in sorted({1, length // 2, length - 1}) if 0 < count < length
+            for count in _prefix_lengths(length, plan.max_context)
         }
         step.reset()
         try:
@@ -1697,13 +1701,13 @@ def check_step_equivalence(
                     "token from its own row and earlier tokens only"
                 )
 
-    # The cached step matches the full prompt; check it is the model's answer
-    # for shorter prompts too.
+    # The cached step matches the full prompt; check the full prompt's
+    # answer for each token is the model's answer for shorter prompts too.
     for count, shorter in prefixes.items():
         for name, axis in plan.outputs:
             leaf = names.index(name)
             expected = shorter[leaf].narrow(axis.axis, count - 1, 1)
-            actual = rows[count - 1][leaf]
+            actual = reference[leaf].narrow(axis.axis, count - 1, 1)
             scale = float(expected.double().abs().max()) if expected.numel() else 0.0
             if actual.shape != expected.shape or not torch.allclose(
                 actual.double(), expected.double(), rtol=0, atol=rtol * max(scale, 1e-3),
@@ -1717,6 +1721,20 @@ def check_step_equivalence(
                     "length (dynamic NTK RoPE). Compute each token from itself and "
                     "earlier tokens only"
                 )
+
+
+def _prefix_lengths(stepped: int, max_context: int) -> list[int]:
+    """Prompt lengths to compare with the full ``max_context`` tokens.
+
+    The tokens the step was run over, and a spread up to ``max_context``,
+    so that a model depending on the prompt's length shows at one of them.
+    About a dozen, whatever ``max_context`` is, to keep the cost bounded.
+    """
+    spread = {round(max_context * eighth / 8) for eighth in range(1, 8)}
+    return sorted(
+        count for count in {1, 2, stepped // 2, stepped - 1, stepped, max_context - 1} | spread
+        if 0 < count < max_context
+    )
 
 
 def build_generation_step(

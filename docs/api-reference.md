@@ -296,7 +296,7 @@ number of multiplications, with a warning. See
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `max_context` | required | Maximum number of tokens the cache holds. The only positional field; the others are keyword-only. |
+| `max_context` | required | Maximum number of tokens the cache holds, at least 3. The only positional field; the others are keyword-only. |
 | `method` | `None` | Name of the model method that takes token IDs and returns next-token logits for every position. `None` means the method marked `@generate`, or `forward`. |
 | `hidden_prefill` | `True` | During prefill, compute logits only for the last prompt token. The final layer's query, attention output and MLP are skipped too. |
 | `top_k` | `None` | If set (1 to 64), also write the top-k logits and their token IDs after each prefill or decode. |

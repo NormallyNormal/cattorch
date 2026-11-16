@@ -376,6 +376,26 @@ def test_a_branch_on_the_prompt_length_is_explained():
         build_generation_step(Branch().eval(), 8)
 
 
+@pytest.mark.parametrize("threshold", [40, 47])
+def test_a_branch_on_a_length_past_the_stepped_tokens_is_rejected(threshold):
+    # The step runs over 32 tokens; the length check reaches max_context.
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(10, 8)
+            self.head = nn.Linear(8, 10)
+
+        def forward(self, tokens):
+            x = self.embed(tokens)
+            x = x + F.scaled_dot_product_attention(x, x, x, is_causal=True)
+            if tokens.shape[1] <= threshold:
+                x = x * 2
+            return self.head(x)
+
+    with pytest.raises(UnsupportedModelError, match=r"length"):
+        build_generation_step(Branch().eval(), 48)
+
+
 def test_positions_scaled_by_the_prompt_length_are_rejected():
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(0)

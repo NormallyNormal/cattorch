@@ -561,8 +561,10 @@ def test_generation_program_signature_and_validation():
         GenerationProgram("forward", torch.tensor([[1]]), 64)
     with pytest.raises(TypeError, match="keyword-only"):
         GenerationProgram("forward")
-    with pytest.raises(ValueError, match="positive"):
-        GenerationProgram(max_context=0)
+    for small in (0, 1, 2):
+        with pytest.raises(ValueError, match=f"at least 3, not {small}"):
+            GenerationProgram(max_context=small)
+    assert GenerationProgram(max_context=3).max_context == 3
 
 
 def test_non_causal_model_is_rejected_at_export(tmp_path):

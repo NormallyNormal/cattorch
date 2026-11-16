@@ -34,7 +34,7 @@ Python API:
 - `CodegenConfig(layer_sharing="auto" | "off")` → `layer_sharing=True |
   False`.
 - `GenerationProgram`: `max_context` is the first field and the only
-  positional one; `example_token` is removed; `method` is optional (the
+  positional one, and must be at least 3; `example_token` is removed; `method` is optional (the
   method marked `@generate`, else `forward`). The method is now a stateless
   `forward(tokens) -> logits` over the whole sequence, from which cattorch
   derives the cached step; a 0.5.0 method that takes one token must become
@@ -151,7 +151,9 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 
 - `GenerationProgram(max_context=...)` exports an ordinary stateless
   `forward(tokens) -> logits` as a KV-cached generator and checks the cached
-  step against `forward` at export. Separate or combined Q/K/V projections,
+  step against `forward` at export, and that `forward`'s answer for a token
+  doesn't depend on the prompt's length, at lengths spread up to
+  `max_context`. Separate or combined Q/K/V projections,
   learned positions, RoPE, grouped-query and single-KV-head attention,
   sliding windows (Mistral, GPT-OSS), ALiBi and attention sinks work, and so
   do unwrapped Hugging Face GPT-2, Llama and Qwen2. Models with float16 or

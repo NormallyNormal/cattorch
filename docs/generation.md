@@ -48,6 +48,16 @@ must agree within `1e-4` of the row's largest value, or export stops with an
 `UnsupportedModelError` naming the first row that differs. This catches models
 that break the requirements below in ways the analysis can't see.
 
+The step is built from a trace at `max_context` tokens, so later positions
+run the same operations as the first 32, with their own rows of any position
+table. What the step can't see is a model whose answer for a token depends
+on the prompt's length. So export also compares the model's answer for a
+token in a prompt of `max_context` tokens with its answer in shorter prompts,
+at about a dozen lengths spread up to `max_context` (1, 2, 16, 31, 32,
+`max_context - 1`, and each eighth of `max_context`). A Python branch on one
+exact length outside those, such as `if tokens.shape[1] == 37:`, isn't
+caught.
+
 ## Requirements
 
 - Attention is causal: each token attends to itself and earlier tokens, through
