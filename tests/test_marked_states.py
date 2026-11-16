@@ -285,13 +285,20 @@ class Writes(nn.Module):
             self.buffer.t()[0] = 1.0
             self.buffer[1] += x[0]
         elif kind == "view read after":
+            # The view sees the update, as in PyTorch.
             row = self.buffer[0]
+            self.buffer[0] = x
+            return row * 1 + self.buffer.sum(0)
+        elif kind == "strided view read after":
+            row = self.buffer.as_strided((3,), (1,))
             self.buffer[0] = x
             return row * 1
         return self.buffer.sum(0)
 
 
-@pytest.mark.parametrize("kind", ["ring", "shift", "mask", "column", "index tensor"])
+@pytest.mark.parametrize(
+    "kind", ["ring", "shift", "mask", "column", "index tensor", "view read after"],
+)
 def test_states_written_in_place(tmp_path, kind):
     model = Writes(kind).eval()
     result = transpile(model, None, tmp_path / "writes")
@@ -303,7 +310,7 @@ def test_states_written_in_place(tmp_path, kind):
 @pytest.mark.parametrize(("kind", "error", "message"), [
     ("0-d index", UnsupportedModelError, r"indexing with a 0-d integer tensor.*i.reshape\(1\)"),
     ("transposed", UnsupportedOperationError, r"in-place update through a view.*out of place"),
-    ("view read after", UnsupportedOperationError, r"a view read again after the update"),
+    ("strided view read after", UnsupportedOperationError, r"a view read again after the update"),
 ])
 def test_state_writes_that_fail_say_what_to_write(tmp_path, kind, error, message):
     with pytest.raises(error, match=message):
