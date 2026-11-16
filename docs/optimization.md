@@ -38,7 +38,10 @@ By default, fast mode:
 - Computes LayerNorm variance in one pass as `E[x²] - E[x]²`.
 - Skips subtracting the maximum in softmax and reuses exponentials.
 
-Fast softmax can overflow on large positive logits. One-pass LayerNorm can lose
+QuickGELU differs from GELU by up to about 0.02 per activation, which
+accumulates through the layers: a small language model whose logits reach
+about 18 can be off by about 0.05, all of it from this replacement. Turn
+`activations` off if that matters. Fast softmax can overflow on large positive logits. One-pass LayerNorm can lose
 precision when all values share a large offset. Sigmoid, tanh, SiLU, and ELU
 stay exact.
 
