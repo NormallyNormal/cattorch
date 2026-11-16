@@ -420,10 +420,10 @@ def _verify_program(
             # having run.
             passes.append((copy.deepcopy(owned), tuple(reversed(calls))))
     call_results = []
-    for reference, sequence in passes:
+    for position, (reference, sequence) in enumerate(passes):
         call_results.extend(_program_calls(
             ScratchEmulator(copy.deepcopy(project)), reference, program, sequence, registry,
-            atol=atol, rtol=rtol,
+            atol=atol, rtol=rtol, tentative=position > 0,
         ))
     return ProgramVerifyResult(
         passed=all(value.passed for value in call_results),
@@ -433,16 +433,36 @@ def _verify_program(
 
 def _program_calls(
     emulator: ScratchEmulator, owned: torch.nn.Module, program: ExportProgram,
-    calls, registry, *, atol: float, rtol: float,
+    calls, registry, *, atol: float, rtol: float, tentative: bool = False,
 ) -> list[ProgramCallVerifyResult]:
-    """Run ``calls`` in the emulator and on ``owned``, comparing each."""
+    """Run ``calls`` in the emulator and on ``owned``, comparing each.
+
+    ``tentative`` calls, which the user didn't ask for, stop where the model
+    itself can't take the next one, as a read of a state still empty can't.
+    """
+    from cattorch.experts import _expert_family_context
+
     # For a marked model, the user's own methods on live buffers.
     replay = program_replay(owned, program)
     call_results = []
+
+    def run(invocation):
+        with (
+            _expert_family_context(registry.expert_families),
+            _reading_stored_uses(owned, registry),
+        ):
+            return replay.run(invocation)
+
     for invocation in calls:
         if not isinstance(invocation, ProgramCall):
             raise TypeError(f"calls must contain ProgramCall values, not {type(invocation).__name__}")
         entry = replay.entry(invocation)
+        ran = None
+        if tentative:
+            try:
+                ran = run(invocation)
+            except Exception:  # noqa: BLE001 - the model can't take this order
+                break
         for binding, value in zip(
             (binding for binding in entry.arguments if isinstance(binding, Input)),
             invocation.inputs,
@@ -455,12 +475,7 @@ def _program_calls(
         status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
         output_results = []
         if status == OK:
-            from cattorch.experts import _expert_family_context
-            with (
-                _expert_family_context(registry.expert_families),
-                _reading_stored_uses(owned, registry),
-            ):
-                leaves = replay.run(invocation)
+            leaves = ran if ran is not None else run(invocation)
             for binding, expected in zip(entry.returns, leaves):
                 if isinstance(binding, Output):
                     output_results.append(_compare_values(
@@ -488,6 +503,9 @@ def _program_calls(
             states=state_results,
             status=status,
         ))
+        if tentative and status != OK:
+            # The states in PyTorch have moved on without the sprite's.
+            break
     return call_results
 
 

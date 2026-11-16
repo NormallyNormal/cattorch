@@ -303,6 +303,25 @@ def test_verify_by_default_calls_the_entry_points_in_both_orders(tmp_path):
     assert report.calls[2].passed
 
 
+class NeedsArm(Flag):
+    """A model that can only run ``look`` after ``arm``, as a read of an
+    append state that starts empty can only run after a write."""
+
+    def look(self, x):
+        if self.scale == 1.0:
+            raise IndexError("look before arm")
+        return x * 1
+
+
+def test_verify_stops_its_reverse_calls_where_the_model_cant_take_them(tmp_path):
+    model = NeedsArm().eval()
+    result = transpile(Flag().eval(), FLAG_PROGRAM, tmp_path / "flag")
+    report = verify(model, FLAG_PROGRAM, result)
+    # arm, look in order, then the reverse order stops at look.
+    assert [call.entrypoint for call in report.calls] == ["arm", "look"]
+    assert report.calls[0].passed
+
+
 # ── The length checks ───────────────────────────────────────────────────────
 
 class CountRows(nn.Module):
