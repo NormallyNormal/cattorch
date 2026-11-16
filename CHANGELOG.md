@@ -490,9 +490,18 @@ Python:
   them raises `ValueError`. A `FastLayerConfig` rank at or above a weight's
   full rank was skipped silently; it warns, as other skipped
   factorizations do.
-- An `output_path` that names no file (empty, ending in a separator, or an
-  existing directory) raises `ValueError` instead of writing a hidden
-  `..sprite3` or a file beside the directory, and so does such a `-o`. The
+- An `output_path` that names no file (empty, ending in a separator, only an
+  extension such as `.sprite3`, or an existing directory) raises
+  `ValueError` instead of writing a hidden `..sprite3` or `.sprite3.sprite3`
+  or a file beside the directory, and so does such a `-o`.
+- `cattorch generate --project` failed with "eos_token_id ... is not a token
+  ID of the model", after writing the sprites, when the tokenizer's end
+  token was past the model's token IDs (such as an added `</s>`) and no
+  `--eos-token-id` was given. The demo then has no end token, and a warning
+  says so. A negative or non-finite `--temperature`, a negative
+  `--eos-token-id`, and `--project` without a tokenizer are rejected before
+  anything is written, and an `--eos-token-id` past the model's IDs before
+  the tokenizer and project are. The
   benchmark builders append `.sb3` as every other writer does, instead of
   replacing the last suffix (`results.v2` wrote `results.sb3`).
 - Character and BPE tokenizer sprites ignored Hugging Face added tokens, so
