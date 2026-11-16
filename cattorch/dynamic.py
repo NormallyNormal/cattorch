@@ -127,10 +127,15 @@ def _exact_tolerance(reference, positional, keywords) -> dict[str, float]:
     from cattorch.frontend import tensor_output_leaves
     from cattorch.verify import _reading_stored_uses
 
-    with torch.no_grad(), _reading_stored_uses(reference):
-        leaves = tensor_output_leaves(
-            copy.deepcopy(reference)(*positional, **keywords), warn=False,
-        )
+    try:
+        with torch.no_grad(), _reading_stored_uses(reference):
+            leaves = tensor_output_leaves(
+                copy.deepcopy(reference)(*positional, **keywords), warn=False,
+            )
+    except Exception:
+        # A model that fails at this length is reported by verify, which
+        # runs it next and says so in the user's terms.
+        return dict(_EXACT_TOLERANCE)
     magnitude = max(
         (
             float(leaf.detach().abs().nan_to_num(posinf=0.0, neginf=0.0).max())
