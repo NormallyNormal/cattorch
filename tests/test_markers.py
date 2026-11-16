@@ -12,10 +12,9 @@ from cattorch import (
     ProgramCall, adapter, entrypoint, example_inputs, export_forward, generate, marked_program,
     moe,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from shared_models import nano
-from sprite_helpers import load_sprite, prefill_and_decode
+from sprite_helpers import SpriteEmulator, load_sprite, prefill_and_decode
 
 
 class Accumulator(nn.Module):
@@ -51,8 +50,8 @@ def test_entrypoints_with_state_export_and_verify(tmp_path):
     result = transpile(model, None, tmp_path / "accumulator")
     entries = {entry.name: entry for entry in result.entrypoints}
     assert set(entries) == {"add", "remember", "recall"}
-    assert [spec.list_name for spec in entries["add"].inputs] == ["cattorch add value"]
-    assert [spec.list_name for spec in entries["add"].outputs] == ["cattorch add doubled"]
+    assert [spec.list_name for spec in entries["add"].inputs] == ["accumulator add value"]
+    assert [spec.list_name for spec in entries["add"].outputs] == ["accumulator add doubled"]
     assert entries["add"].state_updates == ("total",)
     assert entries["remember"].state_updates == ("history",)
     assert {state.name: state.mode for state in result.states} == {
@@ -247,7 +246,7 @@ def test_generate_marker_picks_the_generation_method(tmp_path):
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / "chat")
     with torch.no_grad():
         prefill_and_decode(
-            ScratchEmulator(load_sprite(result.path)), model.decoder, [1, 2, 3], [4],
+            SpriteEmulator(load_sprite(result.path)), model.decoder, [1, 2, 3], [4],
         )
 
 
@@ -299,7 +298,7 @@ def test_an_entry_points_non_tensor_results_are_skipped_with_a_warning(tmp_path)
 
     with pytest.warns(UserWarning, match=r"@entrypoint add: ignoring non-tensor results \(NoneType, int\)"):
         result = transpile(Totals().eval(), None, tmp_path / "totals")
-    assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["cattorch add output"]
+    assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["totals add output"]
 
 
 class _Decaying(nn.Module):
@@ -344,7 +343,7 @@ def test_a_buffer_under_two_names_is_one_state(tmp_path):
             return self.reader.memory * 1
 
     result = transpile(Shared().eval(), None, tmp_path / "shared")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     eager = Shared().eval()
     for _ in range(3):
         emulator.lists["cattorch step value"] = [1.0, 2.0]
@@ -365,7 +364,7 @@ def test_prepare_for_save_keeps_program_state(tmp_path):
             return self.total * 1
 
     result = transpile(Counter().eval(), None, tmp_path / "counter")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     for expected in ([1.0, 1.0], None, [2.0, 2.0]):
         if expected is None:
             emulator.run_procedure("cattorch prepare for save")

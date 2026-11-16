@@ -12,6 +12,7 @@ import torch.nn as nn
 from cattorch import GenerationProgram, UnsupportedOperationError, transpile, verify
 from cattorch import EntryPoint, ExportProgram, Input, Output
 from cattorch.experimental import Kernel, analyze, build_kernel_benchmark, check_kernel
+from sprite_helpers import SpriteEmulator
 from cattorch.scratch import (
     add, append, change_var, clear, div, item, mathop, mul, render, repeat, set_var, sub, var,
 )
@@ -103,7 +104,6 @@ def test_kernels_must_be_kernels(tmp_path):
 def test_kernels_apply_to_generation_and_programs(tmp_path):
     from shared_models import nano
     from sprite_helpers import load_sprite, prefill_and_decode
-    from cattorch.util.scratch.emulator import ScratchEmulator
 
     class Block(nn.Module):
         def __init__(self):
@@ -117,7 +117,7 @@ def test_kernels_apply_to_generation_and_programs(tmp_path):
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / "gen", kernels=[MISH])
     assert result.fallback_operations == ()
     with torch.no_grad():
-        prefill_and_decode(ScratchEmulator(load_sprite(result.path)), model, [1, 2], [3])
+        prefill_and_decode(SpriteEmulator(load_sprite(result.path)), model, [1, 2], [3])
 
     program = ExportProgram(entrypoints=(EntryPoint(
         "squash", arguments=(Input("value", torch.randn(4)),), returns=(Output("value"),),

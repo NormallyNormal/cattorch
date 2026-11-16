@@ -16,9 +16,8 @@ from cattorch import (
     RecurrentGenerationProgram, StorageConfig, transpile, verify,
 )
 from cattorch.quantization import _symmetric_matrix
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.interface import TOKEN_IDS
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 LIMIT = 4000
@@ -65,7 +64,7 @@ def _untied(model, head, table):
 
 def _decoded(result):
     """An emulator of the export with its weights decoded, and how many values they hold."""
-    emulator = ScratchEmulator(load_sprite(result))
+    emulator = SpriteEmulator(load_sprite(result))
     emulator.run_procedure("cattorch init")
     # A program prefixes each entry point's weights with its name.
     stored = sum(len(emulator.lists[name]) for name in emulator._list_name_to_ids if "W_" in name)

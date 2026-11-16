@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from cattorch import BoundedDimension, UnsupportedModelError, entrypoint, transpile, verify
 from cattorch import ProgramCall
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 class Lambda(nn.Module):
@@ -406,7 +406,6 @@ def test_length_check_reaches_the_maximum(tmp_path):
 @pytest.mark.parametrize("by_item", [False, True])
 def test_a_wrong_input_length_is_reported(tmp_path, by_item):
 
-    from cattorch.util.scratch.emulator import ScratchEmulator
 
     if by_item:  # attention that reorders its batch runs once per item
         model = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
@@ -416,16 +415,17 @@ def test_a_wrong_input_length_is_reported(tmp_path, by_item):
     result = transpile(model.eval(), example, tmp_path / "bounded", dynamic={0: (1, 4)})
     sprite = load_sprite(result.path)
     for count, status in (
-        (0, interface.too_few_items("input")), (5 * width, interface.too_many_items("input")),
-        (width + 1, interface.wrong_number_of_items("input")), (2 * width, interface.OK),
+        (0, interface.too_few_items("bounded input")),
+        (5 * width, interface.too_many_items("bounded input")),
+        (width + 1, interface.wrong_number_of_items("bounded input")), (2 * width, interface.OK),
     ):
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["input"] = [0.5] * count
         emulator.run_procedure("cattorch forward")
         assert emulator.variables["cattorch status"] == status, count
         # A forward that fails writes no output.
         assert bool(emulator.lists["output"]) == (status == interface.OK)
-        assert emulator.broadcasts[-1] == interface.completion(interface.FORWARD)
+        assert emulator.broadcasts[-1] == interface.completion("bounded forward")
 
 
 def test_each_item_can_give_several_output_rows(tmp_path):

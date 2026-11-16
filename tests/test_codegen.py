@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.ids import (
     ID_ALPHABET,
@@ -14,7 +13,7 @@ from cattorch.util.scratch.ids import (
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 def test_codegen_config_validation():
@@ -212,7 +211,7 @@ def test_compact_top_k_matches_unrolled_with_fewer_blocks():
     block_counts = {}
     for name, program in programs.items():
         sprite = program.compile()
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["output"] = logits
         emulator.run()
         outputs[name] = (
@@ -227,7 +226,7 @@ def test_compact_top_k_matches_unrolled_with_fewer_blocks():
 def test_top_k_accepts_logits_below_old_finite_sentinel():
     for builder in (_build_top_k_program, _build_compact_top_k_program):
         sprite = builder(2).compile()
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["output"] = [-1e31, -2e31, -3e31]
         emulator.run()
         assert [int(value) for value in emulator.lists["cattorch top k ids"]] == [0, 1]
@@ -261,7 +260,7 @@ def test_internal_name_compaction_preserves_public_interface(tmp_path):
         for block in sprite["blocks"].values()
         if block["opcode"] != "procedures_prototype"
     )
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = [1, 2, 3, 4]
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -322,8 +321,8 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
         )
         sprites[mode] = load_sprite(results[mode].path)
     assert results["auto"].block_count < results["off"].block_count
-    auto = ScratchEmulator(sprites["auto"])
-    off = ScratchEmulator(sprites["off"])
+    auto = SpriteEmulator(sprites["auto"])
+    off = SpriteEmulator(sprites["off"])
     for emulator in (auto, off):
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run_procedure("cattorch forward")
@@ -383,7 +382,7 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
                 id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        sprites[mode] = ScratchEmulator(load_sprite(result.path))
+        sprites[mode] = SpriteEmulator(load_sprite(result.path))
         sprites[mode].lists["input"] = value.flatten().tolist()
         sprites[mode].run_procedure("cattorch forward")
 
@@ -416,7 +415,7 @@ def test_tied_grouped_embedding_head_uses_one_physical_weight(tmp_path):
     assert len(weight_lists) == 1
     assert len(weight_lists[0][1]) == model.embedding.weight.numel()
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(

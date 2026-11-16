@@ -14,11 +14,11 @@ from cattorch import (
     State,
     UnsupportedModelError, build_project, transpile, verify,
 )
-from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
+from cattorch.util.scratch.emulator import ProjectEmulator
 from cattorch.util.scratch.interface import read_logical_list
 from cattorch.interface import TOKEN_IDS
 from shared_models import GRULM, LSTMLM, RECURRENT_MODELS, recurrent_model, reference_rows
-from sprite_helpers import load_sprite, logits
+from sprite_helpers import SpriteEmulator, load_sprite, logits
 
 
 TOLERANCE = 1e-4
@@ -31,7 +31,7 @@ def export(model, path, **options):
     """Export with the model's states; program fields and transpile options mixed."""
     fields = {key: options.pop(key) for key in PROGRAM_FIELDS & set(options)}
     result = transpile(model, RecurrentGenerationProgram(model.states(), **fields), path, **options)
-    return ScratchEmulator(load_sprite(result.path)), result
+    return SpriteEmulator(load_sprite(result.path)), result
 
 
 def run(emulator, procedure, tokens=None):
@@ -74,12 +74,11 @@ def test_prefill_then_decode_matches_the_stateless_forward(exported):
         torch.tensor(emulator.lists["cattorch top k values"], dtype=torch.float64),
         expected[-1].topk(3).values, atol=TOLERANCE, rtol=0,
     )
-    assert result.procedures == (
-        "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
-        "cattorch prepare for save",
+    assert result.broadcasts == (
+        "lm init", "lm reset", "lm prefill", "lm decode", "lm prepare for save",
     )
-    assert result.inputs[0].list_name == TOKEN_IDS
-    assert result.outputs[0].list_name == "cattorch logits"
+    assert result.inputs[0].list_name == "lm token ids"
+    assert result.outputs[0].list_name == "lm logits"
     assert result.outputs[0].numel == expected.shape[1]
 
 
@@ -117,12 +116,12 @@ def test_invalid_tokens_leave_every_state_untouched(exported):
     run(emulator, "cattorch prefill", [1, 2])
     before = states(emulator, model)
     for tokens, status in (
-        ([], interface.wrong_number_of_items(interface.TOKEN_IDS)),
-        ([1, 2], interface.wrong_number_of_items(interface.TOKEN_IDS)),
-        ([vocabulary], interface.invalid_item(interface.TOKEN_IDS)),
-        ([-1], interface.invalid_item(interface.TOKEN_IDS)),
-        ([2.5], interface.invalid_item(interface.TOKEN_IDS)),
-        (["abc"], interface.invalid_item(interface.TOKEN_IDS)),
+        ([], interface.wrong_number_of_items(emulator.public(interface.TOKEN_IDS))),
+        ([1, 2], interface.wrong_number_of_items(emulator.public(interface.TOKEN_IDS))),
+        ([vocabulary], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        ([-1], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        ([2.5], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        (["abc"], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
     ):
         outputs = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
         assert run(emulator, "cattorch decode", tokens) == status, tokens
@@ -199,7 +198,7 @@ def test_max_context_limits_decode_and_prefill(tmp_path):
     assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 3
     assert states(emulator, model) == before
-    assert run(emulator, "cattorch prefill", [1, 2, 3, 4]) == interface.too_many_items(interface.TOKEN_IDS)
+    assert run(emulator, "cattorch prefill", [1, 2, 3, 4]) == interface.too_many_items(emulator.public(interface.TOKEN_IDS))
     assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 3
     assert run(emulator, "cattorch prefill", [5, 6, 7]) == "ok"
@@ -298,33 +297,49 @@ def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
 def test_lifecycle_broadcasts(tmp_path):
     model = recurrent_model("gru")
     emulator, result = export(model, tmp_path / "gru")
-    messages = set(load_sprite(result.path)["broadcasts"].values())
-    assert messages == {
-        "cattorch init complete", "cattorch reset complete", "cattorch prefill complete",
-        "cattorch decode complete", "cattorch prepare for save complete",
+    sprite = load_sprite(result.path)
+    # The sprite declares no message: Scratch keeps them on the stage.
+    assert sprite["broadcasts"] == {}
+    received = {
+        block["fields"]["BROADCAST_OPTION"][0] for block in sprite["blocks"].values()
+        if block["opcode"] == "event_whenbroadcastreceived"
     }
-    # Decode decodes the weights itself, as cattorch init does.
+    assert received == {
+        "gru init", "gru reset", "gru prefill", "gru decode", "gru prepare for save",
+        "cattorch prepare for save",
+    }
+    # Decode decodes the weights itself, as gru init does, and sends one
+    # completion broadcast, its own.
     emulator.lists[TOKEN_IDS] = [4]
     emulator.run_procedure("cattorch decode")
-    assert emulator.broadcasts == ["cattorch init complete", "cattorch decode complete"]
+    assert emulator.broadcasts == ["gru decode complete"]
     for procedure, tokens in (
         ("init", None), ("reset", None), ("prefill", [1, 2, 3]), ("decode", [4]),
         ("prepare for save", None),
     ):
         emulator.broadcasts.clear()
         run(emulator, f"cattorch {procedure}", tokens)
-        assert emulator.broadcasts == [f"cattorch {procedure} complete"]
+        assert emulator.broadcasts == [f"gru {procedure} complete"]
+    # The shared message prepares it too.
+    emulator.broadcasts.clear()
+    emulator.broadcast("cattorch prepare for save")
+    assert emulator.broadcasts == ["gru prepare for save complete"]
     assert emulator.variables["cattorch initialized"] == 0
 
 
 def test_no_loose_canvas_block_runs_a_private_procedure(tmp_path):
     _, result = export(recurrent_model("gru"), tmp_path / "gru")
     sprite = load_sprite(result.path)
-    loose = {
-        block["mutation"]["proccode"] for block in sprite["blocks"].values()
+    assert not [
+        block for block in sprite["blocks"].values()
         if block["opcode"] == "procedures_call" and block.get("topLevel")
+    ]
+    # A loose block runs a call as a project does: it broadcasts its message.
+    loose = {
+        block["inputs"]["BROADCAST_INPUT"][1][1] for block in sprite["blocks"].values()
+        if block["opcode"] == "event_broadcastandwait" and block.get("topLevel")
     }
-    assert loose <= set(result.procedures)
+    assert loose <= set(result.broadcasts)
 
 
 def test_the_reference_check_catches_a_wrong_step(tmp_path):
@@ -472,7 +487,7 @@ def test_the_token_may_be_rearranged_before_its_lookup(tmp_path, form):
     model = TokenForm(form).eval()
     states = (State("hidden", torch.zeros(1, 4)),)
     result = transpile(model, RecurrentGenerationProgram(states), tmp_path / "form")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     hidden, rows = torch.zeros(1, 4), []
     with torch.no_grad():
         for token in (8, 3):
@@ -480,7 +495,7 @@ def test_the_token_may_be_rearranged_before_its_lookup(tmp_path, form):
             rows.append(row.reshape(-1).double())
     assert run(emulator, "cattorch prefill", [8]) == "ok"
     torch.testing.assert_close(logits(emulator), rows[0], atol=TOLERANCE, rtol=0)
-    assert run(emulator, "cattorch decode", [9]) == interface.invalid_item(interface.TOKEN_IDS)
+    assert run(emulator, "cattorch decode", [9]) == interface.invalid_item(emulator.public(interface.TOKEN_IDS))
     assert run(emulator, "cattorch decode", [3]) == "ok"
     torch.testing.assert_close(logits(emulator), rows[1], atol=TOLERANCE, rtol=0)
 
@@ -765,6 +780,6 @@ def test_verify_runs_prefill_and_decode_against_the_step(tmp_path):
         ProgramCall("decode", (torch.tensor([[16]]),)),
     ])
     assert [call.status for call in report.calls] == [
-        "ok", "ok", "ok", "context full", "ok", "invalid item: cattorch token ids",
+        "ok", "ok", "ok", "context full", "ok", "invalid item: gru token ids",
     ]
     assert report.passed, report

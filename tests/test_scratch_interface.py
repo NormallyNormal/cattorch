@@ -2,7 +2,8 @@
 
 The contract page is the source of truth. These tests read its tables and
 check, for a sprite of every kind, that each name it documents is in the
-sprite and that every other name in the sprite is internal (starts with
+sprite (a broadcast it answers or sends, a global it uses, or a variable of
+its own) and that every other name in the sprite is internal (starts with
 ``_``), and that ``cattorch.interface``, where the code takes the names and
 status values from, agrees with it. Within interface version 1 no public
 name or status value may be renamed or removed: if a check fails because one
@@ -30,8 +31,8 @@ from cattorch import (
     build_project, entrypoint, interface, transpile,
 )
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive
-from cattorch.util.scratch.emulator import ScratchEmulator
-from sprite_helpers import load_sprite
+from cattorch.util.scratch.globals import global_references
+from sprite_helpers import SpriteEmulator, load_sprite
 from scratch_status import INTERRUPTED, OVERTAKEN
 
 PAGE = Path(__file__).parents[1] / "docs" / "scratch-interface.md"
@@ -39,6 +40,7 @@ PAGE = Path(__file__).parents[1] / "docs" / "scratch-interface.md"
 # The frozen status values, by situation, and what the code writes for each.
 STATUSES = {
     "ok": interface.OK,
+    "not finished": interface.NOT_FINISHED,
     "wrong number of items: LIST": interface.wrong_number_of_items("LIST"),
     "too few items: LIST": interface.too_few_items("LIST"),
     "too many items: LIST": interface.too_many_items("LIST"),
@@ -64,11 +66,15 @@ NAMES = {
     "cattorch decode": interface.DECODE,
     "cattorch tokenize": interface.TOKENIZE,
     "cattorch detokenize": interface.DETOKENIZE,
-    "cattorch forward complete": interface.completion(interface.FORWARD),
-    "cattorch bridge points run": interface.bridge_procedure("points run"),
-    "story token ids": interface.project_name("story", interface.TOKEN_IDS),
+    "points forward": interface.message("points", interface.FORWARD),
+    "points forward complete": interface.completion(interface.message("points", interface.FORWARD)),
+    "story token ids": interface.global_name("story", interface.TOKEN_IDS),
+    "story status": interface.global_name("story", interface.STATUS_VARIABLE),
+    "story output shard 2": interface.global_name("story", interface.shard_name("output", 1)),
 }
-KINDS = {"block": "procedures", "list": "data", "variable": "data", "broadcast": "broadcasts"}
+KINDS = {
+    "broadcast": "broadcasts", "list": "data", "variable": "data", "sprite variable": "local",
+}
 
 
 def sections() -> dict[str, list[tuple[list[str], str]]]:
@@ -79,43 +85,48 @@ def sections() -> dict[str, list[tuple[list[str], str]]]:
         if line.startswith("## "):
             title = line[3:].strip()
             found[title] = []
-        elif line.startswith("|") and not line.startswith(("|---", "| Name", "| Status")):
+        elif line.startswith("|") and not line.startswith(("|---", "| Name", "| Status", "|   |")):
             cells = [cell.strip() for cell in line.strip("|").split("|")]
             found[title].append((re.findall(r"`([^`]+)`", cells[0]), cells[1]))
     return found
 
 
 def documented(title: str) -> dict[str, set[str]]:
-    names: dict[str, set[str]] = {"procedures": set(), "data": set(), "broadcasts": set()}
+    names: dict[str, set[str]] = {"broadcasts": set(), "data": set(), "local": set()}
     for row, kind in sections()[title]:
         names[KINDS[kind]].update(row)
     return names
 
 
 def sprite_names(sprite: dict) -> dict[str, set[str]]:
+    """What a sprite answers or sends, the globals it uses, and its own public data."""
+    blocks = [block for block in sprite["blocks"].values() if isinstance(block, dict)]
+    references = global_references(sprite)
     return {
-        "procedures": {
-            block["mutation"]["proccode"] for block in sprite["blocks"].values()
-            if isinstance(block, dict) and block.get("opcode") == "procedures_prototype"
-        },
-        "data": {
+        "broadcasts": set(references["broadcasts"].values()),
+        "data": set(references["variables"].values()) | set(references["lists"].values()),
+        "local": {
             entry[0] for section in ("variables", "lists") for entry in sprite[section].values()
+            if not entry[0].startswith(interface.INTERNAL_PREFIX)
         },
-        "broadcasts": set(sprite.get("broadcasts", {}).values()),
+        "procedures": {
+            block["mutation"]["proccode"] for block in blocks
+            if block.get("opcode") == "procedures_prototype"
+        },
     }
 
 
 def expand(names: dict[str, set[str]], **values) -> dict[str, set[str]]:
-    """``names`` with each placeholder (ENTRY, STATE, ...) replaced by every value given."""
+    """``names`` with each placeholder (NAME, ENTRY, STATE, ...) replaced by every value given."""
     expanded = {}
     for kind, patterns in names.items():
         result = set()
         for pattern in patterns:
             options = [pattern]
             for placeholder, choices in values.items():
-                if placeholder in pattern:
+                if re.search(rf"\b{placeholder}\b", pattern):
                     options = [
-                        option.replace(placeholder, choice)
+                        re.sub(rf"\b{placeholder}\b", choice, option)
                         for option in options for choice in choices
                     ]
             result.update(options)
@@ -126,26 +137,29 @@ def expand(names: dict[str, set[str]], **values) -> dict[str, set[str]]:
 def check(sprite: dict, expected: dict[str, set[str]]) -> None:
     """The sprite has every expected name, and every other one is internal."""
     actual = sprite_names(sprite)
-    for kind in expected:
-        public = {name for name in actual[kind] if not name.startswith(interface.INTERNAL_PREFIX)}
-        if kind == "data":
-            public = {name for name in public if " shard " not in name}
-        assert public == expected[kind], kind
+    expected = expand(expected, NAME=[sprite["name"]])
+    for kind in ("broadcasts", "data", "local"):
+        assert {name for name in actual[kind] if " shard " not in name} == expected[kind], kind
+    # Every block is internal: a project calls the sprite with broadcasts.
+    assert all(name.startswith(interface.INTERNAL_PREFIX) for name in actual["procedures"])
+    # Messages are the stage's, never the sprite's own.
+    assert sprite.get("broadcasts", {}) == {}
     for section in ("variables", "lists"):
         # One slot per name, or a user's block could pick the wrong copy.
         listed = [entry[0] for entry in sprite[section].values()]
         assert len(listed) == len(set(listed)), section
     variables = {entry[0]: entry[1] for entry in sprite["variables"].values()}
     assert variables["cattorch interface version"] == 1
-    assert variables["cattorch status"] == ""
     if "cattorch initialized" in variables:
         assert variables["cattorch initialized"] == 0
 
 
-def every(storage: bool = True) -> dict[str, set[str]]:
+def every(storage: bool = True, shared: bool = True) -> dict[str, set[str]]:
     names = documented("Every sprite")
     if not storage:
-        names["data"] = {name for name in names["data"] if name == "cattorch interface version"}
+        names["local"] = {name for name in names["local"] if name == "cattorch interface version"}
+    if not shared:
+        names["broadcasts"] = set()
     return names
 
 
@@ -155,7 +169,9 @@ def union(*parts: dict[str, set[str]]) -> dict[str, set[str]]:
 
 def model_names(result) -> dict[str, set[str]]:
     names = documented("Model sprites")
-    names["data"] = {name for name in names["data"] if not re.fullmatch(r"(input|output)(_1)?", name)}
+    names["data"] = {
+        name for name in names["data"] if not re.fullmatch(r"NAME (input|output)(_1)?", name)
+    }
     names["data"] |= {spec.list_name for spec in (*result.inputs, *result.outputs)}
     return union(names, every())
 
@@ -172,13 +188,35 @@ def test_the_fixed_names_are_the_documented_ones():
         "Model sprites", "Generation sprites", "Program sprites", "Tokenizer sprites",
         "Every sprite",
     )))
-    fixed = {kind: {name for name in found if not re.search(r"[A-Z]", name)} for kind, found in names.items()}
-    assert fixed["procedures"] == interface.PUBLIC_PROCEDURES
-    assert fixed["data"] - {"input", "input_1", "output", "output_1"} == interface.PUBLIC_DATA
-    assert fixed["broadcasts"] == interface.PUBLIC_BROADCASTS
-    assert set(interface.STORAGE_VARIABLES) <= fixed["data"]
+    # Names with no part chosen by the export but its NAME.
+    fixed = {
+        kind: {name for name in found if not re.search(r"[A-Z]", name.replace("NAME", ""))}
+        for kind, found in names.items()
+    }
+    procedures = interface.PUBLIC_PROCEDURES
+    assert fixed["broadcasts"] == {
+        *(interface.message("NAME", block) for block in procedures),
+        *(interface.completion(interface.message("NAME", block)) for block in procedures),
+        *interface.SHARED_MESSAGES,
+    }
+    model_lists = {"NAME input", "NAME input_1", "NAME output", "NAME output_1"}
+    assert fixed["data"] - model_lists == {
+        interface.global_name("NAME", name) for name in interface.PUBLIC_DATA
+        if interface.is_global_data(name, is_list=name in {
+            interface.TOKEN_IDS, interface.LOGITS, interface.TOP_K_VALUES, interface.TOP_K_IDS,
+        })
+    }
+    assert fixed["local"] == {
+        name for name in interface.PUBLIC_DATA
+        if not interface.is_global_data(name, is_list=False)
+        and name not in {
+            interface.TOKEN_IDS, interface.LOGITS, interface.TOP_K_VALUES, interface.TOP_K_IDS,
+        }
+    }
+    assert set(interface.STORAGE_VARIABLES) <= fixed["local"]
     for documented_name, name in NAMES.items():
         assert name == documented_name
+    assert interface.SHARED_MESSAGES == ("cattorch prepare for save",)
 
 
 class Sums(nn.Module):
@@ -241,6 +279,7 @@ def program_names(result) -> dict[str, set[str]]:
         },
         ENTRY=[entry.name for entry in entries],
         STATE=[state.name for state in result.states],
+        NAME=[result.sprite_name],
     )
     expanded["data"] |= {
         spec.list_name for entry in entries for spec in (*entry.inputs, *entry.outputs)
@@ -304,35 +343,41 @@ def test_a_tokenizer_sprite(tmp_path, kind):
         ).save(tmp_path / "bpe")
     else:
         result = SentencePieceBPETokenizer(_SentencePiece()).save(tmp_path / "sentencepiece")
-    check(load_sprite(result.path), union(documented("Tokenizer sprites"), every(storage=False)))
+    check(
+        load_sprite(result.path),
+        union(documented("Tokenizer sprites"), every(storage=False, shared=False)),
+    )
 
 
-def project_names(project) -> dict[str, set[str]]:
-    """The public names a project adds: globals, messages and bridge blocks."""
+def project_names(project) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """The public names in a project, and those its exported sprites bring.
+
+    The first are the stage's globals and messages; the second, every
+    global and message an exported sprite uses (its own interface).
+    """
     data, _ = read_archive(project.path, PROJECT_JSON)
     stage, *sprites = data["targets"]
     names = {
-        "data": {entry[0] for section in ("variables", "lists") for entry in stage[section].values()},
-        # The sprites' own broadcasts are unified on the stage too.
-        "broadcasts": {
-            message for message in stage["broadcasts"].values()
-            if not message.startswith(interface.PUBLIC_PREFIX)
+        "data": {
+            entry[0] for section in ("variables", "lists") for entry in stage[section].values()
+            if not entry[0].startswith(interface.INTERNAL_PREFIX)
         },
-        "procedures": set(),
+        "broadcasts": set(stage["broadcasts"].values()),
     }
+    exported: dict[str, set[str]] = {"data": set(), "broadcasts": set()}
     for sprite in sprites:
-        names["procedures"] |= {
-            block["mutation"]["proccode"] for block in sprite["blocks"].values()
-            if block.get("opcode") == "procedures_prototype"
-            and block["mutation"]["proccode"].startswith(interface.bridge_procedure(""))
-        }
-        if sprite["name"] == "Demo":
+        if sprite["name"] == project.sprites[0]:
+            # The project's own sprite: only internal names of its own.
             demo = sprite_names(sprite)
             assert all(
                 name.startswith(interface.INTERNAL_PREFIX)
-                for kind in ("data", "procedures") for name in demo[kind]
+                for kind in ("local", "procedures") for name in demo[kind]
             )
-    return names
+            continue
+        found = sprite_names(sprite)
+        exported["data"] |= found["data"]
+        exported["broadcasts"] |= found["broadcasts"]
+    return names, exported
 
 
 def test_project_names(tmp_path):
@@ -351,23 +396,24 @@ def test_project_names(tmp_path):
     patterns = documented("Projects")
     used: set[str] = set()
     for name, project in projects.items():
-        values = {
-            "NAME": [name, "words"], "ENTRY": ["add", "latest"],
-            "INPUT": ["row", "rows"], "OUTPUT": ["output"],
-        }
-        for kind, found in project_names(project).items():
-            for actual in found:
+        assert project.sprites[0] == "Demo"
+        found, exported = project_names(project)
+        own = expand(patterns, NAME=[name])
+        for kind in ("data", "broadcasts"):
+            for actual in found[kind]:
+                if actual in exported[kind]:
+                    continue
                 matches = [
                     pattern for pattern in patterns[kind]
-                    if actual in expand({kind: {pattern}}, **values)[kind]
-                    or (pattern == "NAME input" and re.fullmatch(rf"{name} input(_\d+)?", actual))
-                    or (pattern == "NAME output" and re.fullmatch(rf"{name} output(_\d+)?", actual))
+                    if actual in expand({kind: {pattern}}, NAME=[name])[kind]
                 ]
                 assert matches, (name, kind, actual)
                 used.update(matches)
-        # The project's result names what it adds.
-        found = project_names(project)
-        assert set(project.broadcasts) <= found["broadcasts"]
+            # Every global and message of the sprites is declared on the stage.
+            assert exported[kind] <= found[kind] | set(interface.SHARED_MESSAGES)
+        assert own["local"] == set()
+        # The project's result names what it has.
+        assert set(project.broadcasts) == found["broadcasts"]
         assert set(project.lists) | set(project.variables) == found["data"]
     assert used == set().union(*patterns.values())
 
@@ -375,16 +421,19 @@ def test_project_names(tmp_path):
 def test_a_split_output_keeps_its_public_names(tmp_path):
     model = nn.Linear(1, 200_005, bias=False).eval()
     result = transpile(model, torch.ones(1, 1), tmp_path / "wide")
-    names = sprite_names(load_sprite(result.path))["data"]
-    assert "output" in result.sharded_lists
-    assert {"output", "output shard 2", *interface.shard_variables("output")} <= names
+    names = sprite_names(load_sprite(result.path))
+    assert "wide output" in result.sharded_lists
+    assert {"wide output", "wide output shard 2"} <= names["data"]
+    # The variables describing it are the sprite's own, named without NAME.
+    assert set(interface.shard_variables("output")) <= names["local"]
 
 
 def test_sharded_lists_names_only_public_lists(tmp_path):
     # The weight is split in four, but it is internal.
     model = nn.Linear(1000, 250, bias=False).eval()
     result = transpile(model, torch.randn(1, 1000), tmp_path / "weights")
-    names = sprite_names(load_sprite(result.path))["data"]
+    sprite = load_sprite(result.path)
+    names = {entry[0] for entry in sprite["lists"].values()}
     assert any(name.startswith("_W_") and name.endswith(" shard 2") for name in names)
     assert result.sharded_lists == ()
 
@@ -395,9 +444,11 @@ def test_a_reduced_output_adds_no_variable_named_like_a_list(tmp_path):
     example = torch.randn(3, 2)
     result = transpile(Sums().eval(), (example, torch.tensor([[1, 2]])), tmp_path / "sums")
     sprite = load_sprite(result.path)
-    lists = {entry[0] for entry in sprite["lists"].values()}
-    assert not lists & {entry[0] for entry in sprite["variables"].values()}
-    emulator = ScratchEmulator(sprite)
+    references = global_references(sprite)
+    lists = {entry[0] for entry in sprite["lists"].values()} | set(references["lists"].values())
+    variables = {entry[0] for entry in sprite["variables"].values()}
+    assert not lists & (variables | set(references["variables"].values()))
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = example.flatten().tolist()
     emulator.lists["input_1"] = [1, 2]
     emulator.run_procedure("cattorch forward")
@@ -433,12 +484,13 @@ def test_benchmark_project_names(tmp_path):
         "storage": {benchmark.SUITE_RESULTS, benchmark.STORAGE_SIZES, *settings},
     }
     for kind, path in projects.items():
-        stage = next(
-            target for target in read_archive(path, PROJECT_JSON)[0]["targets"] if target["isStage"]
-        )
+        stage, *sprites = read_archive(path, PROJECT_JSON)[0]["targets"]
+        # Besides each sprite's own globals, named after it.
+        own = set().union(*(sprite_names(sprite)["data"] for sprite in sprites))
+        assert all(name.startswith(tuple(f"{sprite['name']} " for sprite in sprites)) for name in own)
         public = {
             entry[0] for section in ("variables", "lists") for entry in stage[section].values()
-            if not entry[0].startswith(interface.INTERNAL_PREFIX)
+            if not entry[0].startswith(interface.INTERNAL_PREFIX) and entry[0] not in own
         }
         assert public == expected[kind], kind
 
@@ -485,8 +537,13 @@ INDEXING = {
 }
 
 
+def invalid_ids(sprite: dict) -> str:
+    """The status naming the global ``NAME input_1``."""
+    return interface.invalid_item(f"{sprite['name']} input_1")
+
+
 def forward_status(sprite: dict, value: torch.Tensor, ids: list) -> tuple[str, list]:
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.lists["input_1"] = list(ids)
     emulator.run_procedure(interface.FORWARD)
@@ -505,7 +562,7 @@ def assert_index_range(sprite, model, value, ids, lowest, highest):
                 torch.tensor([float(item) for item in output]), expected.detach().flatten(),
             )
         else:
-            assert status == interface.invalid_item("input_1"), first
+            assert status == invalid_ids(sprite), first
 
 
 @pytest.mark.parametrize("name", sorted(INDEXING))
@@ -519,7 +576,7 @@ def test_an_index_input_takes_pytorchs_indices(tmp_path, name):
     assert_index_range(sprite, model, value, ids, lowest, highest)
     for invalid in (0.5, "", "x", "Infinity"):
         status, _ = forward_status(sprite, value, [invalid, *ids[1:]])
-        assert status == interface.invalid_item("input_1"), invalid
+        assert status == invalid_ids(sprite), invalid
 
 
 COMPUTED = {
@@ -541,7 +598,7 @@ def test_an_index_computed_from_an_input_is_checked_as_the_block_runs(tmp_path, 
     sprite = load_sprite(result.path)
     assert any(
         isinstance(block, dict) and block.get("opcode") == "data_setvariableto"
-        and interface.invalid_item("input_1") in str(block.get("inputs"))
+        and invalid_ids(sprite) in str(block.get("inputs"))
         for block in sprite["blocks"].values()
     )
     for first in (lowest - 1, highest + 1):
@@ -574,7 +631,7 @@ def test_a_program_entry_points_index_inputs(tmp_path):
         ),
     )
     result = transpile(Tables().eval(), program, tmp_path / "program")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     for entry, valid, invalid in (("look", (-5, 4), (-6, 5)), ("shift", (-6, 3), (-7, 4))):
         for first in (*valid, *invalid):
             emulator.lists[f"cattorch {entry} ids"] = [first, 1]
@@ -584,7 +641,7 @@ def test_a_program_entry_points_index_inputs(tmp_path):
             if first in valid:
                 assert status == interface.OK, (entry, first)
             else:
-                assert status == interface.invalid_item(f"cattorch {entry} ids"), (entry, first)
+                assert status == interface.invalid_item(f"program {entry} ids"), (entry, first)
                 assert emulator.lists["cattorch state total"] == state
 
 
@@ -607,7 +664,7 @@ def test_a_generator_refuses_an_index_computed_from_the_token_ids(tmp_path):
         transpile(Halves().eval(), GenerationProgram(max_context=8), tmp_path / "lm")
 
 
-# ── Item rules (docs/scratch-interface.md#how-every-block-behaves) ──────────
+# ── Item rules (docs/scratch-interface.md#how-every-call-behaves) ───────────
 
 class Affine(nn.Module):
     def forward(self, value, count):
@@ -640,26 +697,29 @@ def test_every_kind_checks_items_by_the_documented_rules(tmp_path, program):
     sprite = load_sprite(result.path)
     for value, accepted in ITEMS.items():
         for position, name in enumerate(lists):
-            emulator = ScratchEmulator(sprite)
+            emulator = SpriteEmulator(sprite)
             for other in lists:
                 emulator.lists[other] = [1, 1]
             emulator.lists[name] = [value, 1]
             emulator.run_procedure(block)
             status = emulator.variables[interface.STATUS_VARIABLE]
-            expected = interface.OK if accepted[position] else interface.invalid_item(name)
+            expected = (
+                interface.OK if accepted[position] else interface.invalid_item(emulator.public(name))
+            )
             assert status == expected, (name, value)
 
 
 def test_an_append_state_holds_at_least_its_initial_rows(tmp_path):
     result = transpile(Memory().eval(), None, tmp_path / "memory")
     sprite = load_sprite(result.path)
-    state = "cattorch state seen"
+    state, status_name = "cattorch state seen", "memory state seen"
     for rows, status in (
-        ([], interface.too_few_items(state)), ([1, 2, 3], interface.OK),
-        ([1, 2, 3] * 8, interface.OK), ([1, 2, 3] * 9, interface.too_many_items(state)),
-        ([1, 2], interface.too_few_items(state)), ([1, 2, 3, 4], interface.wrong_number_of_items(state)),
+        ([], interface.too_few_items(status_name)), ([1, 2, 3], interface.OK),
+        ([1, 2, 3] * 8, interface.OK), ([1, 2, 3] * 9, interface.too_many_items(status_name)),
+        ([1, 2], interface.too_few_items(status_name)),
+        ([1, 2, 3, 4], interface.wrong_number_of_items(status_name)),
     ):
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.run_procedure(interface.RESET)
         emulator.lists[state] = list(rows)
         emulator.lists["cattorch latest rows"] = [1.0, 2.0, 3.0]
@@ -696,7 +756,7 @@ def test_prepare_for_save_leaves_internal_lists_as_exported(tmp_path):
     for kind, result, calls in _prepared_sprites(tmp_path):
         sprite = load_sprite(result.path)
         exported = {entry[0]: len(entry[1]) for entry in sprite["lists"].values()}
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
 
         def run():
             for block, lists in calls:
@@ -726,7 +786,7 @@ def entry(name: str) -> EntryPoint:
     # Broadcasts are matched ignoring case.
     (("step", "Step"), "differ only in case"),
     (("STEP", "step"), "differ only in case"),
-    # A project's bridge for x ends with ``NAME x complete``.
+    # x's completion broadcast is ``NAME x complete``.
     (("x", "x complete"), "completion"),
     (("x complete", "X"), "completion"),
     # The program's own blocks and broadcasts.
@@ -766,19 +826,21 @@ def test_a_split_input_checks_each_shard(tmp_path, small_list_limit):
 
     model = Double().eval()
     result = transpile(model, torch.randn(11, 1), tmp_path / "split")
-    assert "input" in result.sharded_lists
+    assert "split input" in result.sharded_lists
     sprite = load_sprite(result.path)
     values = [float(value) for value in range(11)]
     for sizes, valid in SPLITS.items():
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         fill_split(emulator, "input", values, sizes)
         emulator.run_procedure(interface.FORWARD)
         status = emulator.variables[interface.STATUS_VARIABLE]
-        assert status == (interface.OK if valid else interface.wrong_number_of_items("input")), sizes
-    emulator = ScratchEmulator(sprite)
+        assert status == (
+            interface.OK if valid else interface.wrong_number_of_items("split input")
+        ), sizes
+    emulator = SpriteEmulator(sprite)
     fill_split(emulator, "input", [*values[:9], "x", values[10]], (8, 3))
     emulator.run_procedure(interface.FORWARD)
-    assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("input")
+    assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("split input")
 
 
 def test_a_programs_split_lists_check_each_shard(tmp_path, small_list_limit):
@@ -799,10 +861,15 @@ def test_a_programs_split_lists_check_each_shard(tmp_path, small_list_limit):
     result = transpile(Total().eval(), program, tmp_path / "program")
     sprite = load_sprite(result.path)
     lists = ("cattorch step value", "cattorch step ids", "cattorch state total")
-    assert set(lists) <= set(result.sharded_lists)
+
+    def global_list(name):
+        return interface.global_name("program", name)
+    assert {f"program {name.removeprefix('cattorch ')}" for name in lists} <= set(
+        result.sharded_lists,
+    )
 
     def run(sizes=(8, 3), at=lists[0], items=None):
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.run_procedure(interface.RESET)
         for name in lists:
             values = [0 if name == lists[2] else 1] * 11
@@ -813,11 +880,17 @@ def test_a_programs_split_lists_check_each_shard(tmp_path, small_list_limit):
 
     for name in lists:
         for sizes, valid in SPLITS.items():
-            expected = interface.OK if valid else interface.wrong_number_of_items(name)
+            expected = (
+                interface.OK if valid else interface.wrong_number_of_items(global_list(name))
+            )
             assert run(sizes, name) == expected, (name, sizes)
     # Items in the second shard are checked as numbers, not added to the first's.
-    assert run(at=lists[0], items=[1] * 9 + ["abc", 1]) == interface.invalid_item(lists[0])
-    assert run(at=lists[1], items=[1] * 9 + [1.5, 1]) == interface.invalid_item(lists[1])
+    assert run(at=lists[0], items=[1] * 9 + ["abc", 1]) == interface.invalid_item(
+        global_list(lists[0]),
+    )
+    assert run(at=lists[1], items=[1] * 9 + [1.5, 1]) == interface.invalid_item(
+        global_list(lists[1]),
+    )
 
 
 class BoolReader(nn.Module):
@@ -836,7 +909,7 @@ def test_a_bool_list_holds_booleans_or_ones_and_zeros(tmp_path, flags, valid):
     model = BoolReader().eval()
     example = (torch.tensor([True, False]), torch.tensor([2.0, 3.0]))
     result = transpile(model, example, tmp_path / "flags")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = list(flags)
     emulator.lists["input_1"] = [2, 3]
     emulator.run_procedure(interface.FORWARD)
@@ -846,6 +919,6 @@ def test_a_bool_list_holds_booleans_or_ones_and_zeros(tmp_path, flags, valid):
         # Every item of the float output is a number, not the input's own item.
         assert all(isinstance(item, (int, float)) for item in emulator.lists["output"][:2])
     else:
-        assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("input")
+        assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("flags input")
     # The input list is never changed.
     assert emulator.lists["input"] == list(flags)

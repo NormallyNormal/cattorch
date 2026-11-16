@@ -21,14 +21,13 @@ import torch
 from cattorch import (
     CodegenConfig, GenerationProgram, QuantizationConfig, RecurrentGenerationProgram, transpile,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 import test_generation_init_overlap as generation
 import test_plain_overlap as plain
 import test_program_overlap as program
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 from shared_models import CachedLM, recurrent_model
 
 INT8 = {"quantization": QuantizationConfig(bits=8, min_quantized_values=1)}
@@ -133,7 +132,7 @@ class Program(Kind):
         """The outputs of ``call`` made alone, in a sprite of its own."""
         key = (call[0], tuple(call[1]["x"]))
         if key not in self._expected:
-            result = self.run_call(ScratchEmulator(self.sprite.sprite), call)
+            result = self.run_call(SpriteEmulator(self.sprite.sprite), call)
             assert result[2] == "ok"
             self._expected[key] = result[3]
         return self._expected[key]

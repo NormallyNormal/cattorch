@@ -6,12 +6,11 @@ import pytest
 
 import torch
 import torch.nn.functional as F
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 from cattorch import (
     EntryPoint, ExportProgram, Input, Output, ProgramCall, QuantizationConfig, transpile, verify,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 
 def _transpile(*args, **kwargs):
@@ -211,7 +210,7 @@ def test_weight_read_directly_and_through_a_copy_is_rounded_once(tmp_path, metho
     assert [(item.method, item.values) for item in entries] == [(method, 4096)]
     assert not [item for item in caught if name in item]
     # The parameter is stored in one list.
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.run_procedure("cattorch init")
     assert sum(len(values) == 4096 for values in emulator.lists._by_id.values()) == 1
     if method == "symmetric":

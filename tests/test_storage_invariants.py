@@ -25,8 +25,7 @@ from cattorch import (
     EntryPoint, ExportProgram, GenerationProgram, Input, Output, ProgramCall,
     QuantizationConfig, RecurrentGenerationProgram, State, transpile, verify,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 # ── An independent payload decoder ───────────────────────────────────────────
 
@@ -310,7 +309,7 @@ def test_storage_report_and_reference_agree(tmp_path, small_list_limit, kind, bi
     sprite = load_sprite(result.path)
     lists, stored = decode_payloads(sprite)
     assert lists
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run_procedure("cattorch init")
     names = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
     for name, values in lists.items():

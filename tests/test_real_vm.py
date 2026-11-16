@@ -28,7 +28,7 @@ from cattorch import (
 from cattorch.util.scratch.archive import dumps
 from cattorch.util.scratch.emulator import ProjectEmulator
 from cattorch import interface
-from cattorch.interface import TOKEN_IDS
+from sprite_helpers import SpriteEmulator
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "benchmarks" / "run_project_vm.cjs"
@@ -46,15 +46,17 @@ def scratch_vm():
         pytest.skip(message)
 
 
-def run_vm(project, tmp_path, *, answers=(), lists=None, calls=(), flag=True) -> dict:
+def run_vm(project, tmp_path, *, answers=(), lists=None, calls=(), flag=True, sprites=()) -> dict:
     """Run a project in scratch-vm and return what it left on the stage.
 
-    ``lists`` are set before the green flag. Each of ``calls`` is
+    ``sprites`` are uploaded into it first, as the editor's Upload sprite
+    does. ``lists`` are set before the green flag. Each of ``calls`` is
     ``(message, lists)``: the lists are set, then the message is broadcast and
     waited for.
     """
     output = tmp_path / "vm.json"
     command = ["node", str(RUNNER), str(project.path), f"--out={output}"]
+    command += [f"--sprite={sprite}" for sprite in sprites]
     command += [f"--answer={answer}" for answer in answers]
     command += [f"--list={name}={dumps(values)}" for name, values in (lists or {}).items()]
     for message, inputs in calls:
@@ -73,6 +75,318 @@ def run_vm(project, tmp_path, *, answers=(), lists=None, calls=(), flag=True) ->
 def values(stage, name) -> torch.Tensor:
     # The runner writes infinities and NaN as strings, which float() reads.
     return torch.tensor([float(value) for value in stage[name]])
+
+
+# ── Using an exported sprite without opening it ─────────────────────────────
+
+FLAG = {"opcode": "event_whenflagclicked", "fields": {}}
+
+
+def project_file(tmp_path, name="project", build=None) -> SimpleNamespace:
+    """A project of the stage alone, or what ``build(builder)`` adds to it."""
+    from cattorch.project import _Builder
+
+    builder = _Builder()
+    if build is not None:
+        build(builder)
+    path = tmp_path / f"{name}.sb3"
+    builder.write(path)
+    return SimpleNamespace(path=path)
+
+
+def driver(tmp_path, scripts, *, name="Driver") -> Path:
+    """A ``.sprite3`` of a sprite that runs ``scripts`` on the green flag.
+
+    Each script is ``(body, lists, variables)``. Every list and variable
+    whose name has a space and doesn't start with ``_`` is used as a global:
+    the sprite refers to it without defining it, as an exported sprite does,
+    so uploading binds it to the global of that name or creates one.
+    """
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.archive import SPRITE_JSON, write_archive
+
+    builder = _Builder()
+    sprite = builder.add_demo_sprite()
+    sprite["name"] = name
+    for position, (body, lists, variables) in enumerate(scripts):
+        builder.script(
+            sprite, FLAG, body, lists=lists, variables=(*variables, "_index", "_waits"),
+            y=400 * position,
+        )
+    for section in ("lists", "variables"):
+        for identifier in list(sprite[section]):
+            entry = sprite[section][identifier][0]
+            if " " in entry and not entry.startswith("_"):
+                del sprite[section][identifier]
+    # Messages are the stage's.
+    sprite["broadcasts"] = {}
+    for block in sprite["blocks"].values():
+        menu = block.get("inputs", {}).get("BROADCAST_INPUT")
+        if menu is not None:
+            menu[1][2] = f"driver message {menu[1][1]}"
+    path = tmp_path / f"{name}.sprite3"
+    write_archive(path, sprite, {
+        key: value for key, value in builder.assets.items()
+        if key == sprite["costumes"][0]["md5ext"]
+    }, SPRITE_JSON)
+    return path
+
+
+def run_uploaded(tmp_path, sprites, project=None, **options) -> dict:
+    """Upload each of ``sprites`` into ``project`` (by default an empty one), in
+    order, as the editor's Upload sprite does, then run it as ``run_vm`` does."""
+    project = project or project_file(tmp_path, "empty")
+    return run_vm(project, tmp_path, sprites=[str(path) for path in sprites], **options)
+
+
+def fill(list_name, items) -> tuple:
+    from cattorch.util.scratch.dsl import append, clear
+
+    return (clear(list_name), *(append(list_name, value) for value in items))
+
+
+def copy_into(source, target) -> tuple:
+    from cattorch.util.scratch.dsl import append, clear, for_each, item, length, var
+
+    return (clear(target), for_each("_index", length(source), (
+        append(target, item(source, var("_index"))),
+    )))
+
+
+def test_an_uploaded_model_runs_from_another_sprite(tmp_path):
+    """Load an empty project, upload the model, and drive it from another sprite."""
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 3)).eval()
+    value = torch.randn(1, 4)
+    result = transpile(model, value, tmp_path / "net", name="net")
+    assert [spec.list_name for spec in result.inputs] == ["net input"]
+    assert result.broadcasts == ("net init", "net forward", "net prepare for save")
+    calls = driver(tmp_path, [(
+        (*fill("net input", value.flatten().tolist()), broadcast_and_wait("net forward")),
+        ("net input",), (),
+    )])
+    run = run_uploaded(tmp_path, [result.path, calls])
+    stage = run["stage"]
+    assert stage["net status"] == "ok"
+    torch.testing.assert_close(values(stage, "net output"), model(value).detach().flatten(),
+                               atol=1e-5, rtol=1e-5)
+    # Only what a project uses is global: no constant, weight or working list.
+    assert {name for name in stage if name.startswith("net ")} == {
+        "net input", "net output", "net status",
+    }
+    # Uploading selects the uploaded sprite: the driver, uploaded last.
+    assert run["editing"] == "Driver"
+
+
+def test_an_uploaded_generator_and_tokenizer_run_from_another_sprite(tmp_path):
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+    from shared_models import Language, char_tokenizer
+    from sprite_helpers import logits_of
+
+    torch.manual_seed(2)
+    model = Language().eval()
+    result = transpile(model, GenerationProgram(max_context=16, top_k=2), tmp_path / "lm")
+    words = CharTokenizer(char_tokenizer()).save(tmp_path / "chars")
+    calls = driver(tmp_path, [(
+        (
+            set_text("chars text", "the"),
+            broadcast_and_wait("chars tokenize"),
+            *copy_into("chars token ids", "lm token ids"),
+            broadcast_and_wait("lm prefill"),
+            *copy_into("lm top k ids", "chars token ids"),
+            broadcast_and_wait("chars detokenize"),
+        ),
+        ("chars token ids", "lm token ids", "lm top k ids"), ("chars text",),
+    )])
+    stage = run_uploaded(tmp_path, [result.path, words.path, calls])["stage"]
+    assert stage["lm status"] == "ok" and stage["chars status"] == "ok"
+    from shared_models import CHARACTERS
+
+    prompt = [CHARACTERS.index(character) for character in "the"]
+    expected = logits_of(model, prompt)
+    torch.testing.assert_close(values(stage, "lm logits"), expected, atol=1e-4, rtol=0)
+    best = torch.topk(expected, 2).indices.tolist()
+    assert [int(float(token)) for token in stage["lm top k ids"]] == best
+    assert stage["chars text"] == "".join(CHARACTERS[index] for index in best)
+    assert stage["lm cache length"] == 3
+
+
+def set_text(variable, text):
+    from cattorch.util.scratch.dsl import set_var
+
+    return set_var(variable, text)
+
+
+def test_an_uploaded_program_keeps_its_state_between_calls(tmp_path):
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+
+    torch.manual_seed(3)
+    model = Tally().eval()
+    result = transpile(model, None, tmp_path / "tally")
+    rows = torch.randn(3, 3)
+    body: tuple = ()
+    for row in rows:
+        body += (*fill("tally add row", row.tolist()), broadcast_and_wait("tally add"))
+    calls = driver(tmp_path, [(body, ("tally add row",), ())])
+    stage = run_uploaded(tmp_path, [result.path, calls])["stage"]
+    expected = None
+    for row in rows:
+        expected = model.add(row)
+    assert stage["tally status"] == "ok"
+    torch.testing.assert_close(
+        values(stage, "tally add output"), expected.detach(), atol=1e-4, rtol=1e-4,
+    )
+    # The state starts empty on upload; the first call filled it.
+    assert len(stage["tally state seen"]) == 9
+
+
+def test_an_upload_reuses_an_existing_global_of_the_same_name(tmp_path):
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+
+    model = nn.Linear(2, 2).eval()
+    value = torch.tensor([[1.0, -2.0]])
+    result = transpile(model, value, tmp_path / "pair")
+
+    def existing(builder):
+        builder.global_list("pair input", value.flatten().tolist())
+        builder.global_list("pair output", ["stale"])
+        builder.global_variable("pair status", "stale")
+        sprite = builder.add_demo_sprite()
+        builder.script(sprite, FLAG, (broadcast_and_wait("pair forward"),),
+                       lists=("pair input", "pair output"), variables=("pair status",))
+
+    run = run_uploaded(tmp_path, [result.path], project_file(tmp_path, "existing", existing))
+    stage = run["stage"]
+    assert stage["pair status"] == "ok"
+    torch.testing.assert_close(values(stage, "pair output"), model(value).detach().flatten())
+    # No second global of either name.
+    assert not [name for name in stage if name.startswith("pair input") and name != "pair input"]
+    assert not [name for name in stage if name.startswith("pair status") and name != "pair status"]
+
+
+def test_two_uploaded_models_keep_their_own_globals(tmp_path):
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+
+    torch.manual_seed(8)
+    first, second = nn.Linear(3, 2).eval(), nn.Linear(3, 4).eval()
+    value = torch.randn(1, 3)
+    # The same file name: the sprites are told apart by their names.
+    a = transpile(first, value, tmp_path / "a" / "model", name="first")
+    b = transpile(second, value, tmp_path / "b" / "model", name="second")
+    calls = driver(tmp_path, [(
+        (
+            *fill("first input", value.flatten().tolist()),
+            *fill("second input", (value * 2).flatten().tolist()),
+            broadcast_and_wait("first forward"), broadcast_and_wait("second forward"),
+        ),
+        ("first input", "second input"), (),
+    )])
+    stage = run_uploaded(tmp_path, [a.path, b.path, calls])["stage"]
+    assert stage["first status"] == stage["second status"] == "ok"
+    torch.testing.assert_close(values(stage, "first output"), first(value).detach().flatten())
+    torch.testing.assert_close(values(stage, "second output"), second(value * 2).detach().flatten())
+
+
+def test_a_project_opens_with_its_demo_selected(tmp_path):
+    result = transpile(nn.Linear(2, 2).eval(), torch.ones(1, 2), tmp_path / "small")
+    project = build_project(result, tmp_path / "small")
+    assert project.sprites == ("Demo", "small")
+    assert run_vm(project, tmp_path, flag=False)["editing"] == "Demo"
+
+
+def test_a_restarted_call_never_reads_an_earlier_status(tmp_path):
+    # A second broadcast of a message whose script is running restarts that
+    # script in Scratch: the first call stops where it was, and the first
+    # caller's broadcast and wait returns at once, while the second call is
+    # still running. The first caller must not read an earlier call's ok,
+    # nor ok from the working status the blocks set while they run.
+    from cattorch.util.scratch.dsl import (
+        append, broadcast_and_wait, change_var, div, eq, for_each, length, mod, mul,
+        repeat_until, set_var, sub, var,
+    )
+
+    class Deep(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(6)
+            self.layers = nn.ModuleList(nn.Linear(64, 64) for _ in range(6))
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = torch.tanh(layer(x))
+            return x
+
+    model = Deep().eval()
+    result = transpile(model, torch.zeros(2, 64), tmp_path / "deep", dynamic={0: (1, 64)})
+
+    def rows(count):
+        return (
+            *fill("deep input", ()),
+            for_each("_index", 64 * count, (
+                append("deep input", sub(div(mod(mul(var("_index"), 37), 101), 101), 0.5)),
+            )),
+        )
+
+    calls = driver(tmp_path, [
+        (
+            (
+                # An earlier call that ended ok.
+                *rows(1), broadcast_and_wait("deep forward"),
+                *rows(64), set_var("started", 1), broadcast_and_wait("deep forward"),
+                append("first results", var("deep status")),
+                append("first results", var("second done")),
+                append("first results", length("deep output")),
+            ),
+            ("deep input", "deep output", "first results"),
+            ("deep status", "started", "second done"),
+        ),
+        (
+            (
+                repeat_until(eq(var("started"), 1), (change_var("_waits", 1),)),
+                # Once the long call has started, and Scratch has paused it.
+                repeat_until(eq(var("deep status"), interface.NOT_FINISHED), (
+                    change_var("_waits", 1),
+                )),
+                # At once, on the same 64 rows: a long call too, so that the
+                # first caller gets back while it runs. (Had it ended first,
+                # the first caller would read its status, as any script can
+                # read another call's.)
+                broadcast_and_wait("deep forward"),
+                append("second results", var("deep status")),
+                append("second results", length("deep output")),
+                set_var("second done", 1),
+            ),
+            ("deep input", "deep output", "second results"),
+            ("deep status", "started", "second done"),
+        ),
+    ])
+
+    def results(builder):
+        for name in ("first results", "second results"):
+            builder.global_list(name)
+        for name in ("started", "second done"):
+            builder.global_variable(name, 0)
+        sprite = builder.add_demo_sprite()
+        # Declares the globals on the stage.
+        builder.script(sprite, {"opcode": "event_whenthisspriteclicked", "fields": {}}, (
+            set_var("started", 0), set_var("second done", 0),
+        ), lists=("first results", "second results"), variables=("started", "second done"))
+
+    stage = run_uploaded(tmp_path, [result.path, calls], project_file(tmp_path, "r", results))[
+        "stage"
+    ]
+    # The first caller got back while the second call was running, and read
+    # that the call hadn't finished.
+    assert stage["first results"][:2] == [interface.NOT_FINISHED, 0]
+    assert stage["second results"] == ["ok", 64 * 64]
+    # The second call's outputs, which the stopped first one didn't touch.
+    rows = torch.tensor([((index * 37) % 101) / 101 - 0.5 for index in range(1, 4097)])
+    torch.testing.assert_close(
+        values(stage, "deep output"), model(rows.reshape(64, 64)).detach().flatten(),
+        atol=1e-4, rtol=0,
+    )
 
 
 class Convolutional(nn.Module):
@@ -219,6 +533,7 @@ def test_an_output_list_holding_a_longer_intermediate_is_sharded(tmp_path):
     result = transpile(model, program, tmp_path / "readout")
     project = build_project(result, tmp_path / "readout")
     stage = run_vm(project, tmp_path, flag=False, calls=[("readout read", {})])["stage"]
+    assert stage["readout status"] == interface.OK
     expected = model.read(torch.ones(200_005)).detach()
     torch.testing.assert_close(values(stage, "readout read value"), expected, atol=1e-6, rtol=1e-6)
 
@@ -287,7 +602,7 @@ def test_non_finite_example_values_load_and_round_trip(tmp_path):
     stage = run_vm(project, tmp_path)["stage"]
     # Scratch would read "NaN" as 0 wherever it wants a number, so the
     # forward refuses it, and writes no output.
-    assert stage["scale status"] == interface.invalid_item("input")
+    assert stage["scale status"] == interface.invalid_item("scale input")
     assert stage["scale output"] == []
     stage = run_vm(project, tmp_path, lists={"scale input": [math.inf, 2.0, 0.0, -1.0]})["stage"]
     assert values(stage, "scale output").tolist() == [math.inf, 4.0, 0.0, -2.0]
@@ -298,7 +613,7 @@ def test_tokenizers_tell_characters_apart_by_case(tmp_path):
     # characters up by costume name, which the VM matches exactly.
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        append, call, clear, for_each, item, join, length, set_var, var,
+        append, broadcast_and_wait, clear, for_each, item, join, length, set_var, var,
     )
     from test_tokenizer import (
         _MIXED_CASE_CORPUS, _make_bpe_tokenizer, _mixed_case_strings, _train_sentencepiece,
@@ -322,18 +637,18 @@ def test_tokenizers_tell_characters_apart_by_case(tmp_path):
         builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
             clear(outputs),
             for_each("text index", length(inputs), (
-                set_var("cattorch text", item(inputs, var("text index"))),
-                call("cattorch tokenize"),
+                set_var(f"{name} text", item(inputs, var("text index"))),
+                broadcast_and_wait(f"{name} tokenize"),
                 set_var("joined", ""),
-                for_each("id index", length("cattorch token ids"), (
+                for_each("id index", length(f"{name} token ids"), (
                     set_var("joined", join(var("joined"), join(
-                        item("cattorch token ids", var("id index")), " ",
+                        item(f"{name} token ids", var("id index")), " ",
                     ))),
                 )),
                 append(outputs, var("joined")),
             )),
-        ), lists=(inputs, outputs, "cattorch token ids"),
-            variables=("cattorch text", "text index", "id index", "joined"))
+        ), lists=(inputs, outputs, f"{name} token ids"),
+            variables=(f"{name} text", "text index", "id index", "joined"))
         expected[outputs] = ["".join(f"{token} " for token in encode(text)) for text in texts]
     path = tmp_path / "tokenizers.sb3"
     builder.write(path)
@@ -357,11 +672,12 @@ def test_a_benchmark_suite_runs(tmp_path):
 def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     # Scratch pauses the prefill once it has run for 500 ms, and runs the
     # second script, which resets: the prefill must not then report ok, and
-    # decode must fail until the next prefill.
+    # decode must fail until the next prefill. Each script calls the sprite
+    # as a project does, with a broadcast and wait.
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
-        set_var, var,
+        add, append, broadcast_and_wait, change_var, clear, eq, for_each, gt, item, length,
+        repeat_until, set_var, var,
     )
     from shared_models import NanoGPT
     from scratch_status import INTERRUPTED, OVERTAKEN
@@ -377,33 +693,35 @@ def test_a_reset_while_a_prefill_is_paused_stops_the_prefill(tmp_path):
     )
     done = builder.global_variable("first done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, busy = "cattorch status", "_cattorch busy"
-    tokens = TOKEN_IDS
+    # The scripts are in the sprite, to read whether it is busy; the calls
+    # are broadcasts, as anywhere.
+    status, busy = "lm status", "_cattorch busy"
+    tokens = "lm token ids"
 
-    def run(procedure, values, results):
+    def run(block, values, results):
         return (
             clear(tokens), *(append(tokens, value) for value in values),
-            call(procedure), append(results, var(status)),
+            broadcast_and_wait(f"lm {block}"), append(results, var(status)),
         )
 
     builder.script(sprite, flag, (
-        call("cattorch init"),
-        *run("cattorch prefill", list(range(1, 25)), first),
+        broadcast_and_wait("lm init"),
+        *run("prefill", list(range(1, 25)), first),
         set_var(done, 1),
     ), lists=(tokens, first), variables=(status, done))
     builder.script(sprite, flag, (
         repeat_until(gt(add(var(busy), var(done)), 0), (change_var("waits", 1),)),
         # 0 if the prefill was still running.
         append(second, var(done)),
-        call("cattorch reset"), append(second, var(status)),
+        broadcast_and_wait("lm reset"), append(second, var(status)),
         repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
-        *run("cattorch decode", [6], second),
-        *run("cattorch prefill", [5, 3], second),
-        *run("cattorch decode", [7], second),
-        for_each("index", length("cattorch logits"), (
-            append(logits, item("cattorch logits", var("index"))),
+        *run("decode", [6], second),
+        *run("prefill", [5, 3], second),
+        *run("decode", [7], second),
+        for_each("index", length("lm logits"), (
+            append(logits, item("lm logits", var("index"))),
         )),
-    ), lists=(tokens, second, logits, "cattorch logits"),
+    ), lists=(tokens, second, logits, "lm logits"),
         variables=(status, busy, done, "waits", "index"), y=400)
     path = tmp_path / "overlap.sb3"
     builder.write(path)
@@ -424,8 +742,8 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
     from cattorch.program_runtime import ProgramReplay
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        append, call, change_var, div, eq, for_each, item, length, mod, mul, repeat_until,
-        set_var, sub, var,
+        append, broadcast_and_wait, change_var, div, eq, for_each, item, length, mod, mul,
+        repeat_until, set_var, sub, var,
     )
     from scratch_status import OVERTAKEN
 
@@ -458,26 +776,28 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
     )
     stepping, done = (builder.global_variable(name, 0) for name in ("stepping", "first done"))
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, x, state = "cattorch status", "cattorch step x", "cattorch state counter"
+    status, x, state = "slow status", "slow step x", "slow state counter"
 
     builder.script(sprite, flag, (
-        call("cattorch init"),
+        broadcast_and_wait("slow init"),
         for_each("index", 4096, (
             append(x, sub(div(mod(mul(var("index"), 37), 101), 101), 0.5)),
         )),
         set_var(stepping, 1),
-        call("cattorch step"), append(first, var(status)),
+        broadcast_and_wait("slow step"), append(first, var(status)),
         set_var(done, 1),
     ), lists=(x, first), variables=(status, stepping, done, "index"))
     builder.script(sprite, flag, (
         repeat_until(eq(var(stepping), 1), (change_var("waits", 1),)),
+        # Once the step has started.
+        repeat_until(eq(var(status), interface.NOT_FINISHED), (change_var("waits", 1),)),
         # 0 if the step was still running.
         append(second, var(done)),
-        call("cattorch reset"), append(second, var(status)),
+        broadcast_and_wait("slow reset"), append(second, var(status)),
         repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
         # The states as the first step left them.
         for_each("position", length(state), (append(second, item(state, var("position"))),)),
-        call("cattorch step"), append(second, var(status)),
+        broadcast_and_wait("slow step"), append(second, var(status)),
         for_each("position", length(state), (append(counter, item(state, var("position"))),)),
     ), lists=(second, counter, state), variables=(status, stepping, done, "waits", "position"),
         y=400)
@@ -492,84 +812,6 @@ def test_a_reset_while_a_program_call_is_paused_stops_the_call(tmp_path):
     torch.testing.assert_close(values(stage, "counter"), expected, atol=1e-4, rtol=0)
 
 
-def test_a_forward_while_another_is_paused_fails_the_paused_one(tmp_path):
-    # Scratch pauses the long forward once it has run for 500 ms, and runs the
-    # second script, whose short forward uses the same temporary lists: the
-    # long one must then neither report ok nor write its outputs over the
-    # short one's. (No script listens for the completion broadcasts: a
-    # listener's thread would let the long one resume, and set the status,
-    # before the short one's script reads it; see test_plain_overlap.)
-    from cattorch.project import _Builder
-    from cattorch.util.scratch.dsl import (
-        append, call, change_var, clear, div, eq, for_each, item, length, mod, mul,
-        repeat_until, set_var, sub, var,
-    )
-    from scratch_status import OVERTAKEN
-
-    class Deep(nn.Module):
-        def __init__(self):
-            super().__init__()
-            torch.manual_seed(6)
-            self.layers = nn.ModuleList(nn.Linear(64, 64) for _ in range(6))
-
-        def forward(self, x):
-            for layer in self.layers:
-                x = torch.tanh(layer(x))
-            return x
-
-    model = Deep().eval()
-    result = transpile(model, torch.zeros(2, 64), tmp_path / "deep", dynamic={0: (1, 64)})
-    builder = _Builder()
-    sprite = builder.add_sprite(result.path, visible=False)
-    first, second, outputs = (
-        builder.global_list(name) for name in ("first results", "second results", "outputs")
-    )
-    started, done = (builder.global_variable(name, 0) for name in ("started", "first done"))
-    flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status = "cattorch status"
-
-    def fill(rows, step):
-        return (clear("input"), for_each("index", 64 * rows, (
-            append("input", sub(div(mod(mul(var("index"), step), 101), 101), 0.5)),
-        )))
-
-    # The short call, and recording it, in a warp block, which the first
-    # forward can't resume during.
-    for step in (53, 41):
-        builder.procedure(sprite, f"short forward {step}", (
-            *fill(1, step), call("cattorch forward"), append(second, var(status)),
-            for_each("position", length("output"), (
-                append(outputs, item("output", var("position"))),
-            )),
-        ), lists=("input", "output", second, outputs), variables=(status, "index", "position"))
-    builder.script(sprite, flag, (
-        call("cattorch init"), *fill(64, 37), set_var(started, 1),
-        call("cattorch forward"), append(first, var(status)), append(first, length("output")),
-        set_var(done, 1),
-    ), lists=("input", "output", first), variables=(status, started, done, "index"))
-    builder.script(sprite, flag, (
-        repeat_until(eq(var(started), 1), (change_var("waits", 1),)),
-        # 0 if the long forward was still running.
-        append(second, var(done)),
-        call("short forward 53"),
-        repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
-        # The next call runs as usual.
-        call("short forward 41"),
-    ), lists=(second,), variables=(started, done, "waits"), y=400)
-    path = tmp_path / "overlap.sb3"
-    builder.write(path)
-    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
-    # The short forward's 64 outputs stay.
-    assert stage["first results"] == [OVERTAKEN, 64]
-    assert stage["second results"] == [0, "ok", "ok"]
-
-    def row(step):
-        return torch.tensor([((index * step) % 101) / 101 - 0.5 for index in range(1, 65)])
-
-    expected = torch.cat([model(row(step)[None]).detach().flatten() for step in (53, 41)])
-    torch.testing.assert_close(values(stage, "outputs"), expected, atol=1e-4, rtol=0)
-
-
 def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     # In a freshly loaded project the first decode decodes the weights, and
     # Scratch pauses it once it has run for 500 ms. An init run by another
@@ -577,8 +819,8 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     # not report ok, and the weights must be right for the next blocks.
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        add, append, call, change_var, clear, eq, for_each, gt, item, length, repeat_until,
-        set_var, var,
+        add, append, broadcast_and_wait, change_var, clear, eq, for_each, gt, item, length,
+        repeat_until, set_var, var,
     )
     from shared_models import NanoGPT
     from scratch_status import OVERTAKEN
@@ -594,31 +836,31 @@ def test_init_while_a_decode_is_decoding_the_weights_fails_the_decode(tmp_path):
     )
     done = builder.global_variable("first done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, busy, initialized = "cattorch status", "_cattorch busy", "cattorch initialized"
-    tokens = TOKEN_IDS
+    status, busy, initialized = "lm status", "_cattorch busy", "cattorch initialized"
+    tokens = "lm token ids"
 
-    def run(procedure, values, results):
+    def run(block, values, results):
         return (
             clear(tokens), *(append(tokens, value) for value in values),
-            call(procedure), append(results, var(status)),
+            broadcast_and_wait(f"lm {block}"), append(results, var(status)),
         )
 
     builder.script(sprite, flag, (
-        *run("cattorch decode", [4], first),
+        *run("decode", [4], first),
         set_var(done, 1),
     ), lists=(tokens, first), variables=(status, done))
     builder.script(sprite, flag, (
         repeat_until(gt(add(var(busy), var(done)), 0), (change_var("waits", 1),)),
         # 0 and 0 if the decode was still running, decoding the weights.
         append(second, var(done)), append(second, var(initialized)),
-        call("cattorch init"),
+        broadcast_and_wait("lm init"),
         repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
-        *run("cattorch prefill", [5, 3], second),
-        *run("cattorch decode", [7], second),
-        for_each("index", length("cattorch logits"), (
-            append(logits, item("cattorch logits", var("index"))),
+        *run("prefill", [5, 3], second),
+        *run("decode", [7], second),
+        for_each("index", length("lm logits"), (
+            append(logits, item("lm logits", var("index"))),
         )),
-    ), lists=(tokens, second, logits, "cattorch logits"),
+    ), lists=(tokens, second, logits, "lm logits"),
         variables=(status, busy, done, initialized, "waits", "index"), y=400)
     path = tmp_path / "overlap.sb3"
     builder.write(path)
@@ -639,9 +881,9 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     monkeypatch.setattr("cattorch.guards._GUARD_DECODERS", True)
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        append, call, change_var, clear, eq, for_each, item, length, repeat_until, set_var, var,
+        append, broadcast_and_wait, change_var, clear, eq, for_each, item, length, repeat_until,
+        set_var, var,
     )
-    from cattorch.util.scratch.emulator import ScratchEmulator
     from shared_models import NanoGPT
     from sprite_helpers import load_sprite, logits_of
 
@@ -650,7 +892,7 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     result = transpile(model, GenerationProgram(max_context=32), tmp_path / "lm")
     # The weight lists: empty as stored, filled by init.
     sprite_json = load_sprite(result.path)
-    emulator = ScratchEmulator(sprite_json)
+    emulator = SpriteEmulator(sprite_json)
     emulator.run_procedure("cattorch init")
     weights = {
         entry[0]: len(emulator.lists[entry[0]]) for entry in sprite_json["lists"].values()
@@ -664,31 +906,33 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
     )
     started, done = builder.global_variable("started", 0), builder.global_variable("done", 0)
     flag = {"opcode": "event_whenflagclicked", "fields": {}}
-    status, initialized, tokens = "cattorch status", "cattorch initialized", TOKEN_IDS
+    status, initialized, tokens = "lm status", "cattorch initialized", "lm token ids"
 
-    def run(procedure, values):
+    def run(block, values):
         return (
             clear(tokens), *(append(tokens, value) for value in values),
-            call(procedure), append(results, var(status)),
+            broadcast_and_wait(f"lm {block}"), append(results, var(status)),
         )
 
     builder.script(sprite, flag, (
-        set_var(started, 1), call("cattorch init"), set_var(done, 1),
+        set_var(started, 1), broadcast_and_wait("lm init"), set_var(done, 1),
     ), variables=(started, done))
     builder.script(sprite, flag, (
         repeat_until(eq(var(started), 1), (change_var("waits", 1),)),
+        # Once the init has started.
+        repeat_until(eq(var(status), interface.NOT_FINISHED), (change_var("waits", 1),)),
         # 0 if the init was still running.
         append(results, var(done)),
-        call("cattorch reset"), append(results, var(status)),
+        broadcast_and_wait("lm reset"), append(results, var(status)),
         repeat_until(eq(var(done), 1), (change_var("waits", 1),)),
         append(results, var(initialized)),
         *(append(lengths, length(name)) for name in weights),
-        *run("cattorch prefill", [5, 3]),
-        *run("cattorch decode", [7]),
-        for_each("index", length("cattorch logits"), (
-            append(logits, item("cattorch logits", var("index"))),
+        *run("prefill", [5, 3]),
+        *run("decode", [7]),
+        for_each("index", length("lm logits"), (
+            append(logits, item("lm logits", var("index"))),
         )),
-    ), lists=(tokens, results, lengths, logits, "cattorch logits", *weights),
+    ), lists=(tokens, results, lengths, logits, "lm logits", *weights),
         variables=(status, started, done, initialized, "waits", "index"), y=400)
     path = tmp_path / "overlap.sb3"
     builder.write(path)
@@ -704,9 +948,9 @@ def test_an_init_taken_over_while_decoding_stops_writing_the_weights(tmp_path, m
 def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
     # A forward given the wrong number of items, or an index outside its
     # table, reports why, writes no output, and still sends its completion
-    # broadcast, as a bridge does; so does prepare for save.
+    # broadcast; so does prepare for save.
     from cattorch.project import _Builder
-    from cattorch.util.scratch.dsl import append, call, clear, length, var
+    from cattorch.util.scratch.dsl import append, broadcast_and_wait, clear, length, var
 
     class Lookup(nn.Module):
         def __init__(self):
@@ -721,31 +965,32 @@ def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
     result = transpile(model, torch.tensor([[1, 3]]), tmp_path / "lookup")
     project = build_project(result, tmp_path / "lookup")
     calls = [
-        ("lookup run", {"lookup input": [1, 3]}),
-        ("lookup run", {"lookup input": [1]}),
-        ("lookup run", {"lookup input": [1, 5]}),
-        ("lookup run", {"lookup input": [1, "a"]}),
+        ("lookup forward", {"lookup input": [1, 3]}),
+        ("lookup forward", {"lookup input": [1]}),
+        ("lookup forward", {"lookup input": [1, 5]}),
+        ("lookup forward", {"lookup input": [1, "a"]}),
     ]
     stage = run_vm(project, tmp_path, flag=False, calls=calls[:1])["stage"]
     expected = model(torch.tensor([[1, 3]])).detach().flatten()
     torch.testing.assert_close(values(stage, "lookup output"), expected, atol=1e-6, rtol=0)
     assert stage["lookup status"] == interface.OK
     for call_, status in zip(calls[1:], (
-        interface.wrong_number_of_items("input"), interface.invalid_item("input"),
-        interface.invalid_item("input"),
+        interface.wrong_number_of_items("lookup input"), interface.invalid_item("lookup input"),
+        interface.invalid_item("lookup input"),
     )):
         stage = run_vm(project, tmp_path, flag=False, calls=[calls[0], call_])["stage"]
         assert stage["lookup status"] == status
-        # The bridge copies no output: the first call's stay.
+        # A call that fails writes no output: the first call's stay.
         torch.testing.assert_close(values(stage, "lookup output"), expected, atol=1e-6, rtol=0)
 
-    # In the sprite itself: each block's broadcast, the status it set then.
+    # Listeners: each call's completion broadcast, and the status then.
     builder = _Builder()
-    sprite = builder.add_sprite(result.path, visible=False)
+    builder.add_sprite(result.path, visible=False)
+    sprite = builder.add_demo_sprite()
     heard = builder.global_list("heard")
-    status = interface.STATUS_VARIABLE
+    status = "lookup status"
     for position, message in enumerate((
-        "cattorch forward complete", "cattorch init complete", "cattorch prepare for save complete",
+        "lookup forward complete", "lookup init complete", "lookup prepare for save complete",
     )):
         builder.script(sprite, {
             "opcode": "event_whenbroadcastreceived",
@@ -753,19 +998,20 @@ def test_inputs_are_checked_and_every_block_ends_with_its_broadcast(tmp_path):
         }, (append(heard, message), append(heard, var(status))),
             lists=(heard,), variables=(status,), y=200 * (position + 1))
     builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
-        clear("input"), append("input", 9), call(interface.FORWARD),
-        append(heard, length("output")), call(interface.PREPARE_FOR_SAVE),
-    ), lists=("input", "output", heard))
+        clear("lookup input"), append("lookup input", 9), broadcast_and_wait("lookup forward"),
+        append(heard, length("lookup output")), broadcast_and_wait("lookup prepare for save"),
+    ), lists=("lookup input", "lookup output", heard))
     path = tmp_path / "heard.sb3"
     builder.write(path)
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    # The forward decoded the weights itself, which sends no init broadcast.
     assert stage["heard"][:3] == [
-        "cattorch forward complete", interface.wrong_number_of_items("input"), 0,
+        "lookup forward complete", interface.wrong_number_of_items("lookup input"), 0,
     ]
-    assert stage["heard"][3:] == ["cattorch prepare for save complete", interface.OK]
+    assert stage["heard"][3:] == ["lookup prepare for save complete", interface.OK]
 
 
-def test_a_project_bridges_every_shard_of_a_long_input_and_output(tmp_path):
+def test_a_project_holds_every_shard_of_a_long_input_and_output(tmp_path):
     from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
     torch.manual_seed(0)
@@ -774,7 +1020,7 @@ def test_a_project_bridges_every_shard_of_a_long_input_and_output(tmp_path):
     wide = nn.Sequential(model, nn.Linear(1, size)).eval()
     example = torch.randn(1, size)
     result = transpile(wide, example, tmp_path / "wide")
-    assert set(result.sharded_lists) == {"input", "output"}
+    assert set(result.sharded_lists) == {"wide input", "wide output"}
     project = build_project(result, tmp_path / "wide", example_inputs=example)
     assert {"wide input shard 2", "wide output shard 2"} <= set(project.lists)
     stage = run_vm(project, tmp_path)["stage"]
@@ -823,7 +1069,7 @@ def test_the_demo_stops_and_says_a_tokenizer_failure(tmp_path):
     assert any(message in text for text in project.warnings)
     run = run_vm(project, tmp_path, answers=["hi", ""])
     said = demo_said(run)
-    failure = f"chars detokenize: {interface.invalid_item(interface.TOKEN_IDS)}"
+    failure = f"chars detokenize: {interface.invalid_item('chars token ids')}"
     # The prompt, then the failure, instead of the prompt again and again.
     assert said == ["hi...", failure], said
     asked = [entry["text"] for entry in run["said"] if "Type the start" in entry["text"]]
@@ -836,7 +1082,7 @@ def test_the_demo_stops_and_says_a_tokenizer_failure(tmp_path):
         project = build_project(small, tmp_path / "small", tokenizer=tokenizer, temperature=0)
     run = run_vm(project, tmp_path, answers=["zz", ""])
     said = demo_said(run)
-    assert said == ["zz...", f"small prefill: {interface.invalid_item(interface.TOKEN_IDS)}"]
+    assert said == ["zz...", f"small prefill: {interface.invalid_item('small token ids')}"]
 
 
 # Values whose casts, comparisons and string forms differ between JavaScript
@@ -892,7 +1138,8 @@ def test_the_emulator_casts_compares_and_formats_values_as_scratch_vm_does(tmp_p
     )
 
     builder = _Builder()
-    sprite = builder.add_demo_sprite("Probe")
+    sprite = builder.add_demo_sprite()
+    sprite["name"] = "Probe"
     costume = sprite["costumes"][0]
     sprite["costumes"] = [
         dict(copy.deepcopy(costume), name=name) for name in ("a", "3", "Five", "x y", "b")
@@ -984,7 +1231,7 @@ def test_the_emulator_casts_compares_and_formats_values_as_scratch_vm_does(tmp_p
 def test_tokenizers_match_added_tokens_as_hugging_face_does(tmp_path):
     from cattorch.project import _Builder
     from cattorch.util.scratch.dsl import (
-        append, call, clear, for_each, item, join, length, set_var, var,
+        append, broadcast_and_wait, clear, for_each, item, join, length, set_var, var,
     )
     from test_tokenizer import (
         added_token_texts, bpe_tokenizer_with_added_tokens, char_tokenizer_with_added_tokens,
@@ -1006,20 +1253,20 @@ def test_tokenizers_match_added_tokens_as_hugging_face_does(tmp_path):
             clear(outputs),
             clear(decoded),
             for_each("text index", length(inputs), (
-                set_var("cattorch text", item(inputs, var("text index"))),
-                call("cattorch tokenize"),
+                set_var(f"{name} text", item(inputs, var("text index"))),
+                broadcast_and_wait(f"{name} tokenize"),
                 set_var("joined", ""),
-                for_each("id index", length("cattorch token ids"), (
+                for_each("id index", length(f"{name} token ids"), (
                     set_var("joined", join(var("joined"), join(
-                        item("cattorch token ids", var("id index")), " ",
+                        item(f"{name} token ids", var("id index")), " ",
                     ))),
                 )),
                 append(outputs, var("joined")),
-                call("cattorch detokenize"),
-                append(decoded, var("cattorch text")),
+                broadcast_and_wait(f"{name} detokenize"),
+                append(decoded, var(f"{name} text")),
             )),
-        ), lists=(inputs, outputs, decoded, "cattorch token ids"),
-            variables=("cattorch text", "text index", "id index", "joined"))
+        ), lists=(inputs, outputs, decoded, f"{name} token ids"),
+            variables=(f"{name} text", "text index", "id index", "joined"))
         ids = [tokenizer.encode(text, add_special_tokens=False) for text in texts]
         expected[outputs] = ["".join(f"{token} " for token in row) for row in ids]
         expected[decoded] = ["".join(tokenizer.convert_ids_to_tokens(row)) for row in ids]
@@ -1047,12 +1294,13 @@ def test_index_inputs_are_checked_before_and_while_the_block_runs(tmp_path):
     first = [-5, 1]
     expected = model(torch.tensor(first)).detach().flatten()
     for ids, status in (
-        ([3, 1], interface.OK), ([4, 1], interface.invalid_item("input")),
-        ([-6, 1], interface.invalid_item("input")), ([5, 1], interface.invalid_item("input")),
+        ([3, 1], interface.OK), ([4, 1], interface.invalid_item("rows input")),
+        ([-6, 1], interface.invalid_item("rows input")),
+        ([5, 1], interface.invalid_item("rows input")),
         ([-1, 1], interface.OK),
     ):
         stage = run_vm(project, tmp_path, flag=False, calls=[
-            ("rows run", {"rows input": first}), ("rows run", {"rows input": ids}),
+            ("rows forward", {"rows input": first}), ("rows forward", {"rows input": ids}),
         ])["stage"]
         assert stage["rows status"] == status, ids
         if status == interface.OK:
@@ -1071,7 +1319,7 @@ class BoolReader(nn.Module):
 
 def test_bool_items_mean_the_same_to_every_operation(tmp_path):
     from cattorch.project import _Builder
-    from cattorch.util.scratch.dsl import append, call, clear, eq, item, var
+    from cattorch.util.scratch.dsl import append, broadcast_and_wait, clear, eq, item, var
 
     model = BoolReader().eval()
     example = (torch.tensor([True, False]), torch.tensor([2.0, 3.0]))
@@ -1082,28 +1330,29 @@ def test_bool_items_mean_the_same_to_every_operation(tmp_path):
     # numbers 1 and 0, also as text.
     for flags in ([True, False], [1, 0], ["1", "0"], [True, "0"], ["1.0", 0.0]):
         stage = run_vm(project, tmp_path, flag=False, calls=[
-            ("flags run", {"flags input": flags, "flags input_1": [2, 3]}),
+            ("flags forward", {"flags input": flags, "flags input_1": [2, 3]}),
         ])["stage"]
         assert stage["flags status"] == interface.OK, flags
         assert values(stage, "flags output").tolist() == expected, flags
     # Text such as "true" is 0 in arithmetic, but isn't equal to 0.
     for flags in (["true", 0], [1, "false"], ["TRUE", 0], ["yes", 0], [2, 0], ["", 1], [0.5, 1]):
         stage = run_vm(project, tmp_path, flag=False, calls=[
-            ("flags run", {"flags input": flags, "flags input_1": [2, 3]}),
+            ("flags forward", {"flags input": flags, "flags input_1": [2, 3]}),
         ])["stage"]
-        assert stage["flags status"] == interface.invalid_item("input"), flags
+        assert stage["flags status"] == interface.invalid_item("flags input"), flags
 
-    # Items added by boolean blocks, in a script of the sprite itself.
+    # Items added by boolean blocks, in a script of another sprite.
     builder = _Builder()
-    sprite = builder.add_sprite(result.path, visible=False)
+    builder.add_sprite(result.path, visible=False)
+    sprite = builder.add_demo_sprite()
     heard = builder.global_list("heard")
     builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
-        clear("input"), append("input", eq(1, 1)), append("input", eq(1, 0)),
-        clear("input_1"), append("input_1", 2), append("input_1", 3),
-        call(interface.FORWARD),
-        append(heard, var(interface.STATUS_VARIABLE)),
-        *(append(heard, item("output", position)) for position in range(1, 7)),
-    ), lists=("input", "input_1", "output", heard), variables=(interface.STATUS_VARIABLE,))
+        clear("flags input"), append("flags input", eq(1, 1)), append("flags input", eq(1, 0)),
+        clear("flags input_1"), append("flags input_1", 2), append("flags input_1", 3),
+        broadcast_and_wait("flags forward"),
+        append(heard, var("flags status")),
+        *(append(heard, item("flags output", position)) for position in range(1, 7)),
+    ), lists=("flags input", "flags input_1", "flags output", heard), variables=("flags status",))
     path = tmp_path / "blocks.sb3"
     builder.write(path)
     stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]

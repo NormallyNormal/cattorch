@@ -48,11 +48,11 @@ from cattorch.util.scratch.dsl import (
     switch_costume,
     var,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.instruction import optimized_linear
 from cattorch.interface import TOKEN_IDS
 from shared_models import CachedAttention, CachedLM, CachedMQALM
-from sprite_helpers import load_sprite
+from cattorch.util.scratch.globals import global_references
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 class LinearActivation(nn.Module):
@@ -123,7 +123,7 @@ class NonDivisibleAdaptivePool(nn.Module):
 
 
 def _run(sprite, values):
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = list(values)
     emulator.run()
     return [float(value) for value in emulator.lists["output"]]
@@ -170,7 +170,7 @@ def test_dsl_compiles_and_renders_readable_kernel():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["T1"] = [1, 2, 3]
     emulator.run()
     assert emulator.lists["T2"] == [13]
@@ -185,7 +185,7 @@ def test_dsl_round_reporter():
         body=(append("output", round_(2.6)),),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
     assert emulator.lists["output"] == [3]
     assert "round(2.6)" in program.pseudocode()
@@ -198,7 +198,7 @@ def test_dsl_random_reporter():
         body=(set_var("sample", random(2, 2)),),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
     assert emulator.variables["sample"] == 2
     assert "random(2, 2)" in program.pseudocode()
@@ -271,7 +271,7 @@ def test_dsl_for_each_uses_one_based_indices():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
 
     assert emulator.lists["output"] == [10]
@@ -297,7 +297,7 @@ def test_dsl_auto_lowers_safe_index_mutation_to_for_each():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
 
     assert emulator.lists["output"] == [2, 4, 6]
@@ -373,7 +373,7 @@ def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
     opcodes = {block["opcode"] for block in sprite["blocks"].values()}
     assert {"procedures_definition", "procedures_prototype", "procedures_call"} <= opcodes
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = first.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -416,7 +416,7 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
         )
         sprite = load_sprite(base.with_suffix(".sprite3"))
         sprites[name] = sprite
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["input"] = value.flatten().tolist()
         emulator.lists["input_1"] = residual.flatten().tolist()
         emulator.run()
@@ -469,7 +469,7 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
     assert [len(entry[1]) for entry in physical] == [199_680, 512]
     assert not any(name.startswith("_W_linear_") for name in result.sharded_lists)
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -526,7 +526,7 @@ def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
     transpile(model, inputs, str(base), optimization="exact")
     sprite = load_sprite(base.with_suffix(".sprite3"))
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     for index, value in enumerate(inputs):
         name = "input" if index == 0 else f"input_{index}"
         emulator.lists[name] = value.flatten().tolist()
@@ -574,9 +574,9 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
             entry[1] = [0.033, 0.033]
         elif entry[0] == FAST_TIMINGS:
             entry[1] = [0, 0]
+    # A sprite's output is the global, on the stage, named after it.
     exact_output = next(
-        entry for entry in project["targets"][1]["lists"].values()
-        if entry[0] == "output"
+        entry for entry in stage["lists"].values() if entry[0] == "cattorch exact output"
     )
     exact_output[1] = [1.0]
     with zipfile.ZipFile(project_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -861,7 +861,7 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
     assert [len(entry[1]) for entry in weights] == [199_680, 512]
     assert not any(name.startswith("_W_matmul_") for name in result.sharded_lists)
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -1010,7 +1010,7 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
     )
     sprite = load_sprite(path.with_suffix(".sprite3"))
     # Multiple inputs occupy distinct Scratch lists; use the emulator directly.
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
     emulator.run()
@@ -1072,10 +1072,10 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         str(path),
     )
     sprite = load_sprite(path.with_suffix(".sprite3"))
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     assert {
-        "_cattorch token step for epoch %s", "cattorch init", "cattorch reset",
-        "cattorch prefill", "cattorch decode",
+        "_cattorch token step for epoch %s", "_cattorch init", "_cattorch reset",
+        "_cattorch prefill", "_cattorch decode",
     } <= set(emulator._procedures)
     assert set(sprite["broadcasts"].values()) == {
         "cattorch init complete", "cattorch reset complete",
@@ -1090,7 +1090,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
 
     prompt = [1, 3, 5]
     emulator.lists[TOKEN_IDS] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.run_procedure("cattorch prefill")
     assert emulator.broadcasts == [
         "cattorch init complete", "cattorch prefill complete",
     ]
@@ -1105,7 +1105,7 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     for token in (2, 4):
         prompt.append(token)
         emulator.lists[TOKEN_IDS] = [token]
-        emulator._exec_chain(emulator._procedures["cattorch decode"])
+        emulator.run_procedure("cattorch decode")
         expected = model(torch.tensor([prompt]))[0, -1]
         torch.testing.assert_close(
             torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
@@ -1114,12 +1114,12 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
 
     kept = list(emulator.lists["cattorch logits"])
     emulator.lists[TOKEN_IDS] = [6]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
     assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator._exec_chain(emulator._procedures["cattorch reset"])
+    emulator.run_procedure("cattorch reset")
     assert emulator.variables["cattorch status"] == "ok"
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["_cattorch K cache 1"] == []
@@ -1134,12 +1134,14 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
         GenerationProgram(max_context=5, top_k=3),
         path,
     )
-    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     for invalid in ([], [1, 2]):
         emulator.lists[TOKEN_IDS] = invalid
         emulator.run_procedure("cattorch decode")
-        assert emulator.variables["cattorch status"] == interface.wrong_number_of_items(interface.TOKEN_IDS)
+        assert emulator.variables["cattorch status"] == interface.wrong_number_of_items(
+            emulator.public(interface.TOKEN_IDS),
+        )
         assert emulator.variables["cattorch cache length"] == 0
         assert emulator.lists["cattorch logits"] == []
         assert emulator.lists["cattorch top k ids"] == []
@@ -1165,11 +1167,11 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
         GenerationProgram(max_context=5),
         str(path),
     )
-    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     prompt = [1, 3, 5]
     emulator.lists[TOKEN_IDS] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.run_procedure("cattorch prefill")
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
@@ -1178,7 +1180,7 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     assert len(emulator.lists["_cattorch V cache 2"]) == 3 * 4
 
     emulator.lists[TOKEN_IDS] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.run_procedure("cattorch decode")
     expected = model(torch.tensor([[*prompt, 2]]))[0, -1]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
@@ -1203,7 +1205,7 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     )
     assert result.block_count < baseline.block_count * 0.8
     sprite = load_sprite(result.path)
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     assert "_cattorch shared transformer layer" in emulator._procedures
     assert "_cattorch K cache" in emulator.lists
     assert "_cattorch V cache" in emulator.lists
@@ -1241,12 +1243,12 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         GenerationProgram(max_context=5, top_k=5),
         str(path),
     )
-    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     assert "_cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
     emulator.lists[TOKEN_IDS] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.run_procedure("cattorch prefill")
     expected_logits = model(torch.tensor([prompt]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
@@ -1261,7 +1263,7 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     )
 
     emulator.lists[TOKEN_IDS] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.run_procedure("cattorch decode")
     expected_logits = model(torch.tensor([[*prompt, 2]]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
@@ -1276,19 +1278,19 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     )
 
     emulator.lists[TOKEN_IDS] = [4]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.run_procedure("cattorch decode")
     assert len(emulator.lists["cattorch top k values"]) == 5
     kept = [list(emulator.lists[name]) for name in (
         "cattorch logits", "cattorch top k values", "cattorch top k ids",
     )]
     emulator.lists[TOKEN_IDS] = [6]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
     assert [emulator.lists[name] for name in (
         "cattorch logits", "cattorch top k values", "cattorch top k ids",
     )] == kept
 
-    emulator._exec_chain(emulator._procedures["cattorch reset"])
+    emulator.run_procedure("cattorch reset")
     assert emulator.lists["cattorch top k values"] == []
     assert emulator.lists["cattorch top k ids"] == []
 
@@ -1305,9 +1307,9 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
             GenerationProgram(max_context=5, hidden_prefill=hidden_prefill),
             str(path),
         )
-        emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+        emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
         emulator.lists[TOKEN_IDS] = prompt
-        emulator._exec_chain(emulator._procedures["cattorch prefill"])
+        emulator.run_procedure("cattorch prefill")
         emulators[hidden_prefill] = emulator
 
     expected = model(torch.tensor([prompt]))[0, -1]
@@ -1433,8 +1435,11 @@ def test_parameter_resolution_uses_export_signature_without_name_collisions(tmp_
     path = tmp_path / "colliding_state_names"
     transpile(model, value, str(path), storage=StorageConfig(compression=False))
     sprite = load_sprite(path.with_suffix(".sprite3"))
-    input_names = {entry[0] for entry in sprite["lists"].values() if entry[0].startswith("input")}
-    assert input_names == {"input"}
+    input_names = {
+        name for name in global_references(sprite)["lists"].values()
+        if name.startswith("colliding_state_names input")
+    }
+    assert input_names == {"colliding_state_names input"}
     torch.testing.assert_close(
         torch.tensor(_run(sprite, value.flatten().tolist())),
         model(value).flatten(),
@@ -1481,7 +1486,7 @@ def test_exact_elementwise_supports_general_pytorch_broadcasting(
     right = torch.randn(right_shape)
     path = tmp_path / f"broadcast_{len(left_shape)}_{len(right_shape)}"
     transpile(Add().eval(), (left, right), str(path), storage=StorageConfig(compression=False))
-    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
     emulator.run()
@@ -1502,7 +1507,7 @@ def test_identity_model_materializes_a_distinct_output(tmp_path):
     path = tmp_path / "identity"
     transpile(Identity().eval(), value, str(path))
     sprite = load_sprite(path.with_suffix(".sprite3"))
-    assert {entry[0] for entry in sprite["lists"].values()} >= {"input", "output"}
+    assert set(global_references(sprite)["lists"].values()) >= {"identity input", "identity output"}
     torch.testing.assert_close(
         torch.tensor(_run(sprite, value.flatten().tolist())), value.flatten(),
     )
@@ -1514,7 +1519,7 @@ def test_multiple_model_outputs_are_preserved(tmp_path):
             return value + 1, value * 2
 
     result = transpile(Pair().eval(), torch.ones(2), str(tmp_path / "pair"))
-    assert tuple(value.list_name for value in result.outputs) == ("output", "output_1")
+    assert tuple(value.list_name for value in result.outputs) == ("pair output", "pair output_1")
 
 
 def test_training_dropout_is_exported_as_an_evaluation_copy(tmp_path):
@@ -1559,7 +1564,7 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
         Mask().eval(), (value, mask), str(path),
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = value.flatten().tolist()
     emulator.lists["input_1"] = mask.flatten().tolist()
     emulator.run()
@@ -1621,9 +1626,10 @@ def test_transpile_returns_metadata_and_separates_path_from_sprite_name(tmp_path
     assert result.list_count > 0
     assert result.inputs[0].shape == (1, 3)
     assert result.output.shape == (1, 2)
-    assert {"cattorch init", "cattorch forward", "cattorch prepare for save"} <= set(
-        result.procedures
+    assert result.broadcasts == (
+        "Friendly model init", "Friendly model forward", "Friendly model prepare for save",
     )
+    assert result.inputs[0].list_name == "Friendly model input"
     assert load_sprite(result.path)["name"] == "Friendly model"
 
 

@@ -13,11 +13,10 @@ import pytest
 import torch
 
 from cattorch import CodegenConfig, GenerationProgram, RecurrentGenerationProgram, transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from sprite_helpers import load_sprite, logits_of
+from sprite_helpers import SpriteEmulator, load_sprite, logits_of
 from shared_models import CachedLM, recurrent_model, reference_rows
 from cattorch.interface import TOKEN_IDS
 
@@ -136,7 +135,7 @@ class Generator:
 
     def start(self, fresh=False):
         """A new emulator, after a prefill of ``SETUP`` unless ``fresh``."""
-        emulator = ScratchEmulator(self.sprite)
+        emulator = SpriteEmulator(self.sprite)
         if not fresh:
             emulator.run_procedure("cattorch init")
             emulator.lists[TOKEN_IDS] = list(SETUP)

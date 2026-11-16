@@ -79,7 +79,7 @@ def test_verify_empty_output_and_sharded_later_output(tmp_path):
         model, value, tmp_path / "sharded",
         codegen=CodegenConfig(compact_internal_names=True),
     )
-    assert "output_1" in artifact.sharded_lists
+    assert "sharded output_1" in artifact.sharded_lists
     result = verify(model, value, artifact.path)
     assert result.passed
     assert result.outputs[0].values_compared == 0

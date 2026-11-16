@@ -19,11 +19,10 @@ from cattorch import (
     transpile,
 )
 from cattorch.program_runtime import ProgramReplay
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import LOOPS, Script, Scripts, record_pauses
 from scratch_status import INTERRUPTED, OVERTAKEN
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 TOLERANCE = 1e-5
 LIFECYCLE = ("cattorch init", "cattorch reset", "cattorch prepare for save")
@@ -86,6 +85,9 @@ def pause_points(emulator, public):
     blocks, which commit and restore the states, are pause points.
     """
     blocks = emulator.blocks
+    # A public block is the internal procedure its ``when I receive``
+    # script runs (``_cattorch step``).
+    public = {*public, *(f"_{name}" for name in public)}
     points = {
         start: False for name, start in emulator._procedures.items()
         if name not in public and start is not None
@@ -147,7 +149,7 @@ class Sprite:
         ``prepare(emulator)`` runs first: the chains it replaces are compiled
         into the ones around them as they first run.
         """
-        emulator = ScratchEmulator(self.sprite)
+        emulator = SpriteEmulator(self.sprite)
         prepared = prepare(emulator)
         replay = ProgramReplay(self.model, self.program)
         for call in setup:
@@ -333,7 +335,9 @@ def test_a_resumed_call_that_ends_first_fails_the_call_running(stateful, overlap
             assert [result[3] for result in finished[:2]] == [OVERTAKEN, OVERTAKEN]
             # Each call sent its completion broadcast, though it failed.
             for procedure in {result[1] for result in finished}:
-                assert emulator.broadcasts.count(interface.completion(procedure)) == sum(
+                assert emulator.broadcasts.count(
+                    interface.completion(interface.message(emulator.name, procedure)),
+                ) == sum(
                     call[0] == procedure for call in (*setup, *(result[1:] for result in finished))
                 )
             stateful.check_afterwards(emulator, replay)

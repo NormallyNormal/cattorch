@@ -21,9 +21,74 @@ def load_sprite(source) -> dict:
         return json.loads(archive.read("sprite.json"))
 
 
-def load_emulator(source) -> ScratchEmulator:
+class _InterfaceView:
+    """A list or variable view that takes an exported sprite's names as built."""
+
+    def __init__(self, view, translate):
+        self._view = view
+        self._translate = translate
+
+    def __getitem__(self, name):
+        return self._view[self._translate(name)]
+
+    def __setitem__(self, name, value):
+        self._view[self._translate(name)] = value
+
+    def get(self, name, default=None):
+        return self._view.get(self._translate(name), default)
+
+    def __contains__(self, name):
+        return self._translate(name) in self._view
+
+    def __getattr__(self, attribute):
+        # The underlying view's storage, which tests reach into by ID.
+        return getattr(self._view, attribute)
+
+
+class SpriteEmulator(ScratchEmulator):
+    """An exported sprite uploaded into an empty project, used as a project uses it.
+
+    As in scratch-vm, the globals the sprite uses (``NAME input``,
+    ``NAME status``, ...) are created on the stage. Tests name the interface
+    as the sprite was built (``input``, ``cattorch status``,
+    ``run_procedure("cattorch forward")``), and this translates by the
+    documented rule (``ScratchEmulator.public``): a public list or a
+    run-time variable is the global ``NAME ...``, and a public block is run
+    by broadcasting ``NAME OP`` and waiting. Internal names and constants
+    are as given. A sprite without the interface (no ``when I receive
+    [NAME ...]`` script) is used as given.
+    """
+
+    def __init__(self, sprite: dict, **options):
+        super().__init__(sprite, **options)
+        prefix = f"{self.name} "
+        self.exported = any(
+            block.get("opcode") == "event_whenbroadcastreceived"
+            and str(block["fields"]["BROADCAST_OPTION"][0]).startswith(prefix)
+            for block in self.blocks.values()
+        )
+        if self.exported:
+            self.lists = _InterfaceView(self.lists, self.public)
+            self.variables = _InterfaceView(
+                self.variables, lambda name: self.public(name, is_list=False),
+            )
+
+    def public(self, name: str, *, is_list: bool = True) -> str:
+        return super().public(name, is_list=is_list) if self.exported else name
+
+    def run_procedure(self, name: str) -> None:
+        if self.exported and name not in self._procedures and name.startswith("cattorch "):
+            self.call(name)
+        elif self.exported and name not in self._procedures and self._receivers(name):
+            # A message, as a result names it (``NAME forward``).
+            self.broadcast(name)
+        else:
+            super().run_procedure(name)
+
+
+def load_emulator(source) -> SpriteEmulator:
     """An emulator for a ``.sprite3`` file, given its path or a transpile result."""
-    return ScratchEmulator(load_sprite(source))
+    return SpriteEmulator(load_sprite(source))
 
 
 def run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:

@@ -14,11 +14,10 @@ from cattorch import (
     CattorchWarning, CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
     UnsupportedModelError, transpile,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from shared_models import VOCAB, CachedLM, NanoGPT, NanoMQA, RopeLM, nano, tiny_decoder
 from cattorch.interface import TOKEN_IDS
-from sprite_helpers import assert_logits, load_sprite, logits_of, prefill_and_decode
+from sprite_helpers import SpriteEmulator, assert_logits, load_sprite, logits_of, prefill_and_decode
 from scratch_status import INTERRUPTED
 
 TOLERANCE = 1e-4
@@ -29,7 +28,7 @@ def emulator_for(model, tmp_path, name="auto", *, codegen=None, **program):
     result = transpile(
         model, GenerationProgram(**program), tmp_path / name, codegen=codegen,
     )
-    return ScratchEmulator(load_sprite(result.path)), result
+    return SpriteEmulator(load_sprite(result.path)), result
 
 
 MODELS = {
@@ -91,7 +90,7 @@ def test_overflow_rolls_back_and_reset_recovers(tmp_path):
         assert emulator.lists[name] == values
     emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == interface.too_many_items(interface.TOKEN_IDS)
+    assert emulator.variables["cattorch status"] == interface.too_many_items(emulator.public(interface.TOKEN_IDS))
     emulator.run_procedure("cattorch reset")
     prefill_and_decode(emulator, model, [4], [2])
 
@@ -191,9 +190,12 @@ def test_private_procedures_run_only_from_public_ones(tmp_path, sharing):
     )
     sprite = load_sprite(result.path)
     callers = procedure_callers(sprite)
-    assert set(result.procedures) <= set(callers)
-    assert not [name for name, by in callers.items() if not by and name not in result.procedures]
-    assert canvas_calls(sprite) <= set(result.procedures)
+    # The blocks a call runs, each run by a broadcast of its message.
+    public = {interface.internal_name(interface.PUBLIC_PREFIX + message.removeprefix("gen "))
+              for message in result.broadcasts}
+    assert public <= set(callers)
+    assert not [name for name, by in callers.items() if not by and name not in public]
+    assert canvas_calls(sprite) == set()
 
 
 class Stopped(Exception):
@@ -357,14 +359,14 @@ def test_token_ids_outside_the_vocabulary_are_rejected(tmp_path):
     for tokens in ([1, VOCAB], [1, -1], [1, 2.5], [1, "abc"]):
         emulator.lists[TOKEN_IDS] = list(tokens)
         emulator.run_procedure("cattorch prefill")
-        assert emulator.variables["cattorch status"] == interface.invalid_item(TOKEN_IDS), tokens
+        assert emulator.variables["cattorch status"] == interface.invalid_item(emulator.public(TOKEN_IDS)), tokens
         assert emulator.lists["cattorch logits"] == []
     emulator.lists[TOKEN_IDS] = [VOCAB - 1]
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     emulator.lists[TOKEN_IDS] = [VOCAB]
     emulator.run_procedure("cattorch decode")
-    assert emulator.variables["cattorch status"] == interface.invalid_item(TOKEN_IDS)
+    assert emulator.variables["cattorch status"] == interface.invalid_item(emulator.public(TOKEN_IDS))
 
 
 def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
@@ -407,7 +409,7 @@ def test_fast_softmax_kernel_skips_the_maximum_pass(tmp_path):
     names = lambda result: {e[0] for e in load_sprite(result.path)["variables"].values()}
     assert "_maximum" in names(exact) and "_maximum" not in names(fast)
     assert fast.block_count < exact.block_count
-    emulator = ScratchEmulator(load_sprite(fast.path))
+    emulator = SpriteEmulator(load_sprite(fast.path))
     prefill_and_decode(emulator, model, [1, 2, 3], [4, 5])
 
 
@@ -423,7 +425,7 @@ def test_layer_sharing_banks_the_caches(tmp_path):
         codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
     assert shared.block_count < plain.block_count * 0.8
-    emulator = ScratchEmulator(load_sprite(shared.path))
+    emulator = SpriteEmulator(load_sprite(shared.path))
     assert "_cattorch shared transformer layer" in emulator._procedures
     assert "_cattorch K cache" in emulator.lists
     prefill_and_decode(emulator, model, [1, 3, 5], [2, 4])
@@ -438,7 +440,7 @@ def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
             codegen=CodegenConfig(layer_sharing=True),
         )
     assert any("`blocks.0`" in item for item in result.warnings)
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
 
@@ -542,7 +544,7 @@ def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     # The caches are internal: split, but not listed in sharded_lists.
     assert "_cattorch K cache 1 shard 2" in emulator.lists
     assert "_cattorch V cache 1 shard 2" in emulator.lists

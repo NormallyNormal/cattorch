@@ -15,8 +15,9 @@ from cattorch import (
 )
 from cattorch.project import _sample
 from cattorch.util.scratch.dsl import Program
-from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
+from cattorch.util.scratch.emulator import ProjectEmulator
 from shared_models import CHARACTERS, Language, char_tokenizer, greedy
+from sprite_helpers import SpriteEmulator
 
 
 def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
@@ -36,8 +37,8 @@ def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
     )
     emulator = ProjectEmulator(project.path)
     emulator.green_flag()
-    # NaN isn't a number the sprite takes; the bridge copies no output.
-    assert emulator.stage.variables["same status"] == interface.invalid_item("input")
+    # NaN isn't a number the sprite takes; it writes no output.
+    assert emulator.stage.variables["same status"] == interface.invalid_item("same input")
     assert emulator.stage.lists["same output"] == []
     emulator.stage.lists["same input"] = [1.5, math.inf, -math.inf, 0]
     emulator.green_flag()
@@ -54,7 +55,14 @@ def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
         result, tmp_path / "net", example_inputs=example, labels=["a", "b", "c"],
     )
     assert project.path.suffix == ".sb3"
-    assert project.broadcasts == ("net run", "net run complete", "net predict", "net predict complete")
+    assert project.sprites == ("Demo", "net")
+    assert project.broadcasts == (
+        "net forward", "net forward complete", "net init", "net init complete",
+        "net prepare for save", "net prepare for save complete", "cattorch prepare for save",
+        "net predict", "net predict complete",
+    )
+    assert set(project.lists) == {"net input", "net output", "net labels"}
+    assert set(project.variables) == {"net status", "net prediction"}
     emulator = ProjectEmulator(project.path)
     emulator.green_flag()
     expected = model(example)[0]
@@ -92,16 +100,21 @@ class Counter(nn.Module):
         return self.total.clone()
 
 
-def test_entry_points_are_bridged(tmp_path):
+def test_entry_points_run_by_their_messages(tmp_path):
     torch.manual_seed(1)
     model = Counter().eval()
     result = transpile(model, None, tmp_path / "counter")
     project = build_project(result, tmp_path / "counter")
-    assert project.broadcasts == ("counter add", "counter add complete")
+    assert set(project.broadcasts) == {
+        "counter add", "counter add complete", "counter init", "counter init complete",
+        "counter reset", "counter reset complete", "counter prepare for save",
+        "counter prepare for save complete", "cattorch prepare for save",
+    }
     emulator = ProjectEmulator(project.path)
     value = torch.tensor([[0.5, -1.0]])
     name = result.entrypoints[0].inputs[0].list_name
-    emulator.stage.lists[interface.project_name("counter", name)] = value.flatten().tolist()
+    assert name == "counter add value"
+    emulator.stage.lists[name] = value.flatten().tolist()
     output = result.entrypoints[0].outputs[0].list_name
     for _ in range(2):
         emulator.broadcast("counter add")
@@ -109,7 +122,7 @@ def test_entry_points_are_bridged(tmp_path):
         expected = 2 * model.linear(value)
     assert emulator.stage.variables["counter status"] == interface.OK
     assert emulator.sprites["counter"].broadcasts[-1] == "counter add complete"
-    assert emulator.stage.lists[interface.project_name("counter", output)] == pytest.approx(
+    assert emulator.stage.lists[output] == pytest.approx(
         expected.flatten().tolist(), abs=1e-5,
     )
 
@@ -136,9 +149,10 @@ def test_a_text_generator_continues_each_prompt(generator):
         text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
         assert prompt + text in said
     assert len(emulator.questions) == 3
-    # The weights are decoded once, not before every token.
-    model_sprite = next(name for name in emulator.sprites if name not in {"Demo", tokenizer.sprite_name})
-    assert emulator.sprites[model_sprite].broadcasts.count("cattorch init complete") == 1
+    # The prefill decoded the weights; nothing else ran init.
+    model_sprite = emulator.sprites[result.sprite_name]
+    assert "lm init complete" not in model_sprite.broadcasts
+    assert model_sprite.variables["cattorch initialized"] == 1
 
 
 def test_generation_stops_at_the_end_token_and_the_context(generator):
@@ -161,16 +175,14 @@ def test_generation_stops_at_the_end_token_and_the_context(generator):
 
 
 def test_sampling_follows_the_softmax(tmp_path):
-    from cattorch.project import _BEST
+    from cattorch.project import _BEST, _INDEX, _PICK, _TOTAL
 
     program = Program(
-        "sample", lists=("logits",), variables=("_cattorch bridge index", _BEST,
-                                                "_cattorch bridge total",
-                                                "_cattorch bridge pick", "heat"),
+        "sample", lists=("logits",), variables=(_INDEX, _BEST, _TOTAL, _PICK, "heat"),
         variable_values={"heat": 0.5}, list_values={"logits": [0.0, 0.5, 1.0]},
         body=_sample("logits", "heat"),
     )
-    emulator = ScratchEmulator(program.compile())
+    emulator = SpriteEmulator(program.compile())
     torch.manual_seed(3)
     counts = collections.Counter()
     for _ in range(3000):
@@ -189,13 +201,28 @@ def test_generators_need_their_tokenizer(generator):
         build_project(tokenizer, directory / "wrong")
 
 
-@pytest.mark.parametrize("name", ["cattorch", "Demo", "Stage"])
-def test_reserved_sprite_names_are_renamed(tmp_path, name):
-    result = transpile(nn.Linear(2, 2).eval(), torch.randn(1, 2), tmp_path / "m", name=name)
+def test_names_a_project_cant_use(tmp_path):
+    model, example = nn.Linear(2, 2).eval(), torch.randn(1, 2)
+    # Its prepare for save would be the message every sprite answers.
+    with pytest.raises(ValueError, match="every exported sprite answers"):
+        transpile(model, example, tmp_path / "m", name="Cattorch")
+    # The project's own sprite gives way: the model's name is its interface.
+    result = transpile(model, example, tmp_path / "m", name="Demo")
     project = build_project(result, tmp_path / "project")
-    assert name not in project.sprites
-    assert len(set(project.sprites)) == len(project.sprites)
-    assert not any(entry.startswith("cattorch ") for entry in project.lists)
+    assert project.sprites == ("Demo2", "Demo")
+    assert set(project.lists) == {"Demo input", "Demo output"}
+    result = transpile(model, example, tmp_path / "m", name="Stage")
+    with pytest.raises(ValueError, match="named 'Stage'"):
+        build_project(result, tmp_path / "project")
+
+
+def test_two_sprites_of_one_name_or_global_are_refused(generator, tmp_path):
+    from shared_models import char_tokenizer
+
+    _, result, _, _ = generator
+    words = CharTokenizer(char_tokenizer()).save(tmp_path / "words", name="lm")
+    with pytest.raises(ValueError, match="named 'lm'"):
+        build_project(result, tmp_path / "same", tokenizer=words)
 
 
 @pytest.mark.parametrize(("options", "error", "expected"), [
@@ -270,7 +297,7 @@ def test_example_inputs_must_fit_the_exported_inputs(tmp_path):
     model = nn.Linear(4, 2).eval()
     result = transpile(model, torch.randn(1, 4), tmp_path / "net")
     for example, error, expected in (
-        (torch.randn(2, 4), ValueError, r"shape \(2, 4\), but 'input' takes float32 of shape \(1, 4\)"),
+        (torch.randn(2, 4), ValueError, r"shape \(2, 4\), but 'net input' takes float32 of shape \(1, 4\)"),
         (torch.zeros(1, 4, dtype=torch.int64), ValueError, "int64 tensor"),
         ((torch.randn(1, 4), torch.randn(1, 4)), ValueError, "has 2 tensors, but the export has 1"),
         (([1.0, 2.0, 3.0, 4.0],), TypeError, "example input 0 is a list"),

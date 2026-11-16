@@ -27,6 +27,9 @@ def pause_points(emulator, public, loops=True):
     A script calling a public block isn't paused before it runs. Without
     ``loops`` only the procedure calls count.
     """
+    # A public block of an exported sprite is the internal procedure its
+    # ``when I receive`` script runs (``_cattorch forward``).
+    public = {*public, *(f"_{name}" for name in public)}
     points = {
         start for name, start in emulator._procedures.items()
         if name not in public and start is not None

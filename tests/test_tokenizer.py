@@ -5,7 +5,6 @@ Each test transpiles a tokenizer, runs encode/decode through the emulator,
 and compares against the HuggingFace tokenizer output.
 """
 
-from cattorch import interface
 import os
 import tempfile
 
@@ -20,8 +19,7 @@ from cattorch.tokenizer import (
     transpile_tokenizer,
 )
 from cattorch.results import TokenizerResult
-from cattorch.util.scratch.emulator import ScratchEmulator
-from sprite_helpers import load_emulator, load_sprite
+from sprite_helpers import SpriteEmulator, load_emulator, load_sprite
 
 # One directory per process, so parallel test workers never share the file.
 SPRITE_PATH = os.path.join(tempfile.mkdtemp(prefix="cattorch-tokenizer-"), "tokenizer")
@@ -47,7 +45,7 @@ def _load_sprite() -> dict:
 
 def _encode(sprite: dict, text: str) -> list:
     """Run the encode block stack and return the token IDs."""
-    emu = ScratchEmulator(sprite)
+    emu = SpriteEmulator(sprite)
     emu.variables["cattorch text"] = text
     emu.run(root_index=0)
     return emu.lists["cattorch token ids"]
@@ -55,7 +53,7 @@ def _encode(sprite: dict, text: str) -> list:
 
 def _decode(sprite: dict, token_ids: list) -> str:
     """Run the decode block stack and return the output string."""
-    emu = ScratchEmulator(sprite)
+    emu = SpriteEmulator(sprite)
     emu.lists["cattorch token ids"] = list(token_ids)
     emu.run(root_index=1)
     return emu.variables["cattorch text"]
@@ -603,7 +601,7 @@ class TestSentencePieceBPE:
         ).save(tmp_path / "sentencepiece")
         sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.variables["cattorch text"] = "AB_ab!"
         emulator.run_procedure("cattorch tokenize")
         assert [int(value) for value in emulator.lists["cattorch token ids"]] == [3, 2, 3, 8]
@@ -627,7 +625,7 @@ class TestSentencePieceBPE:
         ).save(tmp_path / "many_split_sentencepiece")
         sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.variables["cattorch text"] = "aaaaaaaa"
         emulator.run_procedure("cattorch tokenize")
         assert [int(value) for value in emulator.lists["cattorch token ids"]] == [9]
@@ -639,7 +637,7 @@ class TestSentencePieceBPE:
         ).save(tmp_path / "sentencepiece")
         sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["cattorch token ids"] = [0, 1, 3, 2, 4, 8]
         emulator.run_procedure("cattorch detokenize")
         # The control token is skipped; the unknown token shows as
@@ -653,11 +651,14 @@ class TestSentencePieceBPE:
         ).save(tmp_path / "sentencepiece")
         sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
+        assert not {name for name in emulator._procedures if not name.startswith("_")}
+        assert {"_cattorch tokenize", "_cattorch detokenize"} <= set(emulator._procedures)
+        # A clickable broadcast of each message, and the scripts receiving them.
         assert {
-            name for name in emulator._procedures if not name.startswith("_")
-        } == {interface.TOKENIZE, interface.DETOKENIZE}
-        assert len(emulator._find_roots()) == 2
+            emulator.blocks[root]["opcode"] for root in emulator._find_roots()
+        } == {"event_broadcastandwait", "event_whenbroadcastreceived"}
+        assert len(emulator._find_roots()) == 4
         assert any("non-ASCII byte tokens" in warning for warning in result.warnings)
         prototypes = [
             block

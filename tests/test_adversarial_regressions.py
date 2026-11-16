@@ -183,6 +183,7 @@ def test_functional_linear_with_a_vector_weight_or_broadcast_bias(tmp_path, weig
 
 from cattorch.experimental import Kernel  # noqa: E402
 from cattorch.scratch import append, clear, repeat  # noqa: E402
+from sprite_helpers import SpriteEmulator
 
 
 def _sevens(target, calls, **options):
@@ -513,7 +514,6 @@ def test_a_dynamic_tensor_reusing_a_longer_list_keeps_its_size(tmp_path, small_l
     # The [n] product reuses the list of the 650-value one; its smaller
     # dynamic capacity must not replace the list's size.
     from cattorch.util.scratch.archive import read_json
-    from cattorch.util.scratch.emulator import ScratchEmulator
 
     small_list_limit(300)
 
@@ -528,7 +528,7 @@ def test_a_dynamic_tensor_reusing_a_longer_list_keeps_its_size(tmp_path, small_l
 
     model = Reuse().eval()
     result = transpile(model, torch.ones(3), tmp_path / "reuse", dynamic={0: {0: (1, 8)}})
-    emulator = ScratchEmulator(read_json(result.path))
+    emulator = SpriteEmulator(read_json(result.path))
     emulator.run_procedure("cattorch init")
     emulator.lists["input"] = [1.0, 2.0]
     emulator.run_procedure("cattorch forward")

@@ -11,7 +11,7 @@ from cattorch import (
     QuantizationConfig, QuantizationOverride, transpile, verify,
 )
 from cattorch.quantization import _StaticSourceRecorder
-from sprite_helpers import load_emulator, load_sprite
+from sprite_helpers import SpriteEmulator, load_emulator, load_sprite
 
 SHARED = CodegenConfig(layer_sharing=True)
 PROCEDURE = "cattorch shared transformer layer"
@@ -93,13 +93,12 @@ def test_layers_share_wherever_they_sit(tmp_path, kind):
 
 
 def test_shared_layers_leave_the_input_list_unchanged(tmp_path):
-    from cattorch.util.scratch.emulator import ScratchEmulator
 
     torch.manual_seed(4)
     model = Stack("plain").eval()
     value = torch.randn(1, 4, 8)
     result, _ = export(model, value, tmp_path / "shared")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     assert emulator.lists["input"] == value.flatten().tolist()

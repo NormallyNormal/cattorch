@@ -16,6 +16,7 @@ from cattorch.frontend import capture_model
 from cattorch.operator_registry import OperationRule, default_registry
 from cattorch.transpiler import _transpile
 from cattorch.util.instruction.optimized_elementwise import elementwise_kernel
+from sprite_helpers import SpriteEmulator
 
 
 class StatefulModel(nn.Module):
@@ -39,7 +40,7 @@ def test_parameters_buffers_constants_and_multiple_inputs_are_lowered(tmp_path):
 
     comparison = verify(model, inputs, result, atol=2e-4)
     assert comparison.passed, comparison
-    assert tuple(item.list_name for item in result.inputs) == ("input", "input_1")
+    assert tuple(item.list_name for item in result.inputs) == ("model input", "model input_1")
     assert result.output.shape == (2, 4)
 
 
@@ -94,7 +95,9 @@ def test_multiple_tensor_outputs_are_preserved(tmp_path):
     result = transpile(
         Multiple().eval(), value, tmp_path / "multiple",
     )
-    assert tuple(output.list_name for output in result.outputs) == ("output", "output_1")
+    assert tuple(output.list_name for output in result.outputs) == (
+        "multiple output", "multiple output_1",
+    )
     assert all(output.shape == (2,) for output in result.outputs)
 
 
@@ -709,14 +712,13 @@ class _IndexWrittenFrom(nn.Module):
 @pytest.mark.parametrize("kind", ["other", "constant"])
 def test_an_index_input_written_through_a_view_checks_every_value_it_uses(tmp_path, kind):
     from cattorch import interface
-    from cattorch.util.scratch.emulator import ScratchEmulator
     from sprite_helpers import load_sprite
 
     model = _IndexWrittenFrom(kind).eval()
     example = (torch.tensor([[1, 2, 3]]), torch.tensor([[5, 0, 0]]))
     result = transpile(model, tuple(value.clone() for value in example), tmp_path / kind)
     assert verify(model, tuple(value.clone() for value in example), result).passed
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
 
     def status(ids, other):
         emulator.lists["input"], emulator.lists["input_1"] = ids, other
@@ -725,7 +727,9 @@ def test_an_index_input_written_through_a_view_checks_every_value_it_uses(tmp_pa
 
     assert status([1, 2, 3], [5, 0, 0]) == interface.OK
     # The input's own items are checked before the call.
-    assert status([1, 9, 3], [5, 0, 0]) == interface.invalid_item("input")
+    assert status([1, 9, 3], [5, 0, 0]) == interface.invalid_item(emulator.public("input"))
     # A value written into it from another input is checked as it runs.
-    expected = interface.invalid_item("input_1") if kind == "other" else interface.OK
+    expected = (
+        interface.invalid_item(emulator.public("input_1")) if kind == "other" else interface.OK
+    )
     assert status([1, 2, 3], [9, 0, 0]) == expected

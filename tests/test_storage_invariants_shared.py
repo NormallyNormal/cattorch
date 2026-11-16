@@ -23,8 +23,7 @@ from torch import nn
 from cattorch import (
     CattorchWarning, CodegenConfig, GenerationProgram, QuantizationConfig, transpile, verify,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 from test_storage_invariants import decode_payloads
 
 V, D, H, LAYERS = 32, 32, 64, 3
@@ -102,7 +101,7 @@ def _check_invariants(result, check, model, bits, *, head_bits=None):
     sprite = load_sprite(result.path)
     lists, stored = decode_payloads(sprite)
     assert lists
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run_procedure("cattorch init")
     names = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
     for name, values in lists.items():

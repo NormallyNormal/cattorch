@@ -11,7 +11,7 @@ from cattorch.sprite import _wrap_optimized_lifecycle
 from cattorch.util.scratch.dsl import (
     Program, add, append, clear, eq, if_, item, length, replace, set_var, sub,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import SpriteEmulator
 
 VOCABULARY = 10
 FAILING_TOKEN = 9
@@ -49,7 +49,7 @@ def toy_emulator(*, capacity=None, hidden_prefill=False, top_k=2):
         compact_top_k=True,
         vocabulary=VOCABULARY,
     )
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run_procedure("cattorch init")
     return emulator, sprite
 
@@ -63,7 +63,7 @@ def test_top_k_matches_torch_with_infinite_nan_and_tied_logits(compact):
     from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
 
     build = _build_compact_top_k_program if compact else _build_top_k_program
-    emulator = ScratchEmulator(build(5, logits="output").compile())
+    emulator = SpriteEmulator(build(5, logits="output").compile())
     inf = math.inf
     for logits in (
         # Fewer finite logits than top_k: -inf logits still get their IDs.
@@ -146,12 +146,12 @@ def test_decode_rejects_anything_but_one_valid_token():
     emulator, _ = toy_emulator()
     assert prefill(emulator, [1, 2]) == interface.OK
     for tokens, status in (
-        ([], interface.wrong_number_of_items(TOKEN_IDS)),
-        ([1, 2], interface.wrong_number_of_items(TOKEN_IDS)),
-        ([VOCABULARY], interface.invalid_item(TOKEN_IDS)),
-        ([-1], interface.invalid_item(TOKEN_IDS)),
-        ([1.5], interface.invalid_item(TOKEN_IDS)),
-        (["one"], interface.invalid_item(TOKEN_IDS)),
+        ([], interface.wrong_number_of_items(emulator.public(TOKEN_IDS))),
+        ([1, 2], interface.wrong_number_of_items(emulator.public(TOKEN_IDS))),
+        ([VOCABULARY], interface.invalid_item(emulator.public(TOKEN_IDS))),
+        ([-1], interface.invalid_item(emulator.public(TOKEN_IDS))),
+        ([1.5], interface.invalid_item(emulator.public(TOKEN_IDS))),
+        (["one"], interface.invalid_item(emulator.public(TOKEN_IDS))),
     ):
         emulator.broadcasts.clear()
         assert decode(emulator, tokens) == status
@@ -169,8 +169,8 @@ def test_prefill_rejects_empty_and_invalid_prompts():
     emulator, _ = toy_emulator()
     assert prefill(emulator, [3]) == interface.OK
     for tokens, status in (
-        ([], interface.too_few_items(TOKEN_IDS)),
-        ([1, 12], interface.invalid_item(TOKEN_IDS)),
+        ([], interface.too_few_items(emulator.public(TOKEN_IDS))),
+        ([1, 12], interface.invalid_item(emulator.public(TOKEN_IDS))),
     ):
         assert prefill(emulator, tokens) == status
         # It changes nothing, not even resetting first.
@@ -205,7 +205,7 @@ def test_capacity_limits_the_counted_tokens():
     emulator, sprite = toy_emulator(capacity=2)
     values = {entry[0]: entry[1] for entry in sprite["variables"].values()}
     assert values[interface.MAX_CONTEXT] == 2
-    assert prefill(emulator, [1, 2, 3]) == interface.too_many_items(TOKEN_IDS)
+    assert prefill(emulator, [1, 2, 3]) == interface.too_many_items(emulator.public(TOKEN_IDS))
     assert prefill(emulator, [1, 2]) == interface.OK
     assert decode(emulator, [3]) == interface.CONTEXT_FULL
     assert logits(emulator) == [3, 0.5, -2]

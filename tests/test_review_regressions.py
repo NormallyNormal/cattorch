@@ -24,13 +24,12 @@ from cattorch import (
 from cattorch.experimental import analyze
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.operator_registry import default_registry
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import (
     read_logical_list,
     rename_list,
     write_logical_list,
 )
-from sprite_helpers import load_emulator
+from sprite_helpers import SpriteEmulator, load_emulator
 
 
 class SharedBatchNorm(nn.Module):
@@ -608,7 +607,7 @@ def test_benchmark_input_restore_and_output_read_are_shard_aware():
     assert sprite["lists"]["b"][1] == [7.0]
     _add_input_restore_procedure(sprite, (x,))
     assert len(sprite["blocks"]) < 100
-    em = ScratchEmulator(sprite)
+    em = SpriteEmulator(sprite)
     em.lists["input"] = []
     em.lists["input shard 2"] = []
     em.run_procedure("_cattorch restore benchmark input")

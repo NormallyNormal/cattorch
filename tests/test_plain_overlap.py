@@ -15,11 +15,11 @@ import torch
 from torch import nn
 
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, interface, transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import OVERTAKEN
-from sprite_helpers import load_sprite
+from cattorch.util.scratch.globals import global_references
+from sprite_helpers import SpriteEmulator, load_sprite
 
 TOLERANCE = 1e-5
 FORWARD, INIT, PREPARE = "cattorch forward", "cattorch init", "cattorch prepare for save"
@@ -51,7 +51,7 @@ class Plain:
         """
         key = tuple((name, tuple(values)) for name, values in inputs.items())
         if key not in self._expected:
-            emulator = ScratchEmulator(self.sprite)
+            emulator = SpriteEmulator(self.sprite)
             procedure, _, status, outputs, _ = self.run_call(emulator, (FORWARD, inputs))
             assert status == "ok"
             values = [
@@ -95,7 +95,9 @@ class Plain:
         taken over while it copied them.
         """
         procedure, inputs, status, outputs, sent = result[-5:]
-        assert sent[-1:] == (interface.completion(procedure),), result
+        assert sent[-1:] == (
+            interface.completion(interface.message(self.sprite["name"], procedure)),
+        ), result
         if procedure != FORWARD:
             return
         if not ok and status != "ok":
@@ -112,7 +114,7 @@ class Plain:
             )
 
     def start(self, setup, prepare):
-        emulator = ScratchEmulator(self.sprite)
+        emulator = SpriteEmulator(self.sprite)
         prepared = prepare(emulator)
         emulator.previous = None
         for call in setup:
@@ -322,7 +324,7 @@ def test_init_and_prepare_for_save_never_leave_wrong_outputs_reported_ok(
     stored, setup, first, second,
 ):
     plain = stored
-    if PREPARE not in ScratchEmulator(plain.sprite)._procedures and "prepare for save" in (
+    if PREPARE not in SpriteEmulator(plain.sprite)._procedures and "prepare for save" in (
         first, second,
     ):
         pytest.skip("this export has no prepare for save")
@@ -362,7 +364,8 @@ def test_sharded_outputs_are_cleared_by_a_forward_another_ran_during(
     model = nn.Sequential(nn.Linear(4, 640), nn.Tanh())
     plain, result = export(tmp_path_factory, "sharded", model, {"input": torch.zeros(1, 4)})
     plain.name = "sharded"
-    assert "output shard 3" in {entry[0] for entry in plain.sprite["lists"].values()}
+    # The global "sharded output" is split in three.
+    assert "sharded output shard 3" in global_references(plain.sprite)["lists"].values()
     first, second = calls(plain, [10]), calls(plain, [20])
     overtaken = 0
     for pause in spread(plain.pauses([], first), 12):
@@ -373,13 +376,19 @@ def test_sharded_outputs_are_cleared_by_a_forward_another_ran_during(
 
 
 def test_the_blocks_on_the_canvas_run_the_public_blocks(plain):
-    # A variable-length export's clickable forward ran the procedure it wraps.
+    # A variable-length export's clickable forward ran the procedure it
+    # wraps. The loose blocks broadcast the calls' messages, as a project does.
+    blocks = [block for block in plain.sprite["blocks"].values() if isinstance(block, dict)]
+    assert not [
+        block for block in blocks
+        if block.get("topLevel") and block["opcode"] == "procedures_call"
+    ]
     loose = sorted(
-        block["mutation"]["proccode"] for block in plain.sprite["blocks"].values()
-        if isinstance(block, dict) and block.get("topLevel")
-        and block["opcode"] == "procedures_call"
+        block["inputs"]["BROADCAST_INPUT"][1][1] for block in blocks
+        if block.get("topLevel") and block["opcode"] == "event_broadcastandwait"
     )
-    assert loose == [FORWARD, INIT]
+    name = plain.sprite["name"]
+    assert loose == [interface.message(name, FORWARD), interface.message(name, INIT)]
 
 
 def test_the_shared_layers_export_runs_one_procedure_for_every_layer(tmp_path_factory):

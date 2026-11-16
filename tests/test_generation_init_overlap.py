@@ -16,11 +16,10 @@ from cattorch import (
     CodegenConfig, GenerationProgram, QuantizationConfig, RecurrentGenerationProgram,
     StorageConfig, transpile,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
 from overlap_harness import Script, Scripts, pause_points, record_pauses, spread
 from scratch_status import INTERRUPTED, OVERTAKEN
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 from shared_models import CachedLM, recurrent_model
 from cattorch.interface import TOKEN_IDS
 
@@ -62,7 +61,7 @@ class Generator:
         """The logits after ``prefix``, from a prefill in a sprite of its own."""
         key = tuple(prefix)
         if key not in self._expected:
-            emulator = ScratchEmulator(self.sprite)
+            emulator = SpriteEmulator(self.sprite)
             assert run_call(emulator, ("cattorch prefill", prefix))[2] == "ok"
             self._expected[key] = list(emulator.lists["cattorch logits"])
         return self._expected[key]
@@ -76,7 +75,7 @@ class Generator:
 
     def start(self, fresh, prepare):
         """A new emulator, after ``prepare(emulator)`` and, unless ``fresh``, init and a prefill."""
-        emulator = ScratchEmulator(self.sprite)
+        emulator = SpriteEmulator(self.sprite)
         prepared = prepare(emulator)
         if not fresh:
             for call in (INIT, ("cattorch prefill", SETUP)):

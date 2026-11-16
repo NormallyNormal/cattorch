@@ -6,10 +6,9 @@ import torch.nn.functional as F
 
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
 from cattorch.quantization import _symmetric_matrix, effective_group_size, quantize_model
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.interface import TOKEN_IDS
 from cattorch.verify import round_as_stored
-from sprite_helpers import load_sprite
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 def test_quantization_config_validation_and_row_aligned_groups():
@@ -205,7 +204,7 @@ def test_transpile_gptq_reconstructs_expected_weights_in_scratch(tmp_path, bits)
         calibration=calibration,
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
 
@@ -251,7 +250,7 @@ def test_row_aligned_quantization_preserves_large_grouped_linear(tmp_path):
         quantization=config,
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     assert "_cattorch interleave grouped weights for epoch %s" in emulator._procedures
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
@@ -377,7 +376,7 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
     names = [tensor.name for tensor in result.quantization.tensors]
     assert len(names) == len(set(names)), names
 
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     expected = expected_model(example).flatten()
@@ -414,7 +413,7 @@ def test_same_shaped_matmul_weights_are_each_sharded_at_their_own_storage_cap(tm
 
     expected_model = copy.deepcopy(model)
     quantize_model(expected_model, config, None, orientation_inputs=[(example,)])
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -521,7 +520,7 @@ def test_addmm_weights_are_stored_as_integers_grouped_over_their_inputs(
         expected_method, expected_method,
     ]
 
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -572,7 +571,7 @@ def test_gpt2_conv1d_weights_are_stored_as_integers_in_generation(
         assert item.fallback_reason is None, item
 
     tokens = [3, 1, 95]
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.run_procedure("cattorch init")
     emulator.lists[TOKEN_IDS] = tokens
     emulator.run_procedure("cattorch prefill")
@@ -717,7 +716,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
         item.method for item in report.tensors
     ]
 
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -829,7 +828,7 @@ def test_weights_computed_from_parameters_are_quantized_as_computed(tmp_path, mo
             if key in original:
                 assert torch.equal(reference.state_dict()[key], original[key]), (case, key)
         round_as_stored(reference, StorageConfig(), quantization=config)
-        emulator = ScratchEmulator(load_sprite(result.path))
+        emulator = SpriteEmulator(load_sprite(result.path))
         emulator.lists["input"] = example.flatten().tolist()
         emulator.run_procedure("cattorch forward")
         torch.testing.assert_close(
@@ -923,7 +922,7 @@ def test_gptq_calibrates_grouped_and_transposed_convolutions(tmp_path, monkeypat
     assert {precision for shape, precision in precisions if shape in kernels} == {"int4"}
     assert not [warning for warning in result.warnings if "GPTQ fallback" in warning]
 
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -963,7 +962,7 @@ def test_weights_copied_into_another_layout_are_stored_as_integers(tmp_path, mon
     assert sorted(set(precisions)) == [((16, 24), "int4"), ((24, 32), "int4")]
     assert not [warning for warning in result.warnings if "quantized weight" in warning]
 
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -1126,7 +1125,7 @@ def test_quantization_errors_name_the_calibration_item_and_the_parameter():
 
 
 def _forward(result, example):
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.lists["input"] = example.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     return torch.tensor([float(value) for value in emulator.lists["output"]])
@@ -1424,7 +1423,7 @@ def test_generation_output_head_is_int8_by_default_at_4_bits(tmp_path, monkeypat
     explicit = QuantizationConfig(
         bits=4, min_quantized_values=512, overrides={head.rsplit(".", 1)[0]: 8},
     )
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.run_procedure("cattorch init")
     emulator.lists[TOKEN_IDS] = tokens
     emulator.run_procedure("cattorch prefill")

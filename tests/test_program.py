@@ -37,9 +37,10 @@ def test_program_exports_multiple_named_outputs(tmp_path):
         codegen=CodegenConfig(compact_internal_names=True),
     )
     assert isinstance(result, ProgramResult)
-    assert result.entrypoints[0].procedure == "cattorch run"
+    assert result.entrypoints[0].broadcast == "program run"
+    assert result.entrypoints[0].completion_broadcast == "program run complete"
     assert tuple(value.list_name for value in result.entrypoints[0].outputs) == (
-        "cattorch run plus one", "cattorch run doubled",
+        "program run plus one", "program run doubled",
     )
     emulator = load_emulator(result)
     emulator.lists["cattorch run value"] = [3.0, 4.0]
@@ -211,8 +212,8 @@ def test_program_merges_multiple_entrypoints_and_shared_state(tmp_path):
     emulator.lists["cattorch multiply value"] = [3.0]
     emulator.run_procedure("cattorch multiply")
     assert emulator.lists["cattorch multiply result"] == [6.0]
-    assert {value.procedure for value in result.entrypoints} == {
-        "cattorch add", "cattorch multiply",
+    assert {value.broadcast for value in result.entrypoints} == {
+        "multiple add", "multiple multiply",
     }
 
 
@@ -239,7 +240,7 @@ def test_append_state_capacity_failure_does_not_partially_commit(tmp_path):
     emulator.lists["cattorch write value"] = [5.0, 6.0]
     emulator.run_procedure("cattorch write")
     assert emulator.lists["cattorch state rows"] == [1.0, 2.0, 3.0, 4.0]
-    assert emulator.variables["cattorch status"] == interface.state_full("cattorch state rows")
+    assert emulator.variables["cattorch status"] == interface.state_full("append state rows")
 
 
 def test_append_state_is_a_bounded_runtime_extent_through_linear(tmp_path):
@@ -504,12 +505,14 @@ def test_constant_initial_state_is_refilled_without_a_stored_copy(tmp_path):
     program = _accumulator_program(initial)
     result = transpile(_Accumulator().eval(), program, tmp_path / "zeros")
     stored = _stored_lists(result)
-    # The public list holds its value from the start, for sprites that read
-    # it before any call; reset refills it with a loop, not from a copy.
-    assert stored["cattorch state total"] == [0.0, 0.0, 0.0]
+    # The public list is global, so not in the sprite: Scratch creates it
+    # empty when the sprite is uploaded, and the first call or init fills
+    # it, as reset refills it, with a loop, not from a copy.
+    assert "cattorch state total" not in stored
     assert not any(name.startswith("_cattorch initial state") for name in stored)
 
     emulator = load_emulator(result)
+    assert emulator.lists["cattorch state total"] == []
     emulator.run_procedure("cattorch init")
     assert _floats(emulator.lists["cattorch state total"]) == [0.0, 0.0, 0.0]
     emulator.lists["cattorch step delta"] = [1.0, 2.0, 3.0]
@@ -541,9 +544,10 @@ def test_non_constant_initial_state_is_still_stored(tmp_path):
     initial = torch.tensor([1.0, 2.0, 3.0])
     result = transpile(_Accumulator().eval(), _accumulator_program(initial), tmp_path / "stored")
     stored = _stored_lists(result)
-    assert stored["cattorch state total"] == [1.0, 2.0, 3.0]
+    assert "cattorch state total" not in stored
     assert stored["_cattorch initial state total"] == [1.0, 2.0, 3.0]
     emulator = load_emulator(result)
+    # The first call fills the global from the stored initial value.
     emulator.lists["cattorch step delta"] = [1.0, 1.0, 1.0]
     emulator.run_procedure("cattorch step")
     assert emulator.lists["cattorch state total"] == [2.0, 3.0, 4.0]
@@ -559,8 +563,9 @@ def test_constant_non_zero_initial_state(tmp_path, initial):
     program = _accumulator_program(initial)
     result = transpile(_Accumulator().eval(), program, tmp_path / "fill")
     expected = _floats(initial.flatten().tolist())
-    assert _floats(_stored_lists(result)["cattorch state total"]) == expected
     emulator = load_emulator(result)
+    emulator.run_procedure("cattorch init")
+    assert _floats(emulator.lists["cattorch state total"]) == expected
     emulator.lists["cattorch state total"] = []
     emulator.run_procedure("cattorch reset")
     assert _floats(emulator.lists["cattorch state total"]) == expected
@@ -584,10 +589,10 @@ def test_sharded_constant_initial_state(tmp_path, small_list_limit):
     size = 2 * limit + limit // 2
     program = _accumulator_program(torch.zeros(size))
     result = transpile(_Accumulator().eval(), program, tmp_path / "sharded")
-    assert "cattorch state total" in result.sharded_lists
+    assert "sharded state total" in result.sharded_lists
     stored = _stored_lists(result)
     shards = ("cattorch state total", "cattorch state total shard 2", "cattorch state total shard 3")
-    assert [len(stored[name]) for name in shards] == [limit, limit, limit // 2]
+    assert not set(shards) & set(stored)
     assert not any(name.startswith("_cattorch initial state") for name in stored)
 
     emulator = load_emulator(result)
@@ -662,7 +667,7 @@ def test_sharded_input_read_by_a_sharded_weight(tmp_path, small_list_limit):
         returns=(Output("result"),),
     ),))
     result = transpile(model, program, tmp_path / "wide")
-    assert "cattorch step value" in result.sharded_lists
+    assert "wide step value" in result.sharded_lists
     calls = tuple(ProgramCall("step", (torch.randn(1, 600),)) for _ in range(2))
     assert verify(model, program, result, calls=calls).passed
 
@@ -687,18 +692,18 @@ def test_private_states_and_renamed_interface(tmp_path, compact):
             "cattorch step delta": TOKEN_IDS,
             "cattorch step value": "cattorch logits",
             "cattorch step": "cattorch run step",
-            "cattorch step complete": "cattorch step done",
         },
     )
     assert result.states == ()
     (entry,) = result.entrypoints
-    assert entry.procedure == "cattorch run step"
-    assert entry.completion_broadcast == "cattorch step done"
-    assert [value.list_name for value in entry.inputs] == [TOKEN_IDS]
-    assert [value.list_name for value in entry.outputs] == ["cattorch logits"]
+    # A block's completion broadcast follows its name.
+    assert entry.broadcast == "private run step"
+    assert entry.completion_broadcast == "private run step complete"
+    assert [value.list_name for value in entry.inputs] == ["private token ids"]
+    assert [value.list_name for value in entry.outputs] == ["private logits"]
     assert entry.state_inputs == entry.state_updates == ()
-    assert result.procedures == (
-        "cattorch init", "cattorch reset", "cattorch prepare for save", "cattorch run step",
+    assert result.broadcasts == (
+        "private run step", "private init", "private reset", "private prepare for save",
     )
     stored = _stored_lists(result)
     assert not any("state" in name for name in stored if not name.startswith("_"))
@@ -707,7 +712,10 @@ def test_private_states_and_renamed_interface(tmp_path, compact):
         assert stored["_cattorch state total"] == []
         assert stored["_cattorch state offset"] == [1.0, 2.0]
     sprite = load_sprite(result.path)
-    assert "cattorch step done" in sprite["broadcasts"].values()
+    assert any(
+        block.get("fields", {}).get("BROADCAST_OPTION", [None])[0] == "private run step"
+        for block in sprite["blocks"].values()
+    )
 
     emulator = load_emulator(result)
     emulator.lists[TOKEN_IDS] = [1.0, 2.0]
@@ -775,7 +783,7 @@ def test_edit_program_callback_adds_a_procedure(tmp_path, compact, small_list_li
     (assembly,) = seen
     assert assembly.states == {"total": "_cattorch state total"}
     assert assembly.names["cattorch reset"] == "cattorch reset"
-    assert "cattorch history" in result.sharded_lists
+    assert "edit history" in result.sharded_lists
     emulator = load_emulator(result)
     emulator.lists["cattorch step delta"] = [1.5]
     emulator.run_procedure("cattorch twice")

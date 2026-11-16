@@ -39,7 +39,7 @@ def _drive(model, result, calls, seed=0, steps=40):
         entry = entries[name]
         for spec, value in zip(entry.inputs, inputs):
             emulator.lists[spec.list_name] = value.flatten().tolist()
-        emulator.run_procedure(entry.procedure)
+        emulator.run_procedure(entry.broadcast)
         status = emulator.variables["cattorch status"]
         before = copy.deepcopy(eager)
         with torch.no_grad():
@@ -233,7 +233,7 @@ def test_entry_points_take_only_the_states_they_use(tmp_path):
     assert emulator.variables["cattorch status"] == "ok"
     emulator.lists["cattorch remember x"] = [1.0, 2.0]
     emulator.run_procedure("cattorch remember")
-    assert emulator.variables["cattorch status"] == "wrong number of items: cattorch state seen"
+    assert emulator.variables["cattorch status"] == "wrong number of items: unrelated state seen"
 
 
 class BranchOnShape(nn.Module):
