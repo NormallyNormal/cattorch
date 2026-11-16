@@ -349,3 +349,47 @@ def test_override_naming_a_folded_batch_norm_names_its_layer(tmp_path, key):
             quantization=QuantizationConfig(bits=4, min_quantized_values=1024, overrides={key: 8}),
         )
 
+
+
+class _BigramLM(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = torch.nn.Embedding(64, 32)
+        self.fc = torch.nn.Linear(32, 64)
+
+    def forward(self, tokens):
+        return self.fc(self.wte(tokens))
+
+
+_GPTQ = QuantizationConfig(bits=4, method="gptq", min_quantized_values=1024)
+
+
+@pytest.mark.parametrize(("bad", "message"), [
+    (torch.randint(0, 64, (1, 9)), r"calibration\[1\] has shape \(1, 9\).*1 to 8 tokens"),
+    (torch.randint(0, 64, (8,)), r"calibration\[1\] has shape \(8,\)"),
+    (torch.full((1, 4), 64), r"calibration\[1\] has token 64"),
+])
+def test_generation_calibration_items_are_checked_up_front(tmp_path, bad, message):
+    from cattorch import GenerationProgram
+
+    good = torch.randint(0, 64, (1, 8))
+    with pytest.raises(ValueError, match=message):
+        transpile(
+            _BigramLM().eval(), GenerationProgram(max_context=8), tmp_path / "lm",
+            quantization=_GPTQ, calibration=[good, bad, good],
+        )
+
+
+@pytest.mark.parametrize(("bad", "message"), [
+    (torch.full((1, 8), 64), r"failed on calibration\[1\] \(inputs \(1, 8\) int64\)"),
+    (torch.randint(0, 64, (8,)), r"calibration\[1\] \(inputs \(8,\) int64\).*1 dimensions, not 2"),
+    (torch.randn(1, 8), r"calibration\[1\] .*input 0 is floating-point, not integer"),
+    ((torch.randint(0, 64, (1, 8)),) * 2, r"calibration\[1\] .*2 tensors, not 1"),
+])
+def test_tensor_calibration_items_name_the_item(tmp_path, bad, message):
+    good = torch.randint(0, 64, (1, 8))
+    with pytest.raises(ValueError, match=message):
+        transpile(
+            _BigramLM().eval(), good, tmp_path / "lm",
+            quantization=_GPTQ, calibration=[good, bad, good],
+        )

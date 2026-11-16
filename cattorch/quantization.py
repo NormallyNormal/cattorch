@@ -887,6 +887,45 @@ _REARRANGEMENTS = frozenset({
 })
 
 
+def _check_calibration_item(
+    batch: tuple[torch.Tensor, ...], example: tuple[torch.Tensor, ...], index: int, name: str,
+) -> None:
+    """Reject a calibration item the model can't be called with as it is
+    called with ``example``: another number of tensors, another number of
+    dimensions, or values of another kind."""
+
+    def kind(value: torch.Tensor) -> str:
+        return (
+            "floating-point" if value.is_floating_point()
+            else "complex" if value.is_complex()
+            else "boolean" if value.dtype == torch.bool else "integer"
+        )
+
+    def shapes(values) -> str:
+        return ", ".join(
+            f"{tuple(value.shape)} {str(value.dtype).removeprefix('torch.')}" for value in values
+        )
+
+    problem = None
+    if len(batch) != len(example):
+        problem = f"{len(batch)} tensors, not {len(example)}"
+    else:
+        for position, (value, expected) in enumerate(zip(batch, example)):
+            if value.ndim != expected.ndim:
+                problem = (
+                    f"input {position} has {value.ndim} dimensions, not {expected.ndim}"
+                )
+            elif kind(value) != kind(expected):
+                problem = f"input {position} is {kind(value)}, not {kind(expected)}"
+            if problem is not None:
+                break
+    if problem is not None:
+        raise ValueError(
+            f"{name}[{index}] (inputs {shapes(batch)}) doesn't match the example inputs "
+            f"({shapes(example)}): {problem}"
+        )
+
+
 def _normalize_batch(batch) -> tuple[torch.Tensor, ...]:
     if isinstance(batch, torch.Tensor):
         return (batch,)
@@ -2037,11 +2076,16 @@ def quantize_model(
             torch.inference_mode(), _expert_family_context(registry.expert_families),
             capture, computed_capture,
         ):
+            # Each calibration item is checked against the example inputs.
+            examples = list(orientation_inputs or ()) if config.method == "gptq" else []
+            example = _normalize_batch(examples[0]) if len(examples) == 1 else None
             for raw_batch in observed_inputs:
                 batch = _normalize_batch(raw_batch)
+                if example is not None:
+                    _check_calibration_item(batch, example, batches, _calibration_name)
                 try:
                     output = model(*batch, **(call_kwargs or {}))
-                except RuntimeError as error:
+                except (RuntimeError, IndexError, ValueError, TypeError) as error:
                     if config.method != "gptq":
                         raise
                     shapes = ", ".join(

@@ -1627,8 +1627,12 @@ def lookup_vocabulary(
     return 1 if first.rows == 1 else None
 
 
-def check_calibration_tokens(sequences: Iterable, vocabulary: int | None) -> list:
-    """Generation ``calibration=`` as a list, each token checked against ``vocabulary``."""
+def check_calibration_tokens(
+    sequences: Iterable, vocabulary: int | None, max_context: int | None = None,
+) -> list:
+    """Generation ``calibration=`` as a list, each item a ``[1, length]``
+    token tensor (a batch of rows is accepted too) of at most
+    ``max_context`` tokens, and each token checked against ``vocabulary``."""
     checked = list(sequences)
     allowed = (
         f"from 0 to {vocabulary - 1}" if vocabulary is not None else "of 0 or more"
@@ -1637,6 +1641,14 @@ def check_calibration_tokens(sequences: Iterable, vocabulary: int | None) -> lis
         tokens = sequence[0] if isinstance(sequence, tuple) and sequence else sequence
         if not isinstance(tokens, torch.Tensor) or tokens.is_complex():
             continue
+        longest = f" of 1 to {max_context} tokens" if max_context is not None else ""
+        if tokens.ndim != 2 or tokens.shape[1] < 1 or (
+            max_context is not None and tokens.shape[1] > max_context
+        ):
+            raise ValueError(
+                f"calibration[{index}] has shape {tuple(tokens.shape)}; a generation "
+                f"export's calibration= takes [1, length] token tensors{longest}"
+            )
         flat = tokens.detach().flatten().double()
         wrong = (flat != flat.round()) | (flat < 0)
         if vocabulary is not None:

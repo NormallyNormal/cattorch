@@ -2612,7 +2612,9 @@ def _transpile_automatic_generation(
         vocabulary = None
     if quantization is not None:
         if calibration_sequences is not None:
-            calibration_sequences = check_calibration_tokens(calibration_sequences, vocabulary)
+            calibration_sequences = check_calibration_tokens(
+                calibration_sequences, vocabulary, max_context,
+            )
         report = quantize_model(
             prepared,
             quantization,

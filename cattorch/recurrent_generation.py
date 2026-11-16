@@ -164,11 +164,12 @@ def step_program(states: tuple[State, ...], step: str) -> ExportProgram:
 
 def _calibration_calls(
     sequences: Iterable[torch.Tensor | tuple[torch.Tensor, ...]], vocabulary: int,
+    max_context: int | None = None,
 ) -> tuple[tuple[ProgramCall, ...], frozenset[int]]:
     """One step call per token, and the calls that start a sequence."""
     calls: list[ProgramCall] = []
     starts: set[int] = set()
-    for sequence in check_calibration_tokens(sequences, vocabulary):
+    for sequence in check_calibration_tokens(sequences, vocabulary, max_context):
         if isinstance(sequence, tuple) and len(sequence) == 1:
             sequence = sequence[0]
         if not isinstance(sequence, torch.Tensor) or sequence.ndim != 2 or sequence.shape[0] != 1:
@@ -349,7 +350,7 @@ def transpile_recurrent_generation(
         _check_reference(model, program, vocabulary, hint)
 
     calls, resets = (
-        _calibration_calls(calibration_sequences, vocabulary)
+        _calibration_calls(calibration_sequences, vocabulary, program.max_context)
         if calibration_sequences is not None else (None, frozenset())
     )
     export = step_program(program.states, program.step)

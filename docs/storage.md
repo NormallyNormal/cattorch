@@ -303,6 +303,12 @@ for tensor in result.quantization.tensors:
 
 Calibration data is read once, so a generator works. For cached generation,
 calibrate with realistic full sequences of up to `max_context` tokens.
+Each item is checked as it is read: a token sequence must be `[1, length]`
+with `length` up to `max_context` and token IDs the model has, and tensor
+items must have as many tensors as the example inputs, with as many
+dimensions and the same kind of values. An item that fails a check, or
+that the model fails on, raises a `ValueError` naming it, such as
+`calibration[3]`.
 
 A matrix that saw too little calibration data, such as an expert the router
 never picked, falls back to symmetric quantization, and so does one with
