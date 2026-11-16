@@ -211,15 +211,15 @@ def _share_repeated_transformer_layers(
     covered = {
         record.key.name: record.covered for record in compiler.graph.fusion_records
     }
-    emitted = []
-    for name, root in compiler.emitted_roots[:compiler.node_roots]:
+    emitted: list[tuple[str, str, int | None]] = []
+    for name, root_id in compiler.emitted_roots[:compiler.node_roots]:
         if name not in nodes:
             continue
-        found = {
+        owners = {
             _graph_layer(node) for node in covered.get(name, (nodes[name],))
             if node.op == "call_function"
         }
-        if len(found) > 1:
+        if len(owners) > 1:
             order = {node.name: index for index, node in enumerate(compiler.graph.nodes)}
             spans = [
                 order[node.name] for node in compiler.graph.nodes
@@ -231,12 +231,12 @@ def _share_repeated_transformer_layers(
             ):
                 return reject("code from outside the `blocks.N` layers runs between them")
             return reject(
-                f"an operation of layer `blocks.{max(item for item in found if item is not None)}` "
+                f"an operation of layer `blocks.{max(item for item in owners if item is not None)}` "
                 + ("is compiled together with code from outside the layers"
-                   if None in found else "is compiled together with another layer's")
+                   if None in owners else "is compiled together with another layer's")
                 + ", so the layers' code can't be separated"
             )
-        emitted.append((name, root, found.pop() if found else None))
+        emitted.append((name, root_id, owners.pop() if owners else None))
     # Every layer, including one whose operations all run in another's code.
     layers = sorted({
         layer for layer in (
@@ -270,7 +270,7 @@ def _share_repeated_transformer_layers(
     stretch = sequence[first:last + 1]
     if None in stretch:
         return reject("code from outside the `blocks.N` layers runs between them")
-    if stretch != sorted(stretch):
+    if stretch != sorted(layer for layer in stretch if layer is not None):
         return reject("the layers' code doesn't run one layer after another")
     if (
         compiler.graph.generation.first_cache is not None
@@ -499,14 +499,14 @@ def _share_repeated_transformer_layers(
     list_ids = {entry[0]: identifier for identifier, entry in sprite["lists"].items()}
     role_names = []
     for owned in owned_groups:
-        found = []
+        read: list[str] = []
         for identifier, block in blocks.items():
             if identifier not in owned:
                 continue
             field = block.get("fields", {}).get("LIST")
-            if field and field[0] in static_names and field[0] not in found:
-                found.append(field[0])
-        role_names.append(found)
+            if field and field[0] in static_names and field[0] not in read:
+                read.append(field[0])
+        role_names.append(read)
     if not role_names[0]:
         return reject("its layers have no weights")
     if any(len(names) != len(role_names[0]) for names in role_names):
@@ -579,12 +579,12 @@ def _share_repeated_transformer_layers(
 
     for _, names, _ in bank_roles:
         formats = [stored_as(name) for name in names]
-        for index, found in enumerate(formats):
-            if found != formats[0]:
+        for index, stored in enumerate(formats):
+            if stored != formats[0]:
                 return reject(
                     f"{_weight_label(nodes, names[index], layers[index])} is stored "
                     f"differently from {_weight_label(nodes, names[0], layers[0])} "
-                    f"({_format_label(found)} instead of {_format_label(formats[0])}), "
+                    f"({_format_label(stored)} instead of {_format_label(formats[0])}), "
                     "for example because it is quantized differently, and one bank "
                     "of layer weights is stored in one format"
                 )
