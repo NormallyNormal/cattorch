@@ -1295,6 +1295,53 @@ def _unwrapped(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _resolve_override_keys(
+    config: QuantizationConfig,
+    all_names: dict[int, list[str]],
+    replaced: dict[str, tuple[str, str | None]],
+) -> tuple[QuantizationConfig, dict[str, str]]:
+    """``config`` with override keys that name the caller's own parameters
+    resolved against the transformed model export quantizes, and the
+    caller's key of each resolved one.
+
+    ``replaced`` maps each module a transform replaced to how: fast mode's
+    low-rank factorization (``("factorized", None)``), whose factors keep
+    the module's path and take its overrides, or BatchNorm folding
+    (``("folded", layer)``), which merges the BatchNorm into its layer.
+    """
+    names = {name for found in all_names.values() for name in found}
+    overrides = dict(cast(dict, config.overrides))
+    user_keys: dict[str, str] = {}
+    for key, override in cast(dict, config.overrides).items():
+        if any(name == key or name.startswith(f"{key}.") for name in names):
+            continue
+        for path, (how, layer) in replaced.items():
+            if key != path and not key.startswith(f"{path}."):
+                continue
+            if how == "folded":
+                raise ValueError(
+                    f"quantization override key {key!r} names a BatchNorm that export "
+                    f"folds into the layer before it, {layer!r}; override {layer!r} instead"
+                )
+            # A factorized parameter's factors: the parameters under the
+            # module with its last name, as `a.weight` selects `a.0.weight`
+            # and `a.1.weight`.
+            attribute = key[len(path) + 1:].rsplit(".", 1)[-1]
+            factors = sorted(
+                name for name in names
+                if name.startswith(f"{path}.") and name.rsplit(".", 1)[-1] == attribute
+            )
+            if factors:
+                del overrides[key]
+                for name in factors:
+                    overrides.setdefault(name, override)
+                    user_keys[name] = key
+            break
+    if not user_keys:
+        return config, {}
+    return replace(config, overrides=overrides), user_keys
+
+
 def _check_override_keys(
     config: QuantizationConfig, all_names: dict[int, list[str]], aliases: Iterable[str] = (),
 ) -> None:
@@ -1924,6 +1971,9 @@ def quantize_model(
         names = all_names.setdefault(pointer, [name])
         parameters_by_storage.setdefault(pointer, names[0])
         base_parameters.setdefault(pointer, (names[0], parameter))
+    config, user_keys = _resolve_override_keys(
+        config, all_names, getattr(names_module, "_cattorch_replaced_modules", {}),
+    )
     _check_override_keys(config, all_names, _parameter_aliases(names_module))
 
     registry = _registry or default_registry()
@@ -2302,6 +2352,13 @@ def quantize_model(
             item = (f"int{settings.bits}", settings.group_size)
             if item not in formats:
                 formats.append(item)
+    if user_keys:
+        # Entries name the override as the caller wrote it.
+        reports = [
+            replace(item, override=user_keys.get(item.override, item.override))
+            if item.override is not None else item
+            for item in reports
+        ]
     gptq_values = sum(item.values for item in reports if item.method == "gptq")
     symmetric_values = sum(item.values for item in reports if item.method == "symmetric")
     return QuantizationReport(

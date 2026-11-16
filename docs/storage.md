@@ -191,7 +191,13 @@ QuantizationConfig(
 ```
 
 A key selects the parameters under it, and the longest matching key wins.
-A key that selects no parameter is an error. A weight read under several
+A key that selects no parameter is an error. Keys name your model's
+parameters, as you passed it: a layer fast mode factorizes into low-rank
+factors (`a` into `a.0` and `a.1`) gives its overrides to the factors, so
+`"a.weight"` selects both, and the report names the key as you wrote it.
+A BatchNorm folded into the convolution or linear layer before it has no
+weights of its own any more; a key naming it is an error that names that
+layer. A weight read under several
 names, such as GPT-2's token embedding `transformer.wte.weight` and its tied
 output head `lm_head.weight`, takes the highest precision its names select
 (float16 above 8 bits above 6 and 4), so `{"lm_head": 8}` keeps the shared

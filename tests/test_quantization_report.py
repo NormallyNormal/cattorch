@@ -298,3 +298,54 @@ def test_dynamic_length_check_accepts_a_float16_copy(tmp_path):
         model, torch.randn(1, 32), tmp_path / "dynamic", dynamic={0: (1, 8)},
         quantization=QuantizationConfig(bits=4, min_quantized_values=1024),
     )
+
+
+class _FactorizedPair(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(64, 256)
+        self.b = torch.nn.Linear(256, 64)
+
+    def forward(self, value):
+        return self.b(torch.relu(self.a(value)))
+
+
+def test_override_names_a_parameter_fast_mode_factorizes(tmp_path):
+    from cattorch import FastConfig, FastLayerConfig
+
+    torch.manual_seed(0)
+    result, _ = _transpile(
+        _FactorizedPair().eval(), torch.randn(1, 64), tmp_path / "fast",
+        optimization="fast",
+        fast_config=FastConfig(
+            activations=False, layer_norm=False, softmax=False,
+            layers=FastLayerConfig(rank=16),
+        ),
+        quantization=QuantizationConfig(
+            bits=4, min_quantized_values=1024, overrides={"a.weight": 8},
+        ),
+    )
+    found = {item.name: (item.bits, item.override) for item in result.quantization.tensors}
+    # The factors of a.weight take its override, under the key as written.
+    assert found["a.0.weight"] == found["a.1.weight"] == (8, "a.weight")
+    assert found["b.0.weight"] == (4, None)
+
+
+class _ConvBatchNorm(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c = torch.nn.Conv2d(32, 32, 3)
+        self.bn = torch.nn.BatchNorm2d(32)
+
+    def forward(self, value):
+        return self.bn(self.c(value))
+
+
+@pytest.mark.parametrize("key", ["bn", "bn.weight"])
+def test_override_naming_a_folded_batch_norm_names_its_layer(tmp_path, key):
+    with pytest.raises(ValueError, match="folds into the layer before it, 'c'; override 'c'"):
+        transpile(
+            _ConvBatchNorm().eval(), torch.randn(1, 32, 6, 6), tmp_path / "bn",
+            quantization=QuantizationConfig(bits=4, min_quantized_values=1024, overrides={key: 8}),
+        )
+

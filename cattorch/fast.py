@@ -496,6 +496,9 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     if unknown:
         raise ValueError(f"unknown or ineligible fast module override(s): {', '.join(unknown)}")
 
+    # Modules replaced by their low-rank factors, which keep their paths;
+    # quantization overrides name the model's own parameters through them.
+    factorized: list[str] = []
     for name, module in eligible:
         policy = config.policy_for(name)
         if not policy.enabled:
@@ -518,6 +521,7 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
                 parent_name, _, child_name = name.rpartition(".")
                 parent = transformed.get_submodule(parent_name) if parent_name else transformed
                 setattr(parent, child_name, replacement)
+                factorized.append(name)
                 log.info("Fast factorized %s at rank %d", name, rank)
         target = replacement if replacement is not None else module
         _apply_pruning(target, policy.block_pruning)
@@ -525,4 +529,9 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
             log.info(
                 "Fast pruned %.1f%% of Scratch blocks in %s", policy.block_pruning * 100, name,
             )
+    if factorized:
+        transformed._cattorch_replaced_modules = {
+            **getattr(transformed, "_cattorch_replaced_modules", {}),
+            **{name: ("factorized", None) for name in factorized},
+        }
     return transformed

@@ -118,6 +118,12 @@ def fold_eval_batch_norms(
             )
         _set_submodule(transformed, layer_path, folded)
         _set_submodule(transformed, batch_norm_path, torch.nn.Identity())
+    # Quantization overrides name the model's own parameters; a folded
+    # BatchNorm's are part of its layer's now.
+    transformed._cattorch_replaced_modules = {
+        **getattr(transformed, "_cattorch_replaced_modules", {}),
+        **{batch_norm_path: ("folded", layer_path) for layer_path, batch_norm_path in pairs},
+    }
     return transformed
 
 
