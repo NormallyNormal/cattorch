@@ -2,6 +2,8 @@
 
 import warnings
 
+import pytest
+
 import torch
 import torch.nn.functional as F
 
@@ -118,3 +120,46 @@ def test_short_last_row_shard_is_reported_as_stored(tmp_path, small_list_limit):
         model, torch.randn(1, 64), result,
         quantization=QuantizationConfig(bits=8, min_quantized_values=1024),
     ).passed
+
+
+class _PositionTable(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wpe = torch.nn.Embedding(512, 64)
+        self.head = torch.nn.Linear(64, 4)
+
+    def forward(self, value):
+        return self.head(value + self.wpe(torch.arange(value.shape[1])))
+
+
+def test_position_table_read_at_constant_positions_is_reported(tmp_path):
+    torch.manual_seed(0)
+    result, _ = _transpile(
+        _PositionTable().eval(), torch.randn(1, 8, 64), tmp_path / "positions",
+        quantization=QuantizationConfig(bits=8),
+    )
+    (entry,) = [item for item in result.quantization.tensors if item.name == "wpe.weight"]
+    # The eight rows read are stored, as they are.
+    assert (entry.method, entry.values) == ("float16", 8 * 64)
+    assert "positions fixed at export" in entry.fallback_reason
+
+
+def test_generation_position_table_is_reported_once(tmp_path):
+    transformers = pytest.importorskip("transformers")
+    from cattorch import GenerationProgram
+
+    torch.manual_seed(0)
+    model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
+        vocab_size=64, n_positions=512, n_embd=32, n_layer=1, n_head=2,
+        bos_token_id=0, eos_token_id=0,
+    )).eval()
+    for minimum in (1, 16384):
+        result, _ = _transpile(
+            model, GenerationProgram(max_context=8), tmp_path / f"gpt2_{minimum}",
+            quantization=QuantizationConfig(bits=8, min_quantized_values=minimum),
+        )
+        entries = [
+            item for item in result.quantization.tensors
+            if item.name == "transformer.wpe.weight"
+        ]
+        assert [(item.method, item.values) for item in entries] == [("float16", 8 * 32)]

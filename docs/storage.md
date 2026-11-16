@@ -138,7 +138,10 @@ several lists is stored at one precision, however short its last list. The
 entry points of an `ExportProgram` each store the lists they read, and the
 report describes them together: a weight one entry point reads as a linear
 weight and another on the right of a matrix product has an integer entry
-and a `name[float16]` entry, whichever entry point comes first.
+and a `name[float16]` entry, whichever entry point comes first. A matrix
+read only at positions fixed before any input arrives, such as a learned
+position table read with `torch.arange` (GPT-2's `wpe`), is stored as the
+rows read, in float16, and reported with the number of values stored.
 
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set

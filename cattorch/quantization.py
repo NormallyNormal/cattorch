@@ -315,6 +315,9 @@ class QuantizationReport:
     )
     # Weights computed from parameters, by storage, which regions may sit in.
     _computed: dict = field(default_factory=dict, repr=False, compare=False)
+    # Matrices quantization left as they are because export computes with
+    # them before any input arrives, by storage, with their names.
+    _unquantized: dict = field(default_factory=dict, repr=False, compare=False)
     # Every (precision, maximum group size) the quantized weights use.
     _integer_formats: tuple = field(default=(), repr=False, compare=False)
 
@@ -353,6 +356,8 @@ class _StorageFindings:
     )
     derived: dict[str, TensorQuantizationReport] = field(default_factory=dict)
     derived_warnings: dict[str, str] = field(default_factory=dict)
+    # Values of unquantized matrices stored as they are, by name.
+    unquantized: dict[str, int] = field(default_factory=dict)
 
     def merged(self, other: _StorageFindings) -> _StorageFindings:
         def union(first, second):
@@ -368,6 +373,10 @@ class _StorageFindings:
             contributions=[*self.contributions, *other.contributions],
             derived={**other.derived, **self.derived},
             derived_warnings={**other.derived_warnings, **self.derived_warnings},
+            unquantized={
+                name: max(self.unquantized.get(name, 0), other.unquantized.get(name, 0))
+                for name in {**self.unquantized, **other.unquantized}
+            },
         )
 
 
@@ -493,6 +502,13 @@ def _stored_quantization_report(
             ),
         ))
     if accumulated is not None:
+        tensors.extend(
+            TensorQuantizationReport(
+                name=name, method="float16", bits=None, values=values, calibration_rows=0,
+                effective_group_size=None, fallback_reason=_READ_AT_CONSTANT_POSITIONS,
+            )
+            for name, values in accumulated.unquantized.items()
+        )
         tensors.extend(accumulated.derived.values())
         warnings_found.extend(accumulated.derived_warnings.values())
     gptq_values = sum(item.values for item in tensors if item.method == "gptq")
@@ -1923,6 +1939,7 @@ def quantize_model(
             ))
 
         quantized_storage: set[int] = set()
+        unquantized: dict[int, str] = {}
         for pointer, uses in uses_by_storage.items():
             taken = torch.zeros_like(uses[0].mask)
             settings = settings_by_storage[pointer]
@@ -1984,6 +2001,13 @@ def quantize_model(
                     and pointer not in capture.direct_reads
                 )
             ):
+                if _is_weight_matrix(parameter, effective_ndim(parameter)):
+                    # Export computes with it before any input arrives. If
+                    # storage holds some of its values as they are, such as
+                    # the rows of a position table read at constant
+                    # positions, the report says so (see
+                    # ``_storage_quantization_report``).
+                    unquantized[pointer] = name
                 continue
             if pointer in quantized_storage and pointer not in uses_by_storage:
                 continue
@@ -2091,6 +2115,7 @@ def quantize_model(
         symmetric_values=symmetric_values,
         tensors=tuple(reports),
         _regions=tuple(regions),
+        _unquantized=unquantized,
         _computed={pointer: weight.tensor for pointer, (weight, _, _) in computed.items()},
         _integer_formats=tuple(formats),
     )
@@ -2164,6 +2189,7 @@ _GRAPH_REARRANGEMENTS = _REARRANGEMENTS | frozenset({
     "aten.movedim.int", "aten.swapaxes.default", "aten.numpy_T.default",
     "aten.as_strided.default", "aten.tensor_split.indices",
     "aten.tensor_split.sections", "<built-in function getitem>",
+    "aten.embedding.default",
 })
 # Conversions keep a rearranged value's identity; positions don't convert.
 _CONVERSION_KEYWORDS = frozenset({"dtype", "layout", "device", "pin_memory", "memory_format"})
@@ -2179,20 +2205,30 @@ class _GraphProvenance:
     are replayed on the numbers.
     """
 
-    def __init__(self, graph, parameters: dict[int, torch.Tensor], resolve):
+    def __init__(self, graph, parameters: dict[int, torch.Tensor], resolve, aliases=None):
         self.nodes = {node.name: node for node in graph.nodes}
         self.resolve = resolve
         self.parameters = parameters
         self.indices = {pointer: index for index, pointer in enumerate(parameters)}
         self.pointers = list(parameters)
         self.traced: dict[str, object] = {}
+        # Tensors of their own that hold parameter elements, by storage:
+        # (the parameter's storage, its element at each of theirs).
+        self.aliases: dict[int, tuple[int, torch.Tensor]] = {
+            pointer: found for pointer, found in (aliases or {}).items()
+            if found[0] in self.indices
+        }
 
     def parameter_of(self, value: torch.Tensor) -> int | None:
         pointer = value.untyped_storage().data_ptr()
-        return pointer if pointer in self.parameters else None
+        return pointer if pointer in self.parameters or pointer in self.aliases else None
 
     def _positions(self, value: torch.Tensor, pointer: int) -> torch.Tensor:
-        base = torch.arange(_storage_numel(value), dtype=torch.long)
+        alias = self.aliases.get(pointer)
+        if alias is not None and pointer not in self.parameters:
+            pointer, base = alias[0], alias[1].reshape(-1).clone()
+        else:
+            base = torch.arange(_storage_numel(value), dtype=torch.long)
         base += self.indices[pointer] << _POSITION_BITS
         return base.as_strided(value.shape, value.stride(), value.storage_offset())
 
@@ -2226,6 +2262,13 @@ class _GraphProvenance:
                 traced[item.name] = found
                 if found is None:
                     value = self.resolve(item.name)
+                    if (
+                        isinstance(value, torch.Tensor) and not value.is_floating_point()
+                        and not value.is_complex() and value.dtype != torch.bool
+                    ):
+                        # Positions known at export, such as a position
+                        # table's indices, select elements as they are.
+                        return value
                     shape = (
                         value.shape if isinstance(value, torch.Tensor)
                         else getattr(item.meta.get("val"), "shape", None)
@@ -2311,6 +2354,12 @@ class _GraphProvenance:
         return masks, frozenset(derived)
 
 
+# Why a matrix export reads only at positions fixed before any input arrives
+# is stored in float16.
+_READ_AT_CONSTANT_POSITIONS = (
+    "read only at positions fixed at export, as a position table read with "
+    "torch.arange is: export stores the values read as they are, in float16"
+)
 # Why a weight computed from parameters stays float16 when quantization
 # couldn't quantize it as computed.
 _UNFOLLOWED_COMPUTATION = (
@@ -2318,6 +2367,61 @@ _UNFOLLOWED_COMPUTATION = (
     "quantized values instead: outside the forward of any of the model's modules "
     "(as in an entry point method), or within an operation that also reads an input"
 )
+
+
+def _storage_sources(model: torch.nn.Module) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    """Tensors a module made from parameter elements before export, such as
+    a generation step's position tables, by storage: the parameter and the
+    element of its storage at each of their storage elements.
+
+    A module lists them in ``_cattorch_storage_sources``, mapping a tensor
+    attribute's name to ``(parameter, element positions)``.
+    """
+    found: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for module in model.modules():
+        for name, (parameter, positions) in getattr(
+            module, "_cattorch_storage_sources", {},
+        ).items():
+            tensor = getattr(module, name, None)
+            if isinstance(tensor, torch.Tensor) and tensor.numel() == positions.numel():
+                found[tensor.untyped_storage().data_ptr()] = (parameter, positions)
+    return found
+
+
+def _parameter_elements(
+    graph_nodes, values: dict, name: str,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(parameter, the element of its storage at each position)`` of the
+    graph value ``name``, when it only rearranges one parameter's elements.
+
+    ``values`` holds the values of the graph's static nodes, parameters
+    included.
+    """
+    nodes = list(graph_nodes)
+    parameters = {
+        value.untyped_storage().data_ptr(): value for value in values.values()
+        if isinstance(value, torch.Tensor) and value.is_floating_point()
+        and value.untyped_storage().data_ptr() != 0
+    }
+
+    class _Graph:
+        pass
+
+    graph = _Graph()
+    graph.nodes = nodes  # type: ignore[attr-defined]
+    found = _GraphProvenance(graph, parameters, values.get)._trace(name)
+    if found is None or found[0] != "ids" or not isinstance(found[1], torch.Tensor):
+        return None
+    ids = found[1]
+    if bool((ids < 0).any()) or not ids.numel():
+        return None
+    indices = (ids >> _POSITION_BITS).unique().tolist()
+    if len(indices) != 1:
+        return None
+    parameter = list(parameters.values())[indices[0]]
+    if values.get(name) is parameter:
+        return None
+    return parameter, (ids & ((1 << _POSITION_BITS) - 1)).contiguous()
 
 
 def _storage_quantization_report(
@@ -2352,7 +2456,16 @@ def _storage_quantization_report(
     # A computed weight is stored as the tensor quantization made of it.
     for pointer, tensor in report._computed.items():
         parameters.setdefault(pointer, tensor)
-    provenance = _GraphProvenance(recorder.graph, parameters, recorder.resolve)
+    sources_of = _storage_sources(model)
+    for parameter, _ in sources_of.values():
+        parameters.setdefault(parameter.untyped_storage().data_ptr(), parameter)
+    provenance = _GraphProvenance(
+        recorder.graph, parameters, recorder.resolve,
+        {
+            pointer: (parameter.untyped_storage().data_ptr(), positions)
+            for pointer, (parameter, positions) in sources_of.items()
+        },
+    )
     region_pointers = {region.pointer for region in report._regions}
 
     findings = _StorageFindings()
@@ -2365,8 +2478,19 @@ def _storage_quantization_report(
         masks, from_parameters = provenance.elements(sources)
         # Traced values are of this list alone.
         provenance.traced.clear()
-        masks = {pointer: mask for pointer, mask in masks.items() if pointer in region_pointers}
         integer = item.precision in ("int8", "int6", "int4")
+        unquantized = {
+            pointer: int(mask.sum()) for pointer, mask in masks.items()
+            if pointer in report._unquantized
+        }
+        if unquantized and not integer and item.shared_with is None:
+            total = sum(unquantized.values())
+            for pointer, count in unquantized.items():
+                name = report._unquantized[pointer]
+                findings.unquantized[name] = (
+                    findings.unquantized.get(name, 0) + round(item.values * count / total)
+                )
+        masks = {pointer: mask for pointer, mask in masks.items() if pointer in region_pointers}
         target = findings.integer if integer else findings.float16
         for pointer, mask in masks.items():
             previous = target.get(pointer)

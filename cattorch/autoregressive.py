@@ -28,6 +28,7 @@ from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.errors import UnsupportedModelError
+from cattorch.quantization import _parameter_elements
 from cattorch.frontend import (
     FALLBACK_META, CapturedGraph, capture_model, tensor_output_leaves,
 )
@@ -123,6 +124,11 @@ class SequenceTable:
     consumers: tuple[str, ...]
     kind: str
     module_path: str | None
+    # The parameter whose elements the table holds, with the element at
+    # each of the table's positions, when it holds one parameter's
+    # elements as they are, as a learned position table read with
+    # ``torch.arange`` does. The quantization report names it.
+    sources: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -1274,6 +1280,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
             consumers=tuple(user.name for user in consumers),
             kind=kind,
             module_path=info.module_path,
+            sources=_parameter_elements(nodes, values, node.name),
         ))
     return tables
 
@@ -1381,6 +1388,8 @@ def build_step_module(
             internal.setdefault(name, block.module_path or f"#{block.index}")
     tables = {table.node: table for table in plan.tables}
     table_buffers: list[tuple[torch.Tensor, str]] = []
+    # See ``quantization._storage_sources``.
+    storage_sources: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def table_buffer(table: SequenceTable) -> str:
         for value, name in table_buffers:
@@ -1393,6 +1402,8 @@ def build_step_module(
         name = f"table_{len(table_buffers)}"
         table_buffers.append((table.value, name))
         root.register_buffer(name, table.value.detach().clone())
+        if table.sources is not None and table.sources[1].shape == table.value.shape:
+            storage_sources[name] = table.sources
         return name
 
     diffs: dict[str, list[LiteralDiff]] = {}
@@ -1496,6 +1507,7 @@ def build_step_module(
     # output node; node order is already that.
     graph.lint()
     step = SequenceStepModule(root, graph)
+    step._cattorch_storage_sources = storage_sources
     step.eval()
     return step
 
