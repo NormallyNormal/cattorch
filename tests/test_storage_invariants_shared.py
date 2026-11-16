@@ -188,7 +188,7 @@ def test_a_differently_quantized_layer_keeps_its_storage_unshared(tmp_path, kind
     config = QuantizationConfig(bits=4, min_quantized_values=512, overrides={"blocks.2.down": 8})
     result, check, emitted = _export(kind, model, tmp_path / "sprite", config)
     assert not _shared(result)
-    assert any("is stored differently from" in message for message in emitted), emitted
+    assert any("are stored in different formats" in message for message in emitted), emitted
     entries = _check_invariants(result, check, model, 4)
     assert entries["blocks.2.down.weight"][0].bits == 8
     assert entries["blocks.1.down.weight"][0].bits == 4

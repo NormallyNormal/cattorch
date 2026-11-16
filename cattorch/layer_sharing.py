@@ -588,12 +588,14 @@ def _share_repeated_transformer_layers(
         formats = [stored_as(name) for name in names]
         for index, stored in enumerate(formats):
             if stored != formats[0]:
+                # Either layer's settings may be the odd ones out.
                 return reject(
-                    f"{_weight_label(nodes, names[index], layers[index])} is stored "
-                    f"differently from {_weight_label(nodes, names[0], layers[0])} "
-                    f"({_format_label(stored)} instead of {_format_label(formats[0])}), "
-                    "for example because it is quantized differently, and one bank "
-                    "of layer weights is stored in one format"
+                    f"{_weight_label(nodes, names[0], layers[0])} and "
+                    f"{_weight_label(nodes, names[index], layers[index])} are stored "
+                    f"in different formats ({_format_label(formats[0])} and "
+                    f"{_format_label(stored)}), for example because one of them is "
+                    "quantized differently, and one bank of layer weights is stored "
+                    "in one format"
                 )
 
     # Code outside the layers that reads a banked weight (a tied output head,
