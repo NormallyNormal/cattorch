@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import math
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Iterable, Literal, Mapping, cast
 
 import numpy as np
@@ -120,9 +120,7 @@ class QuantizationConfig:
         ):
             raise ValueError("damp_percent must be a positive finite number")
         if self.method != "gptq":
-            for name, default in (
-                ("damp_percent", 0.01), ("block_size", 128), ("min_calibration_rows", 128),
-            ):
+            for name, default in _gptq_defaults().items():
                 if getattr(self, name) != default:
                     raise ValueError(
                         f"{name} applies to method='gptq'; a {self.method} config doesn't use it"
@@ -238,6 +236,14 @@ class QuantizationConfig:
         )
 
 
+def _gptq_defaults() -> dict[str, Any]:
+    """The defaults of the settings only GPTQ uses."""
+    return {
+        item.name: item.default for item in fields(QuantizationConfig)
+        if item.name in {"damp_percent", "block_size", "min_calibration_rows"}
+    }
+
+
 # The ``TensorQuantizationReport.override`` of an output head whose settings
 # ``QuantizationConfig.head_bits`` chose.
 HEAD_BITS = "head_bits"
@@ -263,10 +269,13 @@ class _WeightSettings:
         if (self.bits, self.method, self.group_size) == (base.bits, base.method, base.group_size):
             return base
         assert self.bits is not None
+        # A weight a GPTQ config quantizes symmetrically doesn't use the
+        # config's GPTQ settings, which a symmetric config refuses.
+        gptq_settings = _gptq_defaults() if self.method != "gptq" else {}
         return replace(
             base, bits=cast(Literal[4, 6, 8], self.bits),
             method=cast(Literal["symmetric", "gptq"], self.method),
-            group_size=self.group_size, overrides={},
+            group_size=self.group_size, overrides={}, **gptq_settings,
         )
 
 
