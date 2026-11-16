@@ -47,7 +47,7 @@ Export a `torch.nn.Module` as a Scratch `.sprite3` file.
 |---|---|
 | `model` | Module to export (anything else raises `TypeError`). Export works on a copy. A model left in training mode with modules that behave differently in it (dropout, batch norm) is exported in evaluation mode, with a warning. |
 | `example_inputs` | What the sprite is called with: a tensor or tuple of tensors for `forward`, an `ExportProgram`, a `GenerationProgram`, or a `RecurrentGenerationProgram`. `None` takes it from the model's [markers](markers.md). Anything else, such as a dict (pass keyword arguments with `example_kwargs`), raises `TypeError`. |
-| `output_path` | Destination file. `.sprite3` is appended unless the path already ends in it (in any case), and missing parent directories are created. A path that names no file (empty, ending in a separator, or an existing directory) raises `ValueError`. The same rule applies to every function that writes a file, with its own suffix. |
+| `output_path` | Destination file. `.sprite3` is appended unless the path already ends in it (in any case), and missing parent directories are created. A path that names no file (empty, ending in a separator, only an extension such as `.sprite3`, or an existing directory) raises `ValueError`. The same rule applies to every function that writes a file, with its own suffix. |
 | `name` | Scratch sprite display name. Defaults to the destination filename stem. |
 | `optimization` | `"exact"` (default) or `"fast"`. See [optimization modes](optimization.md). |
 | `fast_config` | A `FastConfig`; valid only with `optimization="fast"`. |

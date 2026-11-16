@@ -482,6 +482,13 @@ Python:
   units), booleans (`"0"` and `"false"` are false), list positions (`last`,
   `all`, `0x2`), `mod` with infinities, `pick random` bounds, costume
   switching by number, and `for each` counts read before every iteration.
+- The emulator's `round`, `mathop`, repeat counts and costume numbers could
+  differ from Scratch in the last bit, or raise where Scratch gives NaN:
+  `round` of 0.49999999999999994 gave 1, `sin` of 1e308 raised, and `ln`,
+  `log`, `e ^`, `10 ^`, the trigonometric functions and their inverses used
+  Python's C library where Scratch uses V8's own versions of them. It now
+  computes them as V8 does, `-0` included, checked against scratch-vm bit
+  for bit.
 - Mistakes that ended in an internal exception raise one naming the
   problem: a `model` that isn't a module or `example_inputs` that are a dict
   or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a
@@ -508,9 +515,18 @@ Python:
   them raises `ValueError`. A `FastLayerConfig` rank at or above a weight's
   full rank was skipped silently; it warns, as other skipped
   factorizations do.
-- An `output_path` that names no file (empty, ending in a separator, or an
-  existing directory) raises `ValueError` instead of writing a hidden
-  `..sprite3` or a file beside the directory, and so does such a `-o`. The
+- An `output_path` that names no file (empty, ending in a separator, only an
+  extension such as `.sprite3`, or an existing directory) raises
+  `ValueError` instead of writing a hidden `..sprite3` or `.sprite3.sprite3`
+  or a file beside the directory, and so does such a `-o`.
+- `cattorch generate --project` failed with "eos_token_id ... is not a token
+  ID of the model", after writing the sprites, when the tokenizer's end
+  token was past the model's token IDs (such as an added `</s>`) and no
+  `--eos-token-id` was given. The demo then has no end token, and a warning
+  says so. A negative or non-finite `--temperature`, a negative
+  `--eos-token-id`, and `--project` without a tokenizer are rejected before
+  anything is written, and an `--eos-token-id` past the model's IDs before
+  the tokenizer and project are. The
   benchmark builders append `.sb3` as every other writer does, instead of
   replacing the last suffix (`results.v2` wrote `results.sb3`).
 - Character and BPE tokenizer sprites ignored Hugging Face added tokens, so
@@ -518,7 +534,25 @@ Python:
   such as `dog cat`, gave other token IDs with no warning. They now match
   added tokens in the text first, as the tokenizer does; see
   [added and special tokens](docs/tokenizers.md#added-and-special-tokens).
-  Added tokens with `single_word=True` raise `ValueError`.
+  Added tokens with `single_word=True`, or with a character outside the
+  Basic Multilingual Plane, raise `ValueError`. With `split_special_tokens`
+  the sprite reads special tokens as text, as the tokenizer does, and
+  exporting leaves the tokenizer's settings as they were.
+- Tokenizer sprites left out the tokens a tokenizer's post-processor adds
+  around every text, such as `<s>` before it, so `cattorch tokenize` gave
+  other IDs than `tokenizer.encode(text)`. They now write them too, for
+  `TemplateProcessing`, `BertProcessing` and `RobertaProcessing`, and for a
+  SentencePiece processor made with `add_bos` or `add_eos`; any other
+  post-processor, and SentencePiece's `reverse` or `enable_sampling`, raises
+  `ValueError`. See
+  [special tokens added around the text](docs/tokenizers.md#special-tokens-added-around-the-text).
+- With `split_special_tokens=True`, a character tokenizer or BPE sprite
+  wrote a one-character special token's own ID where the tokenizer gives
+  the unknown token, because the model's vocabulary lacks it.
+- `BPETokenizer` exported a model with `ignore_merges=True` and merged
+  anyway, so a text that is itself a vocabulary entry could get other IDs.
+  It raises `ValueError` unless the merges build every vocabulary entry,
+  when the option changes nothing.
 - Tokenizer sprites looked characters up case-insensitively, so `The`
   encoded like `the`. Sprites whose vocabulary has letters now look
   characters up by costume name, so don't change their costumes. SentencePiece `scratch_casefold=True`
