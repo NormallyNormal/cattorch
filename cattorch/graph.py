@@ -1852,6 +1852,7 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
     # Build alias map for no-op shape ops and splits
     aliases = {}
     split_meta = {}
+    by_name = {node.name: node for node in nodes}
     for node in nodes:
         if node.op != 'call_function':
             continue
@@ -1881,13 +1882,18 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
                 raise _unsupported_operation(
                     node, "complex tensors are not supported",
                 )
-            if not _is_value_preserving_cast(source_dtype, target_dtype):
-                # Truncation to an integer or conversion to bool runs as an
-                # elementwise kernel.
-                continue
             source = node.args[0].name
             while source in aliases:
                 source = aliases[source]
+            if not _is_value_preserving_cast(source_dtype, target_dtype) or (
+                # A bool input list holds Scratch's true and false or 1 and 0,
+                # as its user put them; as numbers they must read 1 and 0.
+                source_dtype == torch.bool and target_dtype != torch.bool
+                and getattr(by_name.get(source), "op", None) == "placeholder"
+            ):
+                # Truncation to an integer or conversion to bool runs as an
+                # elementwise kernel.
+                continue
             aliases[node.name] = source
             log.info("Alias: %s -> %s (dtype conversion)", node.name, source)
 

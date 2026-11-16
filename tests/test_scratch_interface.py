@@ -818,3 +818,34 @@ def test_a_programs_split_lists_check_each_shard(tmp_path, small_list_limit):
     # Items in the second shard are checked as numbers, not added to the first's.
     assert run(at=lists[0], items=[1] * 9 + ["abc", 1]) == interface.invalid_item(lists[0])
     assert run(at=lists[1], items=[1] * 9 + [1.5, 1]) == interface.invalid_item(lists[1])
+
+
+class BoolReader(nn.Module):
+    """A bool list read as a number, by a condition and by a logical not."""
+
+    def forward(self, flags, value):
+        return torch.cat([flags.float(), torch.where(flags, value, -value), (~flags).float()])
+
+
+@pytest.mark.parametrize("flags,valid", [
+    ([True, False], True), ([1, 0], True), (["1", "0"], True), ([1.0, "0.0"], True),
+    (["true", 0], False), ([1, "false"], False), (["yes", 0], False), ([2, 0], False),
+    (["", 1], False), ([0.5, 1], False),
+])
+def test_a_bool_list_holds_booleans_or_ones_and_zeros(tmp_path, flags, valid):
+    model = BoolReader().eval()
+    example = (torch.tensor([True, False]), torch.tensor([2.0, 3.0]))
+    result = transpile(model, example, tmp_path / "flags")
+    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator.lists["input"] = list(flags)
+    emulator.lists["input_1"] = [2, 3]
+    emulator.run_procedure(interface.FORWARD)
+    if valid:
+        assert emulator.variables[interface.STATUS_VARIABLE] == interface.OK
+        assert [float(item) for item in emulator.lists["output"]] == model(*example).tolist()
+        # Every item of the float output is a number, not the input's own item.
+        assert all(isinstance(item, (int, float)) for item in emulator.lists["output"][:2])
+    else:
+        assert emulator.variables[interface.STATUS_VARIABLE] == interface.invalid_item("input")
+    # The input list is never changed.
+    assert emulator.lists["input"] == list(flags)

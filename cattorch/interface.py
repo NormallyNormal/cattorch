@@ -240,6 +240,12 @@ NUMBERS, WHOLE_NUMBERS = "numbers", "whole numbers"
 # The largest whole number an integer input takes, and the negative of the
 # smallest: 2^53, past which a Scratch number (a double) skips integers.
 WHOLE_LIMIT = 2**53
+# A bool list: each item is Scratch's true or false (as a boolean block gives
+# them), or the number 1 or 0 (also as text, such as "1"). Kernels read an
+# item as false when it equals 0, and arithmetic reads true as 1; text such
+# as "true" or "false" is 0 in arithmetic but isn't equal to 0, so it is
+# refused rather than read two ways.
+BOOLEANS = "booleans"
 
 
 def item_checks(
@@ -249,10 +255,10 @@ def item_checks(
     """Statements that set the status to ``invalid_item(list_name)`` unless every item is valid.
 
     ``kind`` is NUMBERS (any number, ``Infinity`` included), WHOLE_NUMBERS
-    (from ``-WHOLE_LIMIT`` to ``WHOLE_LIMIT``), or None for no check (bool
-    lists). With ``rows``, a whole number must also be
-    from 0 to ``rows - 1``: an index into a table of that many rows; or, as
-    ``(low, high)``, from ``low`` to ``high - 1``, such as ``-size`` to
+    (from ``-WHOLE_LIMIT`` to ``WHOLE_LIMIT``), BOOLEANS (true or false, see
+    ``BOOLEANS``), or None for no check. With ``rows``, a whole number must
+    also be from 0 to ``rows - 1``: an index into a table of that many rows;
+    or, as ``(low, high)``, from ``low`` to ``high - 1``, such as ``-size`` to
     ``size - 1`` for an index PyTorch counts from the end when negative.
     ``lists`` are the lists read, by default ``list_name`` (the shards of a
     split list, or a copy). ``status`` names the variable to set,
@@ -274,6 +280,13 @@ def item_checks(
         if kind == NUMBERS:
             # Text, an empty item and NaN aren't equal to themselves plus 0.
             checks = (if_(not_(eq(value, add(value, 0))), invalid),)
+        elif kind == BOOLEANS:
+            # True and false are equal to themselves plus 0 (1 and 0), as
+            # numbers are; text isn't. Of those, only 1 and 0 are booleans.
+            checks = (
+                if_(not_(eq(value, add(value, 0))), invalid),
+                if_(not_(eq(value, 1)), (if_(not_(eq(value, 0)), invalid),)),
+            )
         else:
             checks = (if_(not_(eq(value, round_(value))), invalid),)
             if rows is None:

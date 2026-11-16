@@ -113,7 +113,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   wrong number of items or a non-number item, an integer list item that isn't
   a whole number from -2^53 to 2^53 (`Infinity` isn't one), and a generation
   block with a token ID that isn't a whole number in the vocabulary, fail
-  with a status instead of computing meaningless output.
+  with a status instead of computing meaningless output. A bool list must
+  hold Scratch's `true` and `false` or the numbers 1 and 0; text such as
+  `true`, which some operations read as true and others as false, fails with
+  `invalid item: LIST`, and a bool input converted to numbers reads 1 and 0
+  instead of passing `true` and `false` through to the output.
 - Indices are checked as PyTorch checks them: an integer input used as an
   index, by tensor indexing, `gather`, `index_select`, `take`,
   `take_along_dim`, `one_hot`, `scatter`, `index_add`, `index_put`, an

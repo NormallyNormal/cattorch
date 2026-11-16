@@ -1060,3 +1060,52 @@ def test_index_inputs_are_checked_before_and_while_the_block_runs(tmp_path):
             torch.testing.assert_close(values(stage, "rows output"), expected_now)
         else:
             torch.testing.assert_close(values(stage, "rows output"), expected)
+
+
+class BoolReader(nn.Module):
+    """A bool list read as a number, by a condition and by a logical not."""
+
+    def forward(self, flags, value):
+        return torch.cat([flags.float(), torch.where(flags, value, -value), (~flags).float()])
+
+
+def test_bool_items_mean_the_same_to_every_operation(tmp_path):
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import append, call, clear, eq, item, var
+
+    model = BoolReader().eval()
+    example = (torch.tensor([True, False]), torch.tensor([2.0, 3.0]))
+    expected = model(*example).tolist()
+    result = transpile(model, example, tmp_path / "flags")
+    project = build_project(result, tmp_path / "flags")
+    # Scratch's own true and false (as a boolean block leaves them), and the
+    # numbers 1 and 0, also as text.
+    for flags in ([True, False], [1, 0], ["1", "0"], [True, "0"], ["1.0", 0.0]):
+        stage = run_vm(project, tmp_path, flag=False, calls=[
+            ("flags run", {"flags input": flags, "flags input_1": [2, 3]}),
+        ])["stage"]
+        assert stage["flags status"] == interface.OK, flags
+        assert values(stage, "flags output").tolist() == expected, flags
+    # Text such as "true" is 0 in arithmetic, but isn't equal to 0.
+    for flags in (["true", 0], [1, "false"], ["TRUE", 0], ["yes", 0], [2, 0], ["", 1], [0.5, 1]):
+        stage = run_vm(project, tmp_path, flag=False, calls=[
+            ("flags run", {"flags input": flags, "flags input_1": [2, 3]}),
+        ])["stage"]
+        assert stage["flags status"] == interface.invalid_item("input"), flags
+
+    # Items added by boolean blocks, in a script of the sprite itself.
+    builder = _Builder()
+    sprite = builder.add_sprite(result.path, visible=False)
+    heard = builder.global_list("heard")
+    builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
+        clear("input"), append("input", eq(1, 1)), append("input", eq(1, 0)),
+        clear("input_1"), append("input_1", 2), append("input_1", 3),
+        call(interface.FORWARD),
+        append(heard, var(interface.STATUS_VARIABLE)),
+        *(append(heard, item("output", position)) for position in range(1, 7)),
+    ), lists=("input", "input_1", "output", heard), variables=(interface.STATUS_VARIABLE,))
+    path = tmp_path / "blocks.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    assert stage["heard"][0] == interface.OK
+    assert [float(value) for value in stage["heard"][1:]] == expected

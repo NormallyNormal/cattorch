@@ -61,7 +61,11 @@ benchmark case and its variant.
   [index inputs](supported-models.md#index-inputs). An index the model
   computes from its inputs, such as `x[ids + 1]`, is checked as the block
   runs, and one out of range fails the block with `invalid item: LIST`
-  naming the input it comes from. A bool list takes any values.
+  naming the input it comes from. A bool list must hold `true` and `false`
+  as boolean blocks such as `<(a) > (b)>` give them, or the numbers `1` and
+  `0` (also as text, as typed into a list monitor). The text `true` or
+  `false` is refused: arithmetic reads it as 0, but it isn't 0, so operations
+  would disagree on what it means; type `1` or `0` instead.
 - A block decodes the stored weights itself when they aren't decoded yet,
   which is `cattorch init` running inside it: it sends
   `cattorch init complete` too. A program's entry point decodes only its own

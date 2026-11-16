@@ -92,8 +92,8 @@ from cattorch.static_storage import (
 )
 from cattorch import interface
 from cattorch.interface import (
-    NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, input_name, is_public_data,
-    item_checks, length_checks, output_name, shard_checks,
+    BOOLEANS, NUMBERS, OK, PROJECT_OUTPUT, STATUS_VARIABLE, WHOLE_NUMBERS, input_name,
+    is_public_data, item_checks, length_checks, output_name, shard_checks,
 )
 from cattorch.storage import StorageConfig, quantized_storage
 from cattorch.util.argument import Argument
@@ -215,13 +215,16 @@ def _kinds_of_items(
 
     Numbers in a floating-point list, whole numbers in an integer one, and,
     for an input the model uses as an index, whole numbers in the range
-    every use takes (``_index_bounds``). Bool lists take any values.
+    every use takes (``_index_bounds``); true or false in a bool list
+    (``interface.BOOLEANS``).
     """
     kinds: dict[int, tuple[str | None, tuple[int, int] | None]] = {}
     for index, example in enumerate(flat_inputs):
         if example.is_floating_point():
             kinds[index] = (NUMBERS, None)
-        elif example.dtype == torch.bool or example.is_complex():
+        elif example.dtype == torch.bool:
+            kinds[index] = (BOOLEANS, None)
+        elif example.is_complex():
             kinds[index] = (None, None)
         else:
             kinds[index] = (WHOLE_NUMBERS, _index_bounds(graph, input_name(index)))
