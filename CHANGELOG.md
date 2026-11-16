@@ -424,6 +424,15 @@ Python:
   exported method, is now left untransformed, with a warning.
 - A tied embedding was read in the wrong layout in fast mode with weight
   transforms, and fast weight pruning of `x @ W` changed `W` for other uses.
+- Fast low-rank factorization replaced a layer with two plain layers whatever
+  else it did, so a subclass of `nn.Linear` or a convolution with its own
+  `forward`, such as one that clamps its output, lost those steps and gave
+  wrong output, and a layer's forward hooks were dropped. A layer inside
+  `nn.MultiheadAttention`, `nn.TransformerEncoderLayer` or another `torch.nn`
+  module that reads its weight itself made the export fail with a false
+  "check that example_inputs match" error. Such layers now keep their
+  weights, with a warning; neuron pruning skips layers with forward hooks
+  the same way.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the
   example's values as constants; it is rejected, like `.item()`.
 - `sig_figs` rounded integer buffers.
