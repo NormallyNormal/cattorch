@@ -979,3 +979,52 @@ def test_the_emulator_casts_compares_and_formats_values_as_scratch_vm_does(tmp_p
         ]
     assert not differences, differences[:20]
     assert len(stage["out eq"]) == len(SEMANTICS_VALUES) ** 2
+
+
+def test_tokenizers_match_added_tokens_as_hugging_face_does(tmp_path):
+    from cattorch.project import _Builder
+    from cattorch.util.scratch.dsl import (
+        append, call, clear, for_each, item, join, length, set_var, var,
+    )
+    from test_tokenizer import (
+        added_token_texts, bpe_tokenizer_with_added_tokens, char_tokenizer_with_added_tokens,
+    )
+    from cattorch import BPETokenizer
+
+    texts = added_token_texts(200, seed=1) + ["dog cat", "the cat<eos>", "x [M]", "<s>  a"]
+    builder = _Builder()
+    expected = {}
+    for name, tokenizer, exporter in (
+        ("char", char_tokenizer_with_added_tokens(), CharTokenizer),
+        ("bpe", bpe_tokenizer_with_added_tokens(), BPETokenizer),
+    ):
+        sprite = builder.add_sprite(exporter(tokenizer).save(tmp_path / name).path, visible=False)
+        inputs = builder.global_list(f"{name} texts", texts)
+        outputs = builder.global_list(f"{name} ids")
+        decoded = builder.global_list(f"{name} decoded")
+        builder.script(sprite, {"opcode": "event_whenflagclicked", "fields": {}}, (
+            clear(outputs),
+            clear(decoded),
+            for_each("text index", length(inputs), (
+                set_var("cattorch text", item(inputs, var("text index"))),
+                call("cattorch tokenize"),
+                set_var("joined", ""),
+                for_each("id index", length("cattorch token ids"), (
+                    set_var("joined", join(var("joined"), join(
+                        item("cattorch token ids", var("id index")), " ",
+                    ))),
+                )),
+                append(outputs, var("joined")),
+                call("cattorch detokenize"),
+                append(decoded, var("cattorch text")),
+            )),
+        ), lists=(inputs, outputs, decoded, "cattorch token ids"),
+            variables=("cattorch text", "text index", "id index", "joined"))
+        ids = [tokenizer.encode(text, add_special_tokens=False) for text in texts]
+        expected[outputs] = ["".join(f"{token} " for token in row) for row in ids]
+        expected[decoded] = ["".join(tokenizer.convert_ids_to_tokens(row)) for row in ids]
+    path = tmp_path / "added.sb3"
+    builder.write(path)
+    stage = run_vm(SimpleNamespace(path=path), tmp_path)["stage"]
+    for name, want in expected.items():
+        assert stage[name] == want, name

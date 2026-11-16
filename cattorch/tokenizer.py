@@ -19,6 +19,7 @@ Usage
 import itertools
 import json
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -512,6 +513,7 @@ def _reject_non_bmp(tokens: Sequence[str]) -> None:
 
 def _check_encodes_characters(
     tokenizer, tokens: Sequence[str], special: set[str], unknown_id: int,
+    added: Sequence["_AddedToken"] = (),
 ) -> None:
     """Check that ``tokenizer`` maps each character to its own token.
 
@@ -543,7 +545,9 @@ def _check_encodes_characters(
     except TypeError:
         encoded = encode(probe)
     actual = [int(value) for value in getattr(encoded, "ids", encoded)]
-    expected = [ids.get(character, unknown_id) for character in probe]
+    expected = _reference_ids(probe, added, tokens, unknown_id, None) if added else [
+        ids.get(character, unknown_id) for character in probe
+    ]
     if actual != expected:
         at = next(
             (index for index, pair in enumerate(zip(actual, expected)) if pair[0] != pair[1]),
@@ -556,6 +560,403 @@ def _check_encodes_characters(
             f"{actual[window]} rather than {expected[window]}. A pre-tokenizer, "
             "normalizer, or word-level model makes the difference"
         )
+
+
+# ── Added tokens ────────────────────────────────────────────────────────────
+#
+# Hugging Face tokenizers match their added tokens (``add_tokens``,
+# ``add_special_tokens`` and a trainer's special tokens) in the raw text
+# before the model runs, and the model tokenizes only the text between them.
+# ``tokenizers`` does it in two passes: tokens with ``normalized=False`` on the
+# whole text, then tokens with ``normalized=True`` on each piece left over
+# (there is no normalizer here to apply in between). Each pass takes the
+# leftmost-longest matches, left to right; ``lstrip`` and ``rstrip`` widen a
+# match over the whitespace beside it, which no token then gets.
+
+# Rust's ``char::is_whitespace`` (Unicode White_Space), which ``lstrip`` and
+# ``rstrip`` strip.
+_UNICODE_WHITE_SPACE = (
+    "\t\n\v\f\r \x85\xa0          "
+    "      　"
+)
+
+
+@dataclass(frozen=True)
+class _AddedToken:
+    content: str
+    token_id: int
+    normalized: bool
+    lstrip: bool
+    rstrip: bool
+
+
+def _added_tokens(tokenizer, exporter: str) -> list[_AddedToken]:
+    """The added tokens a Hugging Face tokenizer matches in text, in ID order.
+
+    ``single_word`` tokens are rejected: whether a match stands alone depends
+    on whether its neighbours are Unicode letters or digits, which a sprite
+    can't tell for characters outside its tables.
+    """
+    backend = _backend(tokenizer)
+    if backend is not None and callable(getattr(backend, "get_added_tokens_decoder", None)):
+        decoder = backend.get_added_tokens_decoder()
+        skip_special = bool(getattr(backend, "encode_special_tokens", False))
+    else:
+        decoder = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        skip_special = False
+    added = []
+    for token_id, token in sorted(decoder.items()):
+        content = getattr(token, "content", token)
+        if not isinstance(content, str) or not content:
+            continue
+        special = bool(getattr(token, "special", False))
+        if special and skip_special:
+            continue
+        if getattr(token, "single_word", False):
+            raise ValueError(
+                f"{exporter} doesn't support added tokens with single_word=True, such as "
+                f"{content!r}: whether a match stands alone depends on its neighbours "
+                "being letters or digits, which a sprite can't tell for every character"
+            )
+        added.append(_AddedToken(
+            content, int(token_id), bool(getattr(token, "normalized", not special)),
+            bool(getattr(token, "lstrip", False)), bool(getattr(token, "rstrip", False)),
+        ))
+    return added
+
+
+def _match_added(text: str, tokens: Sequence[_AddedToken]) -> list[tuple[int | None, str]]:
+    """One pass of ``tokenizers``' added-token matching: ``(token ID, text)``
+    for each match and ``(None, text)`` for the text between matches."""
+    if not text:
+        return []
+    candidates = sorted(tokens, key=lambda token: -len(token.content))
+    pieces: list[tuple[int | None, str]] = []
+    start_offset = position = 0
+    while position < len(text):
+        match = next(
+            (token for token in candidates if text.startswith(token.content, position)), None,
+        )
+        if match is None:
+            position += 1
+            continue
+        start, stop = position, position + len(match.content)
+        if match.lstrip:
+            while start > 0 and text[start - 1] in _UNICODE_WHITE_SPACE:
+                start -= 1
+            start = max(start, start_offset)
+        if match.rstrip:
+            while stop < len(text) and text[stop] in _UNICODE_WHITE_SPACE:
+                stop += 1
+        if start_offset < start:
+            pieces.append((None, text[start_offset:start]))
+        pieces.append((match.token_id, text[start:stop]))
+        start_offset = stop
+        position += len(match.content)
+    if start_offset < len(text):
+        pieces.append((None, text[start_offset:]))
+    return pieces
+
+
+def _split_added(text: str, added: Sequence[_AddedToken]) -> list[tuple[int | None, str]]:
+    """Both passes of added-token matching over ``text``."""
+    first = _match_added(text, [token for token in added if not token.normalized])
+    second = [token for token in added if token.normalized]
+    pieces: list[tuple[int | None, str]] = []
+    for token_id, piece in first:
+        if token_id is None:
+            pieces += _match_added(piece, second)
+        else:
+            pieces.append((token_id, piece))
+    return pieces
+
+
+def _reference_ids(
+    text: str, added: Sequence[_AddedToken], tokens: Sequence[str], unknown_id: int | None,
+    merges: Sequence[tuple[int, int, int]] | None,
+) -> list[int]:
+    """The token IDs a character or raw BPE sprite writes for ``text``."""
+    characters: dict[str, int] = {}
+    for token_id, token in enumerate(tokens):
+        if len(token) == 1:
+            characters.setdefault(token, token_id)
+    ranks = {(left, right): (rank, merged) for rank, (left, right, merged) in enumerate(merges or ())}
+    ids: list[int] = []
+    for token_id, piece in _split_added(text, added):
+        if token_id is not None:
+            ids.append(token_id)
+            continue
+        units = [characters.get(character, unknown_id) for character in piece]
+        units = [unit for unit in units if unit is not None]
+        while merges is not None and len(units) > 1:
+            best = min(
+                ((ranks[pair][0], index) for index, pair in enumerate(zip(units, units[1:]))
+                 if pair in ranks),
+                default=None,
+            )
+            if best is None:
+                break
+            rank, index = best
+            units[index:index + 2] = [merges[rank][2]]
+        ids += units
+    return ids
+
+
+def _check_added_tokens(
+    tokenizer, exporter: str, added: Sequence[_AddedToken], tokens: Sequence[str],
+    unknown_id: int | None, merges: Sequence[tuple[int, int, int]] | None,
+) -> None:
+    """Check that the tokenizer matches its added tokens as the sprite will.
+
+    Encodes texts built to make added tokens meet, overlap and touch
+    whitespace, and compares each with ``_reference_ids``, the sprite's
+    algorithm in Python.
+    """
+    encode = getattr(tokenizer, "encode", None)
+    if not added or not callable(encode):
+        return
+    contents = [token.content for token in added][:24]
+    texts = []
+    for content in contents:
+        texts += [content, f"x{content}y", content * 2, f" {content}  ", f"\t{content}\n",
+                  content.swapcase(), content[:-1], f"{content[:1]} {content}"]
+    for left, right in itertools.product(contents[:12], repeat=2):
+        texts += [left + right, left[:-1] + right, left + right[1:], f"{left} {right}"]
+    for text in texts:
+        try:
+            encoded = encode(text, add_special_tokens=False)
+        except TypeError:
+            encoded = encode(text)
+        actual = [int(value) for value in getattr(encoded, "ids", encoded)]
+        expected = _reference_ids(text, added, tokens, unknown_id, merges)
+        if actual != expected:
+            raise ValueError(
+                f"{exporter} can't reproduce how this tokenizer matches its added tokens: "
+                f"{text!r} gives token IDs {actual}, but the sprite would give {expected}"
+            )
+
+
+def _added_token_tables(
+    added: Sequence[_AddedToken], characters: list[str], character_ids: list[int],
+) -> dict[str, list]:
+    """The lists the sprite matches added tokens with.
+
+    Each text character is read as its code, its 1-based position in
+    ``characters``; the characters of added tokens that aren't tokens
+    themselves are appended there with the ID -1. Tokens are sorted by
+    first code, longest first, so the first match at a position is the
+    longest. ``_added first`` and ``_added count`` give, per code, the
+    tokens that start with it.
+    """
+    for token in added:
+        for character in token.content:
+            if character not in characters:
+                characters.append(character)
+                character_ids.append(-1)
+    code = {character: index + 1 for index, character in reversed(list(enumerate(characters)))}
+    ordered = sorted(added, key=lambda token: (code[token.content[0]], -len(token.content)))
+    tables: dict[str, list] = {
+        "_added first": [0] * len(characters), "_added count": [0] * len(characters),
+        "_added length": [], "_added offset": [], "_added id": [], "_added pass": [],
+        "_added lstrip": [], "_added rstrip": [], "_added codes": [],
+    }
+    for position, token in enumerate(ordered, start=1):
+        first = code[token.content[0]] - 1
+        if not tables["_added first"][first]:
+            tables["_added first"][first] = position
+        tables["_added count"][first] += 1
+        tables["_added length"].append(len(token.content))
+        tables["_added offset"].append(len(tables["_added codes"]) + 1)
+        tables["_added id"].append(token.token_id)
+        tables["_added pass"].append(2 if token.normalized else 1)
+        tables["_added lstrip"].append(int(token.lstrip))
+        tables["_added rstrip"].append(int(token.rstrip))
+        tables["_added codes"] += [code[character] for character in token.content]
+    return tables
+
+
+def _added_match(group: int, pieces: tuple[str, str, str], *, strips: bool) -> tuple:
+    """One pass of added-token matching over codes ``lo`` to ``hi``.
+
+    Appends each match, and the text between matches, to ``pieces`` (token
+    ID, first and last position, with ID -1 for text), as ``_match_added``
+    does in Python.
+    """
+    ids, starts, ends = pieces
+    p, k, j, best, same = "_added p", "_added k", "_added j", "_added best", "_added same"
+    start, stop, offset, code, walking = (
+        "_added start", "_added stop", "_added from", "_added code", "_added walking",
+    )
+
+    def piece(token_id, first, last) -> tuple:
+        return (append(ids, token_id), append(starts, first), append(ends, last))
+
+    length_of = item("_added length", var(best))
+    try_token = if_(eq(var(best), 0), (
+        if_(eq(item("_added pass", var(k)), group), (
+            if_(not_(gt(add(var(p), item("_added length", var(k))), add(var("hi"), 1))), (
+                set_var(same, 1),
+                set_var(j, 0),
+                repeat(item("_added length", var(k)), (
+                    if_(eq(var(same), 1), (
+                        if_(not_(eq(
+                            item("_codes", add(var(p), var(j))),
+                            item("_added codes", add(item("_added offset", var(k)), var(j))),
+                        )), (set_var(same, 0),)),
+                    )),
+                    change_var(j, 1),
+                )),
+                if_(eq(var(same), 1), (set_var(best, var(k)),)),
+            )),
+        )),
+    ))
+    widen: tuple = ()
+    if strips:
+        widen = (
+            if_(eq(item("_added lstrip", var(best)), 1), (
+                set_var(walking, 1),
+                repeat_until(eq(var(walking), 0), (
+                    if_else(gt(var(start), var("lo")), (
+                        if_else(eq(item("_spaces", sub(var(start), 1)), 1),
+                                (change_var(start, -1),), (set_var(walking, 0),)),
+                    ), (set_var(walking, 0),)),
+                )),
+                if_(lt(var(start), var(offset)), (set_var(start, var(offset)),)),
+            )),
+            if_(eq(item("_added rstrip", var(best)), 1), (
+                set_var(walking, 1),
+                repeat_until(eq(var(walking), 0), (
+                    if_else(gt(var(stop), var("hi")), (set_var(walking, 0),), (
+                        if_else(eq(item("_spaces", var(stop)), 1),
+                                (change_var(stop, 1),), (set_var(walking, 0),)),
+                    )),
+                )),
+            )),
+        )
+    return (
+        set_var(offset, var("lo")),
+        set_var(p, var("lo")),
+        repeat_until(gt(var(p), var("hi")), (
+            set_var(best, 0),
+            set_var(code, item("_codes", var(p))),
+            if_(gt(var(code), 0), (
+                set_var(k, item("_added first", var(code))),
+                repeat(item("_added count", var(code)), (try_token, change_var(k, 1))),
+            )),
+            if_else(gt(var(best), 0), (
+                set_var(start, var(p)),
+                set_var(stop, add(var(p), length_of)),
+                *widen,
+                if_(lt(var(offset), var(start)), piece(-1, var(offset), sub(var(start), 1))),
+                *piece(item("_added id", var(best)), var(start), sub(var(stop), 1)),
+                set_var(offset, var(stop)),
+                change_var(p, length_of),
+            ), (change_var(p, 1),)),
+        )),
+        if_(not_(gt(var(offset), var("hi"))), piece(-1, var(offset), var("hi"))),
+    )
+
+
+def _added_token_encode(
+    lookup: "_CharacterLookup", added: Sequence[_AddedToken], unknown_id: int | None,
+    merge_body: tuple, *, bpe: bool,
+) -> tuple:
+    """The encode body of a character or raw BPE sprite with added tokens.
+
+    Reads every character's code, matches the added tokens in two passes,
+    then writes each match's ID and runs the model on the text between them,
+    one piece at a time (BPE merges never cross a match).
+    """
+    strips = any(token.lstrip or token.rstrip for token in added)
+    first_pass = ("_pieces 1 id", "_pieces 1 start", "_pieces 1 end")
+    second_pass = ("_pieces id", "_pieces start", "_pieces end")
+    two_passes = any(token.normalized for token in added) and not all(
+        token.normalized for token in added
+    )
+    single_group = 2 if all(token.normalized for token in added) else 1
+    codes = (
+        clear("_codes"),
+        *((clear("_spaces"),) if strips else ()),
+        set_var("idx", 0),
+        repeat(string_length(var("input")), (
+            change_var("idx", 1),
+            *lookup.find("_characters", letter(var("input"), var("idx")), "lookup"),
+            if_else(lookup.missing("lookup"), (append("_codes", 0),),
+                    (append("_codes", var("lookup")),)),
+            *((if_else(
+                gt(index_of("_white space", letter(var("input"), var("idx"))), 0),
+                (append("_spaces", 1),), (append("_spaces", 0),),
+            ),) if strips else ()),
+        )),
+        *lookup.finish(),
+    )
+    target = first_pass if two_passes else second_pass
+    matching = (
+        *(clear(name) for name in (*first_pass, *second_pass)),
+        set_var("lo", 1),
+        set_var("hi", length("_codes")),
+        *_added_match(1 if two_passes else single_group, target, strips=strips),
+    )
+    if two_passes:
+        matching += (
+            set_var("_added i", 0),
+            repeat(length(first_pass[0]), (
+                change_var("_added i", 1),
+                if_else(gt(item(first_pass[0], var("_added i")), -1), (
+                    append(second_pass[0], item(first_pass[0], var("_added i"))),
+                    append(second_pass[1], item(first_pass[1], var("_added i"))),
+                    append(second_pass[2], item(first_pass[2], var("_added i"))),
+                ), (
+                    set_var("lo", item(first_pass[1], var("_added i"))),
+                    set_var("hi", item(first_pass[2], var("_added i"))),
+                    *_added_match(2, second_pass, strips=strips),
+                )),
+            )),
+        )
+    destination = "splitlist" if bpe else _TOKENIZED
+    missing = () if unknown_id is None else (append(destination, unknown_id),)
+    unit = "_added unit"
+    model = (
+        *((clear("splitlist"),) if bpe else ()),
+        set_var("_added q", sub(item(second_pass[1], var("_added i")), 1)),
+        repeat(add(sub(item(second_pass[2], var("_added i")),
+                       item(second_pass[1], var("_added i"))), 1), (
+            change_var("_added q", 1),
+            set_var(unit, -1),
+            if_(gt(item("_codes", var("_added q")), 0), (
+                set_var(unit, item("_character ids", item("_codes", var("_added q")))),
+            )),
+            if_else(gt(var(unit), -1), (append(destination, var(unit)),), missing),
+        )),
+        *(merge_body if bpe else ()),
+        *((
+            set_var("_added q", 0),
+            repeat(length("splitlist"), (
+                change_var("_added q", 1),
+                append(_TOKENIZED, item("splitlist", var("_added q"))),
+            )),
+        ) if bpe else ()),
+    )
+    emit = (
+        set_var("_added i", 0),
+        repeat(length(second_pass[0]), (
+            change_var("_added i", 1),
+            if_else(gt(item(second_pass[0], var("_added i")), -1),
+                    (append(_TOKENIZED, item(second_pass[0], var("_added i"))),), model),
+        )),
+    )
+    return (*codes, *matching, *emit)
+
+
+_ADDED_VARIABLES = (
+    "lo", "hi", "_added p", "_added k", "_added j", "_added best", "_added same",
+    "_added start", "_added stop", "_added from", "_added code", "_added walking", "_added i",
+    "_added q", "_added unit",
+)
+_ADDED_LISTS = (
+    "_codes", "_spaces", "_white space", "_pieces 1 id", "_pieces 1 start", "_pieces 1 end",
+    "_pieces id", "_pieces start", "_pieces end",
+)
 
 
 class CharTokenizer(_TokenizerBase):
@@ -582,8 +983,13 @@ class CharTokenizer(_TokenizerBase):
             raise ValueError(
                 "CharTokenizer requires a tokenizer with a valid unknown-token ID"
             )
-        # The unknown token is never read from text, whatever its length.
-        special = _special_tokens(self.tokenizer) | {tokens[unknown_id]}
+        added = _added_tokens(self.tokenizer, "CharTokenizer")
+        # The unknown token is never read from text, whatever its length, and
+        # added tokens are matched whole before the characters are looked up.
+        special = (
+            _special_tokens(self.tokenizer) | {tokens[unknown_id]}
+            | {token.content for token in added}
+        )
         words = [token for token in tokens if len(token) > 1 and token not in special]
         if words:
             raise ValueError(
@@ -600,9 +1006,10 @@ class CharTokenizer(_TokenizerBase):
                     f"({normalizer.get('type', 'unknown')}); the sprite looks up the "
                     "raw text, so tokens would differ"
                 )
-        _check_encodes_characters(self.tokenizer, tokens, special, unknown_id)
+        _check_encodes_characters(self.tokenizer, tokens, special, unknown_id, added)
+        _check_added_tokens(self.tokenizer, "CharTokenizer", added, tokens, unknown_id, None)
         sprite, self._costume_names = _build_character_tokenizer_sprite(
-            tokens, bpe=False, unknown_id=unknown_id,
+            tokens, bpe=False, unknown_id=unknown_id, added=added,
         )
         return sprite
 
@@ -678,11 +1085,15 @@ class BPETokenizer(_TokenizerBase):
                     f"BPE merge {left!r} + {right!r} has no matching vocabulary entry"
                 )
             merges.append((int(vocab[left]), int(vocab[right]), int(vocab[merged])))
+        added = _added_tokens(self.tokenizer, "BPETokenizer")
+        unknown_id = self._unknown_id()
+        _check_added_tokens(self.tokenizer, "BPETokenizer", added, tokens, unknown_id, merges)
         sprite, self._costume_names = _build_character_tokenizer_sprite(
             tokens,
             bpe=True,
-            unknown_id=self._unknown_id(),
+            unknown_id=unknown_id,
             merges=merges,
+            added=added,
         )
         return sprite
 
@@ -693,11 +1104,13 @@ def _build_character_tokenizer_sprite(
     bpe: bool,
     unknown_id: int | None,
     merges: Sequence[tuple[int, int, int]] = (),
+    added: Sequence[_AddedToken] = (),
 ) -> tuple[dict, tuple[str, ...] | None]:
     """Build the character/raw-BPE contract with the typed DSL.
 
-    Returns the sprite and, when it looks characters up by costume, the
-    costume names.
+    ``added`` are the tokenizer's added tokens, matched in the text before
+    the model runs. Returns the sprite and, when it looks characters up by
+    costume, the costume names.
     """
     variables = (
         (
@@ -715,6 +1128,23 @@ def _build_character_tokenizer_sprite(
         if len(token) == 1:
             characters.append(token)
             character_ids.append(token_id)
+    # A one-character added token that the character lookup already gives
+    # its ID, that no merge combines and no other added token contains,
+    # matches the same with or without the added-token pass.
+    merged_ids = {token_id for left, right, _ in merges for token_id in (left, right)}
+    first_ids = dict(zip(reversed(characters), reversed(character_ids)))
+    added = [
+        token for token in added
+        if not (
+            len(token.content) == 1 and not token.lstrip and not token.rstrip
+            and first_ids.get(token.content) == token.token_id
+            and token.token_id not in merged_ids
+            and not any(
+                token.content in other.content for other in added if other is not token
+            )
+        )
+    ]
+    added_tables = _added_token_tables(added, characters, character_ids) if added else {}
     lookup = _CharacterLookup(characters)
     lists = (
         ("tokens", "token_ids", _TOKENIZED, *lookup.lists("_characters"), "_character ids")
@@ -804,8 +1234,19 @@ def _build_character_tokenizer_sprite(
             repeat_until(eq(var("merging"), 0), merge_once),
         )
 
-    if bpe:
+    encode_lists, encode_variables, encode_values = lists, variables, values
+    if added:
+        encode_lists = (*lists, *added_tables, *_ADDED_LISTS)
+        encode_variables = (*variables, *_ADDED_VARIABLES)
+        encode_values = {
+            **values, **added_tables, "_white space": list(_UNICODE_WHITE_SPACE),
+            **{name: [] for name in _ADDED_LISTS if name != "_white space"},
+        }
         encode_body: tuple[Statement, ...] = (
+            *_added_token_encode(lookup, added, unknown_id, merge_body, bpe=bpe),
+        )
+    elif bpe:
+        encode_body = (
             *split_input,
             *merge_body,
             set_var("idx", 0),
@@ -832,9 +1273,9 @@ def _build_character_tokenizer_sprite(
         )
     tokenize = Program(
         "BPE encode" if bpe else "character encode",
-        variables=variables,
-        lists=lists,
-        list_values=values,
+        variables=encode_variables,
+        lists=encode_lists,
+        list_values=encode_values,
         body=(
             clear(_TOKENIZED),
             *encode_body,
@@ -1436,6 +1877,7 @@ def transpile_tokenizer(
         backend_unknown = _backend_settings(backend)["model"].get("unk_token")
         if isinstance(backend_unknown, str):
             special.add(backend_unknown)
+    special |= {token.content for token in _added_tokens(tokenizer, "transpile_tokenizer")}
     if any(len(token) > 1 for token in tokenizer.get_vocab() if token not in special):
         raise ValueError(
             f"{model_type} tokenizers with multi-character tokens can't be exported; "

@@ -8,7 +8,7 @@ supported:
 
 | Exporter | Use for | Main requirement |
 |---|---|---|
-| `CharTokenizer` | Very small character vocabularies | Single-character tokens, read one character at a time, and a valid unknown-token ID. |
+| `CharTokenizer` | Very small character vocabularies | Single-character tokens (added tokens may be longer), read one character at a time, and a valid unknown-token ID. |
 | `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`. |
 | `SentencePieceBPETokenizer` | Raw SentencePiece BPE (`model_type="bpe"`) with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
 
@@ -68,6 +68,28 @@ if the tokenizer has one. `CharTokenizer` requires an unknown token. A raw
 Hugging Face BPE tokenizer without one drops unknown characters, and the
 exported sprite does the same.
 
+### Added and special tokens
+
+Hugging Face tokenizers find their added tokens in the text before anything
+else: tokens from `add_tokens` and `add_special_tokens`, and a trainer's
+`special_tokens` such as `<unk>` or `</s>`. The character and BPE sprites do
+the same, so `the cat</s>` ends with the ID of `</s>`, and a multi-character
+added token such as `dog cat` is one ID wherever it appears. Matching follows
+the `tokenizers` library: case-sensitive, the longest token at the leftmost
+position first, tokens with `normalized=False` before those with
+`normalized=True`, and `lstrip` and `rstrip` taking the whitespace beside a
+match. The text between matches is tokenized on its own, so BPE merges never
+cross an added token. `CharTokenizer` accepts multi-character added tokens
+for this reason. The export checks the result against the tokenizer on texts
+where added tokens meet, overlap and touch whitespace, and raises
+`ValueError` if they differ. Added tokens with `single_word=True` are
+rejected: whether a match stands alone depends on whether its neighbours are
+letters or digits, which a sprite can't tell for every character.
+
+`cattorch detokenize` writes every token's text, added and special tokens
+included, as `transformers`' `decode(..., skip_special_tokens=False)` keeps
+them, so detokenizing what tokenize wrote gives the text back.
+
 Characters are told apart by case, as the tokenizer does: `a` and `A` can
 both be tokens, and with only lowercase entries `The` starts with the unknown
 token. Scratch compares text without regard to case, so when the vocabulary
@@ -85,7 +107,8 @@ same reason an emoji in the text reads as two unknown characters.
 
 The SentencePiece sprite keeps SentencePiece's token IDs, converts its `▁`
 space marker, skips control tokens when decoding, and supports byte fallback
-for ASCII.
+for ASCII. Like SentencePiece, it doesn't read control tokens such as `<s>`
+from text: `<s>` in the text is three ordinary characters.
 
 ```python
 from cattorch import SentencePieceBPETokenizer

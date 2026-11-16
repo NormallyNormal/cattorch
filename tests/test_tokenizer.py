@@ -791,3 +791,105 @@ def test_hugging_face_models_other_than_bpe_and_characters_are_rejected(kind):
         transpile_tokenizer(tokenizer, SPRITE_PATH)
     with pytest.raises(ValueError, match="single characters|one character at a"):
         CharTokenizer(tokenizer).save(SPRITE_PATH)
+
+
+# ── Added tokens ────────────────────────────────────────────────────────────
+
+def _added_tokens_list():
+    from tokenizers import AddedToken
+
+    # Special and ordinary, matched before (normalized=False) or after
+    # (normalized=True) the other pass, stripping whitespace on either side,
+    # overlapping each other, and differing from text only in case.
+    return [
+        AddedToken("<eos>", special=True, normalized=False),
+        AddedToken("<s>", special=True, normalized=False, rstrip=True),
+        AddedToken("Dog", normalized=True),
+        AddedToken("dog cat", normalized=True),
+        AddedToken("[M]", special=True, normalized=False, lstrip=True),
+        AddedToken("og", normalized=False),
+        AddedToken("zz", normalized=True, lstrip=True, rstrip=True),
+    ]
+
+
+ADDED_TOKEN_PIECES = [
+    "<eos>", "<s>", "Dog", "dog", "DOG", "cat", " ", "  ", "\t", "[M]", "og", "zz", "z", "<",
+    "s>", "the", "a", "　", "é", "Q", "1",
+]
+
+
+def added_token_texts(count: int, seed: int = 0) -> list[str]:
+    import random
+
+    rng = random.Random(seed)
+    return [
+        "".join(rng.choice(ADDED_TOKEN_PIECES) for _ in range(rng.randint(0, 8)))
+        for _ in range(count)
+    ]
+
+
+def char_tokenizer_with_added_tokens():
+    tokenizer = _make_char_tokenizer("?abcdefghijklmnopqrstuvwxyz <>[]DM")
+    tokenizer.unk_token = "?"
+    tokenizer.add_tokens(_added_tokens_list())
+    return tokenizer
+
+
+def bpe_tokenizer_with_added_tokens():
+    corpus = ["the cat sat on the mat", "the dog sat on the log", "a zebra ate grass"] * 5
+    backend = Tokenizer(models.BPE(unk_token="<unk>"))
+    backend.train_from_iterator(
+        corpus, trainers.BpeTrainer(vocab_size=70, special_tokens=["<unk>"]),
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    tokenizer.add_tokens(_added_tokens_list())
+    return tokenizer
+
+
+@pytest.mark.parametrize("kind", ["char", "bpe"])
+def test_added_tokens_are_matched_in_the_text_as_hugging_face_does(tmp_path, kind):
+    if kind == "char":
+        tokenizer, exporter = char_tokenizer_with_added_tokens(), CharTokenizer
+    else:
+        tokenizer, exporter = bpe_tokenizer_with_added_tokens(), BPETokenizer
+    result = exporter(tokenizer).save(tmp_path / kind)
+    assert result.warnings == ()
+    emulator = load_emulator(result.path)
+    for text in added_token_texts(250) + ["dog cat", "the cat<eos>", "x [M]", "<s>  a"]:
+        emulator.variables["cattorch text"] = text
+        emulator.run_procedure("cattorch tokenize")
+        ids = [int(value) for value in emulator.lists["cattorch token ids"]]
+        assert ids == tokenizer.encode(text, add_special_tokens=False), text
+        # Detokenize writes every token's text, added and special ones too.
+        emulator.run_procedure("cattorch detokenize")
+        assert emulator.variables["cattorch text"] == "".join(
+            tokenizer.convert_ids_to_tokens(ids)
+        )
+
+
+def test_transpile_tokenizer_detects_a_character_tokenizer_with_added_tokens(tmp_path):
+    result = transpile_tokenizer(char_tokenizer_with_added_tokens(), tmp_path / "t")
+    assert result.tokenizer_type == "char"
+
+
+def test_single_word_added_tokens_are_rejected(tmp_path):
+    from tokenizers import AddedToken
+
+    for build, exporter in (
+        (char_tokenizer_with_added_tokens, CharTokenizer),
+        (bpe_tokenizer_with_added_tokens, BPETokenizer),
+    ):
+        tokenizer = build()
+        tokenizer.add_tokens([AddedToken("cat", single_word=True)])
+        with pytest.raises(ValueError, match="single_word=True, such as 'cat'"):
+            exporter(tokenizer).save(tmp_path / "t")
+
+
+def test_added_tokens_the_sprite_would_match_differently_are_rejected(tmp_path, monkeypatch):
+    # A tokenizer whose matching the sprite's algorithm doesn't reproduce is
+    # caught by the export's probe, rather than exported with other IDs.
+    from cattorch import tokenizer as module
+
+    monkeypatch.setattr(module, "_match_added", lambda text, tokens: [(None, text)] if text else [])
+    with pytest.raises(ValueError, match="can't reproduce how this tokenizer matches"):
+        BPETokenizer(bpe_tokenizer_with_added_tokens()).save(tmp_path / "t")
