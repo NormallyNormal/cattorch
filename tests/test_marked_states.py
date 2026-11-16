@@ -250,3 +250,61 @@ def test_the_in_place_message_in_an_entry_point_says_how_to_make_state(tmp_path)
     ))
     with pytest.raises(UnsupportedOperationError, match=r"updates the buffer self.total in place, but it isn.t one of its states.*StateInput"):
         transpile(Stepper().eval(), program, tmp_path / "stepper")
+
+
+class Writes(nn.Module):
+    """A state written in place by position, slice, mask and index."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.register_buffer("buffer", torch.zeros(4, 3))
+        self.register_buffer("position", torch.tensor(0))
+
+    @entrypoint(example_inputs=EXAMPLE)
+    def write(self, x):
+        kind = self.kind
+        if kind == "ring":
+            self.buffer[self.position.reshape(1)] = x.unsqueeze(0)
+            self.position.add_(1).remainder_(4)
+        elif kind == "shift":
+            self.buffer[1:] = self.buffer[:-1].clone()
+            self.buffer[0] = x
+        elif kind == "mask":
+            self.buffer[self.buffer > 0.5] = 0.0
+            self.buffer[2] = x
+        elif kind == "column":
+            self.buffer[:, 2].mul_(0.5)
+            self.buffer[1].add_(x)
+        elif kind == "index tensor":
+            self.buffer[torch.tensor([1, 3])] = x
+        elif kind == "0-d index":
+            self.buffer[self.position] = x
+            self.position.add_(1).remainder_(4)
+        elif kind == "transposed":
+            self.buffer.t()[0] = 1.0
+            self.buffer[1] += x[0]
+        elif kind == "view read after":
+            row = self.buffer[0]
+            self.buffer[0] = x
+            return row * 1
+        return self.buffer.sum(0)
+
+
+@pytest.mark.parametrize("kind", ["ring", "shift", "mask", "column", "index tensor"])
+def test_states_written_in_place(tmp_path, kind):
+    model = Writes(kind).eval()
+    result = transpile(model, None, tmp_path / "writes")
+    generator = torch.Generator().manual_seed(0)
+    calls = [ProgramCall("write", (torch.rand(3, generator=generator),)) for _ in range(7)]
+    assert verify(model, None, result, calls=calls).passed
+
+
+@pytest.mark.parametrize(("kind", "error", "message"), [
+    ("0-d index", UnsupportedModelError, r"indexing with a 0-d integer tensor.*i.reshape\(1\)"),
+    ("transposed", UnsupportedOperationError, r"in-place update through a view.*out of place"),
+    ("view read after", UnsupportedOperationError, r"a view read again after the update"),
+])
+def test_state_writes_that_fail_say_what_to_write(tmp_path, kind, error, message):
+    with pytest.raises(error, match=message):
+        transpile(Writes(kind).eval(), None, tmp_path / "writes")

@@ -991,6 +991,16 @@ def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
                 f"{shapes}: {_first_line(raised)}; check that example_inputs match what "
                 "the model takes"
             ) from exc
+        if "aten.item.default" in str(exc) or "_local_scalar_dense" in str(exc):
+            raise UnsupportedModelError(
+                "PyTorch couldn't trace this model: it converts a tensor to a Python "
+                "number, which is fixed when the model is traced. This happens with "
+                "float(x), x.item(), a branch on a tensor's value, or indexing with a "
+                "0-d integer tensor such as x[i] = y. To index with a tensor, give it "
+                "one item, as x[i.reshape(1)] = y.unsqueeze(0), or use torch.where; "
+                "see https://github.com/NormallyNormal/cattorch/blob/main/docs/"
+                "troubleshooting.md#keep-one-inference-return-path"
+            ) from exc
         raise UnsupportedModelError(
             f"PyTorch couldn't trace this model ({type(exc).__name__}: {_first_line(exc)}); "
             "a common cause is control flow that depends on tensor values or "

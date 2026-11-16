@@ -414,8 +414,11 @@ Scratch:
 - Generation needs causal attention as the only place tokens mix, and a
   fixed `max_context`; see
   [requirements](docs/generation.md#requirements).
-- Training and autograd aren't supported, and state can't be updated in
-  place by index; see [limitations](docs/programs-and-moe.md#limitations).
+- Training and autograd aren't supported. State can be updated in place by
+  slices, index tensors and masks, but not through a 0-d index tensor
+  (`buffer[position] = x`; use `buffer[position.reshape(1)]`) or a strided
+  or transposed view, nor read through a view taken before the update; see
+  [limitations](docs/programs-and-moe.md#limitations).
 - Scratch reads NaN as 0, and integer arithmetic doesn't wrap around; see
   [inputs and outputs](docs/supported-models.md#inputs-and-outputs).
 

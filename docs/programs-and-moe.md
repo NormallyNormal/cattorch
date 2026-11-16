@@ -348,5 +348,16 @@ Experts that receive too little data fall back to symmetric quantization; see
 ## Limitations
 
 - Adapters must return PyTorch modules; they can't emit Scratch blocks directly.
-- State can't be updated in place by index.
+- A state can be updated in place like any tensor the method computes:
+  `self.buffer[0] = x`, `self.buffer[1:] = self.buffer[:-1].clone()`,
+  `self.memory[:, 2].mul_(0.5)`, `self.memory[1].add_(x)`, boolean-mask
+  assignment (`self.buffer[self.buffer > 1] = 0`), assignment at index
+  tensors, `masked_fill_`, `copy_`, `fill_`, `zero_` and `clamp_`. To write at
+  a position held in a state, as a ring buffer does, index with a one-item
+  tensor: `self.buffer[self.position.reshape(1)] = x.unsqueeze(0)`; a 0-d
+  index (`self.buffer[self.position] = x`) becomes a Python number when
+  traced and fails the export. Writing through a strided or transposed view
+  (`self.memory.t()[0] = 1`), and reading a view taken before the write
+  (`row = self.buffer[0]; self.buffer[0] = x; return row`), fail the export
+  too; write those out of place, with `torch.cat` or `torch.where`.
 - Training and autograd aren't supported.
