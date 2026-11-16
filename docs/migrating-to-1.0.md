@@ -199,14 +199,15 @@ from cattorch import GenerationProgram, transpile
 
 result = transpile(decoder, GenerationProgram(max_context=8, top_k=3), "decoder")
 logits = result.outputs[0]
-assert logits.list_name == "cattorch logits"
+assert logits.list_name == "decoder logits"
 assert result.vocabulary_size == 16 and result.max_context == 8
 ```
 
 A generation export returns a `GenerationResult` instead of a
-`TranspileResult`. Its `inputs` describes `cattorch token ids` with a
-`BoundedDimension` of 1 to `max_context` tokens (it was a `(1, 1)` list
-named `cattorch tokens`), and `outputs` holds `cattorch logits` with shape
+`TranspileResult`. Its `inputs` describes the global `NAME token ids` list
+(NAME is the export's name, here `decoder`) with a `BoundedDimension` of 1
+to `max_context` tokens (it was a `(1, 1)` list named `cattorch tokens`),
+and `outputs` holds `NAME logits` with shape
 `(vocabulary,)` (it was `(1, 1, vocabulary)`) followed by the top-k lists.
 It also has `max_context`, `vocabulary_size` and `top_k`.
 
@@ -226,6 +227,9 @@ to the float model's. Pass
 | `TokenizerResult.tokenizer_type == "BPETokenizer"` | `"bpe"` |
 | `TokenizerResult.tokenizer_type == "SentencePieceBPETokenizer"` | `"sentencepiece-bpe"` |
 | `ProgramCallVerifyResult.states`, a tuple of `(name, VerifyResult)` pairs | A mapping from state name to `VerifyResult`. |
+| `procedures` of `TranspileResult` and `ProgramResult`: the sprite's public blocks (`cattorch forward`, ...) | `broadcasts`: the messages that run it (`NAME forward`, ...); see [Scratch projects](#scratch-projects). |
+| `EntryPointResult.procedure` (`cattorch ENTRY`) | `EntryPointResult.broadcast` (`NAME ENTRY`); `completion_broadcast` is `NAME ENTRY complete`. |
+| `TensorSpec.list_name`, `StateResult.list_name` and `sharded_lists`: the sprite's own lists (`output`, `cattorch step value`, `cattorch state counter`) | The global lists a project uses (`NAME output`, `NAME step value`, `NAME state counter`). |
 
 ```python
 # cattorch 0.5.0
@@ -363,16 +367,68 @@ your project, then update the scripts that use it. A 1.0 sprite has a
 `cattorch interface version` variable, `1`; a sprite without it is from
 before 1.0. The full contract is in the [Scratch interface](scratch-interface.md).
 
-### Renamed lists, variables and values
+### Calls are broadcasts, data is global
+
+In 0.5.0, a sprite's blocks (`cattorch forward`, ...) were custom blocks
+and its lists (`input`, `output`, ...) were its own, so only scripts inside
+the sprite could use them, and you had to open the sprite to add them. In
+1.0 you never open the sprite: a large one makes the editor slow while it's
+selected. Each export has a NAME, the `name` you pass (by default the file
+name), which is also the sprite's name:
+
+- Each call is a broadcast, `NAME forward`, that a `when I receive` script
+  in the sprite answers. Call it from any sprite with
+  `broadcast [NAME forward] and wait`, then read `NAME status`. The blocks
+  are internal (`_cattorch forward`); scripts must not call them.
+- What a project reads or writes is global and named after the export.
+  Uploading the sprite creates the globals on the stage, or uses the ones
+  of the same name the project has. Constants stay in the sprite; read them
+  with `([cattorch max context] of [NAME])`.
+- Uploading a sprite selects it: select another sprite right away.
+- Two sprites exported under one NAME share their globals and both answer
+  the same broadcasts. To use two copies of one model, export them with
+  different `name`s.
+
+```text
+// cattorch 0.5.0, a script inside the model sprite
+delete all of [input]
+add (0.5) to [input]
+cattorch forward
+say (item (1) of [output])
+
+// cattorch 1.0, a script in any sprite (NAME is "points")
+delete all of [points input]
+add (0.5) to [points input]
+broadcast [points forward] and wait
+if <(points status) = [ok]> then
+  say (item (1) of [points output])
+end
+```
 
 | Sprite | 0.5.0 | 1.0 |
 |---|---|---|
-| Generation | `cattorch tokens` list | `cattorch token ids` |
-| Tokenizer | `input` variable (text to tokenize) and `output` variable (detokenized text) | `cattorch text`, for both |
-| Tokenizer | `token_ids` list | `cattorch token ids` |
+| Model | `cattorch forward`, `cattorch init`, `cattorch prepare for save` blocks | `NAME forward`, `NAME init`, `NAME prepare for save` broadcasts |
+| Model | `input`, `input_1`, ..., `output`, ... lists | `NAME input`, `NAME input_1`, ..., `NAME output`, ... |
+| Program | `cattorch ENTRY`, `cattorch init`, `cattorch reset`, `cattorch prepare for save` blocks | `NAME ENTRY`, `NAME init`, `NAME reset`, `NAME prepare for save` broadcasts |
+| Program | `cattorch ENTRY INPUT`, `cattorch ENTRY OUTPUT`, `cattorch state STATE` lists | `NAME ENTRY INPUT`, `NAME ENTRY OUTPUT`, `NAME state STATE` |
+| Program | `cattorch ENTRY complete` broadcast | `NAME ENTRY complete` |
+| Generation | `cattorch init`, `cattorch reset`, `cattorch prefill`, `cattorch decode` blocks | `NAME init`, `NAME reset`, `NAME prefill`, `NAME decode` broadcasts, and the new `NAME prepare for save` |
+| Generation | `cattorch tokens`, `cattorch logits`, `cattorch top k values`, `cattorch top k ids` lists | `NAME token ids`, `NAME logits`, `NAME top k values`, `NAME top k ids` |
+| Generation | `cattorch cache length` variable | `NAME cache length` |
+| Generation | `cattorch ... complete` broadcasts | `NAME ... complete` |
+| Tokenizer | `cattorch tokenize`, `cattorch detokenize` blocks | `NAME tokenize`, `NAME detokenize` broadcasts |
+| Tokenizer | `input` variable (text to tokenize) and `output` variable (detokenized text) | `NAME text`, for both |
+| Tokenizer | `token_ids` list | `NAME token ids` |
+| Program, generation | `cattorch status` variable, starting as `0` | `NAME status` (Scratch creates it holding `0`) |
+| Every list over 200,000 items | `LIST shard 2`, ... | `NAME LIST shard 2`, ...; the shard counts stay in the sprite as `cattorch LIST shard count` |
 | Model, program, generation | `cattorch storage compression` value `costume-base92` | `base92` |
 | Model, program, generation | `cattorch storage compression` value `costume-base92-huffman-int4` | `base92-huffman-int4` |
-| Program, generation | `cattorch status` starts as `0` | `cattorch status` starts empty |
+
+A program's state lists are empty when the sprite is uploaded, until its
+first call or `NAME init` fills them with their initial values; a project
+you save keeps them. Every model, generation and program sprite also
+answers `cattorch prepare for save`, so one `broadcast and wait` of it
+prepares a whole project for saving.
 
 Every internal name now starts with `_`. In 0.5.0, some internal blocks,
 lists and variables started with `cattorch ` or had no prefix, such as the
@@ -380,68 +436,69 @@ weight decoders (`cattorch decode float32`, `cattorch unpack weights`), the
 generation caches (`cattorch K cache 1`), `cattorch select top k`,
 `cattorch project output`, `cattorch reset 0`, `T1`, `index` and `sum`, and
 a tokenizer's `tokens`, `merge_ids` and `splitlist`. Scripts must not use
-them. The public names are the ones that start with `cattorch ` and a model
-sprite's `input` and `output` lists.
+them.
 
 ### Status values
 
-A program or generation block sets `cattorch status` to one value per
-situation, naming the public list at fault. LIST is that list, such as
-`cattorch step value`, and TOK is `cattorch token ids`:
+A call sets `NAME status` to one value per situation, naming the global
+list at fault. LIST is that list, such as `NAME step value`, and TOK is
+`NAME token ids`:
 
 | 0.5.0 | 1.0 |
 |---|---|
 | `invalid length: LIST` | `wrong number of items: LIST` |
 | `invalid dynamic length: LIST` | `wrong number of items: LIST` |
 | `dynamic capacity exceeded: LIST` | `too many items: LIST` |
-| `state capacity exceeded: STATE` | `state full: cattorch state STATE` |
+| `state capacity exceeded: STATE` | `state full: NAME state STATE` |
 | `decode requires exactly one token` | `wrong number of items: TOK` |
 | `prefill requires at least one token` | `too few items: TOK` |
 | `prefill exceeds maximum context` | `too many items: TOK` |
 | `maximum context exceeded` | `context full` |
 
-`ok` still means success. New values cover items that aren't numbers or
-whole numbers in range (`invalid item: LIST`) and calls from several scripts
-at once; see [status values](scratch-interface.md#status-values).
+`ok` still means success. New values cover a call that hasn't finished
+(`not finished`), items that aren't numbers or whole numbers in range
+(`invalid item: LIST`) and calls from several scripts at once; see
+[status values](scratch-interface.md#status-values).
 
 ### Completion broadcasts and failed calls
 
-Every public block now sets `cattorch status` and does a `broadcast and wait`
-of its `... complete` broadcast whenever it ends, whether it succeeded or
-not. Only a block that is stopped sends none. In 0.5.0, a program entry point
-broadcast `cattorch ENTRY complete` only after a successful call, so a script
-that reacts to that broadcast must now check that `cattorch status` is `ok`
-before reading the outputs.
+Every call now sets `NAME status` and does a `broadcast and wait` of its
+`NAME OP complete` broadcast whenever it ends, whether it succeeded or
+not. Only a call that is stopped, or restarted by a second broadcast of its
+message, sends none. In 0.5.0, a program entry point broadcast
+`cattorch ENTRY complete` only after a successful call, so a script that
+reacts to that broadcast must now check that `NAME status` is `ok` before
+reading the outputs. Better, call with `broadcast [NAME ENTRY] and wait`
+and read `NAME status` right after.
 
 Model and tokenizer sprites had no status or broadcasts in 0.5.0. They now
-have `cattorch status`, and model sprites send `cattorch init complete`,
-`cattorch forward complete` and `cattorch prepare for save complete`;
-tokenizer sprites `cattorch tokenize complete` and
-`cattorch detokenize complete`.
+have `NAME status`, and model sprites send `NAME init complete`,
+`NAME forward complete` and `NAME prepare for save complete`; tokenizer
+sprites `NAME tokenize complete` and `NAME detokenize complete`.
 
-A block that fails now changes nothing:
+A call that fails now changes nothing:
 
-- A model sprite's `cattorch forward` checks its input lists. With the wrong
-  number of items, or an item that isn't a number, it used to compute and
-  write meaningless outputs; now it writes no outputs and sets
-  `cattorch status`, as program sprites do.
+- A model's forward checks its input lists. With the wrong number of items,
+  or an item that isn't a number, it used to compute and write meaningless
+  outputs; now it writes no outputs and sets `NAME status`, as program
+  sprites do.
 - A generation sprite's prefill or decode with invalid input used to empty
-  `cattorch logits` and the top-k lists, and a failed prefill reset the cache
+  the logits and the top-k lists, and a failed prefill reset the cache
   first. Now both leave the logits and the cache as they were. A token ID
   outside the vocabulary, a fraction or text is rejected with
-  `invalid item: cattorch token ids` instead of reporting `ok`.
-- `cattorch prefill` no longer empties `cattorch token ids`. No block changes
-  its input lists.
+  `invalid item: NAME token ids` instead of reporting `ok`.
+- Prefill no longer empties `NAME token ids`. No call changes its input
+  lists.
 
-`cattorch prepare for save` keeps the public lists: in 0.5.0 it emptied a
-model's input and output lists, and a program's input and state lists, so a program needed `cattorch reset` before its next call.
-Generation sprites now have `cattorch prepare for save` too; it also resets
-the sprite.
+Prepare for save keeps the global lists: in 0.5.0 it emptied a model's input
+and output lists, and a program's input and state lists, so a program
+needed `cattorch reset` before its next call. Generation sprites now have
+`NAME prepare for save` too; it also resets the sprite.
 
 Calls from several scripts at once, which 0.5.0 didn't detect, now fail with
 `another call ran during this one` or
 `an earlier call was stopped or is still running; reset first`. Call a
-sprite's blocks from one script at a time; see
+sprite from one script at a time; see
 [overlapping calls](scratch-interface.md#overlapping-calls).
 
 ## Command line

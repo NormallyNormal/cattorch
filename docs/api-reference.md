@@ -200,7 +200,7 @@ ends in it). A path that isn't a sprite, such as a project, raises
 the inputs raises `UnsupportedModelError`, as in `transpile`. `verify`
 checks correctness, not speed. It works for every kind of export:
 
-- **Tensor inputs**: the sprite runs `cattorch forward` on `example_inputs`.
+- **Tensor inputs**: the sprite runs `NAME forward` on `example_inputs`.
   A model with one tensor output returns a `VerifyResult`, even if the tensor
   is inside a container; a model with several returns a
   `MultiOutputVerifyResult`, whose `outputs` are in the same order as
@@ -213,12 +213,12 @@ checks correctness, not speed. It works for every kind of export:
   inputs.
 - **Generation** (`GenerationProgram` or `RecurrentGenerationProgram`):
   the program must be the one the sprite was exported with (a different
-  `max_context` or `top_k` raises `ValueError`). `calls` names the blocks `"prefill"`, `"decode"` and `"reset"` with their
+  `max_context` or `top_k` raises `ValueError`). `calls` names the calls `"prefill"`, `"decode"` and `"reset"` with their
   token IDs, such as `ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))`;
-  by default a prefill and a few decodes. Each call's `cattorch logits` and
+  by default a prefill and a few decodes. Each call's `NAME logits` and
   top-k lists are compared with the model's next-token logits, and its
-  `cattorch status` with the status its input should give, such as
-  `context full` or `too many items: cattorch token ids`.
+  `NAME status` with the status its input should give, such as
+  `context full` or `too many items: NAME token ids`.
 
 Programs and generation return a `ProgramVerifyResult`.
 
@@ -251,13 +251,17 @@ build_project(
 ```
 
 Write a runnable `.sb3` around a `transpile` result, adding `.sb3` if it's
-missing, as `transpile`'s `output_path` does. Every operation gets a bridge
-to global lists that other sprites can run with `broadcast and wait`. A
+missing, as `transpile`'s `output_path` does. The exported sprites keep
+their names and global interface, which the project declares on the
+stage, so any sprite can run them with `broadcast and wait`; a small Demo
+sprite, selected when the project opens, runs the demo. A
 `TranspileResult` gets list monitors starting from `example_inputs` (or
 zeros) and runs on the green flag or space key; `labels` names a
-classifier's outputs. A `GenerationResult` needs `tokenizer`, a
-`TokenizerResult`, and gets a Demo sprite that continues typed prompts. A
-`ProgramResult` gets bridges only. See
+classifier's outputs and adds `NAME predict`. A `GenerationResult` needs
+`tokenizer`, a `TokenizerResult`, and gets a sampler, `NAME sample`, and a
+Demo that continues typed prompts. A `ProgramResult` gets list monitors and
+a note. Two sprites of one name, or globals or broadcasts Scratch can't
+tell apart, raise `ValueError`. See
 [projects and the command line](projects-and-cli.md).
 
 Each option applies to one kind of result, and given to another kind raises
@@ -276,8 +280,8 @@ warns, since some IDs of one then mean nothing to the other.
 |---|---|
 | `path` | Path of the written `.sb3`. |
 | `sprites` | Names of the project's sprites. |
-| `broadcasts` | The project's public broadcasts: each bridge's message followed by its completion broadcast, such as `points run`, `points run complete`. |
-| `lists`, `variables` | The global lists and variables the bridges read and write. |
+| `broadcasts` | The project's public broadcasts: each sprite's messages, each followed by its completion broadcast, such as `points forward`, `points forward complete`, the shared `cattorch prepare for save`, and the project's own, such as `points predict`. |
+| `lists`, `variables` | The project's global lists and variables: the sprites' and the project's own. |
 | `warnings` | Size warnings, and a tokenizer that doesn't match the model's vocabulary; each is also emitted as a `CattorchWarning`. |
 
 All names are Scratch names.
@@ -409,7 +413,7 @@ Describes one input or output list:
 
 | Field | Meaning |
 |---|---|
-| `list_name` | Name of the list in Scratch. |
+| `list_name` | Name of the global list in Scratch, such as `points input`. |
 | `shape` | Tensor shape. |
 | `dtype` | PyTorch dtype, as a string. |
 | `numel` | Number of values, or `None` if the shape has a runtime extent. |
@@ -430,11 +434,11 @@ Fields shared by every sprite result:
 | Field | Meaning |
 |---|---|
 | `path` | Path of the written file. |
-| `sprite_name` | Sprite name shown in Scratch. |
+| `sprite_name` | The export's name, NAME: the sprite's name in Scratch, which its globals and broadcasts start with. |
 | `archive_bytes` | Size of the `.sprite3` file. |
 | `expanded_json_bytes` | Size of the uncompressed `sprite.json`. |
-| `block_count`, `list_count` | Number of generated blocks and lists. |
-| `sharded_lists` | Names of the public lists (inputs, outputs, states, `cattorch logits`, ...) split into [shards](storage.md#list-sharding). Internal lists, such as weights, can be split too and aren't listed. |
+| `block_count`, `list_count` | Number of generated blocks, and of the sprite's own lists. |
+| `sharded_lists` | Names of the global lists (inputs, outputs, states, `NAME logits`, ...) split into [shards](storage.md#list-sharding). Internal lists, such as weights, can be split too and aren't listed. |
 | `warnings` | Every warning of the export: size, compatibility, fallbacks, and anything that changed what was exported. Each is also emitted as a `CattorchWarning`. Check these before sharing the sprite. |
 
 ### `TranspileResult`
@@ -445,7 +449,7 @@ Fields shared by every sprite result:
 |---|---|
 | `inputs` | A `TensorSpec` per input list, in argument order. |
 | `outputs` | A `TensorSpec` per output list, in output order. The `output` property is `outputs[0]`. |
-| `procedures` | The public blocks. |
+| `broadcasts` | The messages that run the sprite: `NAME init`, `NAME forward`, `NAME prepare for save`. Each call ends by broadcasting its message followed by ` complete`. |
 | `quantization` | A `QuantizationReport`, or `None`. |
 | `fallback_operations` | Operations that have no kernel of their own and ran as PyTorch's decomposition into simpler operations, as `(operation, calls)` pairs such as `("aten.mish.default", 2)`. These usually run slower than a dedicated kernel would, and `warnings` names them too. Calls that depend only on weights are computed at export and aren't listed. |
 | `approximate_operations` | The operations that used an approximate kernel in fast mode, the same way. |
@@ -457,18 +461,18 @@ Fields shared by every sprite result:
 
 | Field | Meaning |
 |---|---|
-| `inputs` | The `cattorch token ids` list: a prompt of 1 to `max_context` tokens for `cattorch prefill` (to 200,000 without a limit), or the one token `cattorch decode` reads. |
-| `outputs` | `cattorch logits`, one value per token ID, then, with `top_k`, `cattorch top k values` and `cattorch top k ids`. |
+| `inputs` | The `NAME token ids` list: a prompt of 1 to `max_context` tokens for `NAME prefill` (to 200,000 without a limit), or the one token `NAME decode` reads. |
+| `outputs` | `NAME logits`, one value per token ID, then, with `top_k`, `NAME top k values` and `NAME top k ids`. |
 | `max_context` | The most tokens read between resets; `None` for no limit. |
 | `vocabulary_size` | The number of token IDs the sprite accepts. |
 | `top_k` | The number of largest logits listed, or `None`. |
-| `procedures` | `cattorch init`, `cattorch reset`, `cattorch prefill`, `cattorch decode` and `cattorch prepare for save`. |
+| `broadcasts` | `NAME init`, `NAME reset`, `NAME prefill`, `NAME decode` and `NAME prepare for save`. |
 | `quantization`, `fallback_operations`, `approximate_operations` | As for `TranspileResult`. |
 
 ### `ProgramResult`
 
 `ArtifactResult` plus `entrypoints` (an `EntryPointResult` per entry point),
-`states` (a `StateResult` per state), `procedures` (the public blocks), and
+`states` (a `StateResult` per state), `broadcasts` (the messages that run it: `NAME ENTRY` per entry point, then `NAME init`, `NAME reset` and `NAME prepare for save`), and
 `quantization`, `fallback_operations` and `approximate_operations` as for a
 `TranspileResult`, summed over the entry points.
 
@@ -477,8 +481,8 @@ Fields shared by every sprite result:
 | Field | Meaning |
 |---|---|
 | `name` | The entry point's name. |
-| `procedure` | Its block, `cattorch ENTRY`. |
-| `completion_broadcast` | The broadcast the block sends when it ends, `cattorch ENTRY complete`. |
+| `broadcast` | The message that calls it, `NAME ENTRY`. |
+| `completion_broadcast` | The broadcast the call sends when it ends, `NAME ENTRY complete`. |
 | `inputs`, `outputs` | A `TensorSpec` per input and output list, in declaration order. |
 | `state_inputs`, `state_updates` | The names of the states it reads and writes. |
 
@@ -487,7 +491,7 @@ Fields shared by every sprite result:
 | Field | Meaning |
 |---|---|
 | `name` | The state's name. |
-| `list_name` | Its list, `cattorch state STATE`. |
+| `list_name` | Its global list, `NAME state STATE`. |
 | `mode` | `"replace"` or `"append"`. |
 | `shape`, `dtype` | Its initial tensor's shape and dtype. |
 | `capacity` | The most rows an append state holds; `None` for a replace state. |
@@ -495,7 +499,10 @@ Fields shared by every sprite result:
 ### `TokenizerResult`
 
 `ArtifactResult` plus `tokenizer_type`, the kind exported (`"char"`,
-`"bpe"` or `"sentencepiece-bpe"`), and `token_count`, its vocabulary size.
+`"bpe"` or `"sentencepiece-bpe"`), `token_count`, its vocabulary size, and
+`broadcasts`, the messages that run it: `NAME tokenize` and
+`NAME detokenize`, which read and write the global `NAME text` and
+`NAME token ids`.
 
 ### `VerifyResult`
 
@@ -529,9 +536,9 @@ A `ProgramVerifyResult` has `passed`, true only if every call passes, and
 |---|---|
 | `entrypoint` | The block called: an entry point, or `prefill`, `decode` or `reset`. |
 | `passed` | Whether `status` is `expected_status` and every comparison passed. |
-| `outputs` | A `VerifyResult` per output list, when the call succeeded. For generation: `cattorch logits`, then the top-k values, then the logits at the top-k IDs compared with the top-k values (ties may list either ID). |
+| `outputs` | A `VerifyResult` per output list, when the call succeeded. For generation: `NAME logits`, then the top-k values, then the logits at the top-k IDs compared with the top-k values (ties may list either ID). |
 | `states` | A `VerifyResult` per state list, by state name. |
-| `status` | The `cattorch status` the call ended with. |
+| `status` | The `NAME status` the call ended with. |
 | `expected_status` | The status its input should give: `ok`, or for generation the failure an invalid call reports. A call that fails doesn't change the state used for later calls. |
 
 ### `QuantizationReport`

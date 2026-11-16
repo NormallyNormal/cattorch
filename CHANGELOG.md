@@ -41,9 +41,9 @@ Python API:
   an ordinary forward over the sequence. See
   [KV-cached generation](docs/generation.md#requirements).
 - Generation exports return a `GenerationResult` instead of a
-  `TranspileResult`: `inputs` describes `cattorch token ids` as
+  `TranspileResult`: `inputs` describes `NAME token ids` as
   `[1, 1..max_context]` (it was `cattorch tokens`, `(1, 1)`), `outputs` holds
-  `cattorch logits` as `(vocabulary,)` (it was `(1, 1, vocabulary)`) and the
+  `NAME logits` as `(vocabulary,)` (it was `(1, 1, vocabulary)`) and the
   top-k lists, and `max_context`, `vocabulary_size` and `top_k` are fields.
 - A generation export with `QuantizationConfig(bits=4)` or `bits=6` stores
   the output head (such as `lm_head`, or GPT-2's tied embedding table) in
@@ -86,33 +86,73 @@ Python API:
 
 Scratch interface (re-export a 0.5.0 sprite to get these):
 
-- Generation sprites' `cattorch tokens` list → `cattorch token ids`.
-- Tokenizer sprites read and write the `cattorch text` variable and the
-  `cattorch token ids` list instead of the `input` and `output` variables and
-  the `token_ids` list.
+- A sprite is used without opening it, from any other sprite. Its calls are
+  broadcasts named after the export (NAME, the `name` argument, by default
+  the file name): `NAME forward`, `NAME init`, `NAME reset`, `NAME prefill`,
+  `NAME decode`, `NAME prepare for save`, `NAME ENTRY`, `NAME tokenize`,
+  `NAME detokenize`, each run by a `when I receive` script in the sprite.
+  Its blocks are internal (`_cattorch forward`, ...); 0.5.0's custom blocks
+  `cattorch forward` and the rest, which only the sprite's own scripts
+  could run, are gone. Call with `broadcast [NAME forward] and wait`, then
+  read `NAME status`. See
+  [using a sprite without opening it](docs/scratch-interface.md#using-a-sprite-without-opening-it).
+- What a project reads or writes is global, named after the export, and
+  created by Scratch on the stage when the sprite is uploaded (or bound to
+  an existing global of that name): a model's `input`, `output`, ... lists
+  → `NAME input`, `NAME output`, ...; a program's `cattorch ENTRY INPUT`,
+  `cattorch ENTRY OUTPUT` and `cattorch state STATE` → `NAME ENTRY INPUT`,
+  `NAME ENTRY OUTPUT` and `NAME state STATE`; a generator's
+  `cattorch tokens` and `cattorch logits` → `NAME token ids` and
+  `NAME logits`; a tokenizer's `input` and `output` variables (text) and
+  `token_ids` list → `NAME text` and `NAME token ids`; long lists' shards
+  `LIST shard 2` → `NAME LIST shard 2`. The sprite's run-time variables are
+  `NAME status` and a generator's `NAME cache length`. Constants stay in
+  the sprite, read with `([VAR] of [NAME])`: `cattorch interface version`,
+  the storage descriptors, `cattorch max context`, shard counts, and
+  `cattorch initialized`.
+- Completion broadcasts are `NAME OP complete` (a program's
+  `cattorch ENTRY complete` → `NAME ENTRY complete`, a generator's
+  `cattorch prefill complete` → `NAME prefill complete`), and every call
+  sends one whenever it ends, whatever happened, not only after a
+  successful call: a script reacting to it must check `NAME status`. A call
+  that decodes the weights itself sends only its own.
+- Every model, generation and program sprite answers
+  `cattorch prepare for save`, so one broadcast prepares a whole project
+  for saving.
+- `NAME status` is `not finished` from when a call starts until it ends. A
+  second broadcast of a running call's message restarts it in Scratch,
+  which returns the first caller's `broadcast and wait` at once: it reads
+  `not finished`, never an earlier call's `ok`. See
+  [overlapping calls](docs/scratch-interface.md#overlapping-calls).
+- Globals that Scratch creates on upload start as 0 or empty:
+  `NAME status` reads `0` until a call ends, `NAME text` holds `0`, and a
+  program's state lists are empty until its first call or `NAME init` fills
+  them from the stored initial values (a project you save keeps them).
+- A NAME whose broadcasts Scratch can't tell apart from each other or from
+  `cattorch prepare for save` (it matches them ignoring case), or that
+  Scratch keeps for its menus (`_stage_`, ...), is refused at export. Two sprites exported under one
+  NAME share their globals and broadcasts; export copies under different
+  names.
 - `cattorch storage compression` values `costume-base92` and
   `costume-base92-huffman-int4` → `base92` and `base92-huffman-int4`.
-- `cattorch status` values, one per situation, naming the list at fault:
+- Status values, one per situation, naming the global list at fault:
   `invalid length: LIST` and `invalid dynamic length: LIST` →
   `wrong number of items: LIST`; `dynamic capacity exceeded: LIST` →
   `too many items: LIST`; `state capacity exceeded: STATE` →
-  `state full: cattorch state STATE`; `maximum context exceeded` →
+  `state full: NAME state STATE`; `maximum context exceeded` →
   `context full`; `decode requires exactly one token`,
   `prefill requires at least one token` and `prefill exceeds maximum context`
   → `wrong number of items`, `too few items` and `too many items` of
-  `cattorch token ids`. `cattorch status` starts empty instead of `0`. See
+  `NAME token ids`. See
   [status values](docs/scratch-interface.md#status-values).
-- A program entry point sends `cattorch ENTRY complete` whenever it ends,
-  not only after a successful call, so a script reacting to it must check
-  `cattorch status`.
-- A block that fails changes nothing: a generation prefill or decode with
-  invalid input no longer empties `cattorch logits` and the top-k lists, and
-  a failed prefill no longer resets the cache first. `cattorch prefill` no
-  longer empties `cattorch token ids`.
-- Input lists are checked: a model sprite's `cattorch forward` with the
+- A call that fails changes nothing: a generation prefill or decode with
+  invalid input no longer empties `NAME logits` and the top-k lists, and
+  a failed prefill no longer resets the cache first. Prefill no longer
+  empties `NAME token ids`.
+- Input lists are checked: a model's forward with the
   wrong number of items or a non-number item, an integer list item that isn't
   a whole number from -2^53 to 2^53 (`Infinity` isn't one), and a generation
-  block with a token ID that isn't a whole number in the vocabulary, fail
+  call with a token ID that isn't a whole number in the vocabulary, fail
   with a status instead of computing meaningless output. A bool list must
   hold Scratch's `true` and `false` or the numbers 1 and 0; text such as
   `true`, which some operations read as true and others as false, fails with
@@ -123,7 +163,7 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   `take_along_dim`, `one_hot`, `scatter`, `index_add`, `index_put`, an
   embedding or an embedding bag's offsets, must hold indices valid for every
   operation that uses it, and an index computed from the inputs, such as
-  `x[ids + 1]` or a loss's targets, is checked as the block runs; either
+  `x[ids + 1]` or a loss's targets, is checked as the call runs; either
   fails with `invalid item: LIST` naming the input. `index_select`,
   `index_add`, `index_copy`, `index_reduce` and `take_along_dim` refuse
   negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
@@ -139,32 +179,41 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   `init`, `reset` and `prepare for save` in any case.
 - An input or state list split into shards is checked shard by shard: each
   must hold its part, every shard but the last holding items holding exactly
-  200,000, or the block fails with `wrong number of items: LIST`; a
+  200,000, or the call fails with `wrong number of items: LIST`; a
   program's split lists check every shard's items. See
   [long lists](docs/scratch-interface.md#long-lists).
-- `cattorch prepare for save` keeps the public lists. It used to empty a
+- Prepare for save keeps the global lists. It used to empty a
   model's input and output lists and a program's input and state lists.
 - Every internal block, list and variable starts with `_`, including the
   0.5.0 ones that started with `cattorch ` (`cattorch decode float32`,
   `cattorch K cache 1`, `cattorch select top k`, ...) or had no prefix
-  (`index`, `sum`, `T1`, a tokenizer's `tokens`). Only names starting with
-  `cattorch ` and a model's `input` and `output` lists are public.
+  (`index`, `sum`, `T1`, a tokenizer's `tokens`). The public names are the
+  broadcasts and globals named after the export, and the sprite's own
+  variables starting with `cattorch `.
 
 ## New features
 
 ### Interface and stability
 
 - The [Scratch interface](docs/scratch-interface.md) is versioned. It lists
-  every public block, list, variable and broadcast and every
-  `cattorch status` value; within interface version 1 (all of 1.x) none is
-  renamed or removed. Each sprite has a `cattorch interface version`
-  variable, and Python has `cattorch.INTERFACE_VERSION`.
-- Every public block, in every kind of sprite, sets `cattorch status` and
-  does a `broadcast and wait` of its `... complete` broadcast whenever it
-  ends, unless it is stopped. Model and tokenizer sprites gain `cattorch status` and their
-  broadcasts; program sprites gain `cattorch initialized`,
-  `cattorch reset complete` and `cattorch prepare for save complete`;
-  generation sprites gain `cattorch prepare for save`.
+  every public broadcast, list and variable and every `NAME status` value;
+  within interface version 1 (all of 1.x) none is renamed or removed. Each
+  sprite has a `cattorch interface version` variable, and Python has
+  `cattorch.INTERFACE_VERSION`.
+- Every call, in every kind of sprite, sets `NAME status` and does a
+  `broadcast and wait` of its `NAME OP complete` broadcast whenever it
+  ends, unless it is stopped or restarted. Model and tokenizer sprites gain
+  a status and their broadcasts; program sprites gain
+  `cattorch initialized`, `NAME reset complete` and
+  `NAME prepare for save complete`; generation sprites gain
+  `NAME prepare for save`.
+- Result objects name what a project uses: `inputs`, `outputs`, a
+  program's entry point lists and states, and `sharded_lists` give the
+  global list names (`NAME input`), and `TranspileResult.procedures`,
+  `GenerationResult.procedures` and `ProgramResult.procedures` →
+  `broadcasts`, the messages that run the sprite (`NAME forward`, ...);
+  `EntryPointResult.procedure` → `broadcast` (`NAME ENTRY`), with
+  `completion_broadcast` `NAME ENTRY complete`.
 - [Stability](docs/stability.md) says what 1.x keeps compatible and what is
   experimental. `cattorch.__version__` and `cattorch --version` give the
   installed version.
@@ -189,7 +238,7 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   bfloat16 weights are exported in float32. See
   [KV-cached generation](docs/generation.md).
 - `verify` runs a generation sprite's `prefill`, `decode` and `reset` calls
-  and compares each call's logits, top-k lists and `cattorch status` with
+  and compares each call's logits, top-k lists and `NAME status` with
   PyTorch; see [verify a generator](docs/generation.md#verify-a-generator).
 
 ### Recurrent generation
@@ -298,9 +347,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 
 ### Command line and projects
 
-- `build_project` writes a runnable `.sb3` around exported sprites, with
-  bridges other sprites can call by broadcast, list monitors for a model,
-  and a prompt-and-continue Demo sprite for a text generator.
+- `build_project` writes a runnable `.sb3` around exported sprites, which
+  keep their global interface: list monitors and a green-flag run for a
+  model, a classifier's `NAME predict`, a text generator's `NAME sample`
+  and prompt-and-continue demo. It opens with its small Demo sprite
+  selected, not a model's.
 - The `cattorch` command: `cattorch export` exports and verifies a model from
   a Python file, module or `.pt`, `cattorch generate` exports a text
   generator and its tokenizer (also `--hf REPO`), and `--project` builds the
@@ -516,13 +567,12 @@ Scratch:
 - `cattorch prepare for save` clears every internal working list, including
   those of recurrent layers, experts and cached attention and a generator's
   copy of the prompt, which it used to leave holding the last call's values.
-- Loose call blocks on the canvas ran internal procedures directly.
-- A tokenizer sprite's `cattorch text` started as `0`, so tokenizing before
-  setting it tokenized "0"; it starts empty.
+- Loose call blocks on the canvas ran internal procedures directly; they
+  now broadcast the sprite's messages, as a project calls it.
 
 ## Known limitations
 
-- Call a sprite's blocks from one script at a time. Two rare overlaps are
+- Call a sprite from one script at a time. Two rare overlaps are
   still not detected; see
   [overlapping calls](docs/scratch-interface.md#overlapping-calls).
 - Tokenizers other than character, raw BPE and SentencePiece BPE, such as

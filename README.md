@@ -31,12 +31,16 @@ assert verify(model, example, artifact).passed
 print(artifact.path)  # build/model.sprite3
 ```
 
-Import the file using Scratch's **Upload Sprite** option. On the imported
-sprite, fill the `input` list, click `cattorch forward`, and read `output`.
-The first call initializes the model automatically.
+Import the file using Scratch's **Upload Sprite** option, then select
+another sprite: you never need to open the model's sprite, which is slow to
+show in the editor when it's large. From any sprite, fill the global
+`model input` list, `broadcast [model forward] and wait`, and read
+`model status` (`ok`) and `model output`. The lists and broadcasts are named
+after the export (`model`, from the file name, or `name=`). The first call
+decodes the weights automatically.
 
-For a complete project instead, with the inputs and outputs on the stage and
-scripts other sprites can call, pass the result to `cattorch.build_project`,
+For a complete project instead, with the inputs and outputs on the stage
+and a demo, pass the result to `cattorch.build_project`,
 or export from the terminal with `cattorch export my_models.py:Net --project`.
 See [projects and the command line](https://github.com/NormallyNormal/cattorch/blob/main/docs/projects-and-cli.md)
 and the [examples](https://github.com/NormallyNormal/cattorch/tree/main/examples).

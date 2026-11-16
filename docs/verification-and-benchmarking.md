@@ -26,7 +26,7 @@ print(result.max_abs_error, result.max_rel_error)
 print(result.worst_index)
 ```
 
-`verify` loads the sprite, runs `cattorch forward` once in the emulator, and
+`verify` loads the sprite, runs `NAME forward` once in the emulator, and
 compares the result with PyTorch value by value. Sharded lists are handled.
 Run it after every change that can affect accuracy: float16 or integer storage,
 `sig_figs`, fast mode, pruning, or low-rank transforms.
@@ -74,7 +74,7 @@ sequence of `ProgramCall`s with state carried between them (see
 [program verification](programs-and-moe.md#named-entry-points-and-state)). For
 a `GenerationProgram` or `RecurrentGenerationProgram`, `calls` names the
 blocks `"prefill"`, `"decode"` and `"reset"`; each call's logits and top-k
-lists are compared with the model's, and its `cattorch status` with the one
+lists are compared with the model's, and its `NAME status` with the one
 its input should give (see [generation](generation.md#verify-a-generator)).
 
 The reference is always your own code, never cattorch's export machinery:

@@ -4,7 +4,9 @@
 
 writes ``build/quadrants.sprite3`` and a runnable ``build/quadrants.sb3``:
 edit the two numbers in the "quadrants input" list and press space to see the
-predicted quadrant. The same model exports from the command line with
+predicted quadrant. Any sprite can do the same: fill "quadrants input",
+broadcast "quadrants forward" and wait, and read "quadrants status" and
+"quadrants output". The same model exports from the command line with
 
     cattorch export examples/mlp.py:trained --project --labels "top right,top left,bottom left,bottom right"
 """

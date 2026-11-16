@@ -129,12 +129,12 @@ broadcasting pattern, or option. The error names the operation that failed.
 
 ## Inputs and outputs
 
-- The first tensor argument is flattened into `input`; later tensor arguments
-  use `input_1`, `input_2`, and so on. Tensor values in `example_kwargs`
+- The first tensor argument is flattened into the global `NAME input` list;
+  later tensor arguments use `NAME input_1`, `NAME input_2`, and so on. Tensor values in `example_kwargs`
   follow the positional ones, in dict order.
 - The model may return a tensor or a nested tuple, list, dictionary,
   NamedTuple, or Hugging Face `ModelOutput` of tensors. Leaves are flattened
-  into `output`, `output_1`, and so on in order. Non-tensor leaves are
+  into `NAME output`, `NAME output_1`, and so on in order. Non-tensor leaves are
   skipped with a warning; at least one tensor is required. Tensors inside
   any other object, such as a dataclass, aren't read: such an output raises
   `UnsupportedModelError` naming it, rather than losing them.

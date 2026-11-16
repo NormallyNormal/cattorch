@@ -3,7 +3,7 @@
 [Documentation home](index.md)
 
 An exported sprite is one piece of a Scratch project: something still has to
-fill its input list, call its blocks, and show the result. `build_project`
+fill its input list, broadcast its call, and show the result. `build_project`
 writes that project for you, and the `cattorch` command exports a model and
 builds its project in one step.
 
@@ -25,8 +25,10 @@ project = cattorch.build_project(
 print(project.path)  # build/points.sb3
 ```
 
-Open the `.sb3` with Scratch's **File > Load from your computer**. The stage
-shows the `points input` and `points output` lists, starting from
+Open the `.sb3` with Scratch's **File > Load from your computer**. It opens
+with its small Demo sprite selected, not the model's: a large model sprite
+makes the editor slow while it's selected, and you never need to open it.
+The stage shows the `points input` and `points output` lists, starting from
 `example_inputs` (or zeros). Click the green flag or press space to run the
 model. Edit the input list's items to try other inputs. With `labels`, the
 `points prediction` monitor shows the label of the largest output.
@@ -51,8 +53,8 @@ when you give one, or when the model's context is full (never, for a recurrent
 generator without `max_context`). `prompt` replaces the
 question it asks. When the model or the tokenizer fails, such as a prompt
 longer than the context or a token ID the tokenizer doesn't have, the Demo
-stops, says which bridge failed with its status (`chars detokenize: invalid
-item: cattorch token ids`), and repeats it before the next question.
+stops, says which call failed with its status (`chars detokenize: invalid
+item: chars token ids`), and repeats it before the next question.
 
 The model's vocabulary and the tokenizer's token IDs should match.
 `build_project` warns when they don't: a vocabulary padded past the
@@ -62,40 +64,42 @@ until the text contains it. Options of another kind of project, such as
 `temperature` for a classifier, raise `ValueError`; see
 [`build_project`](api-reference.md#build_project).
 
-A model with [entry points](markers.md) gets a bridge for each one but no
-demo, since only you know what its calls mean.
+A model with [entry points](markers.md) gets monitors of its lists and a
+note on how to call it, but no demo, since only you know what its calls
+mean.
 
-## Bridges
+## Projects
 
-Every operation in the project is bridged to global lists and variables, so
-any sprite can use the model with `broadcast and wait`. A bridge copies the
-global inputs into the sprite's own lists, runs the operation, and copies the
-results back, inside a block that runs without screen refresh. It sets
-`NAME status` to the sprite's `cattorch status`, copies the results only when
-it is `ok`, and ends with a `broadcast and wait` of the message followed by
-` complete`, such as `NAME run complete`. A list over 200,000 items, which
-the sprite [splits into shards](storage.md#list-sharding), is bridged shard
-by shard to global lists of the same names, such as `NAME output shard 2`. The names start with the sprite's
-name; the [Scratch interface](scratch-interface.md#projects) lists them all:
+An exported sprite already has the interface other sprites use: its
+broadcasts (`NAME forward`, ...) and its global lists and variables
+(`NAME input`, `NAME status`, ...), NAME being its name; see
+[using a sprite without opening it](scratch-interface.md#using-a-sprite-without-opening-it).
+A project from `build_project` holds the sprites as they are and declares
+their globals on the stage, as uploading them would. Any sprite in the
+project can fill the inputs, `broadcast [NAME forward] and wait`, and read
+`NAME status` and the outputs.
 
-| Model | Broadcast | Reads | Writes |
+The project adds a small sprite, Demo, first among the sprites so that the
+project opens with it selected. It runs the demo, and holds the project's
+own messages, which a project of your own can use too:
+
+| Project | Broadcast | Reads | Writes |
 |---|---|---|---|
-| Plain model | `NAME run` | `NAME input`, `NAME input_1`, ... | `NAME output`, ..., `NAME status` |
-| Classifier (with `labels`) | `NAME predict`, after `NAME run` | `NAME output`, `NAME labels` | `NAME prediction` |
-| Entry point | `NAME ENTRY` | `NAME ENTRY INPUT` for each input | `NAME ENTRY OUTPUT` for each output, `NAME status` |
-| Text generator | `NAME prefill`, `NAME decode` | `NAME token ids`, `NAME temperature` | `NAME next token`, `NAME status` |
-| Tokenizer | `NAME tokenize` | `NAME text` | `NAME token ids`, `NAME status` |
-| Tokenizer | `NAME detokenize` | `NAME token ids` | `NAME text`, `NAME status` |
+| Classifier (with `labels`) | `NAME predict`, after `NAME forward` | `NAME output`, `NAME labels` | `NAME prediction` |
+| Text generator | `NAME sample`, after a `NAME prefill` or `NAME decode` that ended `ok` | `NAME logits`, `NAME temperature` | `NAME next token` |
 
-`NAME prefill` takes a whole prompt and `NAME decode` one token, as the
-[generation blocks](generation.md#scratch-interface) do. Both sample the next
-token from the logits and write it to `NAME next token`, zero-based. `NAME
-status` is `ok` or an error message. `ProjectResult` lists every broadcast,
-list, and variable a project defines.
+Each ends with a `broadcast and wait` of the message followed by
+` complete`. `NAME sample` picks the next token, zero-based, from the
+softmax of the logits divided by the temperature (0 picks the likeliest
+token). The [Scratch interface](scratch-interface.md#projects) lists every
+name, and `ProjectResult` every sprite, broadcast, list and variable of a
+project. No two of a project's sprites may share a name, nor two of its
+globals or broadcasts: export the tokenizer under another name than the
+model, for one.
 
-To use the bridges in your own project, build one with `build_project`, then
-drag its sprites into your project, or start from it and add your own sprites.
-In the editor, the bridges are the `cattorch bridge ...` blocks on each sprite.
+To use the sprites in your own project, upload the `.sprite3` files into it
+(select another sprite after each upload), or start from a built project
+and add your own sprites.
 
 ## The command line
 
@@ -176,9 +180,11 @@ their defaults.
 
 The JSON summary uses the result's field names: `path`, `sprite_name`,
 `archive_bytes`, `expanded_json_bytes`, `block_count`, `list_count`,
-`sharded_lists`, `warnings`, `fallback_operations` and
-`approximate_operations`, and for `generate` also `max_context`,
-`vocabulary_size` and `top_k`. `export` adds `verify`, with `passed` and
+`sharded_lists`, `warnings`, `fallback_operations`,
+`approximate_operations` and `broadcasts` (the messages that run the
+sprite, such as `net forward`), and for `generate` also `max_context`,
+`vocabulary_size` and `top_k`. `lists` names the global lists a project
+uses the sprite through, such as `net input` and `net output`. `export` adds `verify`, with `passed` and
 `max_abs_error`, the largest error over every output (and, for a model with
 entry points, every call and state; a call that ended with an unexpected
 status counts as infinite, written as the string `"Infinity"`);

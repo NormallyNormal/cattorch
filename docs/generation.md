@@ -137,7 +137,7 @@ otherwise; see [the output head](storage.md#the-output-head-of-a-language-model)
 ## Verify a generator
 
 `verify` runs prefill, decode and reset calls in the emulator and compares
-each with PyTorch: the logits, the top-k lists, and `cattorch status`,
+each with PyTorch: the logits, the top-k lists, and `NAME status`,
 including the statuses an invalid call should give:
 
 ```python
@@ -177,77 +177,77 @@ the values the sprite stores.
 
 ## Scratch interface
 
-The sprite has `cattorch init`, `cattorch reset`, `cattorch prefill`,
-`cattorch decode` and `cattorch prepare for save` blocks. Put the prompt's
-token IDs in the `cattorch token ids` list and run `cattorch prefill`; it
+The sprite, named NAME (the export's `name`, by default the file name, here
+`decoder`), runs on five broadcasts: `NAME init`, `NAME reset`,
+`NAME prefill`, `NAME decode` and `NAME prepare for save`. You never need
+to open it; call it from another sprite. Put the prompt's token IDs in the
+global `NAME token ids` list and `broadcast [NAME prefill] and wait`; it
 resets the cache, reads the prompt, and writes the next token's logits to
-`cattorch logits`, one per zero-based token ID. Then put one token ID in
-`cattorch token ids` and run `cattorch decode` for each token after that.
-`cattorch cache length` counts the tokens in the cache, and
-`cattorch max context` holds `max_context`. Each block sets `cattorch status`
-and sends its completion broadcast, such as `cattorch prefill complete`, when
-it ends; check that the status is `ok` before you read the logits. The
+`NAME logits`, one per zero-based token ID. Then put one token ID in
+`NAME token ids` and `broadcast [NAME decode] and wait` for each token after
+that. After each, read `NAME status`, and read the logits only when it's
+`ok`. `NAME cache length` counts the tokens in the cache, and the sprite's
+own `cattorch max context` holds `max_context` (read it with
+`([cattorch max context] of [NAME])`). Each call also sends a completion
+broadcast, such as `NAME prefill complete`, when it ends. The
 [Scratch interface](scratch-interface.md#generation-sprites) page lists every
 name and status.
 
 `top_k` can be `None` (the default) or an integer from 1 to 64. With an
 integer, each prefill and decode also writes the `top_k` largest logits,
-largest first, to `cattorch top k values`, and their token IDs to
-`cattorch top k ids`. Top-k only sorts candidates; it doesn't pick a token.
+largest first, to `NAME top k values`, and their token IDs to
+`NAME top k ids`. Top-k only sorts candidates; it doesn't pick a token.
 Like `torch.topk`, it always gives `top_k` real token IDs, including tokens
 whose logit is `-Infinity`, and ranks a NaN logit first. Equal logits are
 listed lowest token ID first; `torch.topk` doesn't specify their order, so
 the IDs of tied logits can differ from it.
 Sampling, temperature, repetition penalties, stopping at EOS, and turning
 tokens into text are up to your Scratch project.
-
-These blocks and lists belong to the generated sprite. To drive generation from
-another sprite, use the
-[global-list bridge](getting-started.md#connect-another-sprite), or let
-[`build_project`](projects-and-cli.md) write a project with the model, its
-tokenizer, bridges, and a generation loop already wired together.
+[`build_project`](projects-and-cli.md) writes a project with the model, its
+tokenizer, a sampler (`NAME sample`) and a generation loop already wired
+together.
 
 ## Generation loop
 
-A typical loop looks like this:
+A typical loop, in a sprite of your own, looks like this:
 
 ```text
-copy prompt token IDs into local [cattorch token ids]
-cattorch prefill
+copy prompt token IDs into [NAME token ids]
+broadcast [NAME prefill] and wait
 
 set [finished] to [false]
-repeat until <(finished) = [true] or (cattorch status) != [ok] or
-              (cattorch cache length) = (cattorch max context)>
-    sample one token from [cattorch logits] or [cattorch top k values/ids]
+repeat until <(finished) = [true] or (NAME status) != [ok] or
+              (NAME cache length) = ([cattorch max context] of [NAME])>
+    sample one token from [NAME logits] or [NAME top k values/ids]
     if <(sampled token) = (EOS)> then
         set [finished] to [true]
     else
         stream or detokenize the sampled token
-        delete all of [cattorch token ids]
-        add (sampled token) to [cattorch token ids]
-        cattorch decode
+        delete all of [NAME token ids]
+        add (sampled token) to [NAME token ids]
+        broadcast [NAME decode] and wait
     end
 end
 ```
 
-The prompt counts toward the context, so stop when `cattorch cache length`
+The prompt counts toward the context, so stop when `NAME cache length`
 reaches `cattorch max context`.
 
 ## Invalid input
 
-Prefill and decode check `cattorch token ids` before they change anything. A
-block that fails writes no logits and leaves the cache as it was: a prefill
+Prefill and decode check `NAME token ids` before they change anything. A
+call that fails writes no logits and leaves the cache as it was: a prefill
 that fails doesn't reset first.
 
-| Situation | `cattorch status` |
+| Situation | `NAME status` |
 |---|---|
-| Decode with zero or several tokens | `wrong number of items: cattorch token ids` |
+| Decode with zero or several tokens | `wrong number of items: NAME token ids` |
 | Decode when the cache is full | `context full` |
-| Prefill with no tokens | `too few items: cattorch token ids` |
-| Prefill longer than `max_context` | `too many items: cattorch token ids` |
-| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: cattorch token ids` |
-| Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
-| A block that another of the sprite's blocks started during | `another call ran during this one`; see [overlapping calls](scratch-interface.md#overlapping-calls) |
+| Prefill with no tokens | `too few items: NAME token ids` |
+| Prefill longer than `max_context` | `too many items: NAME token ids` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: NAME token ids` |
+| Decode after a reset, prefill or decode was stopped, restarted or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
+| A call that another of the sprite's calls started during | `another call ran during this one`; see [overlapping calls](scratch-interface.md#overlapping-calls) |
 
 ## Cache behavior
 
@@ -255,17 +255,19 @@ A step past `max_context` is refused before it changes any cache. Caches
 longer than 200,000 items are [sharded](storage.md#list-sharding)
 automatically. To shrink the sprite, see [layer sharing](#layer-sharing).
 
-Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
-`cattorch prefill` or `cattorch decode` partway, leaving some layers' caches a
-token longer than others or holding part of a token. Every `cattorch decode`
-after that fails as in the table above and changes nothing, until
-`cattorch reset` or `cattorch prefill` runs; both start from empty caches.
-`cattorch init` doesn't clear the condition. `cattorch cache length` keeps
-whatever value the stopped block left. Call the sprite's blocks from one
-script at a time; what the sprite detects when calls overlap, and how to
-recover, is in [overlapping calls](scratch-interface.md#overlapping-calls).
+Scratch's stop sign, or a `stop all` block, can stop `NAME reset`,
+`NAME prefill` or `NAME decode` partway (so can a second broadcast of the
+same message, which restarts it), leaving some layers' caches a token longer
+than others or holding part of a token. Every `NAME decode` after that fails
+as in the table above and changes nothing, until `NAME reset` or
+`NAME prefill` runs; both start from empty caches. `NAME init` doesn't
+clear the condition. `NAME cache length` keeps whatever value the stopped
+call left. Call the sprite from one script at a time; what the sprite
+detects when calls overlap, and how to recover, is in
+[overlapping calls](scratch-interface.md#overlapping-calls).
 
-Before saving a project that has generated, call `cattorch prepare for save`;
+Before saving a project that has generated, `broadcast [cattorch prepare for
+save] and wait`;
 see [save after running](storage.md#save-after-running).
 
 Related: [recurrent generation](recurrent-generation.md),

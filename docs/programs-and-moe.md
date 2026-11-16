@@ -51,24 +51,25 @@ result = cattorch.transpile(model, program, "model.sprite3")
 state. `returns` maps each returned tensor to an output list or a state update.
 Here, each call adds `value` to the stored counter and outputs the new total.
 
-The sprite gets `cattorch step`, `cattorch init`, `cattorch reset`, and
-`cattorch prepare for save` blocks. Lists are named after the entry point and
-state, such as `cattorch step value`, `cattorch step result`, and
-`cattorch state counter`. When a call ends, the sprite sets `cattorch status`
-to `ok`, or to why it failed, such as an input list with the wrong number of
-items, and broadcasts `cattorch step complete`. The
+The sprite, named NAME (here `model`, from the file name), answers the
+broadcasts `NAME step`, `NAME init`, `NAME reset` and
+`NAME prepare for save`. Its global lists are named after the entry point
+and state, such as `NAME step value`, `NAME step result`, and
+`NAME state counter`. From another sprite, fill `NAME step value`,
+`broadcast [NAME step] and wait`, and read `NAME status`: `ok`, or why the
+call failed, such as an input list with the wrong number of items. The call
+also broadcasts `NAME step complete` when it ends. The
 [Scratch interface](scratch-interface.md#program-sprites) lists every name.
 
 Rules:
 
 - `init`, `reset`, and `prepare for save` can't be used as entry point names,
   in any case: Scratch matches broadcasts ignoring case, so `Init` would
-  share `cattorch init complete`.
+  share `NAME init`.
 - For the same reason, two entry point names can't differ only in case, such
   as `step` and `Step`, and an entry point can't be named like another's
-  completion, such as `x complete` beside `x`, whose
-  [project bridge](projects-and-cli.md#bridges) ends by broadcasting
-  `NAME x complete`.
+  completion, such as `x complete` beside `x`, whose call ends by
+  broadcasting `NAME x complete`.
 - List names must be unique across entry points and states, and can't end in
   `shard N`, which is used for [sharding](storage.md#list-sharding).
 - An input and an output of the same entry point can share a name only if
@@ -77,7 +78,9 @@ Rules:
 ### State
 
 A `State(name, initial)` is a tensor the sprite keeps between calls, in the
-list `cattorch state NAME`. An entry point reads it with `StateInput(name)`
+global list `NAME state STATE`, STATE being its name. The list is empty
+when the sprite is uploaded; the first call, or `NAME init`, fills it with
+`initial`, and a project you save keeps it. An entry point reads it with `StateInput(name)`
 among its `arguments`, and writes it with `StateUpdate(name)` among its
 `returns`. Every entry point can read every state.
 
@@ -85,12 +88,12 @@ among its `arguments`, and writes it with `StateUpdate(name)` among its
 |---|---|---|
 | Shape | Fixed: the shape of `initial`. | The first dimension grows, from `initial`'s rows up to `capacity` rows; the others are fixed. `capacity=` is required. |
 | An update | The returned tensor, with the state's shape, replaces it. | The returned rows are added at the end. |
-| When full | | The call is refused with `state full: cattorch state NAME` and changes nothing. |
+| When full | | The call is refused with `state full: NAME state STATE` and changes nothing. |
 
 - A call can update each state at most once. It writes its updates at its
   end, all together, and only if it succeeds: a call that fails leaves the
   outputs and states as they were.
-- `cattorch reset` restores every state to its `initial` value, so a learned
+- `NAME reset` restores every state to its `initial` value, so a learned
   start state works.
 - A state list belongs to the sprite. A project may read it, and may save
   and restore it, with values the sprite wrote. Each call checks its length:
@@ -132,12 +135,12 @@ state if it grows along its first dimension, with the `capacity=` you give.
 
 ### Stopped and overlapping calls
 
-Call the sprite's blocks from one script at a time. What the sprite detects
+Call the sprite from one script at a time. What the sprite detects
 when calls overlap, and how to recover, is in
 [overlapping calls](scratch-interface.md#overlapping-calls). A call stopped,
-or taken over, while it writes the states leaves them partly written: every
-entry point then reports `an earlier call was stopped or is still running;
-reset first` and changes nothing, until `cattorch reset`. A program without
+restarted or taken over while it writes the states leaves them partly
+written: every entry point then reports `an earlier call was stopped or is
+still running; reset first` and changes nothing, until `NAME reset`. A program without
 state has nothing to reset; its next call simply runs.
 
 To test a sequence of calls, pass `ProgramCall` values to `verify()`:

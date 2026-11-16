@@ -42,24 +42,27 @@ The returned `TokenizerResult` gives the saved path, size, and any warnings.
 As with `transpile`, parent directories are created, `.sprite3` is added if
 missing, and `name=` sets the sprite name.
 
-Every tokenizer sprite has two custom blocks, which run without screen
-refresh, and a clickable stack for each (see the
-[Scratch interface](scratch-interface.md#tokenizer-sprites)):
+A tokenizer sprite, named NAME (the `name=`, by default the file name),
+answers two broadcasts, and runs each without screen refresh (see the
+[Scratch interface](scratch-interface.md#tokenizer-sprites)). Use them from
+another sprite with `broadcast [...] and wait`; you never need to open the
+sprite:
 
-- `cattorch tokenize` reads the `cattorch text` variable and writes token IDs
-  to the `cattorch token ids` list.
-- `cattorch detokenize` reads `cattorch token ids` and writes the text to
-  `cattorch text`. A token ID that isn't a whole number in the vocabulary
-  sets `cattorch status` to `invalid item: cattorch token ids`, and the text
+- `NAME tokenize` reads the global `NAME text` variable and writes token IDs
+  to the global `NAME token ids` list.
+- `NAME detokenize` reads `NAME token ids` and writes the text to
+  `NAME text`. A token ID that isn't a whole number in the vocabulary
+  sets `NAME status` to `invalid item: NAME token ids`, and the text
   is left as it was.
 
-Like every sprite's blocks, each sets `cattorch status` when it ends and then
-broadcasts `cattorch tokenize complete` or `cattorch detokenize complete`.
+Like every call, each sets `NAME status` when it ends and then broadcasts
+`NAME tokenize complete` or `NAME detokenize complete`. Read `NAME status`
+after the `broadcast and wait`, and use the result only when it's `ok`.
+`NAME text` holds 0 when Scratch creates it on upload; set it before
+tokenizing.
 
 Token IDs are zero-based, as in Python, even though Scratch list positions
-start at 1. The variables and lists belong to the tokenizer sprite; to use them
-from another sprite, see the
-[global-list bridge](getting-started.md#connect-another-sprite).
+start at 1.
 
 `CharTokenizer` maps each character to its ID. `BPETokenizer` applies the
 tokenizer's merges, in the tokenizer's order, to the whole input string,
@@ -86,7 +89,7 @@ where added tokens meet, overlap and touch whitespace, and raises
 rejected: whether a match stands alone depends on whether its neighbours are
 letters or digits, which a sprite can't tell for every character.
 
-`cattorch detokenize` writes every token's text, added and special tokens
+`NAME detokenize` writes every token's text, added and special tokens
 included, as `transformers`' `decode(..., skip_special_tokens=False)` keeps
 them, so detokenizing what tokenize wrote gives the text back.
 

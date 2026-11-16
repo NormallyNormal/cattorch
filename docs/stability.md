@@ -20,9 +20,9 @@ changed on the way to 1.0.
   with its result types, and `INTERFACE_VERSION`, also importable as
   `cattorch.interface.INTERFACE_VERSION`. `tests/test_stability.py` pins
   every signature and field.
-- **The Scratch interface:** every block, list, variable, and broadcast in the
+- **The Scratch interface:** every broadcast, list, variable and status in the
   [Scratch interface](scratch-interface.md), including the names
-  [`build_project`](projects-and-cli.md#bridges) adds to a project, and a
+  [`build_project`](projects-and-cli.md#projects) adds to a project, and a
   [benchmark project's](scratch-interface.md#benchmark-projects) results
   lists and settings variables.
 - **The command line:** the `cattorch` commands, options, exit statuses and
@@ -56,7 +56,7 @@ names, and supported operations. A name that is replaced keeps working, with a
   warning classes don't change: invalid arguments raise `TypeError` or
   `ValueError`, an unconvertible operation `UnsupportedOperationError`, and
   any other model cattorch can't export `UnsupportedModelError`. The values
-  of a sprite's `cattorch status` aren't wording: they're part of the
+  of a sprite's `NAME status` aren't wording: they're part of the
   [Scratch interface](scratch-interface.md#status-values).
 
 Programs, markers, `GenerationProgram`, `ModuleAdapter`, `AdapterContext`

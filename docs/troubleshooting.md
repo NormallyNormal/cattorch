@@ -9,7 +9,7 @@ Problems usually happen at one of three stages:
 2. **Conversion.** cattorch traced the model but can't convert an operation.
    The exception is an `UnsupportedOperationError` or `UnsupportedModelError`.
 3. **Running in Scratch.** The sprite exported but doesn't work in a project.
-   Check `result.warnings`, `expanded_json_bytes`, and `cattorch status`
+   Check `result.warnings`, `expanded_json_bytes`, and `NAME status`
    (its values are in the [status table](scratch-interface.md#status-values)),
    then try the sprite with the smallest possible surrounding script. Call
    the sprite's blocks from one script at a time; see
@@ -85,15 +85,32 @@ GPTQ calibration inputs are different: they should be realistic data, and are
 only used to choose quantized weights. See
 [GPTQ calibration](storage.md#gptq-calibration).
 
-## Check sprite-local data
+## Check the sprite's globals and broadcasts
 
-The generated `input` and `output` lists and My Blocks belong to the generated
-sprite, and other sprites can't use them directly. If clicking the blocks works
-but calling from another sprite doesn't, add the
-[global-list bridge](getting-started.md#connect-another-sprite).
+A sprite is used through global lists and variables named after it
+(`NAME input`, `NAME output`, `NAME status`) and its broadcasts
+(`NAME forward`); see
+[using a sprite without opening it](scratch-interface.md#using-a-sprite-without-opening-it).
+If a call seems to do nothing:
 
-Don't replace a generated list with a new list of the same name. Blocks refer to
-lists by ID, so they keep using the original.
+- Check NAME. It is the export's `name` (by default the file name), not
+  the sprite's name in your project: Scratch renames a second sprite of one
+  name (`NAME2`), but its globals and broadcasts keep NAME.
+- Two sprites exported under one NAME, such as two uploads of the same
+  file, share their globals and both answer the same broadcasts, so a call
+  runs in both and they overwrite each other's outputs. To use two copies
+  of one model, export them with different `name`s.
+- Read `NAME status` right after `broadcast [NAME forward] and wait`. It
+  reads `not finished` when a second broadcast of the same message
+  restarted the call, or after the stop sign stopped it; see
+  [overlapping calls](scratch-interface.md#overlapping-calls).
+- Don't make a new local list or variable with a global's name in one of
+  your sprites: Scratch then gives that sprite its own copy, which the
+  model never sees.
+
+You never need to open the model's sprite, and a large one makes the editor
+slow while it's selected. Uploading a sprite selects it, so select another
+sprite afterwards.
 
 ## Preserve processor costumes
 

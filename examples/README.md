@@ -19,6 +19,34 @@ python examples/text_generator.py
 python examples/recurrent_generator.py
 ```
 
+## Use a model from your own sprites
+
+Each project holds the exported sprite, named after it (`quadrants`,
+`lines`, `rhyme`, `gru`), and a small Demo sprite, which the project opens
+with. You never need to open the model's sprite. From a sprite of your own,
+fill its input list, broadcast its call and wait, then read its status:
+
+```text
+when green flag clicked
+delete all of [quadrants input]
+add (0.5) to [quadrants input]
+add (-0.25) to [quadrants input]
+broadcast [quadrants forward] and wait
+if <(quadrants status) = [ok]> then
+  broadcast [quadrants predict] and wait
+  say (quadrants prediction)
+end
+```
+
+To put a model in a project of your own, upload `build/quadrants.sprite3`
+(**Upload Sprite**), then select another sprite: Scratch creates the
+`quadrants ...` lists and variables, and the script above works, except
+`quadrants predict`, which the built project adds: pick the label of the
+largest item of `quadrants output` yourself. See
+[using a sprite without opening it](../docs/scratch-interface.md#using-a-sprite-without-opening-it).
+
+## Options
+
 `--output DIR` writes somewhere other than `build/`. The models export from
 the command line too, for example:
 

@@ -6,7 +6,7 @@ Some language models carry the past in a fixed-size state instead of a cache
 of attention keys and values: GRU and LSTM language models, Mamba, Mamba-2 and
 RWKV. A `RecurrentGenerationProgram` exports such a model as a sprite that
 reads one token at a time, updates the state, and writes the next token's
-logits. The sprite has the same blocks and lists as a
+logits. The sprite has the same broadcasts and lists as a
 [KV-cached generator](generation.md), so a Scratch project or
 [`build_project`](projects-and-cli.md) demo written for one drives the other.
 
@@ -100,11 +100,11 @@ can be used. A stack of layers can loop over them in Python.
 Each state is a `State(name, initial)` in replace mode: the step's return
 value replaces it. `RecurrentGenerationProgram` rejects append states.
 
-- **Initial values.** `cattorch reset` and `cattorch prefill` set every state
+- **Initial values.** `NAME reset` and `NAME prefill` set every state
   back to its `initial` tensor, so a learned start state works.
 - **Constant states aren't stored.** A state whose initial value is one number
   everywhere, such as zeros, is saved as an empty list and filled by a loop on
-  `cattorch init`, on `cattorch reset`, and on the first prefill or decode in a
+  `NAME init`, on `NAME reset`, and on the first prefill or decode in a
   freshly loaded project. Any other state is stored twice: the live list and a
   copy of its initial value.
 - **Large states are sharded.** A state over 200,000 values is split into
@@ -112,7 +112,7 @@ value replaces it. `RecurrentGenerationProgram` rejects append states.
   extra blocks and time on every step, so a model with a big state per layer
   is better off with one state per layer than one stacked state; the Hugging
   Face adapters do this.
-- **Names are internal.** The states are the sprite's `_cattorch state NAME`
+- **Names are internal.** The states are the sprite's `_cattorch state STATE`
   lists, which aren't part of the [Scratch interface](scratch-interface.md).
 
 ## The reference check
@@ -189,20 +189,20 @@ and `GenerationResult.approximate_operations` lists what it approximated;
 
 ## Scratch interface
 
-The blocks, lists, variables, statuses and broadcasts are those of a
+The broadcasts, lists, variables and statuses are those of a
 [KV-cached generator](generation.md#scratch-interface), and the
 [generation loop](generation.md#generation-loop) there works unchanged. The
 differences:
 
 - There is no K/V cache. The states live in internal lists.
-- `cattorch cache length` counts the tokens consumed since the last reset or
+- `NAME cache length` counts the tokens consumed since the last reset or
   prefill.
 - `cattorch max context` is `max_context`, or `Infinity` when `max_context` is
-  `None`. The loop's stop condition `(cattorch cache length) = (cattorch max
-  context)` then never ends generation; stop on a token count or an end token
-  instead.
-- `cattorch reset` restores every state's initial value and clears the logits
-  and top-k lists. `cattorch prefill` restores the states too, once it has
+  `None`. The loop's stop condition `(NAME cache length) = ([cattorch max
+  context] of [NAME])` then never ends generation; stop on a token count or an
+  end token instead.
+- `NAME reset` restores every state's initial value and clears the logits
+  and top-k lists. `NAME prefill` restores the states too, once it has
   checked the prompt.
 
 ## Invalid input
@@ -210,31 +210,32 @@ differences:
 A failed prefill or decode changes no state partway: the step's results are
 committed only after it succeeds.
 
-Scratch's stop sign, or a `stop all` block, can stop `cattorch reset`,
-`cattorch prefill` or `cattorch decode` partway, even while a step commits its
-states, so some states may be updated and others not. Every `cattorch decode`
-after that fails as in the table below and changes nothing, until
-`cattorch reset` or `cattorch prefill` runs; both start from the initial
-states. `cattorch init` doesn't clear the condition. `cattorch cache length`
-keeps whatever value the stopped block left.
+Scratch's stop sign, or a `stop all` block, can stop `NAME reset`,
+`NAME prefill` or `NAME decode` partway (so can a second broadcast of the
+same message, which restarts it), even while a step commits its states, so
+some states may be updated and others not. Every `NAME decode` after that
+fails as in the table below and changes nothing, until `NAME reset` or
+`NAME prefill` runs; both start from the initial states. `NAME init`
+doesn't clear the condition. `NAME cache length` keeps whatever value the
+stopped call left.
 
-Call the sprite's blocks from one script at a time. What the sprite detects
+Call the sprite from one script at a time. What the sprite detects
 when calls overlap, and how to recover, is in
 [overlapping calls](scratch-interface.md#overlapping-calls).
 
-Prefill and decode check `cattorch token ids` before they change anything, and
-a block that fails writes no logits and leaves the states as they were. The
+Prefill and decode check `NAME token ids` before they change anything, and
+a call that fails writes no logits and leaves the states as they were. The
 statuses are those of a K/V cache, with `max_context` as the context:
 
-| Situation | `cattorch status` |
+| Situation | `NAME status` |
 |---|---|
-| Decode with zero or several tokens | `wrong number of items: cattorch token ids` |
+| Decode with zero or several tokens | `wrong number of items: NAME token ids` |
 | Decode after `max_context` tokens | `context full` |
-| Prefill with no tokens | `too few items: cattorch token ids` |
-| Prefill longer than `max_context` | `too many items: cattorch token ids` |
-| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: cattorch token ids` |
-| Decode after a reset, prefill or decode was stopped or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
-| A block that another of the sprite's blocks started during | `another call ran during this one` |
+| Prefill with no tokens | `too few items: NAME token ids` |
+| Prefill longer than `max_context` | `too many items: NAME token ids` |
+| A token ID that isn't a whole number from 0 to the vocabulary size minus 1 | `invalid item: NAME token ids` |
+| Decode after a reset, prefill or decode was stopped, restarted or taken over partway, or while one runs in another script | `an earlier call was stopped or is still running; reset first` |
+| A call that another of the sprite's calls started during | `another call ran during this one` |
 
 ## Hugging Face models
 

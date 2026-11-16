@@ -14,7 +14,7 @@ as before, and markers change nothing for a model without them. Import them from
 
 ## Entry points and state
 
-`@entrypoint` exports a method as a Scratch block. A buffer the method updates
+`@entrypoint` exports a method as a Scratch call. A buffer the method updates
 becomes persistent state:
 
 ```python
@@ -55,15 +55,16 @@ assert report.passed
 ```
 
 Passing `None` as the example tells `transpile` and `verify` to take the
-interface from the markers. Each entry point becomes a block named
-`cattorch <name>`, with a list per input named after its parameter
-(`cattorch add value`) and a list per output (`cattorch score scores`).
+interface from the markers. Each entry point becomes a broadcast,
+`NAME <name>` (NAME being the export's name), with a global list per input
+named after its parameter (`NAME add value`) and a list per output
+(`NAME score scores`).
 
 - `example_inputs=` gives the arguments to export with: a tuple, a tensor,
   or a function returning one. They must be tensors. `example_inputs=()`
   exports a method with no arguments, computed from the weights and the
   state.
-- `name=` names the block, `input_names=` and `output_names=` name its
+- `name=` names the entry point, `input_names=` and `output_names=` name its
   lists. Outputs default to `output`, `output_1`, and so on. Only the
   method's tensor results become outputs, as with `forward`; other results,
   such as `None`, are skipped with a warning, and tensors inside a dataclass
@@ -75,8 +76,8 @@ interface from the markers. Each entry point becomes a block named
   `(1, 32)` is short for the first dimension (see
   [variable-length inputs](supported-models.md#variable-length-inputs)).
 - cattorch runs each entry point once on a copy of the model to find the
-  buffers it changes. Each one becomes a state list, `cattorch state total`,
-  starting from the buffer's value; `cattorch reset` restores it. Each entry
+  buffers it changes. Each one becomes a state list, `NAME state total`,
+  starting from the buffer's value; `NAME reset` restores it. Each entry
   point takes, and checks, only the states it reads or writes; the others
   aren't part of its interface.
 - A buffer that grows along its first dimension, like `seen`, needs its

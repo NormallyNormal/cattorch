@@ -29,24 +29,24 @@ Where things live:
 | `cattorch.decompositions` | Rewrites operations without a kernel into ones that have one. |
 | `cattorch.graph` | Constant folding, aliases, validation, and recognizing fusable patterns. |
 | `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
-| `cattorch.transpiler` | `transpile` itself, and the two stages of one graph's export: `_compile_sprite` turns graph nodes into instruction programs (`_Compiler`), stores the weights and shards the lists; `_finalize_sprite` adds a standalone sprite's input checks and guards, marks internal names and writes the file. |
+| `cattorch.transpiler` | `transpile` itself, and the two stages of one graph's export: `_compile_sprite` turns graph nodes into instruction programs (`_Compiler`), stores the weights and shards the lists; `_finalize_sprite` adds a standalone sprite's input checks and guards, marks internal names, gives the sprite its global interface and writes the file. |
 | `cattorch.program_export` | Exports an `ExportProgram`: one compiled graph per entry point, joined into one sprite with its state lists. |
 | `cattorch.autoregressive` | Derives a `GenerationProgram`'s one-token step and caches from the model, and checks it against the model. |
 | `cattorch.recurrent_generation` | Exports a `RecurrentGenerationProgram` around the model's step. |
-| `cattorch.sprite` | Wraps a plain export's compiled program in `cattorch init` and `cattorch forward`, adds input checks and `cattorch prepare for save`, and sizes the lists for sharding. |
+| `cattorch.sprite` | Wraps a plain export's compiled program in its init and forward procedures, adds input checks and prepare for save, and sizes the lists for sharding. |
 | `cattorch.procedures` | Adds DSL programs to a sprite as custom blocks, and finds and edits them. |
 | `cattorch.guards` | Keeps stopped and overlapping calls of a sprite's blocks from reporting ok wrongly; its docstring compares what each kind of export does. |
 | `cattorch.static_storage` | Chooses each static tensor's storage precision, shares identical tensors, and installs the compressed payloads and their decoder. |
 | `cattorch.generation_blocks` | Adds the reset, prefill and decode blocks, top-k selection and cache bookkeeping around a generation sprite's one-token step. |
 | `cattorch.layer_sharing` | Replaces a transformer's identical repeated layers with one custom block called once per layer. |
 | `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. `generic` holds kernels for operations without a specialized one, and `row_loop` runs a one-row kernel once per row of a variable-length input. |
-| `cattorch.util.scratch` | The DSL (`dsl`), the Python emulator (`emulator`), list sharding (`sharding`), and writing the `.sprite3` archive (`finalize_scratch`, `archive`). |
+| `cattorch.util.scratch` | The DSL (`dsl`), the Python emulator (`emulator`), list sharding (`sharding`), the global interface every finished sprite gets (`globals`: broadcasts that run its blocks, and global lists and variables named after the export), and writing the `.sprite3` archive (`finalize_scratch`, `archive`). |
 
 A change to an operation should come with:
 
 1. Tests against PyTorch covering shapes, edge cases, and broadcasting.
 2. Emulator tests of the generated blocks.
-3. A benchmark project whose timer starts after `cattorch init`.
+3. A benchmark project whose timer starts after `NAME init`.
 4. Results from real Scratch, with enough iterations to be well above the
    timer's resolution.
 

@@ -3,7 +3,7 @@
 [Documentation home](index.md)
 
 Storage settings control how parameters, buffers, and constants are saved in
-the sprite. Compressed values are decoded once during `cattorch init`, and
+the sprite. Compressed values are decoded once during `NAME init`, and
 inference then runs on ordinary Scratch number lists.
 
 ## Choose a storage mode
@@ -348,15 +348,16 @@ different sprite. A sprite stored with `compression=False` has one costume.
 ## List sharding
 
 Scratch limits each list to 200,000 items, so cattorch splits a larger
-tensor across several lists, called shards. A public list, such as an input,
-an output, a state or `cattorch logits`, is split like this:
+tensor across several lists, called shards. A global list, such as an input,
+an output, a state or `NAME logits`, is split like this:
 
 - The first shard keeps the original name.
-- Later shards are named `<name> shard 2`, `<name> shard 3`, and so on.
-- The variables `cattorch <base> shard count` and
+- Later shards are named `<name> shard 2`, `<name> shard 3`, and so on,
+  such as `NAME output shard 2`; they are global too.
+- The sprite's own variables `cattorch <base> shard count` and
   `cattorch <base> logical length` hold the number of shards and the total
-  number of items, where `<base>` is the list's name without the `cattorch `
-  it may start with.
+  number of items, where `<base>` is the list's name without NAME, such as
+  `cattorch output shard count`.
 - The generated blocks read and write every shard.
 
 The result's `sharded_lists` names the public lists that were split. If your
