@@ -432,6 +432,17 @@ def _decompose_when_rejected(operator, validator, decomposition):
 _DECOMPOSE_WHEN_REJECTED = frozenset({"aten.batch_norm.default"})
 
 
+def _eye_decomposition(n, m=None, *, dtype=None, layout=None, device=None, pin_memory=None):
+    """``torch.eye``: PyTorch's own decomposition counts rows in the
+    smallest unsigned type that holds them, which ``arange`` can't make
+    past 255 rows."""
+    columns = n if m is None else m
+    rows = torch.arange(n, device=device).unsqueeze(-1)
+    return (rows == torch.arange(columns, device=device)).to(
+        dtype if dtype is not None else torch.get_default_dtype(),
+    )
+
+
 def own_decompositions() -> dict:
     """The ATen decompositions cattorch writes itself, by operator overload.
 
@@ -450,6 +461,8 @@ def own_decompositions() -> dict:
             torch.ops.aten.amin.default, torch.ops.aten.argmin.default,
         ),
         torch.ops.aten.topk.default: _topk_decomposition,
+        torch.ops.aten.eye.default: _eye_decomposition,
+        torch.ops.aten.eye.m: _eye_decomposition,
     }
     table.update(_POINTWISE_DECOMPOSITIONS)
     for operator in (
