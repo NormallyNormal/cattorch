@@ -28,6 +28,7 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 
+from cattorch.util.scratch import jsmath
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 
@@ -805,13 +806,18 @@ class ScratchEmulator:
                 self._set_costume(number - 1)
 
     def _set_costume(self, index) -> None:
-        """``RenderedTarget.setCostume``: rounded, wrapped into the costumes."""
+        """``RenderedTarget.setCostume``: rounded, wrapped into the costumes.
+
+        ``MathUtil.wrapClamp`` wraps in doubles, so a huge index lands where
+        its rounding puts it, as in Scratch, not at its exact remainder.
+        """
         if not math.isfinite(index):
             index = 0
-        index = math.floor(index + 0.5)
+        index = float(jsmath.round(index))
         count = len(self._costume_names)
         if count:
-            self._current_costume = index % count
+            wrapped = index - float(math.floor(index / count)) * count
+            self._current_costume = int(wrapped) if abs(wrapped) <= _EXACT_INTEGER else wrapped
 
     def _eval_input(self, input_spec):
         """Evaluate a Scratch input specification and return a Python value."""
@@ -968,10 +974,9 @@ class ScratchEmulator:
             value = number_of(inputs["NUM"])
 
             def round_half_up():
-                # Scratch uses JavaScript Math.round, including its handling
-                # of negative half values and of infinities.
-                number = value()
-                return math.floor(number + 0.5) if math.isfinite(number) else number
+                # JavaScript's Math.round, which rounds once: floor(x + 0.5)
+                # rounds 0.49999999999999994 up.
+                return jsmath.round(value())
             round_half_up.numeric = True
             return round_half_up
 
@@ -1108,57 +1113,40 @@ class ScratchEmulator:
 
     @staticmethod
     def _compile_mathop(value, op):
-        # Match JavaScript's Math functions, which return Infinity or NaN
-        # where Python raises.
-        if op == "e ^":
-            def exp():
-                try:
-                    return math.exp(value())
-                except OverflowError:
-                    return math.inf
-            return exp
+        # scratch-vm's mathop, with JavaScript's Math functions as V8
+        # computes them (see jsmath), so results match to the last bit.
         if op == "abs":
             return lambda: abs(value())
-        if op in {"floor", "ceiling"}:
-            rounding = math.floor if op == "floor" else math.ceil
-
-            def round_value():
-                number = value()
-                return rounding(number) if math.isfinite(number) else number
-            return round_value
+        if op == "floor":
+            return lambda: jsmath.floor(value())
+        if op == "ceiling":
+            return lambda: jsmath.ceil(value())
         if op == "sqrt":
             def square_root():
                 number = value()
                 return math.sqrt(number) if number >= 0 else math.nan
             return square_root
-        if op in {"ln", "log"}:
-            logarithm = math.log if op == "ln" else math.log10
-
-            def log_value():
-                number = value()
-                if math.isnan(number) or number < 0:
-                    return math.nan
-                if number == 0:
-                    return -math.inf
-                if math.isinf(number):
-                    return math.inf
-                return logarithm(number)
-            return log_value
+        if op == "ln":
+            return lambda: jsmath.log(float(value()))
+        if op == "log":
+            # Math.log(n) / Math.LN10, not log10.
+            return lambda: jsmath.log(float(value())) / 2.302585092994046
+        if op == "e ^":
+            return lambda: jsmath.exp(float(value()))
+        if op == "10 ^":
+            return lambda: jsmath.pow(10.0, float(value()))
         if op in {"sin", "cos"}:
-            function = math.sin if op == "sin" else math.cos
+            function = jsmath.sin if op == "sin" else jsmath.cos
 
             def trigonometry():
-                # scratch-vm: Math.round(Math.sin(Math.PI * n / 180) * 1e10) / 1e10
-                number = value()
-                if not math.isfinite(number):
-                    return math.nan
-                return math.floor(function(math.pi * number / 180) * 1e10 + 0.5) / 1e10
+                # parseFloat(Math.sin((Math.PI * n) / 180).toFixed(10))
+                return jsmath.to_fixed(function(math.pi * float(value()) / 180), 10)
             return trigonometry
         if op == "tan":
             def tangent():
                 # scratch-vm's MathUtil.tan: exact infinities at ±90 degrees,
                 # otherwise rounded like sin and cos.
-                number = value()
+                number = float(value())
                 if not math.isfinite(number):
                     return math.nan
                 angle = math.fmod(number, 360)
@@ -1166,24 +1154,12 @@ class ScratchEmulator:
                     return math.inf
                 if angle in {-90, 270}:
                     return -math.inf
-                return math.floor(math.tan(math.pi * angle / 180) * 1e10 + 0.5) / 1e10
+                return jsmath.to_fixed(jsmath.tan(math.pi * angle / 180), 10)
             return tangent
         if op in {"asin", "acos", "atan"}:
-            function = {"asin": math.asin, "acos": math.acos, "atan": math.atan}[op]
-
-            def inverse_trigonometry():
-                number = value()
-                if op != "atan" and not -1 <= number <= 1:
-                    return math.nan
-                return function(number) * 180 / math.pi
-            return inverse_trigonometry
-        if op == "10 ^":
-            def power():
-                try:
-                    return 10.0 ** value()
-                except OverflowError:
-                    return math.inf
-            return power
+            function = {"asin": jsmath.asin, "acos": jsmath.acos, "atan": jsmath.atan}[op]
+            # (Math.asin(n) * 180) / Math.PI
+            return lambda: function(float(value())) * 180 / math.pi
 
         def unknown():
             raise NotImplementedError(f"unknown mathop: {op}")
@@ -1269,7 +1245,7 @@ class ScratchEmulator:
         number = cls._scratch_numeric(value)
         if not math.isfinite(number):
             return 0 if math.isnan(number) or number < 0 else 2**31
-        return math.floor(number + 0.5)
+        return int(jsmath.round(number))
 
     @classmethod
     def _scratch_compare(cls, left, right) -> float:

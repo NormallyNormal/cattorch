@@ -21,7 +21,8 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from contextlib import contextmanager
+from typing import Iterator, Sequence
 
 from cattorch import interface
 from cattorch.codegen import CodegenConfig
@@ -329,6 +330,9 @@ class _TokenizerBase(ABC):
         self.tokenizer = tokenizer
         # Set by ``_build_sprite`` when the sprite looks characters up by costume.
         self._costume_names: tuple[str, ...] | None = None
+        # Set by ``_build_sprite``: the token IDs encode puts before and
+        # after the text's, as the tokenizer's post-processor does.
+        self._wrap: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
 
     def _build_tokens_list(self) -> list[str]:
         vocab = self.tokenizer.get_vocab()
@@ -396,7 +400,7 @@ class _TokenizerBase(ABC):
         Its warnings are also emitted as ``CattorchWarning``.
         """
         _check_codegen(name, codegen)
-        with collect_warnings() as collected:
+        with collect_warnings() as collected, _unchanged(self.tokenizer):
             result = self._save(output_path, name=name, codegen=codegen)
         return with_warnings(result, collected)
 
@@ -409,7 +413,7 @@ class _TokenizerBase(ABC):
         # The public interface: one text variable for both directions.
         rename_variables(sprite, {"input": TEXT_VARIABLE, "output": _DETOKENIZED})
         rename_lists(sprite, {"token_ids": TOKEN_IDS_LIST, "tokens": "_cattorch tokens"})
-        sprite = _add_tokenizer_interface(sprite, len(tokens))
+        sprite = _add_tokenizer_interface(sprite, len(tokens), *self._wrap)
         # The text starts empty, so tokenize before any text is set reads
         # no text rather than "0".
         for entry in sprite["variables"].values():
@@ -443,7 +447,9 @@ class _TokenizerBase(ABC):
         )
 
 
-def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
+def _add_tokenizer_interface(
+    sprite: dict, vocabulary: int, prefix: Sequence[int] = (), suffix: Sequence[int] = (),
+) -> dict:
     """Give the tokenize and detokenize blocks the interface every sprite's blocks have.
 
     Each sets ``cattorch status`` and sends its completion broadcast when it
@@ -451,6 +457,7 @@ def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
     the vocabulary. Each writes into an internal list or variable, and
     copies it to the public one at its end only if it succeeded and no
     other call started meanwhile, so a call that fails writes nothing.
+    Tokenize writes ``prefix`` and ``suffix`` around the text's token IDs.
     """
     status, ok = interface.STATUS_VARIABLE, interface.OK
     current = _epoch_current()
@@ -477,9 +484,11 @@ def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
             call("_cattorch tokenize text"),
             if_(current, (
                 clear(TOKEN_IDS_LIST),
+                *(append(TOKEN_IDS_LIST, token_id) for token_id in prefix),
                 for_each(copy, length(_TOKENIZED), (
                     append(TOKEN_IDS_LIST, item(_TOKENIZED, var(copy))),
                 )),
+                *(append(TOKEN_IDS_LIST, token_id) for token_id in suffix),
             )),
             *overtaken,
         ),
@@ -508,6 +517,133 @@ def _add_tokenizer_interface(sprite: dict, vocabulary: int) -> dict:
     return sprite
 
 
+@contextmanager
+def _unchanged(tokenizer) -> Iterator[None]:
+    """Leave a Hugging Face tokenizer's backend settings as they were.
+
+    transformers' ``encode``, which the export's checks call, sets the
+    backend's ``encode_special_tokens`` and turns off its truncation and
+    padding.
+    """
+    backend = _backend(tokenizer)
+    if backend is None:
+        yield
+        return
+    saved: dict = {}
+    for setting in ("encode_special_tokens", "truncation", "padding"):
+        try:
+            saved[setting] = getattr(backend, setting)
+        except Exception:  # noqa: BLE001 - a backend without the setting
+            pass
+    try:
+        yield
+    finally:
+        if "encode_special_tokens" in saved:
+            backend.encode_special_tokens = saved["encode_special_tokens"]
+        if "truncation" in saved:
+            if saved["truncation"] is None:
+                backend.no_truncation()
+            else:
+                backend.enable_truncation(**saved["truncation"])
+        if "padding" in saved:
+            if saved["padding"] is None:
+                backend.no_padding()
+            else:
+                backend.enable_padding(**saved["padding"])
+
+
+def _post_processor_wrap(processor: dict | None, exporter: str) -> tuple[list[int], list[int]]:
+    """The token IDs a ``tokenizers`` post-processor adds before and after
+    one sequence's, from its settings.
+
+    ``TemplateProcessing`` (with one ``$A`` in its single template),
+    ``BertProcessing`` and ``RobertaProcessing`` add fixed tokens;
+    ``ByteLevel`` only moves offsets; a ``Sequence`` applies each in turn.
+    Others raise ``ValueError``.
+    """
+    if processor is None:
+        return [], []
+    kind = processor.get("type")
+    if kind == "ByteLevel":
+        return [], []
+    if kind in ("BertProcessing", "RobertaProcessing"):
+        return [int(processor["cls"][1])], [int(processor["sep"][1])]
+    if kind == "Sequence":
+        prefix: list[int] = []
+        suffix: list[int] = []
+        for step in processor.get("processors", []):
+            step_prefix, step_suffix = _post_processor_wrap(step, exporter)
+            prefix, suffix = step_prefix + prefix, suffix + step_suffix
+        return prefix, suffix
+    if kind == "TemplateProcessing":
+        pieces = processor.get("single", [])
+        sequences = [index for index, piece in enumerate(pieces) if "Sequence" in piece]
+        if len(sequences) == 1:
+            special = processor.get("special_tokens", {})
+            before: list[int] = []
+            after: list[int] = []
+            for index, piece in enumerate(pieces):
+                if "SpecialToken" in piece:
+                    ids = special[piece["SpecialToken"]["id"]]["ids"]
+                    (before if index < sequences[0] else after).extend(map(int, ids))
+            return before, after
+    raise ValueError(
+        f"{exporter} can't reproduce this tokenizer's {kind or 'unknown'} post-processor, "
+        "which changes the token IDs encode gives; it reproduces TemplateProcessing with one "
+        "sequence, BertProcessing, RobertaProcessing and ByteLevel"
+    )
+
+
+def _special_token_wrap(
+    tokenizer, exporter: str, tokens: Sequence[str], texts: Sequence[str],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The token IDs ``encode(text)`` adds before and after the text's.
+
+    A post-processor such as ``TemplateProcessing("<s> $A")`` adds them when
+    encoding with its default ``add_special_tokens=True``, and the sprite
+    writes them too. They are read from the post-processor's settings, or,
+    without a ``tokenizers`` backend, from what ``encode`` adds to a probe;
+    either way the export checks them against ``encode`` on ``texts``.
+    """
+    if not callable(getattr(tokenizer, "encode", None)):
+        return (), ()
+    backend = _backend(tokenizer)
+    if backend is not None:
+        prefix, suffix = _post_processor_wrap(
+            _backend_settings(backend).get("post_processor"), exporter,
+        )
+    else:
+        probe = "a"
+        bare = _encode_ids(tokenizer, probe)
+        full = _encode_ids(tokenizer, probe, special_tokens=True)
+        at = next(
+            (start for start in range(len(full) - len(bare) + 1)
+             if full[start:start + len(bare)] == bare), None,
+        )
+        if at is None:
+            raise ValueError(
+                f"{exporter} can't reproduce the special tokens this tokenizer adds: "
+                f"encode({probe!r}) gives {full}, which doesn't contain the text's {bare}"
+            )
+        prefix, suffix = full[:at], full[at + len(bare):]
+    for token_id in (*prefix, *suffix):
+        if not 0 <= token_id < len(tokens):
+            raise ValueError(
+                f"{exporter}: the tokenizer's post-processor adds token ID {token_id}, which "
+                f"isn't in its vocabulary of {len(tokens)}"
+            )
+    for text in ("", "a", *texts[:64]):
+        bare = _encode_ids(tokenizer, text)
+        full = _encode_ids(tokenizer, text, special_tokens=True)
+        if full != [*prefix, *bare, *suffix]:
+            raise ValueError(
+                f"{exporter} can't reproduce the special tokens this tokenizer adds: "
+                f"encode({text!r}) gives {full}, but the sprite would give "
+                f"{[*prefix, *bare, *suffix]}"
+            )
+    return tuple(prefix), tuple(suffix)
+
+
 def _reject_non_bmp(tokens: Sequence[str]) -> None:
     """Reject vocab entries vanilla Scratch can't read one character at a time.
 
@@ -517,29 +653,36 @@ def _reject_non_bmp(tokens: Sequence[str]) -> None:
     for token in tokens:
         if any(ord(character) > 0xFFFF for character in token):
             raise ValueError(
-                "tokenizer vocabulary contains a non-BMP character which "
+                f"tokenizer vocabulary contains a non-BMP character, in {token!r}, which "
                 "vanilla Scratch splits into UTF-16 surrogate halves"
             )
 
 
+def _encode_ids(tokenizer, text: str, *, special_tokens: bool = False) -> list[int]:
+    """The token IDs ``tokenizer`` gives ``text``, with or without the special
+    tokens its post-processor adds."""
+    encode = tokenizer.encode
+    try:
+        encoded = encode(text, add_special_tokens=special_tokens)
+    except TypeError:
+        encoded = encode(text)
+    return [int(value) for value in getattr(encoded, "ids", encoded)]
+
+
 def _check_encodes_characters(
-    tokenizer, tokens: Sequence[str], special: set[str], unknown_id: int,
-    added: Sequence["_AddedToken"] = (),
+    tokenizer, matching: "_Matching", unknown_id: int,
 ) -> None:
     """Check that ``tokenizer`` maps each character to its own token.
 
     A word-level or WordPiece tokenizer whose vocabulary happens to be single
     characters, or one with a pre-tokenizer or a normalizer, encodes text
-    differently from a character table. Encode a probe of every character,
-    their other cases and unknown characters, and compare.
+    differently from a character table. Encode a probe of every character in
+    the sprite's table, their other cases and unknown characters, and compare
+    with what the sprite does.
     """
-    encode = getattr(tokenizer, "encode", None)
-    if not callable(encode):
+    if not callable(getattr(tokenizer, "encode", None)):
         return
-    ids: dict[str, int] = {}
-    for token_id, token in enumerate(tokens):
-        if len(token) == 1 and token not in special:
-            ids.setdefault(token, token_id)
+    ids = dict.fromkeys(matching.characters)
     # A character outside the vocabulary; any character not in it will do,
     # so the search ends within len(ids) + 1 code points.
     unknown = next(
@@ -551,14 +694,8 @@ def _check_encodes_characters(
         if len(swapped) == 1 and swapped not in ids
     ]
     probe = "".join(ids) + unknown * 2 + "".join(other_cases) + "".join(ids)[:1]
-    try:
-        encoded = encode(probe, add_special_tokens=False)
-    except TypeError:
-        encoded = encode(probe)
-    actual = [int(value) for value in getattr(encoded, "ids", encoded)]
-    expected = _reference_ids(probe, added, tokens, unknown_id, None) if added else [
-        ids.get(character, unknown_id) for character in probe
-    ]
+    actual = _encode_ids(tokenizer, probe)
+    expected = _reference_ids(probe, matching, unknown_id, None)
     if actual != expected:
         at = next(
             (index for index, pair in enumerate(zip(actual, expected)) if pair[0] != pair[1]),
@@ -601,27 +738,52 @@ class _AddedToken:
     rstrip: bool
 
 
-def _added_tokens(tokenizer, exporter: str) -> list[_AddedToken]:
-    """The added tokens a Hugging Face tokenizer matches in text, in ID order.
+def _split_special_tokens(tokenizer) -> bool:
+    """Whether ``tokenizer.encode`` reads special tokens as ordinary text.
 
-    ``single_word`` tokens are rejected: whether a match stands alone depends
-    on whether its neighbours are Unicode letters or digits, which a sprite
-    can't tell for characters outside its tables.
+    transformers' ``split_special_tokens`` decides, and transformers sets the
+    backend's ``encode_special_tokens`` from it on every call, so the backend
+    flag only records the last call. A bare ``tokenizers.Tokenizer`` has only
+    the flag.
+    """
+    split = getattr(tokenizer, "split_special_tokens", None)
+    if isinstance(split, bool):
+        return split
+    backend = _backend(tokenizer)
+    return backend is not None and bool(getattr(backend, "encode_special_tokens", False))
+
+
+def _added_token_split(tokenizer, exporter: str) -> tuple[list[_AddedToken], list[_AddedToken]]:
+    """The added tokens the tokenizer matches in text, and those it reads as
+    ordinary text, each in ID order.
+
+    With ``split_special_tokens``, a fast tokenizer reads its special tokens
+    as text, and a Python (slow) one all its added tokens. ``single_word``
+    tokens are rejected: whether a match stands alone depends on whether its
+    neighbours are Unicode letters or digits, which a sprite can't tell for
+    characters outside its tables.
     """
     backend = _backend(tokenizer)
+    split = _split_special_tokens(tokenizer)
     if backend is not None and callable(getattr(backend, "get_added_tokens_decoder", None)):
         decoder = backend.get_added_tokens_decoder()
-        skip_special = bool(getattr(backend, "encode_special_tokens", False))
+        skip_all = False
     else:
         decoder = getattr(tokenizer, "added_tokens_decoder", None) or {}
-        skip_special = False
-    added = []
+        skip_all = split
+    added: list[_AddedToken] = []
+    skipped: list[_AddedToken] = []
     for token_id, token in sorted(decoder.items()):
         content = getattr(token, "content", token)
         if not isinstance(content, str) or not content:
             continue
         special = bool(getattr(token, "special", False))
-        if special and skip_special:
+        entry = _AddedToken(
+            content, int(token_id), bool(getattr(token, "normalized", not special)),
+            bool(getattr(token, "lstrip", False)), bool(getattr(token, "rstrip", False)),
+        )
+        if skip_all or (special and split):
+            skipped.append(entry)
             continue
         if getattr(token, "single_word", False):
             raise ValueError(
@@ -629,11 +791,91 @@ def _added_tokens(tokenizer, exporter: str) -> list[_AddedToken]:
                 f"{content!r}: whether a match stands alone depends on its neighbours "
                 "being letters or digits, which a sprite can't tell for every character"
             )
-        added.append(_AddedToken(
-            content, int(token_id), bool(getattr(token, "normalized", not special)),
-            bool(getattr(token, "lstrip", False)), bool(getattr(token, "rstrip", False)),
-        ))
-    return added
+        added.append(entry)
+    return added, skipped
+
+
+@dataclass(frozen=True)
+class _Matching:
+    """What a character or raw BPE sprite matches text with.
+
+    ``characters`` and ``character_ids`` are its table of single characters,
+    in ID order (the first of equal characters wins); ``added`` the added
+    tokens it matches before looking characters up. ``probes`` are the
+    contents of every added token, including those left out of ``added``
+    and those the tokenizer reads as text, for the export's checks.
+    """
+    characters: tuple[str, ...]
+    character_ids: tuple[int, ...]
+    added: tuple[_AddedToken, ...]
+    probes: tuple[str, ...]
+
+
+def _sprite_matching(
+    tokenizer, exporter: str, tokens: Sequence[str], unknown_id: int | None,
+    merges: Sequence[tuple[int, int, int]] = (),
+) -> _Matching:
+    """Decide the sprite's character table and added tokens.
+
+    The sprite, ``_reference_ids`` and the export's checks all use what this
+    returns, so the checks test exactly what the sprite does.
+    """
+    added, skipped = _added_token_split(tokenizer, exporter)
+    # A token the tokenizer reads as text is the model's to encode: when the
+    # model doesn't know it, it isn't in the character table.
+    left_out: set[int] = set()
+    for token in skipped:
+        if len(token.content) != 1 or not callable(getattr(tokenizer, "encode", None)):
+            continue
+        ids = _encode_ids(tokenizer, token.content)
+        if ids == [token.token_id]:
+            continue
+        if ids in ([], [unknown_id]):
+            left_out.add(token.token_id)
+            continue
+        raise ValueError(
+            f"{exporter} can't reproduce how this tokenizer encodes {token.content!r}, a "
+            f"special token it reads as text (split_special_tokens): it gives token IDs {ids}"
+        )
+    characters: list[str] = []
+    character_ids: list[int] = []
+    for token_id, text in enumerate(tokens):
+        if len(text) == 1 and token_id not in left_out:
+            characters.append(text)
+            character_ids.append(token_id)
+    # A one-character added token matches the same with or without the
+    # added-token pass when the character lookup already gives its ID, no
+    # merge combines it and no other added token contains it, unless it is
+    # whitespace and a token strips whitespace: then matching it ends the
+    # whitespace lstrip takes, and tokenizers emits it inside what rstrip took.
+    merged_ids = {token_id for left, right, _ in merges for token_id in (left, right)}
+    first_ids = dict(zip(reversed(characters), reversed(character_ids)))
+    strips = any(token.lstrip or token.rstrip for token in added)
+    matched = [
+        token for token in added
+        if not (
+            len(token.content) == 1 and not token.lstrip and not token.rstrip
+            and first_ids.get(token.content) == token.token_id
+            and token.token_id not in merged_ids
+            and not (strips and token.content in _UNICODE_WHITE_SPACE)
+            and not any(
+                token.content in other.content for other in added if other is not token
+            )
+        )
+    ]
+    # The sprite reads text in UTF-16 units, so it can't match a character
+    # outside the BMP, alone or in an added token.
+    _reject_non_bmp([*characters, *(token.content for token in matched)])
+    # The checks probe the first tokens most: put those that change how
+    # others match (one character, or stripping whitespace) first.
+    probes = sorted(
+        (*added, *skipped),
+        key=lambda token: not (len(token.content) == 1 or token.lstrip or token.rstrip),
+    )
+    return _Matching(
+        tuple(characters), tuple(character_ids), tuple(matched),
+        tuple(token.content for token in probes),
+    )
 
 
 def _match_added(text: str, tokens: Sequence[_AddedToken]) -> list[tuple[int | None, str]]:
@@ -683,17 +925,14 @@ def _split_added(text: str, added: Sequence[_AddedToken]) -> list[tuple[int | No
 
 
 def _reference_ids(
-    text: str, added: Sequence[_AddedToken], tokens: Sequence[str], unknown_id: int | None,
+    text: str, matching: _Matching, unknown_id: int | None,
     merges: Sequence[tuple[int, int, int]] | None,
 ) -> list[int]:
     """The token IDs a character or raw BPE sprite writes for ``text``."""
-    characters: dict[str, int] = {}
-    for token_id, token in enumerate(tokens):
-        if len(token) == 1:
-            characters.setdefault(token, token_id)
+    characters = dict(zip(reversed(matching.characters), reversed(matching.character_ids)))
     ranks = {(left, right): (rank, merged) for rank, (left, right, merged) in enumerate(merges or ())}
     ids: list[int] = []
-    for added_id, piece in _split_added(text, added):
+    for added_id, piece in _split_added(text, matching.added):
         if added_id is not None:
             ids.append(added_id)
             continue
@@ -713,33 +952,34 @@ def _reference_ids(
     return ids
 
 
-def _check_added_tokens(
-    tokenizer, exporter: str, added: Sequence[_AddedToken], tokens: Sequence[str],
-    unknown_id: int | None, merges: Sequence[tuple[int, int, int]] | None,
-) -> None:
-    """Check that the tokenizer matches its added tokens as the sprite will.
-
-    Encodes texts built to make added tokens meet, overlap and touch
-    whitespace, and compares each with ``_reference_ids``, the sprite's
-    algorithm in Python.
-    """
-    encode = getattr(tokenizer, "encode", None)
-    if not added or not callable(encode):
-        return
-    contents = [token.content for token in added][:24]
+def _added_token_texts(matching: _Matching) -> list[str]:
+    """Texts that make added tokens meet, overlap and touch whitespace."""
+    contents = list(matching.probes[:24])
     texts = []
     for content in contents:
         texts += [content, f"x{content}y", content * 2, f" {content}  ", f"\t{content}\n",
                   content.swapcase(), content[:-1], f"{content[:1]} {content}"]
     for left, right in itertools.product(contents[:12], repeat=2):
-        texts += [left + right, left[:-1] + right, left + right[1:], f"{left} {right}"]
-    for text in texts:
-        try:
-            encoded = encode(text, add_special_tokens=False)
-        except TypeError:
-            encoded = encode(text)
-        actual = [int(value) for value in getattr(encoded, "ids", encoded)]
-        expected = _reference_ids(text, added, tokens, unknown_id, merges)
+        texts += [left + right, left[:-1] + right, left + right[1:], f"{left} {right}",
+                  f"{left}  {right} "]
+    return texts
+
+
+def _check_added_tokens(
+    tokenizer, exporter: str, matching: _Matching, unknown_id: int | None,
+    merges: Sequence[tuple[int, int, int]] | None,
+) -> None:
+    """Check that the tokenizer matches its added tokens as the sprite will.
+
+    Encodes texts built to make added tokens meet, overlap and touch
+    whitespace, and compares each with ``_reference_ids``, the sprite's
+    algorithm in Python, run on the same tables as the sprite.
+    """
+    if not matching.probes or not callable(getattr(tokenizer, "encode", None)):
+        return
+    for text in _added_token_texts(matching):
+        actual = _encode_ids(tokenizer, text)
+        expected = _reference_ids(text, matching, unknown_id, merges)
         if actual != expected:
             raise ValueError(
                 f"{exporter} can't reproduce how this tokenizer matches its added tokens: "
@@ -994,12 +1234,12 @@ class CharTokenizer(_TokenizerBase):
             raise ValueError(
                 "CharTokenizer requires a tokenizer with a valid unknown-token ID"
             )
-        added = _added_tokens(self.tokenizer, "CharTokenizer")
+        added, skipped = _added_token_split(self.tokenizer, "CharTokenizer")
         # The unknown token is never read from text, whatever its length, and
         # added tokens are matched whole before the characters are looked up.
         special = (
             _special_tokens(self.tokenizer) | {tokens[unknown_id]}
-            | {token.content for token in added}
+            | {token.content for token in (*added, *skipped)}
         )
         words = [token for token in tokens if len(token) > 1 and token not in special]
         if words:
@@ -1007,7 +1247,6 @@ class CharTokenizer(_TokenizerBase):
                 "CharTokenizer needs a tokenizer whose tokens are single characters, "
                 f"but this vocabulary has multi-character tokens such as {words[0]!r}"
             )
-        _reject_non_bmp([token for token in tokens if len(token) == 1])
         backend = _backend(self.tokenizer)
         if backend is not None:
             normalizer = _backend_settings(backend).get("normalizer")
@@ -1017,10 +1256,14 @@ class CharTokenizer(_TokenizerBase):
                     f"({normalizer.get('type', 'unknown')}); the sprite looks up the "
                     "raw text, so tokens would differ"
                 )
-        _check_encodes_characters(self.tokenizer, tokens, special, unknown_id, added)
-        _check_added_tokens(self.tokenizer, "CharTokenizer", added, tokens, unknown_id, None)
+        matching = _sprite_matching(self.tokenizer, "CharTokenizer", tokens, unknown_id)
+        _check_encodes_characters(self.tokenizer, matching, unknown_id)
+        _check_added_tokens(self.tokenizer, "CharTokenizer", matching, unknown_id, None)
+        self._wrap = _special_token_wrap(
+            self.tokenizer, "CharTokenizer", tokens, _added_token_texts(matching),
+        )
         sprite, self._costume_names = _build_character_tokenizer_sprite(
-            tokens, bpe=False, unknown_id=unknown_id, added=added,
+            tokens, bpe=False, unknown_id=unknown_id, matching=matching,
         )
         return sprite
 
@@ -1077,6 +1320,8 @@ class BPETokenizer(_TokenizerBase):
         for option in ("fuse_unk", "byte_fallback"):
             if model.get(option):
                 raise ValueError(f"BPETokenizer doesn't support {option}=True")
+        if model.get("ignore_merges") not in (None, False, True):
+            raise ValueError(f"unexpected ignore_merges {model.get('ignore_merges')!r}")
 
         vocab = self.tokenizer.get_vocab()
         merges: list[tuple[int, int, int]] = []
@@ -1096,17 +1341,50 @@ class BPETokenizer(_TokenizerBase):
                     f"BPE merge {left!r} + {right!r} has no matching vocabulary entry"
                 )
             merges.append((int(vocab[left]), int(vocab[right]), int(vocab[merged])))
-        added = _added_tokens(self.tokenizer, "BPETokenizer")
         unknown_id = self._unknown_id()
-        _check_added_tokens(self.tokenizer, "BPETokenizer", added, tokens, unknown_id, merges)
+        matching = _sprite_matching(self.tokenizer, "BPETokenizer", tokens, unknown_id, merges)
+        if model.get("ignore_merges"):
+            _check_merges_build_vocabulary(model, matching, unknown_id, merges)
+        _check_added_tokens(self.tokenizer, "BPETokenizer", matching, unknown_id, merges)
+        self._wrap = _special_token_wrap(
+            self.tokenizer, "BPETokenizer", tokens, _added_token_texts(matching),
+        )
         sprite, self._costume_names = _build_character_tokenizer_sprite(
             tokens,
             bpe=True,
             unknown_id=unknown_id,
             merges=merges,
-            added=added,
+            matching=matching,
         )
         return sprite
+
+
+def _check_merges_build_vocabulary(
+    model: dict, matching: _Matching, unknown_id: int | None,
+    merges: Sequence[tuple[int, int, int]],
+) -> None:
+    """Accept ``ignore_merges=True`` only where it changes nothing.
+
+    With it, the model gives a text that is itself a vocabulary entry that
+    entry's ID without merging. The sprite always merges, which gives the
+    same ID exactly when the merges build every entry from its characters.
+    """
+    vocab = model.get("vocab")
+    if not isinstance(vocab, dict):
+        raise ValueError("BPETokenizer can't read the vocabulary of an ignore_merges model")
+    bare = _Matching(matching.characters, matching.character_ids, (), ())
+    # The sprite matches its added tokens before merging.
+    matched = {token.content for token in matching.added}
+    for entry, token_id in vocab.items():
+        if len(entry) > 1 and entry not in matched and (
+            _reference_ids(entry, bare, unknown_id, merges) != [token_id]
+        ):
+            raise ValueError(
+                "BPETokenizer doesn't support ignore_merges=True when the merges don't "
+                f"build every vocabulary entry: the model gives the text {entry!r} its "
+                "entry's ID, where merging, as the sprite does, gives "
+                f"{_reference_ids(entry, bare, unknown_id, merges)}"
+            )
 
 
 def _build_character_tokenizer_sprite(
@@ -1115,13 +1393,13 @@ def _build_character_tokenizer_sprite(
     bpe: bool,
     unknown_id: int | None,
     merges: Sequence[tuple[int, int, int]] = (),
-    added: Sequence[_AddedToken] = (),
+    matching: _Matching,
 ) -> tuple[dict, tuple[str, ...] | None]:
     """Build the character/raw-BPE contract with the typed DSL.
 
-    ``added`` are the tokenizer's added tokens, matched in the text before
-    the model runs. Returns the sprite and, when it looks characters up by
-    costume, the costume names.
+    ``matching`` gives the character table and the added tokens, matched in
+    the text before the model runs. Returns the sprite and, when it looks
+    characters up by costume, the costume names.
     """
     variables = (
         (
@@ -1132,29 +1410,10 @@ def _build_character_tokenizer_sprite(
     )
     # Look characters up among single-character tokens only. Scratch's
     # item # of compares numbers by value, so searching every token would let
-    # "1" match an earlier " 1" or "01".
-    characters: list[str] = []
-    character_ids: list[int] = []
-    for token_id, token in enumerate(tokens):
-        if len(token) == 1:
-            characters.append(token)
-            character_ids.append(token_id)
-    # A one-character added token that the character lookup already gives
-    # its ID, that no merge combines and no other added token contains,
-    # matches the same with or without the added-token pass.
-    merged_ids = {token_id for left, right, _ in merges for token_id in (left, right)}
-    first_ids = dict(zip(reversed(characters), reversed(character_ids)))
-    added = [
-        token for token in added
-        if not (
-            len(token.content) == 1 and not token.lstrip and not token.rstrip
-            and first_ids.get(token.content) == token.token_id
-            and token.token_id not in merged_ids
-            and not any(
-                token.content in other.content for other in added if other is not token
-            )
-        )
-    ]
+    # "1" match an earlier " 1" or "01". The added-token tables extend these.
+    characters = list(matching.characters)
+    character_ids = list(matching.character_ids)
+    added = list(matching.added)
     added_tables = _added_token_tables(added, characters, character_ids) if added else {}
     lookup = _CharacterLookup(characters)
     lists = (
@@ -1469,6 +1728,39 @@ class SentencePieceBPETokenizer(_TokenizerBase):
                     "scratch_casefold does not match the SentencePiece normalizer"
                 )
 
+    def _bos_and_eos(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """The IDs ``processor.encode`` adds around the text's, as a processor
+        made with ``add_bos=True`` or ``add_eos=True`` does."""
+        processor = self.processor
+        for option in ("reverse", "enable_sampling"):
+            if getattr(processor, f"_{option}", False):
+                raise ValueError(
+                    f"SentencePieceBPETokenizer can't reproduce a processor made with "
+                    f"{option}=True"
+                )
+        prefix = (int(processor.bos_id()),) if getattr(processor, "_add_bos", False) else ()
+        suffix = (int(processor.eos_id()),) if getattr(processor, "_add_eos", False) else ()
+        if any(token_id < 0 for token_id in (*prefix, *suffix)):
+            raise ValueError(
+                "this SentencePiece processor adds a beginning or end token its model "
+                "doesn't define"
+            )
+        encode = getattr(processor, "encode", None)
+        if callable(encode):
+            for text in ("", "a"):
+                try:
+                    bare = list(encode(text, add_bos=False, add_eos=False))
+                except TypeError:
+                    break
+                full = list(encode(text))
+                if full != [*prefix, *bare, *suffix]:
+                    raise ValueError(
+                        "SentencePieceBPETokenizer can't reproduce the tokens this "
+                        f"processor adds: encode({text!r}) gives {full}, but the sprite "
+                        f"would give {[*prefix, *bare, *suffix]}"
+                    )
+        return prefix, suffix
+
     def _build_tokens_list(self) -> list[str]:
         raw_pieces = [
             self.processor.id_to_piece(token_id)
@@ -1606,6 +1898,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         ) = self._tables(pieces)
         lookup = _CharacterLookup(characters, case_insensitive=self.scratch_casefold)
         self._costume_names = lookup.costume_names
+        self._wrap = self._bos_and_eos()
         variables = (
             "input",
             "output",
@@ -1896,7 +2189,8 @@ def transpile_tokenizer(
         backend_unknown = _backend_settings(backend)["model"].get("unk_token")
         if isinstance(backend_unknown, str):
             special.add(backend_unknown)
-    special |= {token.content for token in _added_tokens(tokenizer, "transpile_tokenizer")}
+    added, skipped = _added_token_split(tokenizer, "transpile_tokenizer")
+    special |= {token.content for token in (*added, *skipped)}
     if any(len(token) > 1 for token in tokenizer.get_vocab() if token not in special):
         raise ValueError(
             f"{model_type} tokenizers with multi-character tokens can't be exported; "

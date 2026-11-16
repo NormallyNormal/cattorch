@@ -9,7 +9,7 @@ supported:
 | Exporter | Use for | Main requirement |
 |---|---|---|
 | `CharTokenizer` | Very small character vocabularies | Single-character tokens (added tokens may be longer), read one character at a time, and a valid unknown-token ID. |
-| `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`. |
+| `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`, and `ignore_merges` only if the merges build every vocabulary entry. |
 | `SentencePieceBPETokenizer` | Raw SentencePiece BPE (`model_type="bpe"`) with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
 
 Hugging Face tokenizers need the optional dependencies:
@@ -89,6 +89,26 @@ where added tokens meet, overlap and touch whitespace, and raises
 rejected: whether a match stands alone depends on whether its neighbours are
 letters or digits, which a sprite can't tell for every character.
 
+With `split_special_tokens=True` (transformers) or `encode_special_tokens`
+(a bare `tokenizers.Tokenizer`), the tokenizer reads its special tokens as
+ordinary text, and so does the sprite: a special token the model's
+vocabulary doesn't have becomes the unknown token. Exporting leaves the
+tokenizer's settings as they were.
+
+### Special tokens added around the text
+
+A tokenizer's post-processor can add tokens around every text it encodes,
+such as `<s>` before it: `tokenizer.encode("the cat")` then starts with the
+ID of `<s>`. `NAME tokenize` writes the same IDs as `encode(text)` with
+its default `add_special_tokens=True`, so a model trained on such sequences
+sees the prompts it was trained on. The sprite reproduces
+`TemplateProcessing` with one `$A` in its single-sequence template (such as
+`"<s> $A"` or `"<s> $A </s>"`), `BertProcessing`, `RobertaProcessing`,
+`ByteLevel` (which changes no IDs) and a `Sequence` of these; any other
+post-processor raises `ValueError`, and the export checks the result against
+`encode`. `NAME detokenize` writes these tokens' text too, as
+`decode(..., skip_special_tokens=False)` does.
+
 `NAME detokenize` writes every token's text, added and special tokens
 included, as `transformers`' `decode(..., skip_special_tokens=False)` keeps
 them, so detokenizing what tokenize wrote gives the text back.
@@ -103,7 +123,8 @@ without letters, such as digits and punctuation, is looked up with
 `item # of` and has one costume.
 
 Export fails on characters outside the Basic Multilingual Plane, such as
-emoji, because Scratch treats each one as two separate characters. For the
+emoji, in a single-character token or an added token, because Scratch treats
+each one as two separate characters. For the
 same reason an emoji in the text reads as two unknown characters.
 
 ## SentencePiece BPE
@@ -112,7 +133,10 @@ The SentencePiece sprite keeps SentencePiece's token IDs, converts its `▁`
 space marker, skips control tokens when decoding, decodes the unknown token
 as SentencePiece does (its `unk_surface`, ` ⁇ ` by default), and supports
 byte fallback for ASCII. Like SentencePiece, it doesn't read control tokens such as `<s>`
-from text: `<s>` in the text is three ordinary characters.
+from text: `<s>` in the text is three ordinary characters. A processor made
+with `add_bos=True` or `add_eos=True` adds the beginning or end token to
+every text it encodes, and so does the sprite; one made with `reverse=True`
+or `enable_sampling=True` raises `ValueError`.
 
 ```python
 from cattorch import SentencePieceBPETokenizer

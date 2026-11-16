@@ -53,8 +53,9 @@ def _traced_node(value):
 
 
 # ``node.meta`` key of an integer input's placeholder: ``(low, high)``, the
-# range every one of its items must be in, because the model uses the input,
-# whole, as an index (``_mark_index``). The input checks read it.
+# range every one of its items must be in, because the model uses the input's
+# values, whole, as an index (``fold_input_index_checks``). The input checks
+# read it.
 INDEX_BOUND_META = "cattorch_index_bound"
 
 # Operations whose result holds exactly the values of their first argument,
@@ -215,34 +216,41 @@ def _mark_index(index, low: int, high: int):
     ``size - 1`` where it counts negative indices from the end, else 0 to
     ``size - 1``).
 
-    - The values of an integer input, through views, copies and casts:
-      the input's placeholder records the range, and the input check refuses
-      an item outside it with ``invalid item``.
-    - Indices the model computes from its inputs in another way, such as
-      ``idx + 1``: ``cattorch::check_index`` checks them as the sprite runs
-      and fails the call with ``invalid item`` naming the first input they
-      come from. Returns its result, to use in place of ``index``.
-    - Constant indices, and those in range by construction, such as an
-      ``argmax`` index over an extent within the range, or ``idx % size``
-      (``_value_range``), aren't checked.
+    Indices computed from the inputs go through ``cattorch::check_index``,
+    which checks them as the sprite runs and fails the call with ``invalid
+    item`` naming the first input they come from; the function returns its
+    result, to use in place of ``index``. Once the capture has turned
+    in-place updates into dataflow, ``fold_input_index_checks`` replaces a
+    check of an integer input's own values (through views, copies and casts)
+    by a range on the input's placeholder, which the input check applies
+    before the call. Only then is it known whether the operation reads the
+    input's values or ones the model wrote over them first.
 
-    Returns ``index`` when it adds no check to the graph.
+    Constant indices, and those in range by construction, such as an
+    ``argmax`` index over an extent within the range, or ``idx % size``
+    (``_value_range``), aren't checked. Returns ``index`` when it adds no
+    check to the graph.
     """
     if _IndicesMarked.depth:
         return index
     node = _traced_node(index)
     if node is None:
         return index
-    source = _same_values_source(node)
-    if source.op == "placeholder" and _is_integer(source):
-        known = source.meta.get(INDEX_BOUND_META)
-        if known is not None:
-            low, high = max(low, known[0]), min(high, known[1])
-        source.meta[INDEX_BOUND_META] = (low, high)
-        return index
     known = _value_range(node)
     if known is not None and low <= known[0] and known[1] < high:
         return index
+    position = _index_source(node)
+    if position is None:
+        return index
+    return torch.ops.cattorch.check_index(index, low, high, position)
+
+
+def _index_source(node) -> int | None:
+    """The position of the first input an index ``node`` is computed from, if any.
+
+    Values a fill makes, such as ``full_like(x, 3)``, don't depend on its
+    input's values, so the search doesn't go through one.
+    """
     placeholders = [n for n in node.graph.nodes if n.op == "placeholder"]
     seen, stack, reached = set(), [node], set()
     while stack:
@@ -255,10 +263,84 @@ def _mark_index(index, low: int, high: int):
         if current.op == "call_function" and str(current.target) in _FILLS:
             continue
         stack.extend(current.all_input_nodes)
-    if not reached:
-        return index
-    position = next(i for i, placeholder in enumerate(placeholders) if placeholder in reached)
-    return torch.ops.cattorch.check_index(index, low, high, position)
+    return next(
+        (i for i, placeholder in enumerate(placeholders) if placeholder in reached), None,
+    )
+
+
+def fold_input_index_checks(graph: torch.fx.Graph) -> None:
+    """Check an integer input's own values as an index before the call.
+
+    A ``cattorch::check_index`` whose index holds the values of an integer
+    input, through views, copies and casts, becomes a range on the input's
+    placeholder (``INDEX_BOUND_META``, the intersection of every such use's
+    range), which the input check applies to every item before the call;
+    the check itself is removed. Run it once in-place updates are dataflow:
+    an index the model wrote into first then holds a computed value, which
+    stays checked as the sprite runs. A check of a ``cat`` checks each of
+    its pieces, so each one that is an input's values is checked before the
+    call, and each other one names the input it comes from. The remaining
+    checks name the first input their index now comes from.
+    """
+    for node in list(graph.nodes):
+        if node.op == "call_function" and str(node.target) == "cattorch.check_index.default":
+            _settle_index_check(graph, node)
+
+
+def _settle_index_check(graph: torch.fx.Graph, node) -> None:
+    index, low, high = node.args[:3]
+    source = _same_values_source(index)
+    if source.op == "placeholder" and _is_integer(source):
+        known = source.meta.get(INDEX_BOUND_META)
+        if known is not None:
+            low, high = max(low, known[0]), min(high, known[1])
+        source.meta[INDEX_BOUND_META] = (low, high)
+        node.replace_all_uses_with(index)
+        graph.erase_node(node)
+        return
+    # Views of the integer values of a cat, as an index is reshaped to one
+    # dimension: the check moves to the cat's pieces.
+    chain = []
+    current = index
+    while (
+        current.op == "call_function" and str(current.target) in _SAME_VALUES
+        and current.args and isinstance(current.args[0], torch.fx.Node)
+        and _is_integer(current) and _is_integer(current.args[0])
+    ):
+        chain.append(current)
+        current = current.args[0]
+    if (
+        current.op == "call_function" and str(current.target) == "aten.cat.default"
+        and _is_integer(current)
+    ):
+        pieces, rest = current.args[0], current.args[1:]
+        checks = []
+        with graph.inserting_before(node):
+            for piece in pieces:
+                check = graph.call_function(node.target, (piece, low, high, node.args[3]))
+                check.meta.update(node.meta)
+                check.meta["val"] = piece.meta.get("val")
+                checks.append(check)
+            value = graph.call_function(current.target, (checks, *rest), dict(current.kwargs))
+            value.meta.update(current.meta)
+            for link in reversed(chain):
+                previous = value
+                value = graph.call_function(
+                    link.target, (previous, *link.args[1:]), dict(link.kwargs),
+                )
+                value.meta.update(link.meta)
+        node.replace_all_uses_with(value)
+        graph.erase_node(node)
+        for check in checks:
+            _settle_index_check(graph, check)
+        return
+    position = _index_source(index)
+    if position is None:
+        # The model wrote constants over every item it reads.
+        node.replace_all_uses_with(index)
+        graph.erase_node(node)
+    else:
+        node.args = (index, low, high, position)
 
 
 def _sign(value):

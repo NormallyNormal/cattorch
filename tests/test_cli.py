@@ -261,6 +261,44 @@ def test_generate_with_a_tokenizer_writes_a_project(models, capsys):
     assert code == 2 and "needs a tokenizer" in message
 
 
+def test_a_tokenizer_end_token_past_the_model_is_dropped_with_a_warning(models, capsys):
+    from transformers import AutoTokenizer
+
+    save_characters(models / "chars")
+    tokenizer = AutoTokenizer.from_pretrained(models / "chars")
+    tokenizer.add_special_tokens({"eos_token": "</s>"})
+    assert tokenizer.eos_token_id == len(CHARACTERS)  # past the model's 12 IDs
+    tokenizer.save_pretrained(models / "chars")
+    with pytest.warns(UserWarning, match="end token, ID 12, is not a token ID of the model"):
+        code, report = run(
+            capsys, "generate", "models.py:Language", "--tokenizer", "chars",
+            "--max-context", "4", "--project",
+        )
+    assert code == 0
+    assert any("--eos-token-id" in warning for warning in report["project"]["warnings"])
+
+
+def test_generate_options_are_checked_before_the_files_they_affect(models, capsys):
+    save_characters(models / "chars")
+    common = ["generate", "models.py:Language", "--tokenizer", "chars", "--max-context", "4"]
+    for argv, message in (
+        (["--project", "--temperature", "-1"], "finite number of 0 or more"),
+        (["--project", "--temperature", "nan"], "finite number of 0 or more"),
+        (["--project", "--eos-token-id", "-1"], "0 or more"),
+    ):
+        code, error = run(capsys, *common, *argv)
+        assert code == 2 and message in error, (argv, error)
+    assert not list(models.glob("*.sprite3")) and not list(models.glob("*.sb3"))
+    code, error = run(capsys, "generate", "models.py:Language", "--project")
+    assert code == 2 and "needs a tokenizer" in error
+    assert not list(models.glob("*.sprite3"))
+    # The model's vocabulary is known once it is exported, before the
+    # tokenizer and project are written.
+    code, error = run(capsys, *common, "--project", "--eos-token-id", "12")
+    assert code == 2 and "--eos-token-id 12 is not a token ID of the model" in error
+    assert not list(models.glob("*tokenizer.sprite3")) and not list(models.glob("*.sb3"))
+
+
 @pytest.mark.parametrize("output", ["build/demo", "build/demo.sprite3", "build/demo.sb3"])
 def test_every_output_is_named_after_the_output_option(models, capsys, output):
     save_characters(models / "chars")
@@ -411,7 +449,7 @@ def test_hugging_face_names_that_cannot_be_loaded_exit_with_usage(models, capsys
 
 def test_an_output_option_naming_a_directory_is_rejected(models, capsys):
     (models / "build").mkdir()
-    for output in ("build/", "build", ""):
+    for output in ("build/", "build", "", ".sprite3", "build/.SB3", ".sb3"):
         code, message = run(capsys, "export", "models.py:Marked", "-o", output)
         assert code == 2 and "-o" in message, (output, message)
     assert not list(models.rglob("*.sprite3"))

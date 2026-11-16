@@ -293,7 +293,7 @@ message ignoring case; see the
 | `NAME reset` | broadcast | Restores every state to its initial value. |
 | `NAME prepare for save` | broadcast | Clears the decoded weights and working lists before saving the project. |
 | `NAME ENTRY INPUT`, `NAME ENTRY OUTPUT` | list | An entry point's inputs and outputs, named after its parameters and outputs. |
-| `NAME state STATE` | list | A piece of persistent state. It belongs to the sprite: read it, or save and restore values the sprite wrote. A call checks its length, not its items, so writing anything else gives undefined results. Empty when the sprite is uploaded, until the first call or `NAME init` fills it with its initial value; a project you save keeps it. |
+| `NAME state STATE` | list | A piece of persistent state. It belongs to the sprite: read it, or save and restore values the sprite wrote. A call checks its length, and its items only where the model uses the state as an index ([index inputs](supported-models.md#index-inputs)), so writing anything else gives undefined results. Empty when the sprite is uploaded, until the first call or `NAME init` fills it with its initial value; a project you save keeps it. |
 | `NAME status` | variable | How the last call ended; see [status values](#status-values). |
 | `cattorch initialized` | sprite variable | `1` once every entry point's weights are decoded, by `NAME init` or by calls; `0` before and after prepare for save. |
 | `NAME ENTRY complete`, `NAME init complete`, `NAME reset complete`, `NAME prepare for save complete` | broadcast | Sent when each call ends. |

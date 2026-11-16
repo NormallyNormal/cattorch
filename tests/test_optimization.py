@@ -1745,6 +1745,97 @@ def test_weight_transforms_leave_modules_whose_parameters_are_read_elsewhere(tmp
     assert isinstance(transformed.up, nn.Sequential)
 
 
+class _ClampLinear(nn.Linear):
+    """A Linear subclass whose forward does more than read its weight."""
+
+    def forward(self, value):
+        return super().forward(value).clamp(min=0.0) * 3.0
+
+
+class _ClampConv(nn.Conv1d):
+    def forward(self, value):
+        return super().forward(value).clamp(min=0.0) * 3.0
+
+
+@pytest.mark.parametrize("kind", ["linear", "conv"])
+def test_factorization_keeps_a_layer_whose_class_has_its_own_forward(tmp_path, kind):
+    # Factoring puts two plain layers in place of the module, which would
+    # drop the clamp and the scale.
+    torch.manual_seed(0)
+    if kind == "linear":
+        model = nn.Sequential(_ClampLinear(16, 16), nn.Linear(16, 16)).eval()
+        value = torch.randn(3, 16)
+    else:
+        model = nn.Sequential(_ClampConv(8, 8, 3), nn.Conv1d(8, 8, 1)).eval()
+        value = torch.randn(1, 8, 6)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning, match="left '0' without its low-rank factorization: its class"):
+        transformed = prepare_fast_model(model, config)
+    assert type(transformed[0]) is type(model[0])
+    assert torch.equal(transformed[0].weight, model[0].weight)
+    assert isinstance(transformed[1], nn.Sequential)
+    with pytest.warns(CattorchWarning, match="has its own forward"):
+        result = transpile(model, value, tmp_path / kind, optimization="fast", fast_config=config)
+    # Only the plain second layer is approximated.
+    reference = prepare_fast_model(model, config)
+    assert verify(reference, value, result).passed
+
+
+def test_factorization_keeps_a_layer_with_forward_hooks():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 16)).eval()
+    model[0].register_forward_hook(lambda module, args, output: output * 2)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning, match="left '0' without its low-rank factorization: it has forward hooks"):
+        transformed = prepare_fast_model(model, config)
+    assert type(transformed[0]) is nn.Linear and transformed[0]._forward_hooks
+    assert isinstance(transformed[2], nn.Sequential)
+
+
+def test_neuron_pruning_keeps_layers_with_forward_hooks():
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 4)).eval()
+    model[2].register_forward_pre_hook(lambda module, args: (args[0] * 2,))
+    with pytest.warns(CattorchWarning, match="left '2' without neuron pruning: it has forward hooks"):
+        transformed = prepare_fast_model(model, FastConfig(neuron_pruning=0.5))
+    assert transformed[0].out_features == 16
+
+
+@pytest.mark.parametrize("layer", ["attention", "encoder"])
+def test_factorization_keeps_layers_a_torch_module_reads_itself(tmp_path, layer):
+    # nn.MultiheadAttention reads out_proj.weight itself, and the encoder
+    # layer may take a fast path that reads every weight.
+    torch.manual_seed(0)
+    if layer == "attention":
+        inner = nn.MultiheadAttention(16, 2, batch_first=True)
+        names = ["m.out_proj"]
+    else:
+        inner = nn.TransformerEncoderLayer(16, 2, 32, dropout=0.0, batch_first=True)
+        names = ["m.self_attn.out_proj", "m.linear1", "m.linear2"]
+
+    class Wrap(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m = inner
+
+        def forward(self, value):
+            if layer == "attention":
+                return self.m(value, value, value, need_weights=False)[0]
+            return self.m(value)
+
+    model = Wrap().eval()
+    value = torch.randn(1, 3, 16)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning) as caught:
+        result = transpile(model, value, tmp_path / layer, optimization="fast", fast_config=config)
+    messages = [str(item.message) for item in caught]
+    for name in names:
+        assert any(
+            f"left {name!r} without its low-rank factorization: it belongs to 'm'" in message
+            for message in messages
+        ), (name, messages)
+    assert verify(model, value, result).passed
+
+
 def test_weight_transforms_check_every_program_method():
     class TwoMethods(nn.Module):
         def __init__(self):

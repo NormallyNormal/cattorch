@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import math
 import pickle
 import re
 import sys
@@ -23,7 +24,7 @@ import torch
 from torch import nn
 
 from cattorch import __version__
-from cattorch.errors import CattorchError
+from cattorch.errors import CattorchError, warn
 from cattorch.util.paths import output_file
 from cattorch.util.scratch.archive import dumps
 
@@ -405,6 +406,8 @@ def _generate(args) -> int:
         model, name = load_model(args.model)
         if args.tokenizer:
             tokenizer = _from_pretrained("--tokenizer", args.tokenizer, "AutoTokenizer")
+    if args.project and tokenizer is None:
+        raise CommandError("--project needs a tokenizer that exports to Scratch; pass --tokenizer")
     outputs = _outputs(args.output, name)
     program: GenerationProgram | RecurrentGenerationProgram
     if recurrent_family(model) is not None:
@@ -416,6 +419,7 @@ def _generate(args) -> int:
         )
     result = transpile(model, program, outputs.sprite, **options)
     report = _summary(result)
+    eos, eos_warnings = _eos_token_id(args, tokenizer, result.vocabulary_size)
     tokenizer_result = None
     tokenizer_error = None
     if tokenizer is not None:
@@ -431,17 +435,67 @@ def _generate(args) -> int:
                 "--project needs a tokenizer that exports to Scratch; "
                 + (tokenizer_error or "pass --tokenizer")
             )
-        eos = args.eos_token_id
-        if eos is None and tokenizer is not None:
-            eos = getattr(tokenizer, "eos_token_id", None)
         project = build_project(
             result, outputs.project, tokenizer=tokenizer_result,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature,
             eos_token_id=eos,
         )
-        report["project"] = {"path": str(project.path)}
+        report["project"] = {
+            "path": str(project.path), "warnings": [*eos_warnings, *project.warnings],
+        }
     print(dumps(report, indent=2))
     return EXIT_OK
+
+
+def _eos_token_id(args, tokenizer, vocabulary: int) -> tuple[int | None, list[str]]:
+    """The token ID that ends the demo's continuations, and any warning.
+
+    ``--eos-token-id`` must be one of the model's token IDs. Without it, the
+    tokenizer's end token is used if it is one; a tokenizer with more IDs
+    than the model (an added ``</s>``) may give one past them, which the
+    demo can never generate, so it is dropped with a warning.
+    """
+    if not args.project:
+        return None, []
+    if args.eos_token_id is not None:
+        if not 0 <= args.eos_token_id < vocabulary:
+            raise CommandError(
+                f"--eos-token-id {args.eos_token_id} is not a token ID of the model, whose "
+                f"vocabulary has {vocabulary}"
+            )
+        return args.eos_token_id, []
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if not isinstance(eos, int) or isinstance(eos, bool):
+        return None, []
+    if 0 <= eos < vocabulary:
+        return eos, []
+    message = (
+        f"the tokenizer's end token, ID {eos}, is not a token ID of the model, whose "
+        f"vocabulary has {vocabulary}, so the demo runs to --max-new-tokens; pass "
+        "--eos-token-id to stop at another token"
+    )
+    warn(message)
+    return None, [message]
+
+
+def _temperature(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number of 0 or more")
+    return value
+
+
+def _token_id(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a token ID, which is 0 or more")
+    return value
 
 
 def _analyze(args) -> int:
@@ -603,12 +657,12 @@ def _parser() -> argparse.ArgumentParser:
         help="the most tokens the project's demo adds to a prompt",
     )
     generate.add_argument(
-        "--temperature", type=float, default=0.8, action=_Given,
+        "--temperature", type=_temperature, default=0.8, action=_Given,
         help="the project's demo's starting sampling temperature; 0 always picks the "
         "likeliest token",
     )
     generate.add_argument(
-        "--eos-token-id", type=int, metavar="ID", action=_Given,
+        "--eos-token-id", type=_token_id, metavar="ID", action=_Given,
         help="the token ID that ends a continuation (default: the tokenizer's end token)",
     )
     options(generate)

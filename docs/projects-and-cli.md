@@ -169,7 +169,9 @@ is a GPTQ export, which can't be reproduced and is compared with the model
 itself. It also takes `--labels` for its project and
 `--no-verify`. `generate` takes `--max-new-tokens` (default 40),
 `--temperature` (default 0.8), and `--eos-token-id` (defaulting to the
-tokenizer's end token) for its project's demo, as `build_project` does.
+tokenizer's end token) for its project's demo, as `build_project` does. A
+tokenizer's end token past the model's token IDs, such as an added `</s>`,
+can never be generated, so the demo then has none, and a warning says so.
 These project options, and `--labels`, need `--project`: without it they
 are an error rather than ignored. `cattorch analyze-benchmark PROJECT` prints a saved
 [benchmark project's](verification-and-benchmarking.md) results as JSON, the
@@ -188,7 +190,7 @@ uses the sprite through, such as `net input` and `net output`. `export` adds `ve
 `max_abs_error`, the largest error over every output (and, for a model with
 entry points, every call and state; a call that ended with an unexpected
 status counts as infinite, written as the string `"Infinity"`);
-`--project` adds `project`, with its `path`; `generate` adds `tokenizer`,
+`--project` adds `project`, with its `path` and `warnings`; `generate` adds `tokenizer`,
 with the tokenizer result's fields, or its `error` when it couldn't be
 exported.
 

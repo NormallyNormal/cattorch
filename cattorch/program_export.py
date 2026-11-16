@@ -394,7 +394,8 @@ def _build_entry_wrapper(
     whatever happened, with the ``finish_variables``. An unguarded body then
     sends its completion broadcast, which a guarded one's public block sends. ``item_kinds`` say
     what each input's items must be (``interface.item_checks``), by position;
-    a guarded body computes nothing once another call started. The
+    of a state's, only the range of an index is checked. A guarded body
+    computes nothing once another call started. The
     ``index_checked`` inputs, by position, are those indices the entry point
     computes come from: an index out of range fails the call naming the
     input as the compiled entry point knows it, ``input_name(position)``.
@@ -439,7 +440,12 @@ def _build_entry_wrapper(
             )
         else:
             length_options = dict(numel=spec.numel)
-        kind = item_kinds.get(index) if isinstance(binding, Input) else None
+        kind = item_kinds.get(index)
+        if isinstance(binding, StateInput) and kind is not None:
+            # A state's items are what the sprite wrote, so only the range
+            # of one the model uses as an index is checked: the model may
+            # have moved it out of range, as a counter past a table's rows.
+            kind = kind if kind[1] is not None else None
         capacity = spec.numel if spec.numel is not None else spec.max_numel
         if split_checks is not None and capacity is not None and capacity > SCRATCH_LIST_LIMIT:
             # The list will be split: its shards are checked one by one, in
@@ -867,7 +873,26 @@ def transpile_program(
         validate_entry_outputs(program, entrypoint, sub_result.outputs)
         if not _guard_overlaps:
             # A recurrent generator's step, which gets the generation guards.
-            refuse_runtime_index_checks(sub_result.graph.nodes, "RecurrentGenerationProgram")
+            sources = {
+                index: "the token IDs" if isinstance(binding, Input) else f"state {binding.name!r}"
+                for index, binding in enumerate(entrypoint.arguments)
+            }
+            refuse_runtime_index_checks(
+                sub_result.graph.nodes, "RecurrentGenerationProgram", sources,
+            )
+            for index, binding in enumerate(entrypoint.arguments):
+                bounds = sub_result.item_kinds.get(index, (None, None))[1]
+                if isinstance(binding, StateInput) and bounds is not None:
+                    # A state only the steps change, which a prefill could
+                    # take out of range part way through its tokens.
+                    raise UnsupportedModelError(
+                        f"a RecurrentGenerationProgram can't use state {binding.name!r} "
+                        "as an index: a step could take it out of range part way "
+                        "through a prefill, which would leave the states half "
+                        "updated. Keep the index in range by construction, as "
+                        "with pos % rows or pos.clamp(max=rows - 1), or export the "
+                        "model with an ExportProgram"
+                    )
         sprite = sub_result.sprite
         # An interface list's peak size, when the compiler used it as scratch
         # space for a larger intermediate first.
