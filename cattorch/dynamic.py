@@ -114,8 +114,34 @@ def reproducible_export(*, optimization, quantization) -> bool:
 
 # Tolerances for a sprite compared with a model holding its stored values, a
 # little looser than ``verify``'s because a long sum accumulates float32
-# rounding.
+# rounding. That rounding grows with the values summed, so the absolute
+# tolerance grows with the output's largest magnitude too: an output near
+# zero among others near 1e5 differs by float32 noise of their size.
 _EXACT_TOLERANCE = {"atol": 1e-3, "rtol": 1e-4}
+_EXACT_MAGNITUDE_TOLERANCE = 1e-5
+
+
+def _exact_tolerance(reference, positional, keywords) -> dict[str, float]:
+    """``_EXACT_TOLERANCE``, with ``atol`` at least ``_EXACT_MAGNITUDE_TOLERANCE``
+    of the reference output's largest magnitude."""
+    from cattorch.frontend import tensor_output_leaves
+    from cattorch.verify import _reading_stored_uses
+
+    with torch.no_grad(), _reading_stored_uses(reference):
+        leaves = tensor_output_leaves(
+            copy.deepcopy(reference)(*positional, **keywords), warn=False,
+        )
+    magnitude = max(
+        (
+            float(leaf.detach().abs().nan_to_num(posinf=0.0, neginf=0.0).max())
+            for leaf in leaves if leaf.numel() and leaf.is_floating_point()
+        ),
+        default=0.0,
+    )
+    return {
+        **_EXACT_TOLERANCE,
+        "atol": max(_EXACT_TOLERANCE["atol"], _EXACT_MAGNITUDE_TOLERANCE * magnitude),
+    }
 
 
 def _stored_values_model(
@@ -195,7 +221,10 @@ def check_lengths(
         values[index] = varied_at_length(values[index], axis, length)
         keywords = dict(example_kwargs or {})
         keywords.update(zip(kwarg_names, values[positional:]))
-        tolerance = _EXACT_TOLERANCE if exact else {"atol": math.inf, "rtol": math.inf}
+        tolerance = (
+            _exact_tolerance(reference, tuple(values[:positional]), keywords)
+            if exact else {"atol": math.inf, "rtol": math.inf}
+        )
         # verify runs the model; a fresh copy each time keeps a forward that
         # changes module state away from the caller's model and later runs.
         try:

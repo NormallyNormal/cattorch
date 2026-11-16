@@ -393,3 +393,37 @@ def test_tensor_calibration_items_name_the_item(tmp_path, bad, message):
             _BigramLM().eval(), good, tmp_path / "lm",
             quantization=_GPTQ, calibration=[good, bad, good],
         )
+
+
+class _LargeActivations(torch.nn.Module):
+    """Four residual MLP blocks whose activations reach about 1e5."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            torch.nn.Sequential(
+                torch.nn.Linear(64, 256), torch.nn.GELU(), torch.nn.Linear(256, 64),
+            )
+            for _ in range(4)
+        )
+        with torch.no_grad():
+            for block in self.blocks:
+                block[0].weight.mul_(8)
+                block[2].weight.mul_(8)
+        self.out = torch.nn.Linear(64, 8)
+
+    def forward(self, value):
+        for block in self.blocks:
+            value = value + block(value)
+        return self.out(value)
+
+
+def test_dynamic_length_check_tolerates_float32_noise_of_large_outputs(tmp_path):
+    # The check's reference runs in float32: an output near zero among
+    # others near 1e5 differs from the sprite's by noise of their size.
+    torch.manual_seed(0)
+    model = _LargeActivations().eval()
+    _transpile(
+        model, torch.randn(3, 64), tmp_path / "large", dynamic={0: (1, 8)},
+        quantization=QuantizationConfig(bits=4, overrides={"blocks.3.2": 8}),
+    )
