@@ -100,12 +100,20 @@ QKV weight, even and odd rows, or one half read by `F.linear` and the other
 on the right of a matrix product, is quantized once, grouped over that use's
 inputs, and reported as its own entry (`qkv[offset=...,shape=...]`). Uses
 that read the same values the same way, such as `F.linear(h, weight)` and
-`h @ weight.T`, share one entry and GPTQ calibrates it with both. Values no
-such use reads are grouped along the parameter's last dimension, reported as
-`name[remaining]` when the rest of the parameter is quantized for its uses.
-When two uses read the same values grouped along different axes, as
-`F.linear(x, weight)` and `x @ weight` do, only one layout can be stored in
-integers: the larger use's, or the first one's.
+`h @ weight.T`, share one entry and GPTQ calibrates it with both. A matrix
+read other than by a matrix product, such as an embedding table gathered by
+token, is stored as it is read, grouped along its rows, so that read is a
+use too, without calibration data. Values read only in other ways, such as
+the experts of a bank an expert operation reads whole, are grouped along the
+parameter's last dimension, reported as `name[remaining]` when the rest of
+the parameter is quantized for its uses. When two uses read the same values
+grouped along different axes, as `F.linear(x, weight)` and `x @ weight` do,
+or an embedding gathered by token and the first rows of it read by
+`h @ embedding[:16]`, only one layout can be stored in integers: the larger
+use's, or the first one's. A parameter, or part of one, that the export
+never reads, such as a submodule `forward` doesn't call or the rows of
+`weight[:256]` past 256, isn't stored, so it is neither quantized nor
+reported.
 
 A weight the model copies before using it, such as
 `F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is the
@@ -145,6 +153,10 @@ a quantized value read in another layout is kept in float16. Each stored list is
 back to the parameter values it holds: an entry whose values are all stored
 in float16 is reported with `method` `"float16"` and the reason, and
 values also or only stored in float16 elsewhere get a `name[float16]` entry.
+Storage keeps one list for lists that hold the same values, as a weight and
+a `view` of it do, and stores it in the fewest bits any of their shapes
+allows, whichever use comes first; `verify` reads that list for each of
+them.
 `result.warnings` names the parameter each time. A weight split into
 several lists is stored at one precision, however short its last list. The
 entry points of an `ExportProgram` each store the lists they read, and the
@@ -159,7 +171,11 @@ Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set
 `min_quantized_values=1` to quantize every eligible matrix. A matrix is a
 parameter read as one by the uses above, or one with at least two
-dimensions larger than one (for an expert bank, per expert). Vectors stay
+dimensions larger than one (for an expert bank, per expert). The minimum
+applies to the whole parameter (or computed weight), however it is read: a
+weight above it is quantized and stored in integers even where the export
+reads it in smaller slices, such as `F.linear(x, w[:32])`, or splits it
+into several lists. Vectors stay
 float16: biases, normalization parameters, `nn.MultiheadAttention`'s
 `(1, 1, E)` `bias_k` and `bias_v`, and `(N, 1)` gains such as
 `weight_norm`'s. Buffers such as RoPE tables and masks use float16 too.

@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from sprite_helpers import load_sprite
 
 from cattorch import (
-    EntryPoint, ExportProgram, Input, Output, ProgramCall, QuantizationConfig, transpile, verify,
+    EntryPoint, ExportProgram, Input, Output, ProgramCall, QuantizationConfig,
+    QuantizationOverride, StorageConfig, transpile, verify,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
@@ -292,9 +293,14 @@ def test_program_verify_reads_each_entry_points_list(tmp_path):
         assert verify(model, program, result, quantization=config, calls=calls).passed
 
 
-def test_dynamic_length_check_accepts_a_float16_copy(tmp_path):
+@pytest.mark.parametrize("traced", [False, True])
+def test_dynamic_length_check_accepts_a_float16_copy(tmp_path, traced):
+    # The check runs a copy of its reference at each length: a traced
+    # model's copy must still read each use's list.
     torch.manual_seed(0)
     model = _TwoLayoutsForward().eval()
+    if traced:
+        model = torch.fx.symbolic_trace(model)
     _transpile(
         model, torch.randn(1, 32), tmp_path / "dynamic", dynamic={0: (1, 8)},
         quantization=QuantizationConfig(bits=4, min_quantized_values=1024),
@@ -428,3 +434,235 @@ def test_dynamic_length_check_tolerates_float32_noise_of_large_outputs(tmp_path)
         model, torch.randn(3, 64), tmp_path / "large", dynamic={0: (1, 8)},
         quantization=QuantizationConfig(bits=4, overrides={"blocks.3.2": 8}),
     )
+
+
+@pytest.mark.parametrize(
+    "setting", [{"min_calibration_rows": 32}, {"damp_percent": 0.05}, {"block_size": 64}],
+)
+def test_symmetric_override_within_a_tuned_gptq_config(tmp_path, setting):
+    # The symmetric weight's settings don't carry the config's GPTQ ones,
+    # which a symmetric config refuses.
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(64, 256), torch.nn.ReLU(), torch.nn.Linear(256, 64),
+    ).eval()
+    config = QuantizationConfig(
+        bits=4, method="gptq", min_quantized_values=256,
+        overrides={"2": QuantizationOverride(bits=4, method="symmetric")}, **setting,
+    )
+    result, _ = _transpile(
+        model, torch.randn(4, 64), tmp_path / "gptq", quantization=config,
+        calibration=[torch.randn(64, 64) for _ in range(4)],
+    )
+    assert [(item.name, item.method) for item in result.quantization.tensors] == [
+        ("0.weight", "gptq"), ("2.weight", "symmetric"),
+    ]
+
+
+class _ViewedWeight(torch.nn.Module):
+    """``w`` read as a (512, 64) linear weight and through a (1024, 32) view,
+    whose lists hold the same values: storage stores them once."""
+
+    def __init__(self, view_first):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(512, 64) * 0.1)
+        self.view_first = view_first
+
+    def forward(self, x, y):
+        if self.view_first:
+            viewed = F.linear(y, self.w.view(1024, 32)).sum(-1, keepdim=True)
+            return viewed + F.linear(x, self.w).sum(-1, keepdim=True)
+        whole = F.linear(x, self.w).sum(-1, keepdim=True)
+        return whole + F.linear(y, self.w.view(1024, 32)).sum(-1, keepdim=True)
+
+
+@pytest.mark.parametrize("view_first", [False, True])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_verify_reads_the_list_storage_shares_between_views(tmp_path, view_first, bits):
+    # Storage keeps the integer list for both uses, whichever comes first;
+    # verify's reference must read it for the view too.
+    torch.manual_seed(0)
+    model = _ViewedWeight(view_first).eval()
+    example = (torch.randn(1, 64), torch.randn(1, 32))
+    config = QuantizationConfig(bits=bits)
+    result, caught = _transpile(model, example, tmp_path / "view", quantization=config)
+    assert _entries(result.quantization) == [("w", "symmetric", bits, 32768)]
+    assert not [item for item in caught if "float16" in item]
+    outcome = verify(model, example, result, quantization=config)
+    assert outcome.passed and outcome.max_abs_error < 1e-4
+
+
+@pytest.mark.parametrize("layer_sharing", [False, True])
+def test_generation_position_table_is_reported_with_layer_sharing(tmp_path, layer_sharing):
+    from shared_models import NanoGPT
+    from cattorch import CodegenConfig, GenerationProgram
+
+    torch.manual_seed(1)
+    model = NanoGPT(layers=3, width=32, heads=2, context=16).eval()
+    for name, overrides in (("shared", {}), ("refused", {"blocks.1.q": 8})):
+        result, _ = _transpile(
+            model, GenerationProgram(max_context=16), tmp_path / f"{name}_{layer_sharing}",
+            quantization=QuantizationConfig(
+                bits=4, min_quantized_values=256, overrides=overrides,
+            ),
+            codegen=CodegenConfig(layer_sharing=layer_sharing),
+        )
+        entries = [item for item in result.quantization.tensors if item.name == "wpe.weight"]
+        assert [(item.method, item.values) for item in entries] == [("float16", 16 * 32)]
+
+
+class _UnusedParameters(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(64, 256)
+        self.b = torch.nn.Linear(256, 64)
+        self.unused = torch.nn.Linear(64, 512)
+        self.small_unused = torch.nn.Linear(8, 8)
+        self.conv = torch.nn.Conv1d(4, 64, 3, padding=1)
+
+    def forward(self, value):
+        return self.b(torch.relu(self.a(value)))
+
+    def c(self, value):
+        return self.conv(value)
+
+
+def test_parameters_the_export_never_reads_are_not_reported(tmp_path):
+    torch.manual_seed(0)
+    model = _UnusedParameters().eval()
+    config = QuantizationConfig(bits=4, min_quantized_values=128)
+    result, _ = _transpile(model, torch.randn(1, 64), tmp_path / "tensor", quantization=config)
+    assert _entries(result.quantization) == [
+        ("a.weight", "symmetric", 4, 16384), ("b.weight", "symmetric", 4, 16384),
+    ]
+    assert result.quantization.quantized_values == 32768
+    program = ExportProgram(entrypoints=(EntryPoint(
+        "c", method="c", arguments=(Input("x", torch.randn(1, 4, 16)),),
+        returns=(Output("y"),),
+    ),))
+    result, _ = _transpile(model, program, tmp_path / "program", quantization=config)
+    assert _entries(result.quantization) == [("conv.weight", "symmetric", 4, 768)]
+
+
+class _HalfRead(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(512, 64) * 0.1)
+
+    def forward(self, value):
+        return F.linear(value, self.w[:256])
+
+
+def test_rows_the_export_never_reads_are_not_reported(tmp_path):
+    torch.manual_seed(0)
+    result, _ = _transpile(
+        _HalfRead().eval(), torch.randn(1, 64), tmp_path / "half",
+        quantization=QuantizationConfig(bits=4, min_quantized_values=64),
+    )
+    assert _entries(result.quantization) == [
+        ("w[offset=0,shape=(256, 64)]", "symmetric", 4, 16384),
+    ]
+
+
+class _Slices(torch.nn.Module):
+    """A 6,144-value weight read as three 2,048-value slices."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(96, 64) * 0.1)
+
+    def forward(self, value):
+        return (
+            F.linear(value, self.w[:32]) * torch.sigmoid(F.linear(value, self.w[32:64]))
+            + F.linear(value, self.w[64:])
+        )
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_min_quantized_values_applies_to_the_weight_a_slice_is_read_from(tmp_path, bits):
+    # The weight is above the minimum, so its slices are quantized, and
+    # storage stores them in integers, not as float16 copies of the
+    # integer values.
+    torch.manual_seed(0)
+    model = _Slices().eval()
+    example = torch.randn(2, 64)
+    config = QuantizationConfig(bits=bits, min_quantized_values=4096)
+    result, caught = _transpile(
+        model, example, tmp_path / "slices", quantization=config,
+        storage=StorageConfig(compression=True),
+    )
+    assert [(item.method, item.values) for item in result.quantization.tensors] == [
+        ("symmetric", 2048),
+    ] * 3
+    assert not [item for item in caught if "float16" in item]
+    names = {entry[0] for entry in load_sprite(result.path)["lists"].values()}
+    assert any(name.endswith("cattorch decoded scales") for name in names)
+    outcome = verify(
+        model, example, result, quantization=config, storage=StorageConfig(compression=True),
+    )
+    assert outcome.passed and outcome.max_abs_error < 1e-4
+
+
+class _GatheredAndSliced(torch.nn.Module):
+    """A table gathered whole, and part of it read by a matrix product."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.E = torch.nn.Parameter(torch.randn(256, 64) * 0.1)
+        self.kind = kind
+
+    def forward(self, tokens, hidden):
+        gathered = F.embedding(tokens, self.E).sum(1)
+        if self.kind == "rows":
+            return gathered + hidden @ self.E[:16]
+        return gathered + F.linear(hidden[..., :32], self.E[:, :32])[..., :64]
+
+
+@pytest.mark.parametrize("kind", ["rows", "columns"])
+def test_gathered_table_is_quantized_as_the_gather_reads_it(tmp_path, kind):
+    # The gather reads the whole table, grouped along its rows: the larger
+    # use decides its grid and the matrix product reads a float16 copy,
+    # rather than the table's other values being rounded to integers and
+    # then stored in float16.
+    torch.manual_seed(0)
+    model = _GatheredAndSliced(kind).eval()
+    example = (torch.randint(0, 256, (1, 5)), torch.randn(1, 16 if kind == "rows" else 64))
+    config = QuantizationConfig(bits=4, min_quantized_values=1024)
+    result, _ = _transpile(model, example, tmp_path / kind, quantization=config)
+    copies = 1024 if kind == "rows" else 8192
+    assert _entries(result.quantization) == [
+        ("E", "symmetric", 4, 16384), ("E[float16]", "float16", None, copies),
+    ]
+    assert verify(model, example, result, quantization=config).passed
+
+
+class _OverlappingLayouts(torch.nn.Module):
+    """Rows 0-99 read as a linear weight, rows 50-199 on the right of a
+    matrix product: the larger use's layout is quantized."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(200, 64) * 0.1)
+
+    def forward(self, value, hidden):
+        return F.linear(value, self.w[:100]).sum(-1) + (hidden @ self.w[50:]).sum(-1)
+
+
+def test_float16_list_of_several_entries_says_so(tmp_path):
+    # The first use's list holds the second use's rows and the rest: the
+    # rest were quantized along the list's own rows, so "a different axis"
+    # would be untrue of them.
+    torch.manual_seed(0)
+    model = _OverlappingLayouts().eval()
+    example = (torch.randn(1, 64), torch.randn(1, 150))
+    config = QuantizationConfig(bits=4, min_quantized_values=1024)
+    result, _ = _transpile(model, example, tmp_path / "overlap", quantization=config)
+    reasons = {
+        item.name: item.fallback_reason for item in result.quantization.tensors
+        if item.method == "float16"
+    }
+    assert "w[remaining]" in reasons, reasons
+    assert all(
+        "also holds values quantized in other groups" in reason for reason in reasons.values()
+    ), reasons
+    assert verify(model, example, result, quantization=config).passed

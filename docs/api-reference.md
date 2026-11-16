@@ -363,7 +363,7 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `method` | `"symmetric"` | `"symmetric"` (round to nearest) or `"gptq"` (uses calibration data). |
 | `group_size` | `64` | Maximum group size. The actual size is the largest divisor of the matrix input width (for a convolution, its fan-in) that doesn't exceed this. A matrix whose integer storage wouldn't be smaller than float16 stays float16. |
 | `scale_precision` | `"float16"` | `"float16"` or `"float32"` scales. |
-| `min_quantized_values` | `16384` | Matrices with fewer values stay float16. |
+| `min_quantized_values` | `16384` | Matrices with fewer values stay float16. It applies to each parameter as a whole: smaller slices of a larger one are quantized. |
 | `damp_percent` | `0.01` | GPTQ damping added to the Hessian diagonal, as a fraction of its mean. GPTQ only. |
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
 | `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. GPTQ only. |
@@ -558,7 +558,8 @@ or `weight computed from <parameters>`. A `method` of `"float16"` means the
 values are stored in float16, and `fallback_reason` says why: the tensor
 was smaller than `min_quantized_values`, integer storage wouldn't be
 smaller, an override or `head_bits=None` keeps it float16, storage reads it
-grouped along a different axis than it was quantized in, or it is a weight
+grouped along a different axis than it was quantized in, or from a list that
+also holds values quantized in other groups, or it is a weight
 computed from parameters where quantization couldn't compute it from
 quantized values instead.
 Values of a quantized entry that are also, or only, stored in float16, such
