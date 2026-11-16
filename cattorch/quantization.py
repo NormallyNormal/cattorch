@@ -315,6 +315,8 @@ class QuantizationReport:
     )
     # Weights computed from parameters, by storage, which regions may sit in.
     _computed: dict = field(default_factory=dict, repr=False, compare=False)
+    # The parameters regions sit in, by storage.
+    _parameters: dict = field(default_factory=dict, repr=False, compare=False)
     # Matrices quantization left as they are because export computes with
     # them before any input arrives, by storage, with their names.
     _unquantized: dict = field(default_factory=dict, repr=False, compare=False)
@@ -2080,6 +2082,10 @@ def quantize_model(
         if found is not None:
             copies[pointer] = (weight, *found)
             del computed[pointer]
+            if pointer in head and found[0] not in head:
+                # The output head read through a copy is the parameter.
+                head.add(found[0])
+                settings_by_storage[found[0]] = config._head_settings(all_names[found[0]])
     if copies:
         stats: dict[tuple, _ActivationStats] = {}
         for key, stat in capture.stats.items():
@@ -2372,6 +2378,10 @@ def quantize_model(
         tensors=tuple(reports),
         _regions=tuple(regions),
         _unquantized=unquantized,
+        _parameters={
+            region.pointer: base_parameters[region.pointer][1] for region in regions
+            if region.pointer in base_parameters and region.pointer not in computed
+        },
         _copies={
             pointer: (base_parameters[source][1], positions)
             for pointer, (_, source, positions) in copies.items()
@@ -2713,8 +2723,10 @@ def _storage_quantization_report(
         pointer = parameter.untyped_storage().data_ptr()
         parameter_names.setdefault(pointer, name)
         parameters.setdefault(pointer, parameter)
-    # A computed weight is stored as the tensor quantization made of it.
-    for pointer, tensor in report._computed.items():
+    # The parameters quantization quantized, which a generation step reads
+    # as constants of its own, and computed weights, stored as the tensors
+    # quantization made of them.
+    for pointer, tensor in (*report._parameters.items(), *report._computed.items()):
         parameters.setdefault(pointer, tensor)
     sources_of = {**report._copies, **_storage_sources(model)}
     for parameter, _ in sources_of.values():
