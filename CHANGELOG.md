@@ -205,7 +205,9 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   convolution and pooling option (dilation, groups, `padding="same"`,
   transposed and 3D), `gather`, `scatter` and indexing with indices computed
   at run time, `nn.EmbeddingBag`, broadcast batched `matmul`, and in-place
-  updates of tensors the model creates or of its inputs. `torch.pow` takes
+  updates of tensors the model creates or of its inputs, with every in-place
+  method and augmented assignment whose out-of-place form exports (`x %= 2`
+  included). `torch.pow` takes
   any exponent. See [supported models](docs/supported-models.md) and
   [operator coverage](docs/operator-coverage.md).
 - Operations without a kernel of their own export through PyTorch's

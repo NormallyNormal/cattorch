@@ -336,6 +336,89 @@ def test_in_place_operations_keep_pytorchs_casting_rule(tmp_path, update):
         transpile(Updates().eval(), torch.randint(0, 5, (3, 4)), tmp_path / "integer")
 
 
+IN_PLACE_FORMS = {
+    # In place, as written, and out of place: each pair must export alike.
+    "remainder": (lambda y: y.remainder_(0.75), lambda y: y.remainder(0.75)),
+    "%=": (lambda y: y.__imod__(0.75), lambda y: y % 0.75),
+    "//=": (lambda y: y.__ifloordiv__(0.5), lambda y: y // 0.5),
+    "fmod": (lambda y: y.fmod_(0.5), lambda y: y.fmod(0.5)),
+    "trunc": (lambda y: y.trunc_(), lambda y: y.trunc()),
+    "sinh": (lambda y: y.sinh_(), lambda y: y.sinh()),
+    "atanh": (lambda y: y.atanh_(), lambda y: y.atanh()),
+    "hypot": (lambda y: y.hypot_(y + 1), lambda y: y.hypot(y + 1)),
+    "atan2": (lambda y: y.atan2_(y + 1), lambda y: y.atan2(y + 1)),
+    "pow with a scalar exponent": (lambda y: y.pow_(2.0), lambda y: y.pow(2.0)),
+    "ldexp": (lambda y: y.ldexp_(torch.ones_like(y)), lambda y: y.ldexp(torch.ones_like(y))),
+    "logical_or": (lambda y: y.logical_or_(y - 0.5), lambda y: y.logical_or(y - 0.5)),
+    "conj_physical": (lambda y: y.conj_physical_(), lambda y: y.conj_physical()),
+}
+
+
+@pytest.mark.parametrize("name", sorted(IN_PLACE_FORMS))
+def test_in_place_and_out_of_place_forms_export_alike(tmp_path, name):
+    in_place, out_of_place = IN_PLACE_FORMS[name]
+
+    class Form(nn.Module):
+        def __init__(self, update, written):
+            super().__init__()
+            self.update, self.written = update, written
+
+        def forward(self, x):
+            y = x * 0.9
+            if self.written:
+                self.update(y)
+                return y * 1
+            return self.update(y) * 1
+
+    value = torch.rand(3, 4) * 0.8 + 0.05
+    for written, update in ((True, in_place), (False, out_of_place)):
+        model = Form(update, written).eval()
+        result = transpile(model, value, tmp_path / f"form{written}")
+        assert verify(model, value, result).passed
+
+
+def test_an_integer_pointer_wraps_in_place(tmp_path):
+    from cattorch import ProgramCall, entrypoint
+
+    class Ring(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("pointer", torch.tensor(0))
+
+        @entrypoint(example_inputs=())
+        def advance(self):
+            self.pointer += 3
+            self.pointer %= 4
+            return self.pointer * 1
+
+    model = Ring().eval()
+    result = transpile(model, None, tmp_path / "ring")
+    assert verify(model, None, result, calls=[ProgramCall("advance", ())] * 6).passed
+
+
+@pytest.mark.parametrize("update", [lambda x: x.remainder_(0.5), lambda x: x.__imod__(1.5)])
+def test_in_place_remainder_keeps_pytorchs_casting_rule(tmp_path, update):
+    class Updates(nn.Module):
+        def forward(self, x):
+            update(x)
+            return x
+
+    with pytest.raises(UnsupportedModelError, match="Float can.t be cast to the desired output type"):
+        transpile(Updates().eval(), torch.randint(0, 5, (3, 4)), tmp_path / "integer")
+
+
+@pytest.mark.parametrize("update", [lambda y: y.t_(), lambda y: y.unsqueeze_(0), lambda y: y.squeeze_()])
+def test_in_place_shape_changes_say_what_to_write(tmp_path, update):
+    class Reshape(nn.Module):
+        def forward(self, x):
+            y = x * 1
+            update(y)
+            return y * 1
+
+    with pytest.raises(UnsupportedOperationError, match=r"changes the tensor's shape in place.*write x = x\."):
+        transpile(Reshape().eval(), torch.randn(3, 4), tmp_path / "reshape")
+
+
 def test_a_buffer_updated_in_forward_points_to_entry_points(tmp_path):
     class Counter(nn.Module):
         def __init__(self):

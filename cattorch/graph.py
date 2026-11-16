@@ -1258,6 +1258,12 @@ def _mix_runtime_axis(
     return False
 
 
+# In-place operations that change a tensor's shape or layout, not its values.
+_SHAPE_IN_PLACE = frozenset({
+    "t_", "transpose_", "swapdims_", "swapaxes_", "squeeze_", "unsqueeze_",
+    "as_strided_", "resize_", "resize_as_", "set_",
+})
+
 _ARITHMETIC = {"aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"}
 
 
@@ -2754,6 +2760,18 @@ def _validate_lowering_operations(graph: _GraphInfo) -> None:
         if node.target is operator.getitem and getattr(node.args[0], "name", None) in graph.split_meta:
             continue
         if graph.registry.operation(target) is None:
+            packet = getattr(node.target, "overloadpacket", None)
+            name = getattr(packet, "__name__", "")
+            if name in _SHAPE_IN_PLACE:
+                raise _unsupported_operation(node, (
+                    f"x.{name}() changes the tensor's shape in place, which cattorch "
+                    f"can't follow; write x = x.{name[:-1]}(...) instead"
+                ))
+            if name.endswith("_") and not name.startswith("_"):
+                raise _unsupported_operation(node, (
+                    f"x.{name}() isn't supported in place, and neither is "
+                    f"x.{name[:-1]}(...)"
+                ))
             raise _unsupported_operation(node)
         if node.name not in graph.causal_value_matmuls:
             detail = graph.registry.validate(

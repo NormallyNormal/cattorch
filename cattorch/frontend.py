@@ -429,11 +429,14 @@ _NOT_VALUE_UPDATES = frozenset({"copy_", "resize_", "resize_as_", "set_"})
 
 
 def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | None:
-    """``x.op_(...)`` as ``x.copy_(op(x, ...))`` when ``op`` has a kernel.
+    """``x.op_(...)`` as ``x.copy_(op(x, ...))``, for every value update.
 
     PyTorch's own decomposition of an in-place operation decomposes the
     operation itself, so ``x.clamp_()`` would run as primitives rather than
-    the clamp kernel. Written as a copy, the capture's in-place handling
+    the clamp kernel, and ``x.remainder_()`` as a primitive cattorch doesn't
+    lower, where ``remainder`` has a decomposition of cattorch's own. As a
+    copy, ``op`` takes whichever route it takes out of place, so the two
+    forms export alike. Written as a copy, the capture's in-place handling
     turns it into dataflow (``_replace_intermediate_copies``). ``fill_``
     copies a constant of the tensor's shape (times the value, for a tensor
     value), and runs ``decomposition`` for a variable-length tensor.
@@ -453,18 +456,22 @@ def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | Non
         return fill
     if not packet.endswith("_") or packet.startswith("_") or packet in _NOT_VALUE_UPDATES:
         return None
+    if operator == aten.polygamma_.default:
+        # polygamma_(n) is polygamma(n, x): the tensor is its second argument.
+        def polygamma(self, n):
+            return aten.copy_.default(self, aten.polygamma.default(n, self))
+        return polygamma
     functional = getattr(aten, packet[:-1], None)
-    overload = operator._overloadname
-    if functional is None or overload not in functional.overloads():
+    if functional is None:
         return None
-    out_of_place = getattr(functional, overload)
-    if any(result.alias_info is not None for result in out_of_place._schema.returns):
-        return None
-    if registry.operation(str(out_of_place)) is None and str(out_of_place) not in kept:
+    out_of_place = _functional_overload(operator, functional)
+    if out_of_place is None:
         return None
 
     def update(self, *args, **kwargs):
         result = out_of_place(self, *args, **kwargs)
+        if result is self or _same_memory(result, self):
+            return self  # an identity for this input, as conj_physical of a real tensor
         # copy_ would cast silently where the in-place operation raises,
         # such as for an integer tensor's x.add_(0.5).
         if not torch.can_cast(result.dtype, self.dtype):
@@ -474,6 +481,42 @@ def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | Non
             )
         return aten.copy_.default(self, result)
     return update
+
+
+def _same_memory(first, second) -> bool:
+    try:
+        return first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):  # tensors without storage
+        return False
+
+
+def _functional_overload(operator, functional):
+    """The overload of ``functional`` taking ``operator``'s arguments, or ``None``.
+
+    Overload names don't always line up: ``pow_.Scalar`` takes a scalar
+    exponent, like ``pow.Tensor_Scalar``, while ``pow.Scalar`` takes a
+    scalar base. The one whose argument names and types match is used.
+    """
+    def signature(schema):
+        return [
+            (argument.name, str(argument.type).replace("(a!)", ""), argument.kwarg_only)
+            for argument in schema.arguments
+        ]
+
+    wanted = signature(operator._schema)
+    names = [operator._overloadname] + [
+        name for name in functional.overloads() if name != operator._overloadname
+    ]
+    for name in names:
+        if name not in functional.overloads():
+            continue
+        candidate = getattr(functional, name)
+        schema = candidate._schema
+        if signature(schema) == wanted and all(
+            result.alias_info is None for result in schema.returns
+        ):
+            return candidate
+    return None
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
