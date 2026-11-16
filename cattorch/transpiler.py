@@ -2338,7 +2338,7 @@ def _transpile_dynamic(
         model, flat, kwarg_names, spec, result, verify, example_kwargs,
         optimization=options.get("optimization", "exact"), storage=options.get("storage"),
         quantization=options.get("quantization"), sig_figs=sig_figs, adapters=adapters,
-        kernels=kernels,
+        kernels=kernels, fast_config=options.get("fast_config"),
     )
     return result
 

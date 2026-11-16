@@ -271,8 +271,14 @@ that check, as does a write to a fixed item, such as `x[0] = 1`. The error
 says at which length the export's numbers differ from the model's. With lossy storage (`quantization=`, float16 storage, `sig_figs`),
 the sprite is checked against a copy of the model holding the values it
 stores, so the check is as strict as for an exact export; with
-`optimization="fast"` or GPTQ, whose effect it can't reproduce, it allows the
-difference it finds at the shortest length. Language models should use a [`GenerationProgram`](generation.md)
+`optimization="fast"`, that copy computes GELU as fast mode's QuickGELU
+does (its other approximations are the same numbers in exact arithmetic).
+The tolerance grows with the values compared, and with the float32 rounding
+of PyTorch's own result, measured against the same model run in float64.
+Effects the check can't reproduce, fast mode's weight transforms, an
+approximate kernel passed to the export, and GPTQ in `transpile`, are
+allowed ten times the difference at the shortest length, in proportion to
+the length. Language models should use a [`GenerationProgram`](generation.md)
 instead, which handles prompts of any length up to `max_context`.
 
 Entry points take the same bounds, in the same form, with
@@ -281,7 +287,11 @@ Entry points take the same bounds, in the same form, with
 `(1, 32)` alone is short for the first dimension, as for `transpile`, and
 the command line's `--dynamic INPUT.DIM=MIN:MAX` is the same again. Export checks each such input, and each
 [append state](programs-and-moe.md#state) an entry point reads, at several
-lengths in the same way, one at a time and then together. An
+lengths in the same way, one at a time and then together; an append state
+the entry point grows is checked up to the longest it can be before that
+call fills it. A GPTQ program is checked against its own quantized weights.
+Both are traced with one row, whatever the least length, so the method must
+run on one row of each. An
 entry point whose operations can't follow the length runs once per item, as
 `forward` does, if it has one variable-length input and updates no state.
 
