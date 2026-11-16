@@ -2727,11 +2727,17 @@ def _transpile_automatic_generation(
         _prepared_quantization_report=report,
     )
     example = torch.zeros(1, 1, dtype=torch.long)
+
+    def attempt_copy():
+        # Tracing runs the step, which updates its caches and position, so
+        # every attempt gets its own copy. The tensors it stores are shared:
+        # the quantization report finds the weights the sprite stores by them.
+        return copy.deepcopy(step, {id(value): value for value in step.static_tensors()})
+
     try:
-        # Tracing runs the step, so every attempt gets its own copy. Without
-        # layer sharing there is no second attempt.
+        # Without layer sharing there is no second attempt.
         result = _transpile(
-            copy.deepcopy(step) if codegen.layer_sharing else step,
+            attempt_copy() if codegen.layer_sharing else step,
             (example,),
             output_path,
             sig_figs,
@@ -2741,7 +2747,7 @@ def _transpile_automatic_generation(
     except _LayerSharingUnavailable as unavailable:
         warn(layer_sharing_warning(str(unavailable)))
         result = _transpile(
-            copy.deepcopy(step),
+            attempt_copy(),
             (example,),
             output_path,
             sig_figs,
