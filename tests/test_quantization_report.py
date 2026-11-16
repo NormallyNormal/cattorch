@@ -201,7 +201,8 @@ def test_weight_read_directly_and_through_a_copy_is_rounded_once(tmp_path, metho
         else [torch.randn(16, 32) for _ in range(10)]
     ) if method == "gptq" else None
     config = QuantizationConfig(
-        bits=4, method=method, min_quantized_values=1024, min_calibration_rows=8,
+        bits=4, method=method, min_quantized_values=1024,
+        **({"min_calibration_rows": 8} if method == "gptq" else {}),
     )
     result, caught = _transpile(
         model, example, tmp_path / "copy", quantization=config, calibration=calibration,
