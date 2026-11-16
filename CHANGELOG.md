@@ -124,7 +124,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   embedding or an embedding bag's offsets, must hold indices valid for every
   operation that uses it, and an index computed from the inputs, such as
   `x[ids + 1]` or a loss's targets, is checked as the block runs; either
-  fails with `invalid item: LIST` naming the input. `index_select`,
+  fails with `invalid item: LIST` naming the input. Only the values an
+  operation reads are checked: an item the model writes over first, as
+  `ids[0] = 0` does, can hold anything, and a float written into an index
+  input is checked once converted to an integer. `index_select`,
   `index_add`, `index_copy`, `index_reduce` and `take_along_dim` refuse
   negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
   A generator can't index with an index computed from the token IDs. See
@@ -132,7 +135,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 - A program checks the length of its state lists, not their items: an
   append state must hold from its initial rows up to its capacity. State
   lists belong to the sprite; see
-  [state](docs/programs-and-moe.md#state).
+  [state](docs/programs-and-moe.md#state). A state the model uses as an
+  index is checked like an index input, so an entry point whose model moved
+  a counter past a table's rows fails with `invalid item: cattorch state
+  STATE` and keeps the state, instead of reporting `ok` with zeros. A
+  `RecurrentGenerationProgram` that uses a state as an index is refused.
 - `ExportProgram` refuses entry point names whose broadcasts Scratch would
   match as one, since it matches them ignoring case: names that differ only
   in case, a name like another's completion (`x complete` beside `x`), and
@@ -424,6 +431,24 @@ Python:
   exported method, is now left untransformed, with a warning.
 - A tied embedding was read in the wrong layout in fast mode with weight
   transforms, and fast weight pruning of `x @ W` changed `W` for other uses.
+- Fast low-rank factorization replaced a layer with two plain layers whatever
+  else it did, so a subclass of `nn.Linear` or a convolution with its own
+  `forward`, such as one that clamps its output, lost those steps and gave
+  wrong output, and a layer's forward hooks were dropped. A layer inside
+  `nn.MultiheadAttention`, `nn.TransformerEncoderLayer` or another `torch.nn`
+  module that reads its weight itself made the export fail with a false
+  "check that example_inputs match" error. Such layers now keep their
+  weights, with a warning; neuron pruning skips layers with forward hooks
+  the same way.
+- `x.put_()`, `x.addr_()`, `x.addmm_()` and `x.addmv_()` were refused
+  although their out-of-place forms export, with reasons that didn't apply
+  ("neither is x.put(...)", "an in-place update through a view"). Every
+  in-place method now runs as its out-of-place form, whether or not PyTorch
+  has a decomposition for it.
+- A `dynamic=` export that writes the first item of the variable-length
+  dimension, or joins `x[:, :1]` and `x[:, 1:]` with `cat`, was refused
+  saying the model might use the length itself. It names the cause now:
+  such a slice holds nothing in the one-item trace.
 - Reading input-dependent values with `tolist()` or `.numpy()` exported the
   example's values as constants; it is rejected, like `.item()`.
 - `sig_figs` rounded integer buffers.
@@ -503,6 +528,13 @@ Python:
   units), booleans (`"0"` and `"false"` are false), list positions (`last`,
   `all`, `0x2`), `mod` with infinities, `pick random` bounds, costume
   switching by number, and `for each` counts read before every iteration.
+- The emulator's `round`, `mathop`, repeat counts and costume numbers could
+  differ from Scratch in the last bit, or raise where Scratch gives NaN:
+  `round` of 0.49999999999999994 gave 1, `sin` of 1e308 raised, and `ln`,
+  `log`, `e ^`, `10 ^`, the trigonometric functions and their inverses used
+  Python's C library where Scratch uses V8's own versions of them. It now
+  computes them as V8 does, `-0` included, checked against scratch-vm bit
+  for bit.
 - Mistakes that ended in an internal exception raise one naming the
   problem: a `model` that isn't a module or `example_inputs` that are a dict
   or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a
@@ -529,9 +561,18 @@ Python:
   them raises `ValueError`. A `FastLayerConfig` rank at or above a weight's
   full rank was skipped silently; it warns, as other skipped
   factorizations do.
-- An `output_path` that names no file (empty, ending in a separator, or an
-  existing directory) raises `ValueError` instead of writing a hidden
-  `..sprite3` or a file beside the directory, and so does such a `-o`. The
+- An `output_path` that names no file (empty, ending in a separator, only an
+  extension such as `.sprite3`, or an existing directory) raises
+  `ValueError` instead of writing a hidden `..sprite3` or `.sprite3.sprite3`
+  or a file beside the directory, and so does such a `-o`.
+- `cattorch generate --project` failed with "eos_token_id ... is not a token
+  ID of the model", after writing the sprites, when the tokenizer's end
+  token was past the model's token IDs (such as an added `</s>`) and no
+  `--eos-token-id` was given. The demo then has no end token, and a warning
+  says so. A negative or non-finite `--temperature`, a negative
+  `--eos-token-id`, and `--project` without a tokenizer are rejected before
+  anything is written, and an `--eos-token-id` past the model's IDs before
+  the tokenizer and project are. The
   benchmark builders append `.sb3` as every other writer does, instead of
   replacing the last suffix (`results.v2` wrote `results.sb3`).
 - Character and BPE tokenizer sprites ignored Hugging Face added tokens, so
@@ -539,7 +580,25 @@ Python:
   such as `dog cat`, gave other token IDs with no warning. They now match
   added tokens in the text first, as the tokenizer does; see
   [added and special tokens](docs/tokenizers.md#added-and-special-tokens).
-  Added tokens with `single_word=True` raise `ValueError`.
+  Added tokens with `single_word=True`, or with a character outside the
+  Basic Multilingual Plane, raise `ValueError`. With `split_special_tokens`
+  the sprite reads special tokens as text, as the tokenizer does, and
+  exporting leaves the tokenizer's settings as they were.
+- Tokenizer sprites left out the tokens a tokenizer's post-processor adds
+  around every text, such as `<s>` before it, so `cattorch tokenize` gave
+  other IDs than `tokenizer.encode(text)`. They now write them too, for
+  `TemplateProcessing`, `BertProcessing` and `RobertaProcessing`, and for a
+  SentencePiece processor made with `add_bos` or `add_eos`; any other
+  post-processor, and SentencePiece's `reverse` or `enable_sampling`, raises
+  `ValueError`. See
+  [special tokens added around the text](docs/tokenizers.md#special-tokens-added-around-the-text).
+- With `split_special_tokens=True`, a character tokenizer or BPE sprite
+  wrote a one-character special token's own ID where the tokenizer gives
+  the unknown token, because the model's vocabulary lacks it.
+- `BPETokenizer` exported a model with `ignore_merges=True` and merged
+  anyway, so a text that is itself a vocabulary entry could get other IDs.
+  It raises `ValueError` unless the merges build every vocabulary entry,
+  when the option changes nothing.
 - Tokenizer sprites looked characters up case-insensitively, so `The`
   encoded like `the`. Sprites whose vocabulary has letters now look
   characters up by costume name, so don't change their costumes. SentencePiece `scratch_casefold=True`

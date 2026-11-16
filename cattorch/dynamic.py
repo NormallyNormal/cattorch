@@ -398,11 +398,49 @@ def check_lengths(
     for length in lengths[1:]:
         found, matches = error(report(length))
         if not matches or (not exact and _beyond_baseline(found, baseline, length, lengths[0])):
+            cause = (
+                _CHANGES_OPERATIONS
+                if _operations_change(model, flat_inputs, kwarg_names, spec, example_kwargs)
+                else _USES_LENGTH
+            )
             raise UnsupportedModelError(
                 f"with {length} items along the dynamic dimension the export gives "
                 f"different numbers from the model (largest difference {found:.3g}), "
-                f"though it matches with {lengths[0]}. {_USES_LENGTH}"
+                f"though it matches with {lengths[0]}. {cause}"
             )
+
+
+_CHANGES_OPERATIONS = (
+    "The model runs other operations with two items than with the one the "
+    "export traces, as when a slice past the first item, such as x[:, 1:], or "
+    "the rest of a tensor after a write to its first row, holds nothing with "
+    "one item; dynamic= can't follow such an operation"
+)
+
+
+def _operations_change(model, flat_inputs, kwarg_names, spec, example_kwargs) -> bool:
+    """Whether the model's traced operations differ between one and two items."""
+    from cattorch.frontend import capture_model
+    from cattorch.graph import _dynamic_placeholders, _normalize_graph
+
+    ((index, (_, _, _, axis)),) = spec.items()
+    positional = len(flat_inputs) - len(kwarg_names)
+
+    def operations(length):
+        values = list(flat_inputs)
+        values[index] = varied_at_length(values[index], axis, length)
+        keywords = dict(example_kwargs or {})
+        keywords.update(zip(kwarg_names, values[positional:]))
+        captured = capture_model(
+            copy.deepcopy(model), tuple(values[:positional]), example_kwargs=keywords or None,
+        )
+        _normalize_graph(captured.graph, varying=_dynamic_placeholders(captured, spec))
+        return [(node.op, str(node.target)) for node in captured.graph.nodes]
+
+    try:
+        return operations(1) != operations(2)
+    except Exception:  # noqa: BLE001 - without both traces, the cause stays open
+        return False
 
 
 def _lengths(minimum, original, maximum) -> list[int]:

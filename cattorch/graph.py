@@ -1363,6 +1363,8 @@ _RUNTIME_ELEMENTWISE = {
     "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
     "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
     "aten.mean.dim", "aten.embedding.default",
+    # Checks each index it copies, over the whole list.
+    "cattorch.check_index.default",
 } | ELEMENTWISE_OPS
 _RUNTIME_POINTWISE = _RUNTIME_ELEMENTWISE - {
     "aten.linear.default", "aten.layer_norm.default", "aten.native_layer_norm.default",
@@ -3010,9 +3012,11 @@ def _validate_lowering_operations(graph: _GraphInfo) -> None:
                     f"can't follow; write x = x.{name[:-1]}(...) instead"
                 ))
             if name.endswith("_") and not name.startswith("_"):
+                # Capture writes an in-place update as its out-of-place
+                # form and a copy where the two take the same arguments.
                 raise _unsupported_operation(node, (
-                    f"x.{name}() isn't supported in place, and neither is "
-                    f"x.{name[:-1]}(...)"
+                    f"x.{name}() changes a tensor in place, and cattorch has no "
+                    "out-of-place operation taking the same arguments to run instead"
                 ))
             raise _unsupported_operation(node)
         if node.name not in graph.causal_value_matmuls:

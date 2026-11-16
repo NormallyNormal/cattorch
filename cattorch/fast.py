@@ -185,6 +185,57 @@ def _factor_conv(module: nn.Conv1d | nn.Conv2d, rank: int) -> nn.Sequential | No
     return nn.Sequential(first, second).train(module.training)
 
 
+_CONTAINERS = (
+    nn.Sequential, nn.ModuleList, nn.ModuleDict, nn.ParameterList, nn.ParameterDict,
+)
+
+
+def _replacement_drops(model: nn.Module, path: str) -> str | None:
+    """Why putting plain layers in place of the module at ``path`` would drop code.
+
+    A low-rank factorization or a neuron pruning puts new ``nn.Linear`` or
+    convolution modules in the module's place, which keep only the weight
+    read. That is only correct when the module does nothing else: its class
+    uses the stock ``forward``, it has no forward hooks, and nothing inside
+    a ``torch.nn`` module (whose forward ``torch.fx`` can't see into, such as
+    ``nn.MultiheadAttention`` reading ``out_proj.weight``) uses it. Returns
+    ``None`` when the replacement is safe.
+    """
+    module = model.get_submodule(path) if path else model
+    for base in (nn.Linear, nn.Conv1d, nn.Conv2d):
+        if isinstance(module, base):
+            overridden = [
+                method for method in ("forward", "_conv_forward")
+                if hasattr(base, method)
+                and getattr(type(module), method) is not getattr(base, method)
+            ]
+            if overridden:
+                return (
+                    f"its class {type(module).__name__} has its own "
+                    f"{overridden[0]}, which replacing the module would drop"
+                )
+    if module._forward_hooks or module._forward_pre_hooks:
+        return "it has forward hooks, which replacing the module would drop"
+    parts = path.split(".") if path else []
+    for depth in range(len(parts)):
+        ancestor_path = ".".join(parts[:depth])
+        ancestor = model.get_submodule(ancestor_path) if ancestor_path else model
+        if isinstance(ancestor, _CONTAINERS):
+            continue
+        if type(ancestor).__module__.startswith(("torch.nn", "torch.ao.nn")):
+            where = f"{ancestor_path!r}" if ancestor_path else "the model"
+            return (
+                f"it belongs to {where}, an nn.{type(ancestor).__name__}, whose "
+                "own code may read the module's parameters directly"
+            )
+    return None
+
+
+def _kept_warning(transform: str, path: str, reason: str) -> str:
+    name = repr(path) if path else "the model"
+    return f"fast mode left {name} without {transform}: {reason}"
+
+
 def _prune_linear_blocks(weight: torch.Tensor, fraction: float) -> torch.Tensor:
     """Prune contiguous groups of four inputs so Scratch can skip whole blocks."""
     result = weight.detach().clone()
@@ -391,6 +442,14 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float, uses: _ModelUse
             warn(_skipped_warning("neuron pruning", (up_path, down_path)))
             claimed.update(paths)
             continue
+        drops = [
+            (path, reason) for path in (up_path, down_path)
+            if (reason := _replacement_drops(model, path)) is not None
+        ]
+        if drops:
+            warn(_kept_warning("neuron pruning", drops[0][0], drops[0][1]))
+            claimed.update(paths)
+            continue
         triples.append((up_path, down_path))
         claimed.update(paths)
 
@@ -537,6 +596,10 @@ def prepare_fast_model(
         policy = config.policy_for("<root>")
         rank = _selected_rank(transformed.weight, policy)
         replacement = None
+        drops = _replacement_drops(transformed, "") if rank is not None else None
+        if drops is not None:
+            warn(_kept_warning("its low-rank factorization", "", drops))
+            rank = None
         if rank is not None:
             replacement = (
                 _factor_linear(transformed, rank)
@@ -580,6 +643,10 @@ def prepare_fast_model(
             continue
         rank = _selected_rank(module.weight, policy, repr(name))
         replacement = None
+        drops = _replacement_drops(transformed, name) if rank is not None else None
+        if drops is not None:
+            warn(_kept_warning("its low-rank factorization", name, drops))
+            rank = None
         if rank is not None:
             if isinstance(module, nn.Linear):
                 replacement = _factor_linear(module, rank)

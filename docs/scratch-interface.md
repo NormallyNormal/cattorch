@@ -219,7 +219,7 @@ bridges, are the same message ignoring case; see the
 | `cattorch reset` | block | Restores every state to its initial value. |
 | `cattorch prepare for save` | block | Clears the decoded weights and working lists before saving the project. |
 | `cattorch ENTRY INPUT`, `cattorch ENTRY OUTPUT` | list | An entry point's inputs and outputs, named after its parameters and outputs. |
-| `cattorch state STATE` | list | A piece of persistent state. It belongs to the sprite: read it, or save and restore values the sprite wrote. A block checks its length, not its items, so writing anything else gives undefined results. |
+| `cattorch state STATE` | list | A piece of persistent state. It belongs to the sprite: read it, or save and restore values the sprite wrote. A block checks its length, and its items only where the model uses the state as an index ([index inputs](supported-models.md#index-inputs)), so writing anything else gives undefined results. |
 | `cattorch status` | variable | How the last block ended; see [status values](#status-values). |
 | `cattorch initialized` | variable | `1` once every entry point's weights are decoded, by `cattorch init` or by calls; `0` before and after `cattorch prepare for save`. |
 | `cattorch ENTRY complete`, `cattorch init complete`, `cattorch reset complete`, `cattorch prepare for save complete` | broadcast | Sent when each block ends. |
