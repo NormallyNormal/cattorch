@@ -51,7 +51,8 @@ benchmark case and its variant.
 - A block checks its input lists before it runs: the number of items, and
   each item. A list of floating-point values must hold numbers (`Infinity`
   and `-Infinity` count; text, an empty item and `NaN` don't); a list of
-  integers must hold whole numbers. Token IDs must be from 0 to the
+  integers must hold whole numbers from -2^53 to 2^53, the ones a Scratch
+  number holds exactly (`Infinity` doesn't count). Token IDs must be from 0 to the
   vocabulary size minus 1, and an integer input the model uses as an index
   must hold indices valid for every operation that uses it, as in PyTorch:
   from 0 to the size minus 1, or, where PyTorch counts a negative index from

@@ -607,6 +607,49 @@ def test_a_generator_refuses_an_index_computed_from_the_token_ids(tmp_path):
         transpile(Halves().eval(), GenerationProgram(max_context=8), tmp_path / "lm")
 
 
+# ── Item rules (docs/scratch-interface.md#how-every-block-behaves) ──────────
+
+class Affine(nn.Module):
+    def forward(self, value, count):
+        return value * 2, count * 2 + 1
+
+
+# Each item, and whether a floating-point and an integer list take it.
+ITEMS = {
+    1: (True, True), -3: (True, True), "1e3": (True, True), 0.5: (True, False),
+    "Infinity": (True, False), "-Infinity": (True, False), "NaN": (False, False),
+    "": (False, False), "x": (False, False),
+    2**53: (True, True), -(2**53): (True, True),
+    2**53 + 2: (True, False), -(2**53) - 2: (True, False),
+}
+
+
+@pytest.mark.parametrize("program", [False, True])
+def test_every_kind_checks_items_by_the_documented_rules(tmp_path, program):
+    if program:
+        example = ExportProgram(entrypoints=(EntryPoint("go", arguments=(
+            Input("value", torch.ones(2)), Input("count", torch.ones(2, dtype=torch.long)),
+        ), returns=(Output("a"), Output("b"))),))
+        result = transpile(Affine().eval(), example, tmp_path / "items")
+        lists, block = ("cattorch go value", "cattorch go count"), "cattorch go"
+    else:
+        result = transpile(
+            Affine().eval(), (torch.ones(2), torch.ones(2, dtype=torch.long)), tmp_path / "items",
+        )
+        lists, block = ("input", "input_1"), interface.FORWARD
+    sprite = load_sprite(result.path)
+    for value, accepted in ITEMS.items():
+        for position, name in enumerate(lists):
+            emulator = ScratchEmulator(sprite)
+            for other in lists:
+                emulator.lists[other] = [1, 1]
+            emulator.lists[name] = [value, 1]
+            emulator.run_procedure(block)
+            status = emulator.variables[interface.STATUS_VARIABLE]
+            expected = interface.OK if accepted[position] else interface.invalid_item(name)
+            assert status == expected, (name, value)
+
+
 # ── Long lists (docs/scratch-interface.md#long-lists) ───────────────────────
 
 def fill_split(emulator, name, values, sizes):

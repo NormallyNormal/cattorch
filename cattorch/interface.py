@@ -227,6 +227,9 @@ def bridge_procedure(message: str) -> str:
 
 # What a block checks an input list's items for, before it runs.
 NUMBERS, WHOLE_NUMBERS = "numbers", "whole numbers"
+# The largest whole number an integer input takes, and the negative of the
+# smallest: 2^53, past which a Scratch number (a double) skips integers.
+WHOLE_LIMIT = 2**53
 
 
 def item_checks(
@@ -235,8 +238,9 @@ def item_checks(
 ):
     """Statements that set the status to ``invalid_item(list_name)`` unless every item is valid.
 
-    ``kind`` is NUMBERS (any number, ``Infinity`` included), WHOLE_NUMBERS, or
-    None for no check (bool lists). With ``rows``, a whole number must also be
+    ``kind`` is NUMBERS (any number, ``Infinity`` included), WHOLE_NUMBERS
+    (from ``-WHOLE_LIMIT`` to ``WHOLE_LIMIT``), or None for no check (bool
+    lists). With ``rows``, a whole number must also be
     from 0 to ``rows - 1``: an index into a table of that many rows; or, as
     ``(low, high)``, from ``low`` to ``high - 1``, such as ``-size`` to
     ``size - 1`` for an index PyTorch counts from the end when negative.
@@ -262,7 +266,11 @@ def item_checks(
             checks = (if_(not_(eq(value, add(value, 0))), invalid),)
         else:
             checks = (if_(not_(eq(value, round_(value))), invalid),)
-            if rows is not None:
+            if rows is None:
+                # Negative exactly when the number is outside -2^53 to 2^53,
+                # the integers a Scratch number holds exactly; Infinity is too.
+                checks += (if_(lt(mul(add(value, WHOLE_LIMIT), sub(WHOLE_LIMIT, value)), 0), invalid),)
+            else:
                 low, high = (0, rows) if isinstance(rows, int) else rows
                 # Negative exactly when the index is outside low to high - 1.
                 below = value if low == 0 else sub(value, low)

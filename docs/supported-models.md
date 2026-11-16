@@ -158,7 +158,9 @@ broadcasting pattern, or option. The error names the operation that failed.
   `atan2` of two infinities gives NaN where PyTorch gives an odd multiple of
   pi/4.
 - Integer arithmetic doesn't wrap around at the dtype's range: `uint8` 250 + 10
-  is 260, not 4. Values are exact up to 2^53.
+  is 260, not 4. Values are exact up to 2^53, and an integer input takes whole
+  numbers from -2^53 to 2^53: a larger one, or `Infinity`, is refused with
+  `invalid item: LIST`.
 - Arithmetic runs in double precision, so a float32 result that lands exactly
   on a rounding boundary in PyTorch can round the other way, as
   `torch.round(x, decimals=1)` does for -0.05 (-0.0 in PyTorch, -0.1 in the

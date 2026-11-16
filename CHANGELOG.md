@@ -110,9 +110,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   a failed prefill no longer resets the cache first. `cattorch prefill` no
   longer empties `cattorch token ids`.
 - Input lists are checked: a model sprite's `cattorch forward` with the
-  wrong number of items or a non-number item, and a generation block with a
-  token ID that isn't a whole number in the vocabulary, fail with a status
-  instead of computing meaningless output.
+  wrong number of items or a non-number item, an integer list item that isn't
+  a whole number from -2^53 to 2^53 (`Infinity` isn't one), and a generation
+  block with a token ID that isn't a whole number in the vocabulary, fail
+  with a status instead of computing meaningless output.
 - Indices are checked as PyTorch checks them: an integer input used as an
   index, by tensor indexing, `gather`, `index_select`, `take`,
   `take_along_dim`, `one_hot`, `scatter`, `index_add`, `index_put`, an
