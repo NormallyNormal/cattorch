@@ -107,7 +107,9 @@ class FastConfig:
         return self.overrides.get(module_name, self.layers)
 
 
-def _selected_rank(weight: torch.Tensor, policy: FastLayerConfig) -> int | None:
+def _selected_rank(
+    weight: torch.Tensor, policy: FastLayerConfig, where: str = "the model",
+) -> int | None:
     matrix = weight.flatten(1)
     full_rank = min(matrix.shape)
     if policy.rank is not None:
@@ -117,6 +119,12 @@ def _selected_rank(weight: torch.Tensor, policy: FastLayerConfig) -> int | None:
     else:
         return None
     if rank >= full_rank:
+        from cattorch.errors import warn
+
+        warn(
+            f"{where} was exported without its low-rank factorization: rank {rank} is not "
+            f"below the weight's full rank {full_rank}, so it would change nothing"
+        )
         return None
     return rank
 
@@ -227,8 +235,16 @@ def prepare_fast_matmul_weights(
     if weight.ndim != 2:
         return (weight,)
     inner, columns = weight.shape
-    rank = _selected_rank(weight, policy)
+    where = f"an x @ W weight of shape {tuple(weight.shape)}"
+    rank = _selected_rank(weight, policy, where)
     factors: tuple[torch.Tensor, ...]
+    if rank is not None and rank * (inner + columns) >= inner * columns:
+        from cattorch.errors import warn
+
+        warn(
+            f"{where} was exported without its low-rank factorization at rank {rank}, "
+            "which would not make it smaller or faster"
+        )
     if rank is not None and rank * (inner + columns) < inner * columns:
         matrix = weight.detach()
         svd_input = (
@@ -484,7 +500,7 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
         policy = config.policy_for(name)
         if not policy.enabled:
             continue
-        rank = _selected_rank(module.weight, policy)
+        rank = _selected_rank(module.weight, policy, repr(name))
         replacement = None
         if rank is not None:
             if isinstance(module, nn.Linear):

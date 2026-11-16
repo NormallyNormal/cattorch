@@ -642,7 +642,9 @@ class TestSentencePieceBPE:
         emulator = ScratchEmulator(sprite)
         emulator.lists["cattorch token ids"] = [0, 1, 3, 2, 4, 8]
         emulator.run_procedure("cattorch detokenize")
-        assert emulator.variables["cattorch text"] == "ab_ ab!"
+        # The control token is skipped; the unknown token shows as
+        # SentencePiece decodes it.
+        assert emulator.variables["cattorch text"] == " \u2047 ab_ ab!"
 
     def test_exports_clickable_stacks_warp_procedures_and_warning(self, tmp_path):
         result = SentencePieceBPETokenizer(
@@ -893,3 +895,15 @@ def test_added_tokens_the_sprite_would_match_differently_are_rejected(tmp_path, 
     monkeypatch.setattr(module, "_match_added", lambda text, tokens: [(None, text)] if text else [])
     with pytest.raises(ValueError, match="can't reproduce how this tokenizer matches"):
         BPETokenizer(bpe_tokenizer_with_added_tokens()).save(tmp_path / "t")
+
+
+def test_sentencepiece_unknown_token_decodes_as_sentencepiece_does(tmp_path):
+    processor = _train_sentencepiece()
+    result = SentencePieceBPETokenizer(processor).save(tmp_path / "sp")
+    emulator = load_emulator(result.path)
+    for text in ("the Qcat", "\u2603", "a\u2603\u2603b"):
+        ids = processor.encode(text)
+        assert processor.unk_id() in ids
+        emulator.lists["cattorch token ids"] = list(ids)
+        emulator.run_procedure("cattorch detokenize")
+        assert emulator.variables["cattorch text"] == processor.decode(ids)

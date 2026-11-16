@@ -212,7 +212,8 @@ checks correctness, not speed. It works for every kind of export:
   PyTorch and Scratch; by default each entry point once with its example
   inputs.
 - **Generation** (`GenerationProgram` or `RecurrentGenerationProgram`):
-  `calls` names the blocks `"prefill"`, `"decode"` and `"reset"` with their
+  the program must be the one the sprite was exported with (a different
+  `max_context` or `top_k` raises `ValueError`). `calls` names the blocks `"prefill"`, `"decode"` and `"reset"` with their
   token IDs, such as `ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))`;
   by default a prefill and a few decodes. Each call's `cattorch logits` and
   top-k lists are compared with the model's next-token logits, and its
@@ -305,8 +306,9 @@ error when the object is created.
 | `rank` | `None` | Truncated-SVD rank. Can't be combined with `rank_ratio`. |
 | `rank_ratio` | `None` | Rank as a fraction in `(0, 1]` of the matrix's full rank. Can't be combined with `rank`. |
 
-A low-rank transform is skipped for a layer when it wouldn't reduce the
-number of multiplications, with a warning. See
+A low-rank transform is skipped for a layer, with a warning, when it
+wouldn't reduce the number of multiplications or its rank isn't below the
+weight's full rank (where it would change nothing). See
 [optimization modes](optimization.md#weight-transforms).
 
 ### `GenerationProgram`
@@ -364,7 +366,9 @@ For integer weights, pass `quantization=QuantizationConfig(bits=...)` to
 | `min_quantized_values` | `16384` | Matrices with fewer values stay float16. |
 | `damp_percent` | `0.01` | GPTQ damping added to the Hessian diagonal, as a fraction of its mean. GPTQ only. |
 | `block_size` | `128` | Number of columns GPTQ processes at a time. GPTQ only. |
-| `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. |
+| `min_calibration_rows` | `128` | Minimum calibration rows a matrix needs to use GPTQ; below this it uses symmetric quantization. GPTQ only. |
+
+The three GPTQ-only fields raise `ValueError` when set with `method="symmetric"`.
 | `overrides` | `{}` | Other settings for some weights: a module path or parameter name mapped to bits (`4`, `6`, `8`), `None` for float16, or a `QuantizationOverride`. See [per-weight settings](storage.md#per-weight-settings). |
 | `head_bits` | `"auto"` | The output head of a generation export: `"auto"` for int8 when `bits` is 4 or 6 and `bits` otherwise, `4`, `6` or `8`, or `None` for float16. An override that selects the head wins. Other exports accept only `"auto"` and raise `ValueError` for any other value. See [the output head](storage.md#the-output-head-of-a-language-model). |
 
@@ -656,7 +660,8 @@ project).
 compared variants' names `baseline` and `candidate` (such as `"exact"` and
 `"fast"`), `repeats` and `warmups`, `cases`, `storage`, the `raw_results`
 list, and the file's `project_bytes` and `project_sha256`. Each
-`BenchmarkCase` in `cases` has its `name`, `baseline_seconds` and
+`BenchmarkCase` in `cases` has its `name` (empty for a paired benchmark's one
+case, whose builder takes no name), `baseline_seconds` and
 `candidate_seconds` (the seconds one call took), `speedup`, each sprite's
 `baseline_blocks` and `candidate_blocks`, `baseline_output_values`,
 `candidate_output_values`, `output_length_match` and `output_max_abs_error`

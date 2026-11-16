@@ -119,6 +119,14 @@ class QuantizationConfig:
             or self.damp_percent <= 0
         ):
             raise ValueError("damp_percent must be a positive finite number")
+        if self.method != "gptq":
+            for name, default in (
+                ("damp_percent", 0.01), ("block_size", 128), ("min_calibration_rows", 128),
+            ):
+                if getattr(self, name) != default:
+                    raise ValueError(
+                        f"{name} applies to method='gptq'; a {self.method} config doesn't use it"
+                    )
         if self.head_bits is not None and (
             isinstance(self.head_bits, bool) or self.head_bits not in {"auto", 4, 6, 8}
         ):

@@ -410,6 +410,13 @@ Python:
   `unrolling`, which a tokenizer ignored, raise `ValueError` for one.
   `CharTokenizer` and `BPETokenizer` given a SentencePiece model point to
   `SentencePieceBPETokenizer` instead of saying they take one.
+- SentencePiece tokenizer sprites decoded the unknown token as nothing; they
+  decode it as SentencePiece does (` ⁇ ` by default).
+- `QuantizationConfig`'s GPTQ-only `damp_percent`, `block_size` and
+  `min_calibration_rows` were ignored with `method="symmetric"`; setting
+  them raises `ValueError`. A `FastLayerConfig` rank at or above a weight's
+  full rank was skipped silently; it warns, as other skipped
+  factorizations do.
 - An `output_path` that names no file (empty, ending in a separator, or an
   existing directory) raises `ValueError` instead of writing a hidden
   `..sprite3` or a file beside the directory, and so does such a `-o`. The
@@ -441,6 +448,8 @@ Scratch:
 - Initialization left the last compressed weights in a variable, so a saved
   project stored them twice.
 - Loose call blocks on the canvas ran internal procedures directly.
+- A tokenizer sprite's `cattorch text` started as `0`, so tokenizing before
+  setting it tokenized "0"; it starts empty.
 
 ## Known limitations
 

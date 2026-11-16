@@ -441,6 +441,7 @@ def _verify_generation(
     if interface.LOGITS not in names:
         raise ValueError(f"{path} is not a generation sprite: it has no {interface.LOGITS!r} list")
     top_k = interface.TOP_K_VALUES in names
+    _check_generation_program(project, sprite, program, top_k)
     registry = default_registry().for_export(adapters=adapters)
     reference = _GenerationReference(
         model, program, registry, quantization=quantization, storage=storage, sig_figs=sig_figs,
@@ -520,6 +521,40 @@ def _verify_generation(
     return ProgramVerifyResult(
         passed=all(value.passed for value in results), calls=tuple(results),
     )
+
+
+def _check_generation_program(project: dict, sprite, program, top_k: bool) -> None:
+    """The program must be the one the sprite was exported with.
+
+    The expected statuses follow the program's ``max_context`` and the
+    compared lists its ``top_k``, so another program would report false
+    failures or skip checks.
+    """
+    from cattorch import interface
+
+    stored = next(
+        (entry[1] for entry in project.get("variables", {}).values()
+         if entry[0] == interface.MAX_CONTEXT),
+        None,
+    )
+    if stored is not None:
+        number = ScratchEmulator._scratch_number(stored)
+        sprite_context = None if number == math.inf else number
+        if sprite_context != program.max_context:
+            shown = "no limit" if sprite_context is None else sprite_context
+            raise ValueError(
+                f"the program's max_context={program.max_context} doesn't match the sprite's "
+                f"({shown}); verify with the program the sprite was exported with"
+            )
+    sprite_top_k = sprite.top_k if isinstance(sprite, GenerationResult) else None
+    if (program.top_k is not None) != top_k or (
+        sprite_top_k is not None and sprite_top_k != program.top_k
+    ):
+        shown = sprite_top_k if sprite_top_k is not None else ("some" if top_k else None)
+        raise ValueError(
+            f"the program's top_k={program.top_k} doesn't match the sprite's ({shown}); "
+            "verify with the program the sprite was exported with"
+        )
 
 
 def _expected_generation_status(

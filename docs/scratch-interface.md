@@ -215,7 +215,7 @@ A sprite from [`transpile_tokenizer`](tokenizers.md):
 |---|---|---|
 | `cattorch tokenize` | block | Reads `cattorch text` and writes its token IDs to `cattorch token ids`. |
 | `cattorch detokenize` | block | Reads `cattorch token ids` and writes the text to `cattorch text`. |
-| `cattorch text` | variable | The text to tokenize, or the detokenized text. |
+| `cattorch text` | variable | The text to tokenize, or the detokenized text. Starts empty. |
 | `cattorch token ids` | list | Zero-based token IDs. |
 | `cattorch status` | variable | How the last block ended; see [status values](#status-values). |
 | `cattorch tokenize complete`, `cattorch detokenize complete` | broadcast | Sent when each block ends. |

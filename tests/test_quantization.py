@@ -349,7 +349,8 @@ def test_right_hand_matmul_weights_use_integer_storage_that_matches_eager(
         example = torch.randn(4, 64)
         calibration = [torch.randn(16, 64) for _ in range(20)]
     config = QuantizationConfig(
-        bits=4, method=method, min_quantized_values=1, min_calibration_rows=64,
+        bits=4, method=method, min_quantized_values=1,
+        **({"min_calibration_rows": 64} if method == "gptq" else {}),
     )
     expected_model = copy.deepcopy(model)
     quantize_model(
@@ -490,7 +491,7 @@ def test_addmm_weights_are_stored_as_integers_grouped_over_their_inputs(
     calibration = [torch.randn(1, 16, 64) for _ in range(8)] if method == "gptq" else None
     config = QuantizationConfig(
         bits=bits, method=method, group_size=32, min_quantized_values=1,
-        min_calibration_rows=64,
+        **({"min_calibration_rows": 64} if method == "gptq" else {}),
     )
     expected_model = copy.deepcopy(model)
     report = quantize_model(
@@ -545,7 +546,8 @@ def test_gpt2_conv1d_weights_are_stored_as_integers_in_generation(
     )).eval()
     assert model.lm_head.weight is model.transformer.wte.weight
     config = QuantizationConfig(
-        bits=8, method=method, min_quantized_values=512, min_calibration_rows=32,
+        bits=8, method=method, min_quantized_values=512,
+        **({"min_calibration_rows": 32} if method == "gptq" else {}),
     )
     calibration = (
         [torch.randint(0, 96, (1, 8)) for _ in range(8)] if method == "gptq" else None
@@ -682,7 +684,7 @@ def test_matrix_product_weights_are_stored_as_integers_grouped_over_their_inputs
     calibration = [torch.randn(*shape) for _ in range(8)] if method == "gptq" else None
     config = QuantizationConfig(
         bits=bits, method=method, group_size=8, min_quantized_values=1,
-        min_calibration_rows=16,
+        **({"min_calibration_rows": 16} if method == "gptq" else {}),
     )
     expected_model = copy.deepcopy(model)
     report = quantize_model(expected_model, config, calibration, orientation_inputs=[(example,)])

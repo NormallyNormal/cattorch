@@ -84,6 +84,8 @@ _SENTENCEPIECE_METHODS = (
 )
 # ``TrainerSpec.ModelType`` in sentencepiece_model.proto.
 _SENTENCEPIECE_MODEL_TYPES = {1: "unigram", 2: "bpe", 3: "word", 4: "char"}
+# SentencePiece's ``kDefaultUnknownSymbol``: what it decodes the unknown token to.
+_SENTENCEPIECE_UNKNOWN_SURFACE = " \u2047 "
 # ``SentencePiece.Type``.
 _SENTENCEPIECE_USER_DEFINED = 4
 # The costume shown between lookups; never the name of a single character.
@@ -408,6 +410,11 @@ class _TokenizerBase(ABC):
         rename_variables(sprite, {"input": TEXT_VARIABLE, "output": _DETOKENIZED})
         rename_lists(sprite, {"token_ids": TOKEN_IDS_LIST, "tokens": "_cattorch tokens"})
         sprite = _add_tokenizer_interface(sprite, len(tokens))
+        # The text starts empty, so tokenize before any text is set reads
+        # no text rather than "0".
+        for entry in sprite["variables"].values():
+            if entry[0] in (TEXT_VARIABLE, _DETOKENIZED):
+                entry[1] = ""
 
         uniquify_data_ids(sprite)
         output_path = output_file(output_path, ".sprite3")
@@ -1507,7 +1514,14 @@ class SentencePieceBPETokenizer(_TokenizerBase):
         decode_pieces: list[str] = []
 
         for token_id, piece in enumerate(pieces):
-            if token_id in self._special_ids:
+            if token_id == self.unknown_id:
+                # What SentencePiece decodes the unknown token to: its
+                # unk_surface, " \u2047 " by default.
+                decode = getattr(self.processor, "decode", None)
+                decoded = (
+                    decode([token_id]) if callable(decode) else _SENTENCEPIECE_UNKNOWN_SURFACE
+                )
+            elif token_id in self._special_ids:
                 decoded = ""
             elif self.processor.is_byte(token_id):
                 raw_piece = self.processor.id_to_piece(token_id)

@@ -106,8 +106,9 @@ same reason an emoji in the text reads as two unknown characters.
 ## SentencePiece BPE
 
 The SentencePiece sprite keeps SentencePiece's token IDs, converts its `▁`
-space marker, skips control tokens when decoding, and supports byte fallback
-for ASCII. Like SentencePiece, it doesn't read control tokens such as `<s>`
+space marker, skips control tokens when decoding, decodes the unknown token
+as SentencePiece does (its `unk_surface`, ` ⁇ ` by default), and supports
+byte fallback for ASCII. Like SentencePiece, it doesn't read control tokens such as `<s>`
 from text: `<s>` in the text is three ordinary characters.
 
 ```python

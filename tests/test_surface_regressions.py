@@ -441,3 +441,57 @@ def test_other_flags_reject_values_that_are_only_truthy():
         moe(router="router", experts="experts", top_k=1, normalize="yes")
     with pytest.raises(TypeError, match="approximate must be True or False"):
         Kernel(torch.ops.aten.mish.default, lambda ctx: (), approximate=1)
+
+
+def test_tokenizer_text_starts_empty(tmp_path):
+    from sprite_helpers import load_emulator
+
+    from cattorch import CharTokenizer
+
+    result = CharTokenizer(_char_tokenizer()).save(tmp_path / "t")
+    emulator = load_emulator(result.path)
+    assert emulator.variables["cattorch text"] == ""
+    emulator.run_procedure("cattorch tokenize")
+    assert emulator.lists["cattorch token ids"] == []
+
+
+@pytest.mark.parametrize("field", [
+    {"damp_percent": 0.05}, {"block_size": 64}, {"min_calibration_rows": 1},
+])
+def test_gptq_settings_are_rejected_for_symmetric_quantization(field):
+    from cattorch import QuantizationConfig
+
+    with pytest.raises(ValueError, match="applies to method='gptq'"):
+        QuantizationConfig(bits=8, **field)
+    assert QuantizationConfig(bits=8, method="gptq", **field)
+
+
+@pytest.mark.parametrize("policy", [{"rank": 4}, {"rank": 9}, {"rank_ratio": 1.0}])
+def test_a_rank_that_changes_nothing_warns(tmp_path, policy):
+    from cattorch import FastConfig, FastLayerConfig
+
+    model = nn.Sequential(nn.Linear(4, 6), nn.ReLU(), nn.Linear(6, 4)).eval()
+    config = FastConfig(layers=FastLayerConfig(**policy))
+    with pytest.warns(CattorchWarning, match="without its low-rank factorization"):
+        result = transpile(
+            model, torch.randn(1, 4), tmp_path / "m", optimization="fast", fast_config=config,
+        )
+    assert any("low-rank factorization" in message for message in result.warnings)
+
+
+def test_verify_rejects_a_generation_program_that_differs_from_the_sprites(tmp_path):
+    from shared_models import Language
+
+    from cattorch import GenerationProgram, verify
+
+    torch.manual_seed(0)
+    model = Language().eval()
+    result = transpile(model, GenerationProgram(8, top_k=3), tmp_path / "lm")
+    assert verify(model, GenerationProgram(8, top_k=3), result.path).passed
+    for program, field in (
+        (GenerationProgram(4, top_k=3), "max_context=4"),
+        (GenerationProgram(8), "top_k=None"),
+        (GenerationProgram(8, top_k=5), "top_k=5"),
+    ):
+        with pytest.raises(ValueError, match=f"the program's {field} doesn't match"):
+            verify(model, program, result)
