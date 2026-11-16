@@ -749,11 +749,6 @@ def _split_special_tokens(tokenizer) -> bool:
     return backend is not None and bool(getattr(backend, "encode_special_tokens", False))
 
 
-def _added_tokens(tokenizer, exporter: str) -> list[_AddedToken]:
-    """The added tokens a Hugging Face tokenizer matches in text, in ID order."""
-    return _added_token_split(tokenizer, exporter)[0]
-
-
 def _added_token_split(tokenizer, exporter: str) -> tuple[list[_AddedToken], list[_AddedToken]]:
     """The added tokens the tokenizer matches in text, and those it reads as
     ordinary text, each in ID order.
@@ -2189,7 +2184,8 @@ def transpile_tokenizer(
         backend_unknown = _backend_settings(backend)["model"].get("unk_token")
         if isinstance(backend_unknown, str):
             special.add(backend_unknown)
-    special |= {token.content for token in _added_tokens(tokenizer, "transpile_tokenizer")}
+    added, skipped = _added_token_split(tokenizer, "transpile_tokenizer")
+    special |= {token.content for token in (*added, *skipped)}
     if any(len(token) > 1 for token in tokenizer.get_vocab() if token not in special):
         raise ValueError(
             f"{model_type} tokenizers with multi-character tokens can't be exported; "
