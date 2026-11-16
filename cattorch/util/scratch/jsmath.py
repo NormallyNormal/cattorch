@@ -608,6 +608,7 @@ def _kernel_rem_pio2(x: list[float], e0: int, nx: int) -> tuple[int, float, floa
             fw += x[j] * f[jx + i - j]
         q[i] = fw
     jz = jk
+    z = 0.0
     while True:
         i, j, z = 0, jz, q[jz]
         while j > 0:
