@@ -435,7 +435,7 @@ def _verify_generation(
     from cattorch import interface
 
     project = _sprite_json(sprite, GenerationResult, "a generation")
-    path = sprite.path if isinstance(sprite, GenerationResult) else Path(sprite)
+    path = getattr(sprite, "path", sprite)
     emulator = ScratchEmulator(project)
     names = {entry[0] for entry in project.get("lists", {}).values()}
     if interface.LOGITS not in names:

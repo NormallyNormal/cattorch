@@ -2706,7 +2706,7 @@ def _transpile(
     ``prepared_model``, and so on) and ``_unit_inputs``, which
     ``_finalize_sprite`` takes.
     """
-    output_path = output_file(output_path, ".sprite3")
+    output_path = Path(output_file(output_path, ".sprite3"))
     sprite_name = output_path.stem if name is None else name
     if not isinstance(sprite_name, str) or not sprite_name.strip():
         raise ValueError("name must be a non-empty string")

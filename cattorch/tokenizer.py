@@ -417,7 +417,7 @@ class _TokenizerBase(ABC):
                 entry[1] = ""
 
         uniquify_data_ids(sprite)
-        output_path = output_file(output_path, ".sprite3")
+        output_path = Path(output_file(output_path, ".sprite3"))
         sprite_name = output_path.stem if name is None else name
         if not isinstance(sprite_name, str) or not sprite_name.strip():
             raise ValueError("name must be a non-empty string")
@@ -689,12 +689,12 @@ def _reference_ids(
             characters.setdefault(token, token_id)
     ranks = {(left, right): (rank, merged) for rank, (left, right, merged) in enumerate(merges or ())}
     ids: list[int] = []
-    for token_id, piece in _split_added(text, added):
-        if token_id is not None:
-            ids.append(token_id)
+    for added_id, piece in _split_added(text, added):
+        if added_id is not None:
+            ids.append(added_id)
             continue
-        units = [characters.get(character, unknown_id) for character in piece]
-        units = [unit for unit in units if unit is not None]
+        found = [characters.get(character, unknown_id) for character in piece]
+        units = [unit for unit in found if unit is not None]
         while merges is not None and len(units) > 1:
             best = min(
                 ((ranks[pair][0], index) for index, pair in enumerate(zip(units, units[1:]))

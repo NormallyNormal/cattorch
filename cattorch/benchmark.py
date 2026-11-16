@@ -515,7 +515,7 @@ def _build_suite(
             name, model, _normalise_inputs(model, raw_inputs, f"case {name!r}: "), case_options,
         ))
     _check_names([case[0] for case in normalized_cases])
-    output_path = output_file(output_path, ".sb3")
+    output_path = Path(output_file(output_path, ".sb3"))
 
     broadcasts: dict[str, str] = {}
     controller_cases: list[dict] = []
@@ -666,7 +666,7 @@ def build_generation_benchmark_suite(
                 f"use max_context={needed} or more"
             )
     _check_names([case[0] for case in cases])
-    output_path = output_file(output_path, ".sb3")
+    output_path = Path(output_file(output_path, ".sb3"))
     broadcasts: dict[str, str] = {}
     controller_cases = []
     sprites = []
@@ -772,7 +772,7 @@ def build_storage_benchmark_suite(
         for name, model, raw_inputs in cases
     ]
 
-    output_path = output_file(output_path, ".sb3")
+    output_path = Path(output_file(output_path, ".sb3"))
     variants = {
         "plain-f32": (StorageConfig(compression=False, precision="float32"), None),
         "base92-f32": (StorageConfig(compression=True, precision="float32"), None),
@@ -886,7 +886,7 @@ def build_paired_benchmark(
         kernels=kernels,
     )
     example_inputs = _normalise_inputs(model, example_inputs)
-    output_path = output_file(output_path, ".sb3")
+    output_path = Path(output_file(output_path, ".sb3"))
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)

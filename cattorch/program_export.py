@@ -654,7 +654,7 @@ def transpile_program(
         storage=storage, quantization=quantization, codegen=codegen,
         sig_figs=sig_figs, adapters=adapters,
     )
-    output_path = output_file(output_path, ".sprite3")
+    output_path = Path(output_file(output_path, ".sprite3"))
     sprite_name = output_path.stem if name is None else name
     codegen = codegen or CodegenConfig()
     registry = default_registry().for_export(adapters=adapters, kernels=kernels)

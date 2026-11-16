@@ -784,7 +784,7 @@ def build_project(
         raise TypeError(
             f"model must be the result of cattorch.transpile, not a {type(model).__name__}"
         )
-    output_path = output_file(output_path, ".sb3")
+    output_path = Path(output_file(output_path, ".sb3"))
     if isinstance(example_inputs, torch.Tensor):
         example_inputs = (example_inputs,)
     _check_options(
