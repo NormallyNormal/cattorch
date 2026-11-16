@@ -1363,6 +1363,8 @@ _RUNTIME_ELEMENTWISE = {
     "aten.rsqrt.default", "aten.linear.default", "aten.layer_norm.default",
     "aten.native_layer_norm.default", "aten._softmax.default", "aten.softmax.int",
     "aten.mean.dim", "aten.embedding.default",
+    # Checks each index it copies, over the whole list.
+    "cattorch.check_index.default",
 } | ELEMENTWISE_OPS
 _RUNTIME_POINTWISE = _RUNTIME_ELEMENTWISE - {
     "aten.linear.default", "aten.layer_norm.default", "aten.native_layer_norm.default",
