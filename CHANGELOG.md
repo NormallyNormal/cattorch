@@ -242,13 +242,18 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 - `QuantizationConfig(overrides=...)` gives some weights other settings: a
   module path or parameter name mapped to bits, `None` for float16, or a
   `QuantizationOverride`. `head_bits` sets a generation export's output head.
-  See [per-weight settings](docs/storage.md#per-weight-settings).
+  Keys name the model's own parameters: a layer fast mode factorizes gives
+  its overrides to its factors. See
+  [per-weight settings](docs/storage.md#per-weight-settings).
 - More weights are stored in integers and calibrated by GPTQ: convolution
   kernels, weights the model
-  copies or slices before use (such as a fused QKV weight), weights computed
-  from parameters (`weight_norm`, `spectral_norm`, `w * g`, LoRA sums), and
-  weights of `bmm`, `einsum`, `tensordot`, `F.bilinear`, `nn.MultiheadAttention`
-  and recurrent layers. A 1D or 2D convolution's kernels are grouped over
+  copies or slices before use (such as a fused QKV weight; a weight read
+  directly and through a copy is quantized once), weights computed
+  from parameters (`weight_norm`, `spectral_norm`, `w * g`, LoRA sums, and
+  a weight masked by a buffer, a tensor attribute or a constant built in
+  `forward`), and
+  weights of `bmm`, `einsum`, `tensordot`, `F.bilinear`, `nn.MultiheadAttention`,
+  recurrent layers and `nn.RNNCell`, `nn.LSTMCell` and `nn.GRUCell`. A 1D or 2D convolution's kernels are grouped over
   each output channel's fan-in, as a linear layer's are, instead of along
   the kernel width. See
   [symmetric quantization behavior](docs/storage.md#symmetric-quantization-behavior).
@@ -256,9 +261,11 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   one with `group_size=1` or a prime input width, stays float16. GPTQ uses
   symmetric quantization for a matrix with more than 8,192 inputs. The
   report says so in both cases.
-- `result.quantization` reports what storage stores, with `name[float16]` and
-  `name[remaining]` entries and `TensorQuantizationReport.sources` and
-  `override`.
+- `result.quantization` reports what storage stores, read from storage's own
+  record of each list it stored, with `name[float16]` and `name[remaining]`
+  entries and `TensorQuantizationReport.sources` and `override`. A
+  program's entry points are reported together, and a position table read
+  at constant positions has an entry for the rows stored.
 
 ### Command line and projects
 
@@ -276,11 +283,12 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 
 - `verify` works for every kind of export, and takes the export's
   `adapters`, `quantization`, `storage` and `sig_figs` so PyTorch computes
-  with the values the sprite stores. `VerifyResult.approximate_operations`
-  names fast-mode approximations. Its reference is your own code: a marked
-  model's methods run on its buffers, a generation model's forward, and a
-  Hugging Face recurrent model's forward rather than the step cattorch
-  writes.
+  with the values the sprite stores, each matrix product reading the list it
+  reads in the sprite, such as a float16 copy of a quantized weight.
+  `VerifyResult.approximate_operations` names fast-mode approximations. Its
+  reference is your own code: a marked model's methods run on its buffers, a
+  generation model's forward, and a Hugging Face recurrent model's forward
+  rather than the step cattorch writes.
 - Every benchmark builder takes `repeats`, `warmups` and `transpile`'s export
   options, and generation benchmarks take a `GenerationProgram` or
   `RecurrentGenerationProgram`. See
@@ -346,6 +354,7 @@ Python:
 - Crashes: `MaxPool1d(1)`, `Conv2d(stride=(2,))`, pooling without an
   explicit stride, softmax and `transpose` of 0-d tensors, `mean(dim=())`,
   `nn.LayerNorm(bias=False)`, `F.rms_norm` without a weight, 0-d parameters,
+  `torch.eye` with 256 rows or more,
   concatenating an empty tensor, `F.linear` with a vector weight, and a
   `RecursionError` reading a tensor split into hundreds of lists.
 - Wrong output: `1 - x` on a 0-d tensor, `F.batch_norm` with statistics
@@ -378,7 +387,10 @@ Python:
   stored in float16 without a warning, `min_quantized_values` was applied to
   each list of a split weight, vector parameters were quantized like
   matrices, and sliced weights were quantized twice.
-- GPTQ errors name the calibration item that failed.
+- GPTQ errors name the calibration item that failed, whatever the model
+  raised, and calibration items are checked before calibration: a token
+  sequence longer than `max_context` or not `[1, length]`, or a tensor item
+  that doesn't match the example inputs, is a `ValueError` naming it.
 - A tuple passed as one example input raises a `TypeError` that says to pass
   the tensors separately, and a wrongly shaped one reports the model's own
   error.
