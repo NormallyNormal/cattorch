@@ -34,7 +34,12 @@ Run it after every change that can affect accuracy: float16 or integer storage,
 Give `verify` the export's `adapters`, `quantization`, `storage` and
 `sig_figs`, and PyTorch runs a copy of the model holding the values the
 sprite stores. The comparison then measures the conversion alone, with tight
-tolerances, however lossy the storage:
+tolerances, however lossy the storage. Each matrix product reads the values
+of the list it reads in the sprite: a weight read as a linear weight in
+integers and on the right of a matrix product as a float16 copy of them
+(see [quantization](storage.md#symmetric-quantization-behavior)) is read
+each way. Values the model computes in `forward` from parameters, other
+than the weights quantization stores, aren't rounded.
 
 ```python
 quantization = QuantizationConfig(bits=8, min_quantized_values=1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import math
@@ -9,9 +10,10 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.errors import UnsupportedModelError
 from cattorch.adapters import ModuleAdapter
@@ -123,13 +125,27 @@ def round_as_stored(
     table built there, aren't rounded. ``report``, the ``QuantizationReport``
     of the model's quantization, gives the integer formats only it knows of,
     such as an output head's.
+
+    Storage stores each matrix as each use reads it, and decides on that
+    list: one use may read a weight in integers and another a float16 copy
+    of it, as ``F.linear(x, w)`` and ``h @ w`` do. Each parameter is
+    rounded as storage keeps it as a whole, and every matrix use run within
+    ``_reading_stored_uses(model)`` reads its own list's values instead,
+    rounded by the same decision storage makes for that list. Weights the
+    model computes from parameters as quantization stored them are read
+    the same way.
     """
-    from cattorch.static_storage import _static_storage_group_size, _static_storage_precision
-    from cattorch.storage import rounded_values
+    from cattorch.static_storage import _static_storage_precision
 
     if quantization is not None:
         storage = quantized_storage(storage, quantization, report)
     effective_ndims = expert_bank_effective_ndims(model)
+    # The values before rounding, of the matrices uses may read otherwise.
+    originals: dict[tuple, torch.Tensor] = {}
+    tensors = _stored_tensors(model)
+    for key, value in tensors.items():
+        if value.is_floating_point() and value.ndim >= 2:
+            originals[key] = value.detach().clone()
     with torch.no_grad():
         for value in (*model.parameters(), *model.buffers()):
             if not value.is_floating_point():
@@ -149,17 +165,161 @@ def round_as_stored(
                 precision = "float16"
             if sig_figs is None and precision not in {"float16"}:
                 continue
-            flat = layout.detach().flatten().tolist()
-            if sig_figs is not None:
-                flat = [float(f"%.{sig_figs}g" % item) for item in flat]
-            if precision != "float32":
-                # Integer storage quantizes the cut values again.
-                flat = rounded_values(
-                    flat, precision, _static_storage_group_size(layout, storage),
-                    storage.scale_precision,
-                )
-            stored = torch.tensor(flat, dtype=value.dtype).reshape(layout.shape)
+            stored = torch.tensor(
+                _stored_values(layout, precision, storage, sig_figs), dtype=value.dtype,
+            ).reshape(layout.shape)
             value.copy_(stored if layout is value else stored.transpose(-1, -2))
+    if originals and storage.precision != "float32":
+        model._cattorch_stored_uses = _StoredUses(storage, sig_figs, originals)
+
+
+def _stored_values(layout: torch.Tensor, precision: str, storage, sig_figs) -> list:
+    """The values storage holds of ``layout`` at ``precision``."""
+    from cattorch.static_storage import _static_storage_group_size
+    from cattorch.storage import rounded_values
+
+    flat = layout.detach().flatten().tolist()
+    if sig_figs is not None:
+        flat = [float(f"%.{sig_figs}g" % item) for item in flat]
+    if precision != "float32":
+        # Integer storage quantizes the cut values again.
+        flat = rounded_values(
+            flat, cast(Any, precision), _static_storage_group_size(layout.contiguous(), storage),
+            storage.scale_precision,
+        )
+    return flat
+
+
+def _stored_tensors(model: torch.nn.Module) -> dict[tuple, torch.Tensor]:
+    """The tensors a sprite stores matrices of, by a name that survives a
+    copy of the model: its parameters, and the weights it computes from
+    them as quantization stored them (see ``quantization._ComputedWeightHooks``)."""
+    from cattorch.quantization import _ComputedWeightHooks
+
+    found: dict[tuple, torch.Tensor] = {
+        ("parameter", name): parameter for name, parameter in model.named_parameters()
+    }
+    for path, module in model.named_modules():
+        for hook in module._forward_pre_hooks.values():
+            owner = getattr(hook, "__self__", None)
+            if isinstance(owner, _ComputedWeightHooks):
+                for recipe, tensor in owner.table.items():
+                    found[("computed", path, recipe)] = tensor
+    return found
+
+
+class _StoredUses:
+    """What each matrix use of a model rounded by ``round_as_stored`` reads.
+
+    ``originals`` are the matrices' values before rounding, by
+    ``_stored_tensors`` name.
+    """
+
+    def __init__(self, storage, sig_figs, originals: dict[tuple, torch.Tensor]):
+        self.storage = storage
+        self.sig_figs = sig_figs
+        self.originals = originals
+
+
+class _StoredUseMode(TorchDispatchMode):
+    """Run every matrix product on the values its stored list holds."""
+
+    def __init__(self, model: torch.nn.Module, uses: _StoredUses, registry):
+        super().__init__()
+        self.registry = registry
+        self.uses = uses
+        tensors = _stored_tensors(model)
+        # Storage -> (current tensor, values before rounding).
+        self.by_storage = {
+            tensor.untyped_storage().data_ptr(): (tensor, uses.originals[key])
+            for key, tensor in tensors.items() if key in uses.originals
+            and uses.originals[key].shape == tensor.shape
+        }
+        # (storage, view, orientation) -> the storage's values for that use,
+        # or None when they are its values as rounded.
+        self.substitutes: dict[tuple, torch.Tensor | None] = {}
+
+    def _substitute(self, weight: torch.Tensor, orientation: str) -> torch.Tensor | None:
+        from cattorch.quantization import _canonical_spec, _storage_numel
+        from cattorch.static_storage import _static_storage_precision
+
+        pointer = weight.untyped_storage().data_ptr()
+        found = self.by_storage.get(pointer)
+        if found is None:
+            return None
+        key = (pointer, _canonical_spec(weight), orientation)
+        if key in self.substitutes:
+            return self.substitutes[key]
+        tensor, original = found
+        flat_original = original.as_strided(
+            (_storage_numel(tensor),), (1,), 0,
+        ) if original.is_contiguous() and tensor.is_contiguous() else None
+        result = None
+        if flat_original is not None:
+            view = flat_original.as_strided(weight.shape, weight.stride(), weight.storage_offset())
+            # The list storage keeps for this use: its matrix as the use
+            # reads it, output-major.
+            transposed = orientation == "rhs_matmul" and view.ndim == 2
+            layout = (view.T if transposed else view).contiguous()
+            precision = _static_storage_precision(
+                layout, self.uses.storage, source_numel=layout.numel(),
+            )
+            stored = torch.tensor(
+                _stored_values(layout, precision, self.uses.storage, self.uses.sig_figs),
+                dtype=tensor.dtype,
+            ).reshape(layout.shape)
+            if transposed:
+                stored = stored.T
+            current = tensor.detach().as_strided(
+                weight.shape, weight.stride(), weight.storage_offset(),
+            )
+            if not torch.equal(stored, current):
+                substitute = tensor.detach().as_strided(
+                    (_storage_numel(tensor),), (1,), 0,
+                ).clone()
+                substitute.as_strided(
+                    weight.shape, weight.stride(), weight.storage_offset(),
+                ).copy_(stored)
+                result = substitute
+        self.substitutes[key] = result
+        return result
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        from torch.utils import _pytree as pytree
+
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        with torch._C._DisableTorchDispatch():
+            observations = self.registry.observe(str(func), func, args, kwargs, result)
+            replacements: dict[int, torch.Tensor] = {}
+            for _, weight, orientation in observations:
+                if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+                    substitute = self._substitute(weight, orientation)
+                    if substitute is not None:
+                        replacements[weight.untyped_storage().data_ptr()] = substitute
+        if not replacements:
+            return result
+
+        def replaced(item):
+            if isinstance(item, torch.Tensor):
+                substitute = replacements.get(item.untyped_storage().data_ptr())
+                if substitute is not None:
+                    return substitute.as_strided(item.shape, item.stride(), item.storage_offset())
+            return item
+
+        return func(*pytree.tree_map(replaced, args), **pytree.tree_map(replaced, kwargs))
+
+
+@contextlib.contextmanager
+def _reading_stored_uses(model: torch.nn.Module, registry=None):
+    """Within it, ``model``'s matrix uses read what their stored lists hold
+    (see ``round_as_stored``)."""
+    uses = getattr(model, "_cattorch_stored_uses", None)
+    if uses is None:
+        yield
+        return
+    with _StoredUseMode(model, uses, registry or default_registry()):
+        yield
 
 
 def _check_reproducible(quantization: QuantizationConfig | None) -> None:
@@ -270,7 +430,10 @@ def _verify_program(
         output_results = []
         if status == OK:
             from cattorch.experts import _expert_family_context
-            with _expert_family_context(registry.expert_families):
+            with (
+                _expert_family_context(registry.expert_families),
+                _reading_stored_uses(owned, registry),
+            ):
                 leaves = replay.run(invocation)
             for binding, expected in zip(entry.returns, leaves):
                 if isinstance(binding, Output):
@@ -383,7 +546,7 @@ class _GenerationReference:
         self.read = 0
 
     def logits(self, tokens: list[int]) -> torch.Tensor:
-        with torch.no_grad():
+        with torch.no_grad(), _reading_stored_uses(self.model):
             if self.states is None or self.whole is not None:
                 value = torch.tensor([tokens], dtype=torch.long)
                 run = self.model if self.whole is None else getattr(self.model, self.whole)
@@ -605,13 +768,15 @@ def _tensor_reference(
         if not _lossy(quantization, storage, sig_figs):
             return owned
         owned = fold_eval_batch_norms(owned)
+        report = None
         if quantization is not None:
-            quantize_model(
+            report = quantize_model(
                 owned, quantization, None, orientation_inputs=[inputs],
                 call_kwargs=example_kwargs, _registry=registry,
             )
         round_as_stored(
             owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs,
+            report=report,
         )
         return owned
     transformers = sys.modules.get("transformers")
@@ -660,7 +825,7 @@ def _verify_tensors(
         storage=storage, sig_figs=sig_figs,
     )
     try:
-        with torch.no_grad():
+        with torch.no_grad(), _reading_stored_uses(reference):
             expected = reference(*inputs, **(example_kwargs or {}))
     except Exception as raised:  # noqa: BLE001 - the model failed; reported as such
         raise UnsupportedModelError(

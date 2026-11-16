@@ -453,15 +453,15 @@ def _record_matrix_precisions(monkeypatch):
     import cattorch.static_storage as static_storage
 
     precisions = []
-    original = static_storage._static_storage_precision
+    original = static_storage._static_storage_decision
 
-    def record(tensor, storage, *args):
-        precision = original(tensor, storage, *args)
+    def record(tensor, storage, *args, **kwargs):
+        decision = original(tensor, storage, *args, **kwargs)
         if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
-            precisions.append((tuple(tensor.shape), precision))
-        return precision
+            precisions.append((tuple(tensor.shape), decision[0]))
+        return decision
 
-    monkeypatch.setattr(static_storage, "_static_storage_precision", record)
+    monkeypatch.setattr(static_storage, "_static_storage_decision", record)
     return precisions
 
 

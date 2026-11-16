@@ -2031,7 +2031,7 @@ def quantize_model(
             copies[pointer] = (weight, *found)
             del computed[pointer]
     if copies:
-        stats = {}
+        stats: dict[tuple, _ActivationStats] = {}
         for key, stat in capture.stats.items():
             copied = copies.get(stat.weight.untyped_storage().data_ptr())
             view = None if copied is None else _strided_view(copied[2].as_strided(

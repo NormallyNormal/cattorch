@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from sprite_helpers import load_sprite
 
 from cattorch import (
-    EntryPoint, ExportProgram, Input, Output, QuantizationConfig, transpile, verify,
+    EntryPoint, ExportProgram, Input, Output, ProgramCall, QuantizationConfig, transpile, verify,
 )
 from cattorch.util.scratch.emulator import ScratchEmulator
 
@@ -251,3 +251,50 @@ def test_weight_masked_by_a_known_constant_is_quantized_as_computed(tmp_path, mo
     assert _entries(result.quantization) == [("weight computed from w", "symmetric", 4, 2048)]
     assert not [item for item in caught if "float16" in item]
     assert verify(model, example, result, quantization=config).passed
+
+
+class _TwoLayoutsForward(torch.nn.Module):
+    def __init__(self, computed=False):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(64, 32))
+        self.computed = computed
+
+    def forward(self, value):
+        weight = self.w * 0.5 if self.computed else self.w
+        return torch.tanh(F.linear(value, weight)) @ weight
+
+
+@pytest.mark.parametrize("computed", [False, True])
+def test_verify_reads_the_float16_copy_a_use_reads(tmp_path, computed):
+    # F.linear reads w in integers, `@ w` a float16 copy of them: verify's
+    # reference must read each, or it fails on a correct sprite.
+    torch.manual_seed(0)
+    model = _TwoLayoutsForward(computed).eval()
+    example = torch.randn(1, 32)
+    config = QuantizationConfig(bits=4, min_quantized_values=1024)
+    result, _ = _transpile(model, example, tmp_path / "two", quantization=config)
+    assert any(item.name.endswith("[float16]") for item in result.quantization.tensors)
+    outcome = verify(model, example, result, quantization=config)
+    assert outcome.passed and outcome.max_abs_error < 1e-4
+
+
+def test_program_verify_reads_each_entry_points_list(tmp_path):
+    torch.manual_seed(0)
+    model = _TwoLayouts().eval()
+    config = QuantizationConfig(bits=4, min_quantized_values=1024)
+    for order in (("enc", "dec"), ("dec", "enc")):
+        program = _two_layout_program(order)
+        result, _ = _transpile(model, program, tmp_path / "_".join(order), quantization=config)
+        calls = [
+            ProgramCall("enc", (torch.randn(1, 32),)), ProgramCall("dec", (torch.randn(1, 64),)),
+        ]
+        assert verify(model, program, result, quantization=config, calls=calls).passed
+
+
+def test_dynamic_length_check_accepts_a_float16_copy(tmp_path):
+    torch.manual_seed(0)
+    model = _TwoLayoutsForward().eval()
+    _transpile(
+        model, torch.randn(1, 32), tmp_path / "dynamic", dynamic={0: (1, 8)},
+        quantization=QuantizationConfig(bits=4, min_quantized_values=1024),
+    )

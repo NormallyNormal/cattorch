@@ -140,13 +140,15 @@ def _stored_values_model(
     if not lossy:
         return owned
     owned = fold_eval_batch_norms(registry.adapt_model(owned, _copy=False))
+    report = None
     if quantization is not None:
-        quantize_model(
+        report = quantize_model(
             owned, quantization, None, orientation_inputs=[tuple(positional)],
             call_kwargs=example_kwargs, _registry=registry,
         )
     round_as_stored(
         owned, storage or StorageConfig(), quantization=quantization, sig_figs=sig_figs,
+        report=report,
     )
     return owned
 
