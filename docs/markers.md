@@ -90,6 +90,16 @@ interface from the markers. Each entry point becomes a block named
   tensor registered under several names, by the model and a submodule, is
   one state, as long as the method updates it in place; reassigning it
   under one of its names fails the export.
+- Only buffers become state. An entry point that changes a parameter, a
+  tensor kept as a plain attribute (`self.total = torch.zeros(3)` in
+  `__init__`, then `self.total = self.total + x`), or a tensor in a list or
+  dictionary attribute, of the model or a submodule, fails the export:
+  register the tensor with `register_buffer` instead. So does one that
+  changes a Python value on every call, such as `self.count += 1` with an
+  `int` or appending to a list, since a Python value is fixed when the method
+  is traced; keep it in a buffer such as `torch.tensor(0)`. A Python value
+  changed on the first call only, such as a cache filled once, gives a
+  warning: the sprite runs every call as that first call.
 
 `marked_program(model)` returns a `MarkedProgram`: the export copy of the
 model and the

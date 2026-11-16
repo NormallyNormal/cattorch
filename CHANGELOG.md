@@ -180,7 +180,9 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
 - [Markers](docs/markers.md) describe the export interface on your own
   classes without changing how they run: `@entrypoint` exports a method as a
   block and turns the buffers it updates into state, which each entry point
-  takes only if it reads or writes it, `@example_inputs` gives
+  takes only if it reads or writes it (a parameter, another tensor
+  attribute, or a Python value changed on every call, fails the export
+  instead of being baked in), `@example_inputs` gives
   `forward` example inputs, `@export_forward` swaps in an export-only method,
   `@moe` declares a block's routing, `@generate` picks a generation method,
   and `@adapter` builds a `ModuleAdapter`. `transpile(model, None, path)` and

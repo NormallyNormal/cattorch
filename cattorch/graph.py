@@ -1938,13 +1938,26 @@ def _aliases_and_splits(nodes, generated_weights, dynamic_axes) -> tuple[dict, d
     return aliases, split_meta
 
 
-def _reject_in_place_updates(nodes) -> None:
+def _reject_in_place_updates(nodes, entry_point=None, state_inputs=None) -> None:
     """Explain an in-place update the capture couldn't turn into dataflow.
 
     Updates of computed tensors and of inputs become ordinary operations
     during capture; a ``copy_`` left over writes to a parameter or buffer, or
-    through a view the rewrite can't follow.
+    through a view the rewrite can't follow. In a program's ``entry_point``
+    (its ``MethodModule``), states are arguments, so the tensor written isn't
+    one.
     """
+    names = {}
+    candidates = []
+    if entry_point is not None:
+        for kind, named in (
+            ("parameter", entry_point.model.named_parameters()),
+            ("buffer", entry_point.model.named_buffers()),
+        ):
+            for name, value in named:
+                names.setdefault(id(value), f"the {kind} self.{name}")
+                names.setdefault(value.data_ptr(), f"the {kind} self.{name}")
+                candidates.append((f"the {kind} self.{name}", value.detach()))
     for node in nodes:
         if node.op != "call_function" or str(node.target) != "aten.copy_.default":
             continue
@@ -1953,7 +1966,28 @@ def _reject_in_place_updates(nodes) -> None:
             _returns_alias_node(base)
         ):
             base = base.args[0]
-        if isinstance(base, torch.fx.Node) and base.op == "get_attr":
+        if isinstance(base, torch.fx.Node) and base.op == "get_attr" and entry_point is not None:
+            value = (state_inputs or {}).get(base.name)
+            written = None
+            if isinstance(value, torch.Tensor):
+                written = names.get(id(value)) or names.get(value.data_ptr())
+                # The trace may hold a copy: the one tensor with its values.
+                alike = {
+                    description for description, candidate in candidates
+                    if candidate.shape == value.shape and candidate.dtype == value.dtype
+                    and torch.equal(candidate, value)
+                }
+                if written is None and len(alike) == 1:
+                    (written,) = alike
+            detail = (
+                f"the entry point updates {written or 'a tensor of the model'} in "
+                "place, but it isn't one of its states, so the sprite would keep its "
+                "first value. With @cattorch.entrypoint, only buffers become state: "
+                "register the tensor with self.register_buffer(...) rather than as a "
+                "parameter or a plain attribute. In an ExportProgram, declare it as a "
+                "State, pass it in with StateInput and return it with StateUpdate"
+            )
+        elif isinstance(base, torch.fx.Node) and base.op == "get_attr":
             detail = (
                 "the model updates one of its parameters or buffers in place, as "
                 "self.count += 1 in forward does. A sprite's forward keeps nothing "
@@ -2649,7 +2683,12 @@ def _prepare_graph(
         return state_inputs.get(arg_name)
 
     input_names = _model_input_names(nodes, captured.user_input_names, resolve_weight)
-    _reject_in_place_updates(nodes)
+    from cattorch.program_runtime import MethodModule
+
+    _reject_in_place_updates(
+        nodes, entry_point=model if isinstance(model, MethodModule) else None,
+        state_inputs=state_inputs,
+    )
     aliases, split_meta = _aliases_and_splits(nodes, generated_weights, runtime_axes.axes)
     _reject_unsupported_variants(
         nodes, generated_weights, registry, fast, fast_config, runtime_axes.axes, resolve_weight,

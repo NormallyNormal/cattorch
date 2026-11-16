@@ -8,7 +8,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from cattorch import ProgramCall, UnsupportedModelError, entrypoint, transpile, verify
+from cattorch import (
+    ProgramCall, UnsupportedModelError, UnsupportedOperationError, entrypoint, transpile, verify,
+)
 from cattorch import markers
 
 from sprite_helpers import load_emulator
@@ -168,3 +170,83 @@ def test_marked_verify_runs_the_users_own_methods(tmp_path, monkeypatch):
     report = verify(model, None, broken, calls=calls)
     assert not report.passed
     assert not report.calls[1].outputs[0].passed or not report.calls[2].outputs[0].passed
+
+
+class Changes(nn.Module):
+    """An entry point changing something other than a buffer."""
+
+    def __init__(self, change):
+        super().__init__()
+        self.change = change
+        self.total = torch.zeros(3)
+        self.weight = nn.Parameter(torch.ones(3))
+        self.inner = nn.Module()
+        self.inner.total = torch.zeros(3)
+        self.tensors = [torch.zeros(3)]
+        self.table = {"sum": torch.zeros(3)}
+        self.count = 0
+        self.history: list[float] = []
+        self.cache = None
+
+    @entrypoint(example_inputs=EXAMPLE)
+    def add(self, x):
+        change = self.change
+        if change == "attribute":
+            self.total = self.total + x
+        elif change == "attribute in place":
+            self.total += x
+        elif change == "parameter":
+            self.weight.add_(x)
+        elif change == "submodule attribute":
+            self.inner.total = self.inner.total + x
+        elif change == "list entry":
+            self.tensors[0].add_(x)
+        elif change == "dict entry":
+            self.table["sum"] = self.table["sum"] + x
+        elif change == "int":
+            self.count += 1
+        elif change == "list":
+            self.history.append(1.0)
+        elif change == "cache":
+            if self.cache is None:
+                self.cache = 2.0
+        return x * self.weight * (self.count + 1) * (self.cache or 1.0)
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ("attribute", r"changes self.total, a tensor attribute that isn't a buffer.*register_buffer\('total'"),
+    ("attribute in place", r"changes self.total, a tensor attribute"),
+    ("parameter", r"changes the parameter self.weight.*register_buffer\('weight'"),
+    ("submodule attribute", r"changes self.inner.total, a tensor attribute"),
+    ("list entry", r"changes self.tensors"),
+    ("dict entry", r"changes self.table"),
+    ("int", r"changes self.count on every call \(from 0 to 1 on the first\).*tensor buffer"),
+    ("list", r"changes self.history on every call"),
+])
+def test_changes_outside_buffers_are_rejected(tmp_path, change, message):
+    with pytest.raises(UnsupportedModelError, match=message):
+        transpile(Changes(change).eval(), None, tmp_path / "changes")
+
+
+def test_a_value_set_on_the_first_call_only_warns(tmp_path):
+    with pytest.warns(UserWarning, match=r"changes self.cache on its first call only"):
+        transpile(Changes("cache").eval(), None, tmp_path / "cache")
+
+
+def test_the_in_place_message_in_an_entry_point_says_how_to_make_state(tmp_path):
+    from cattorch import EntryPoint, ExportProgram, Input, Output
+
+    class Stepper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(3))
+
+        def step(self, x):
+            self.total.add_(x)
+            return x * 1
+
+    program = ExportProgram(entrypoints=(
+        EntryPoint("step", method="step", arguments=(Input("x", torch.ones(3)),), returns=(Output("y"),)),
+    ))
+    with pytest.raises(UnsupportedOperationError, match=r"updates the buffer self.total in place, but it isn.t one of its states.*StateInput"):
+        transpile(Stepper().eval(), program, tmp_path / "stepper")

@@ -372,9 +372,143 @@ def _canonical_buffer_names(model: nn.Module) -> dict[tuple[int, str], str]:
     return found
 
 
+# Attributes every module has, which an entry point doesn't change as state.
+_MODULE_INTERNALS = frozenset(nn.Module().__dict__) | {"forward"}
+_CHEAP = (bool, int, float, complex, str, bytes, type(None))
+
+
+def _snapshot(value, depth: int = 0):
+    """A comparable copy of an attribute's value, or ``None`` if it isn't tracked.
+
+    Tensors, plain Python values, and lists, tuples, dictionaries and sets of
+    them are tracked; other objects aren't.
+    """
+    if isinstance(value, torch.Tensor):
+        return ("tensor", value.detach().clone())
+    if isinstance(value, _CHEAP):
+        return ("value", value)
+    if depth >= 3:
+        return None
+    if isinstance(value, (list, tuple)) and len(value) <= 256:
+        items = [_snapshot(item, depth + 1) for item in value]
+        return None if None in items else (type(value).__name__, items)
+    if isinstance(value, dict) and len(value) <= 256 and all(isinstance(key, _CHEAP) for key in value):
+        entries = {key: _snapshot(item, depth + 1) for key, item in value.items()}
+        return None if None in entries.values() else ("dict", entries)
+    if isinstance(value, (set, frozenset)) and len(value) <= 256 and all(
+        isinstance(item, _CHEAP) for item in value
+    ):
+        return ("value", frozenset(value))
+    return None
+
+
+def _same(before, after) -> bool:
+    if before is None or after is None or before[0] != after[0]:
+        return before is None and after is None
+    kind, old = before
+    new = after[1]
+    if kind in {"tensor", "parameter"}:
+        if old.shape != new.shape or old.dtype != new.dtype:
+            return False
+        if old.is_floating_point() or old.is_complex():
+            return torch.allclose(old, new, rtol=0, atol=0, equal_nan=True)
+        return torch.equal(old, new)
+    if kind in {"list", "tuple"}:
+        return len(old) == len(new) and all(_same(a, b) for a, b in zip(old, new))
+    if kind == "dict":
+        return old.keys() == new.keys() and all(_same(old[key], new[key]) for key in old)
+    return type(old) is type(new) and (old == new or (old != old and new != new))
+
+
+def _attributes(model: nn.Module) -> dict[str, object]:
+    """Snapshots of every module's own attributes and parameters, by path."""
+    found: dict[str, object] = {}
+    for prefix, module in model.named_modules():
+        where = f"{prefix}." if prefix else ""
+        for key, value in vars(module).items():
+            if key not in _MODULE_INTERNALS:
+                found[f"{where}{key}"] = _snapshot(value)
+        for key, value in module._parameters.items():
+            if value is not None:
+                found[f"{where}{key}"] = ("parameter", value.detach().clone())
+    return found
+
+
+def _describe(snapshot) -> str:
+    if snapshot is None:
+        return "nothing"
+    kind, value = snapshot
+    if kind in {"tensor", "parameter"}:
+        return f"a tensor of shape {tuple(value.shape)}"
+    if kind == "value":
+        return repr(value) if len(repr(value)) <= 40 else f"a {type(value).__name__}"
+    return f"a {kind}"
+
+
+def _check_attributes(probe, method_name, arguments, before) -> None:
+    """Reject tensors and Python values an entry point changes outside its buffers.
+
+    The trace bakes them in as constants, so the sprite would keep the values
+    they had when it was traced. A tensor attribute or parameter that changes
+    is rejected; a Python value that changes again on a second call is too.
+    One that changes on the first call only, such as a cache filled once, is
+    reported with a warning, since the sprite always runs as that first call.
+    """
+    after = _attributes(probe)
+    changed = [
+        name for name in {**before, **after}
+        if not _same(before.get(name), after.get(name))
+    ]
+    for name in changed:
+        old = before.get(name)
+        if old is not None and old[0] == "parameter":
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} changes the parameter self.{name}, which a "
+                "sprite keeps as a constant. Only buffers become state: register the "
+                f"tensor with self.register_buffer({name.rpartition('.')[2]!r}, ...) instead"
+            )
+        if old is not None and old[0] == "tensor":
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} changes self.{name}, a tensor attribute that "
+                "isn't a buffer, so the sprite would keep its first value. Only buffers "
+                "become state: register it with "
+                f"self.register_buffer({name.rpartition('.')[2]!r}, ...) in __init__"
+            )
+    if not changed:
+        return
+    second = _attributes(probe)
+    try:
+        with torch.no_grad():
+            getattr(probe, method_name)(*copy.deepcopy(arguments))
+    except Exception:  # noqa: BLE001 - a second call that fails tells nothing more
+        again = changed
+    else:
+        third = _attributes(probe)
+        again = [name for name in changed if not _same(second.get(name), third.get(name))]
+    for name in again:
+        raise UnsupportedModelError(
+            f"@entrypoint {method_name} changes self.{name} on every call (from "
+            f"{_describe(before.get(name))} to {_describe(after.get(name))} on the "
+            "first), but a Python value is fixed when cattorch traces the method, so "
+            "the sprite would keep the value it had then. Keep a value that changes "
+            "between calls in a tensor buffer, such as "
+            f"self.register_buffer({name.rpartition('.')[2].split('[')[0]!r}, torch.tensor(0))"
+        )
+    warnings.warn(
+        f"@entrypoint {method_name} changes "
+        + ", ".join(f"self.{name}" for name in sorted(changed))
+        + " on its first call only. The sprite runs every call as that first call "
+        "traced from the initial values; if later calls take another path because "
+        "of the change, it won't follow them",
+        UserWarning,
+        stacklevel=4,
+    )
+
+
 def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
     """Run a method on a copy: the buffers it changed and read, and its outputs."""
     probe = copy.deepcopy(model).eval()
+    attributes = _attributes(probe)
     before = {
         name: (buffer, buffer._version, buffer.detach().clone())
         for name, buffer in probe.named_buffers()
@@ -403,6 +537,9 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
                 "place (self.mem.mul_(0.5).add_(x)), which keeps the names together"
             )
     after = dict(probe.named_buffers())
+    # Buffers are compared below; a second call (for Python values) runs on
+    # a copy, so it doesn't change what is compared.
+    _check_attributes(copy.deepcopy(probe), method_name, arguments, attributes)
     changed = {}
     for name, (buffer, version, values) in before.items():
         current = after.get(name)
