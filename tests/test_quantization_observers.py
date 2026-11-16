@@ -111,6 +111,21 @@ def _models():
         "aten.rnn_relu.input": (
             _Model(lambda s, x: s.r(x)[0], r=nn.RNN(16, 8, nonlinearity="relu")), 16,
         ),
+        "aten.gru_cell.default": (
+            _Model(lambda s, x: s.r(x, torch.tanh(x)), r=nn.GRUCell(16, 16)), 16,
+        ),
+        "aten.lstm_cell.default": (
+            _Model(lambda s, x: s.r(x, (torch.tanh(x), x))[0], r=nn.LSTMCell(16, 16)), 16,
+        ),
+        "aten.rnn_tanh_cell.default": (
+            _Model(lambda s, x: s.r(x, torch.tanh(x)), r=nn.RNNCell(16, 16)), 16,
+        ),
+        "aten.rnn_relu_cell.default": (
+            _Model(
+                lambda s, x: s.r(x, torch.tanh(x)), r=nn.RNNCell(16, 16, nonlinearity="relu"),
+            ),
+            16,
+        ),
         "aten.conv1d.default": _conv(1),
         "aten.conv2d.default": _conv(2),
         "aten.conv3d.default": _conv(3),
@@ -168,3 +183,4 @@ def test_observed_weights_are_stored_as_integers_and_reported_so(tmp_path, targe
         warning for warning in result.warnings
         if warning.startswith(("quantized weight", "weight computed from"))
     ]
+

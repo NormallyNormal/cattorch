@@ -785,6 +785,20 @@ def _observe_recurrent(func, args, _kwargs, result):
     return tuple(observations)
 
 
+def _observe_recurrent_cell(_func, args, _kwargs, _result):
+    """``nn.RNNCell``, ``nn.LSTMCell`` and ``nn.GRUCell`` weights: the input
+    weight reads the step's input, and the hidden weight the state it
+    starts from (an LSTM cell's hidden state, not its cell state)."""
+    if len(args) < 4 or not isinstance(args[0], torch.Tensor):
+        return ()
+    value, hidden, input_weight, hidden_weight = args[:4]
+    state = hidden[0] if isinstance(hidden, (list, tuple)) and hidden else hidden
+    observations = [(value, input_weight, "linear")]
+    if isinstance(state, torch.Tensor):
+        observations.append((state, hidden_weight, "linear"))
+    return tuple(observations)
+
+
 def _observe_convolution(func, args, kwargs, _result):
     """Each group of a convolution's kernels, with the windows it reads.
 
@@ -907,6 +921,10 @@ _DECOMPOSED_OBSERVERS: dict[str, Observer] = {
     "aten.gru.input": _observe_recurrent,
     "aten.rnn_tanh.input": _observe_recurrent,
     "aten.rnn_relu.input": _observe_recurrent,
+    "aten.gru_cell.default": _observe_recurrent_cell,
+    "aten.lstm_cell.default": _observe_recurrent_cell,
+    "aten.rnn_tanh_cell.default": _observe_recurrent_cell,
+    "aten.rnn_relu_cell.default": _observe_recurrent_cell,
     **{
         target: _observe_convolution
         for target in (

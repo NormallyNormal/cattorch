@@ -75,7 +75,11 @@ GPT-2's `Conv1D` layers), `torch.baddbmm` or `torch.addmv`, by a two-operand
 by `F.bilinear` and `nn.Bilinear` is grouped over its inputs, and GPTQ
 calibrates it. So are `nn.MultiheadAttention`'s input projection, its output
 projection when the call passes no mask, and the input and hidden weights of
-every layer and direction of `nn.RNN`, `nn.LSTM` and `nn.GRU`. A projected
+every layer and direction of `nn.RNN`, `nn.LSTM` and `nn.GRU` and of
+`nn.RNNCell`, `nn.LSTMCell` and `nn.GRUCell`, as a recurrent generation step
+calls them. A cell called without a state reads zeros, so its hidden
+weight sees no calibration data and uses symmetric quantization, with the
+reason in the report. A projected
 LSTM's projection (`weight_hr_l*`) reads a value no output shows, so it uses
 symmetric quantization, and so does every layer but the first when the
 module runs with dropout in training mode. A 1D or 2D convolution is a
