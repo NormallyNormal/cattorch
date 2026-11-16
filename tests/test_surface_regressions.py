@@ -123,12 +123,16 @@ def _char_tokenizer():
     return PreTrainedTokenizerFast(tokenizer_object=backend)
 
 
-@pytest.mark.parametrize("bad", ["", ".", "..", "build/", "sub/.", "sub/.."])
+@pytest.mark.parametrize("bad", [
+    "", ".", "..", "build/", "sub/.", "sub/..",
+    # Only an extension: these wrote a hidden .sprite3.sprite3.
+    ".sprite3", "sub/.SPRITE3", ".sb3",
+])
 def test_output_path_that_names_no_file_raises(tmp_path, monkeypatch, bad):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match="output_path .* doesn't name a file"):
         transpile(nn.Linear(4, 3).eval(), torch.randn(1, 4), bad)
-    assert list(tmp_path.iterdir()) == []
+    assert list(tmp_path.rglob("*")) == []
 
 
 def test_output_path_naming_a_directory_raises(tmp_path):
@@ -160,8 +164,10 @@ def test_every_writer_shares_the_output_path_rule(tmp_path):
         lambda path: build_paired_benchmark(model, x, path, repeats=1),
         lambda path: CharTokenizer(_char_tokenizer()).save(path),
     ):
-        with pytest.raises(ValueError, match="doesn't name a file"):
-            writer(f"{tmp_path}/")
+        for bad in (f"{tmp_path}/", f"{tmp_path}/.sb3", f"{tmp_path}/.Sprite3"):
+            with pytest.raises(ValueError, match="doesn't name a file"):
+                writer(bad)
+    assert not list(tmp_path.glob(".*"))
     assert output_file("x", ".sb3", parameter="-o") == Path("x.sb3")
 
 

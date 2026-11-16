@@ -607,6 +607,86 @@ def test_a_generator_refuses_an_index_computed_from_the_token_ids(tmp_path):
         transpile(Halves().eval(), GenerationProgram(max_context=8), tmp_path / "lm")
 
 
+class _Positions(nn.Module):
+    """Reads a three-row table at a counter state and moves the counter on."""
+
+    def __init__(self):
+        super().__init__()
+        self.table = nn.Parameter(torch.arange(1.0, 7.0).reshape(3, 2))
+        self.register_buffer("pos", torch.tensor([0]))
+
+    def step(self, x, pos):
+        return self.table[pos] + x, pos + 1
+
+    def gather(self, x, pos):
+        return torch.index_select(self.table, 0, pos) * x, pos + 1
+
+    @entrypoint(example_inputs=(torch.zeros(1, 2),))
+    def marked(self, x):
+        y = self.table[self.pos] + x
+        self.pos += 1
+        return y
+
+
+@pytest.mark.parametrize("method", ["step", "gather", "marked"])
+def test_a_state_used_as_an_index_is_checked(tmp_path, method):
+    # The model itself takes the counter past the table: PyTorch raises,
+    # and the call fails keeping the state.
+    model = _Positions().eval()
+    if method == "marked":
+        result = transpile(model, None, tmp_path / method)
+    else:
+        program = ExportProgram(
+            states=(State("pos", torch.tensor([0])),),
+            entrypoints=(EntryPoint(
+                "marked", method=method,
+                arguments=(Input("x", torch.zeros(1, 2)), StateInput("pos")),
+                returns=(Output("output"), StateUpdate("pos")),
+            ),),
+        )
+        result = transpile(model, program, tmp_path / method)
+    emulator = ScratchEmulator(load_sprite(result.path))
+    reference = _Positions().eval()
+    pos = torch.tensor([0])
+    for call in range(5):
+        emulator.lists["cattorch marked x"] = [1.0, 1.0]
+        emulator.run_procedure("cattorch marked")
+        status = emulator.variables[interface.STATUS_VARIABLE]
+        if call < 3:
+            if method == "marked":
+                expected = reference.marked(torch.ones(1, 2))
+            else:
+                expected, pos = getattr(reference, method)(torch.ones(1, 2), pos)
+            assert status == interface.OK, call
+            assert emulator.lists["cattorch marked output"] == expected.flatten().tolist()
+        else:
+            with pytest.raises(IndexError):
+                reference.table[torch.tensor([call])]
+            assert status == interface.invalid_item("cattorch state pos"), call
+        assert emulator.lists["cattorch state pos"] == [min(call + 1, 3)]
+
+
+def test_a_recurrent_generator_refuses_a_state_used_as_an_index(tmp_path):
+    from cattorch import UnsupportedModelError
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+            self.positions = nn.Parameter(torch.randn(3, 4))
+            self.head = nn.Linear(4, 8)
+
+        def states(self):
+            return (State("pos", torch.tensor([0])),)
+
+        def step(self, token, pos):
+            return self.head(self.embed(token).reshape(1, 4) + self.positions[pos]), pos + 1
+
+    model = Counter().eval()
+    with pytest.raises(UnsupportedModelError, match="can't use state 'pos' as an index"):
+        transpile(model, RecurrentGenerationProgram(model.states()), tmp_path / "counter")
+
+
 # ── Item rules (docs/scratch-interface.md#how-every-block-behaves) ──────────
 
 class Affine(nn.Module):

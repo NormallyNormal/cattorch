@@ -101,6 +101,40 @@ def test_round_matches_javascript(value, expected):
     assert _reporter("operator_round", {"NUM": value}) == expected
 
 
+# What scratch-vm (V8) gives; test_emulator_math_vm checks many more in the VM.
+@pytest.mark.parametrize(("opcode", "operator", "value", "expected"), [
+    # Math.round rounds once: floor(x + 0.5) would round these up.
+    ("operator_round", None, 0.49999999999999994, 0),
+    ("operator_round", None, 4503599627370497, 4503599627370497),
+    # V8's fdlibm differs from the C library in the last bit.
+    ("operator_mathop", "ln", 3, 1.0986122886681096),
+    ("operator_mathop", "log", 3, 0.4771212547196623),
+    ("operator_mathop", "e ^", 270, 1.8176493851391001e117),
+    ("operator_mathop", "10 ^", 2.5, 316.2277660168379),
+    ("operator_mathop", "10 ^", -4, 0.00009999999999999999),
+    ("operator_mathop", "atan", 0.8756150886325909, 41.20587914346107),
+    ("operator_mathop", "sin", 1e308, math.nan),
+    ("operator_mathop", "cos", -1e308, math.nan),
+])
+def test_math_matches_scratch_vm_to_the_last_bit(opcode, operator, value, expected):
+    fields = {"OPERATOR": [operator, None]} if operator else None
+    result = _reporter(opcode, {"NUM": value}, fields)
+    assert result == expected or (math.isnan(expected) and math.isnan(result))
+
+
+@pytest.mark.parametrize(("opcode", "operator", "value"), [
+    ("operator_round", None, -0.4),
+    ("operator_mathop", "ceiling", -0.5),
+    ("operator_mathop", "floor", "-0"),
+    # toFixed(10) keeps the sign of a negative value that rounds to 0.
+    ("operator_mathop", "sin", -1e-12),
+])
+def test_math_keeps_negative_zero_as_javascript_does(opcode, operator, value):
+    fields = {"OPERATOR": [operator, None]} if operator else None
+    result = _reporter(opcode, {"NUM": value}, fields)
+    assert result == 0 and math.copysign(1, result) == -1
+
+
 def test_change_by_reads_an_empty_variable_as_zero():
     emulator = ScratchEmulator({
         "variables": {"counter": ["counter", ""]},
@@ -115,7 +149,9 @@ def test_change_by_reads_an_empty_variable_as_zero():
     assert emulator.variables["counter"] == 2
 
 
-@pytest.mark.parametrize(("times", "expected"), [(2.5, 3), (2.4, 2), ("", 0)])
+@pytest.mark.parametrize(("times", "expected"), [
+    (2.5, 3), (2.4, 2), ("", 0), (0.49999999999999994, 0),
+])
 def test_repeat_rounds_its_count(times, expected):
     emulator = ScratchEmulator({
         "variables": {"counter": ["counter", 0]},
@@ -293,6 +329,8 @@ def test_list_indices_follow_cast_to_list_index(index, expected):
 @pytest.mark.parametrize(("requested", "costume"), [
     ("3", 2), ("2", 2), ("0", 5), ("-1", 4), ("1.5", 2), ("0x2", 2), ("next costume", 1),
     ("previous costume", 4), ("five", 5), ("", 5), (3.0, 3), ("１", 5),
+    # MathUtil.wrapClamp wraps in doubles; Math.round doesn't round 2**52 + 1 up.
+    ("4503599627370498", 3), ("1e308", 1),
 ])
 def test_switch_costume_follows_scratch_vm(requested, costume):
     emulator = _list_emulator({}, "")

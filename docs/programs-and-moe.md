@@ -99,7 +99,11 @@ among its `arguments`, and writes it with `StateUpdate(name)` among its
   `wrong number of items`, `too few items` or `too many items` naming it.
   Its items aren't checked, since the sprite rewrites the state every call
   and checking 200,000 items each time would cost more than the call, and
-  writing anything else into it gives undefined results.
+  writing anything else into it gives undefined results. The exception is a
+  state the model uses as an index: its items must be valid indices, as an
+  [index input's](supported-models.md#index-inputs) are, so a call whose
+  model moved one out of range, as a counter past a table's rows, fails with
+  `invalid item` naming the state and leaves the states as they were.
 - Each entry point method is traced once, like any export, so it follows one
   path: it can't branch on tensor values, and every shape is fixed when you
   export, except an append state's first dimension.

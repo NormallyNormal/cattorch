@@ -89,6 +89,16 @@ An `overrides` entry replaces the whole policy for the named module. A
 `x @ weight` product with a stored weight uses the global policy. Products of
 two runtime tensors, such as attention scores, stay exact.
 
+A low-rank factorization puts two plain layers in place of the module, so
+it applies only where the module does nothing but use its weight: a module
+whose class has its own `forward` (a subclass of `nn.Linear` with extra
+steps), one with forward hooks, and one inside a `torch.nn` module that may
+read its parameters itself, such as `out_proj` of `nn.MultiheadAttention` or
+the layers of `nn.TransformerEncoderLayer`, keep their weights, and the
+export warns. Block pruning, which keeps the module, still applies to them.
+Neuron pruning, which also puts new layers in place, skips a pair of layers
+with forward hooks the same way.
+
 A transform only changes the module it applies to. When the model also
 reads that module's parameters directly, outside the module, such as
 `x @ self.up.weight.T` (in any method a program exports), the module is left

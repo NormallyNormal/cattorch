@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from cattorch import BoundedDimension, UnsupportedModelError, entrypoint, transpile, verify
 from cattorch import ProgramCall
+from cattorch.util.scratch.emulator import ScratchEmulator
 from sprite_helpers import load_sprite
 
 
@@ -85,6 +86,49 @@ def test_a_token_dimension_after_a_size_one_batch(tmp_path):
     assert result.inputs[0].shape == (1, BoundedDimension("input", 1, 12))
 
 
+class _AfterStart(nn.Module):
+    """Looks up a start token and the ids, shifted or not: an index along the
+    variable-length dimension, after a fixed item."""
+
+    def __init__(self, shift):
+        super().__init__()
+        self.shift = shift
+        self.emb = nn.Embedding(10, 4)
+
+    def forward(self, ids):
+        return self.emb(torch.cat([torch.tensor([0]), ids]) + self.shift).mean(0)
+
+
+@pytest.mark.parametrize("shift", [0, 1])
+def test_an_index_along_the_variable_length_dimension_is_checked(tmp_path, shift):
+    # The ids themselves are checked before the call; ids + 1 as the
+    # block runs, along the whole variable-length list.
+    torch.manual_seed(2)
+    model = _AfterStart(shift).eval()
+    result = transpile(model, torch.tensor([1, 5, 7]), tmp_path / "ids", dynamic={0: (1, 12)})
+    for length in (1, 4, 12):
+        assert verify(model, torch.randint(-shift, 10 - shift, (length,)), result).passed, length
+    emulator = ScratchEmulator(load_sprite(result.path))
+    highest, lowest = 9 - shift, -shift
+    for ids, valid in (
+        ([3, highest], True), ([3, highest + 1], False), ([8, 0, 2, lowest, 4], True),
+        ([1, 2, 3, lowest - 1], False),
+    ):
+        emulator.lists["input"] = ids
+        emulator.run_procedure(interface.FORWARD)
+        status = emulator.variables[interface.STATUS_VARIABLE]
+        if valid:
+            assert status == interface.OK, ids
+            torch.testing.assert_close(
+                torch.tensor([float(item) for item in emulator.lists["output"]]),
+                model(torch.tensor(ids)).detach(),
+            )
+        else:
+            with pytest.raises(IndexError):
+                model(torch.tensor(ids))
+            assert status == interface.invalid_item("input"), ids
+
+
 def test_a_model_that_reorders_its_batch_runs_once_per_item(tmp_path):
     torch.manual_seed(3)
     layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
@@ -108,6 +152,25 @@ def test_a_model_using_the_length_itself_is_rejected(tmp_path):
         "that the model uses the length itself",
     ):
         transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
+
+
+def _first_row_written(value):
+    written = value * 1.0
+    written[:, 0, :] = 5.0
+    return written
+
+
+@pytest.mark.parametrize("function", [
+    _first_row_written,
+    lambda value: torch.cat([value[:, :1] * 3, value[:, 1:]], 1),
+])
+def test_a_slice_empty_in_the_one_item_trace_is_named_as_the_cause(tmp_path, function):
+    with pytest.raises(UnsupportedModelError, match="holds nothing with one item") as caught:
+        transpile(
+            Lambda(function).eval(), torch.randn(1, 3, 4), tmp_path / "rest",
+            dynamic={0: {1: (1, 6)}},
+        )
+    assert "uses the length itself" not in str(caught.value)
 
 
 def test_the_length_check_compares_with_the_stored_weights(tmp_path):
