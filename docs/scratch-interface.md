@@ -197,7 +197,7 @@ after it:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `cattorch ENTRY` | block | Calls the entry point: reads its input lists and states, writes its output lists and states. |
+| `cattorch ENTRY` | block | Calls the entry point: reads its input lists and the states it takes (with markers, the ones its method reads or writes), checks their sizes, and writes its output lists and the states it updates. Other states are left alone. |
 | `cattorch init` | block | Decodes every entry point's weights. Optional. |
 | `cattorch reset` | block | Restores every state to its initial value. |
 | `cattorch prepare for save` | block | Clears the decoded weights and working lists before saving the project. |
