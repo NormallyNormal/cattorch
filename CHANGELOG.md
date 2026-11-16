@@ -500,7 +500,25 @@ Python:
   such as `dog cat`, gave other token IDs with no warning. They now match
   added tokens in the text first, as the tokenizer does; see
   [added and special tokens](docs/tokenizers.md#added-and-special-tokens).
-  Added tokens with `single_word=True` raise `ValueError`.
+  Added tokens with `single_word=True`, or with a character outside the
+  Basic Multilingual Plane, raise `ValueError`. With `split_special_tokens`
+  the sprite reads special tokens as text, as the tokenizer does, and
+  exporting leaves the tokenizer's settings as they were.
+- Tokenizer sprites left out the tokens a tokenizer's post-processor adds
+  around every text, such as `<s>` before it, so `cattorch tokenize` gave
+  other IDs than `tokenizer.encode(text)`. They now write them too, for
+  `TemplateProcessing`, `BertProcessing` and `RobertaProcessing`, and for a
+  SentencePiece processor made with `add_bos` or `add_eos`; any other
+  post-processor, and SentencePiece's `reverse` or `enable_sampling`, raises
+  `ValueError`. See
+  [special tokens added around the text](docs/tokenizers.md#special-tokens-added-around-the-text).
+- With `split_special_tokens=True`, a character tokenizer or BPE sprite
+  wrote a one-character special token's own ID where the tokenizer gives
+  the unknown token, because the model's vocabulary lacks it.
+- `BPETokenizer` exported a model with `ignore_merges=True` and merged
+  anyway, so a text that is itself a vocabulary entry could get other IDs.
+  It raises `ValueError` unless the merges build every vocabulary entry,
+  when the option changes nothing.
 - Tokenizer sprites looked characters up case-insensitively, so `The`
   encoded like `the`. Sprites whose vocabulary has letters now look
   characters up by costume name, so don't change their costumes. SentencePiece `scratch_casefold=True`
