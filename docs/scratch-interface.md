@@ -66,8 +66,9 @@ benchmark case and its variant.
   which is `cattorch init` running inside it: it sends
   `cattorch init complete` too. A program's entry point decodes only its own
   weights, which isn't an init.
-- `cattorch prepare for save` clears the decoded weights and internal working
-  lists, so a project saved after running stays small, and sets
+- `cattorch prepare for save` clears the decoded weights and every internal
+  working list, so a project saved after running holds no more internal data
+  than the exported sprite, and sets
   `cattorch initialized` to `0`; the next block decodes the weights again.
   Public lists keep their values, except that a generation sprite also
   resets, as `cattorch reset` does: its cache can't be kept.

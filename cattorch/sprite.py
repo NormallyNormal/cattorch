@@ -24,7 +24,9 @@ from cattorch import interface
 from cattorch.graph import _GenerationSpec, _GraphInfo, _get_shape
 from cattorch.guards import _EPOCH, _epoch_current
 from cattorch.interface import STATUS_VARIABLE, is_public_data
-from cattorch.procedures import _add_warp_procedure, _merge_variables_by_name, _procedure_mutation
+from cattorch.procedures import (
+    _add_warp_procedure, _merge_variables_by_name, _procedure_mutation, _used_lists,
+)
 from cattorch.util.scratch.dsl import Program, call, clear, eq, if_, set_var, var
 from cattorch.util.scratch.interface import rename_procedure as _rename_procedure
 from cattorch.util.scratch.remap import remap_ids
@@ -289,9 +291,11 @@ def _add_prepare_for_save(
     """Add the public procedure that drops rebuildable runtime list contents.
 
     It marks the weights undecoded and clears the decoded weights and the
-    working lists. The ``inputs`` lists are kept: they hold the caller's
-    values, or are public lists, and a program's persistent state is passed
-    to its entry points as inputs.
+    working lists, the kernels' private ones included: every list the sprite
+    is exported without items, which holds only what a call left. The
+    ``inputs`` lists are kept: they hold the caller's values, or are public
+    lists, and a program's persistent state is passed to its entry points as
+    inputs.
     """
     names = [
         shard.name
@@ -299,6 +303,12 @@ def _add_prepare_for_save(
         if not layout.name.startswith("_") and layout.name not in inputs
         and (compressed or layout.name not in static_names)
         for shard in layout.shards
+    ]
+    used = _used_lists(sprite)
+    names += [
+        entry[0] for entry in sprite.get("lists", {}).values()
+        if entry[0].startswith("_") and not entry[1] and entry[0] not in inputs
+        and entry[0] not in names and entry[0] in used
     ]
     initialized = interface.INITIALIZED_VARIABLE
     program = Program(

@@ -285,3 +285,11 @@ def _owning_definitions(blocks: dict) -> dict[str, str | None]:
         for visited in path:
             owners[visited] = owner
     return owners
+
+
+def _used_lists(sprite: dict) -> set[str]:
+    """The lists some block of the sprite reads or writes."""
+    return {
+        block["fields"]["LIST"][0] for block in sprite.get("blocks", {}).values()
+        if isinstance(block, dict) and "LIST" in block.get("fields", {})
+    }

@@ -19,7 +19,7 @@ from cattorch.guards import _BUSY, _EPOCH, _add_epoch_procedure, _epoch_current
 from cattorch.interface import STATUS_VARIABLE
 from cattorch.procedures import (
     _add_to_procedure, _add_warp_procedure, _find_procedure_definition, _merge_lists_by_name,
-    _merge_variables_by_name,
+    _merge_variables_by_name, _used_lists,
 )
 from cattorch.util.scratch.dsl import (
     Program, append, broadcast_and_wait, call, change_var, clear, eq, for_each, gt, if_,
@@ -536,11 +536,41 @@ def _finish_generation_prepare(sprite: dict, reset: str) -> None:
         name for name in (interface.LOGITS, _TOP_K_VALUES, _TOP_K_IDS)
         if any(entry[0] == name for entry in sprite.get("lists", {}).values())
     ]
+    # The step's own lists and the prompt's copy hold only what the last call
+    # left; the reset that follows refills the states.
+    used = _used_lists(sprite)
+    # What prepare for save, and the procedures it calls, clear already.
+    blocks = sprite["blocks"]
+    cleared: set[str] = set()
+    pending, seen = [prepare], set()
+    while pending:
+        procedure = pending.pop()
+        if procedure in seen:
+            continue
+        seen.add(procedure)
+        try:
+            current = blocks[_find_procedure_definition(sprite, procedure)].get("next")
+        except ValueError:
+            continue
+        while current is not None:
+            block = blocks[current]
+            if block.get("opcode") == "data_deletealloflist":
+                cleared.add(block["fields"]["LIST"][0])
+            elif block.get("opcode") == "procedures_call":
+                pending.append(block["mutation"]["proccode"])
+            current = block.get("next")
+    working = [
+        entry[0] for entry in sprite.get("lists", {}).values()
+        if not entry[1] and entry[0] in used and entry[0] not in cleared
+        and entry[0] not in (interface.TOKEN_IDS, *outputs)
+    ]
     _add_to_procedure(sprite, prepare, Program(
         "generation_prepare_start", variables=(_EPOCH,), body=(change_var(_EPOCH, 1),),
     ), first=True)
     _add_to_procedure(sprite, prepare, Program(
-        "generation_prepare_end", variables=(_BUSY, STATUS_VARIABLE), lists=outputs, body=(
+        "generation_prepare_end", variables=(_BUSY, STATUS_VARIABLE),
+        lists=(*outputs, *working), body=(
+            *(clear(name) for name in dict.fromkeys(working)),
             call(reset), *(clear(name) for name in outputs), set_var(_BUSY, 0),
             set_var(STATUS_VARIABLE, interface.OK),
             broadcast_and_wait(interface.completion(prepare)),

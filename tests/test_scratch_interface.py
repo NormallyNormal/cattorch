@@ -667,6 +667,55 @@ def test_an_append_state_holds_at_least_its_initial_rows(tmp_path):
         assert emulator.variables[interface.STATUS_VARIABLE] == status, rows
 
 
+# ── cattorch prepare for save ────────────────────────────────────────────────
+
+def _prepared_sprites(tmp_path):
+    from shared_models import GRULM, Language
+
+    torch.manual_seed(0)
+    rnn = nn.LSTM(3, 4, batch_first=True).eval()
+    yield "model", transpile(rnn, torch.randn(1, 5, 3), tmp_path / "rnn"), [
+        (interface.FORWARD, {"input": [0.5] * 15}),
+    ]
+    yield "program", transpile(Memory().eval(), None, tmp_path / "memory"), [
+        ("cattorch add", {"cattorch add row": [1, 2, 3]}),
+        ("cattorch latest", {"cattorch latest rows": [1, 2, 3]}),
+    ]
+    yield "generation", transpile(
+        Language().eval(), GenerationProgram(max_context=16), tmp_path / "lm",
+    ), [(interface.PREFILL, {interface.TOKEN_IDS: [1, 2, 3]})]
+    model = GRULM().eval()
+    yield "recurrent", transpile(
+        model, RecurrentGenerationProgram(model.states()), tmp_path / "gru",
+    ), [(interface.PREFILL, {interface.TOKEN_IDS: [1, 2, 3]})]
+
+
+def test_prepare_for_save_leaves_internal_lists_as_exported(tmp_path):
+    """Whatever a call left in a working list is cleared, so a saved project
+    holds no more than the exported sprite, and the next call still works."""
+    for kind, result, calls in _prepared_sprites(tmp_path):
+        sprite = load_sprite(result.path)
+        exported = {entry[0]: len(entry[1]) for entry in sprite["lists"].values()}
+        emulator = ScratchEmulator(sprite)
+
+        def run():
+            for block, lists in calls:
+                for name, values in lists.items():
+                    emulator.lists[name] = values
+                emulator.run_procedure(block)
+                assert emulator.variables[interface.STATUS_VARIABLE] == interface.OK, (kind, block)
+
+        run()
+        emulator.run_procedure(interface.PREPARE_FOR_SAVE)
+        left = {
+            name: len(emulator.lists[name]) for name in exported
+            if name.startswith(interface.INTERNAL_PREFIX)
+            and len(emulator.lists[name]) > exported[name]
+        }
+        assert not left, (kind, left)
+        run()
+
+
 # ── Names Scratch can't tell apart ───────────────────────────────────────────
 
 def entry(name: str) -> EntryPoint:

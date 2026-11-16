@@ -484,6 +484,9 @@ Scratch:
 - Generation sprites had a second, unused `cattorch status` variable.
 - Initialization left the last compressed weights in a variable, so a saved
   project stored them twice.
+- `cattorch prepare for save` clears every internal working list, including
+  those of recurrent layers, experts and cached attention and a generator's
+  copy of the prompt, which it used to leave holding the last call's values.
 - Loose call blocks on the canvas ran internal procedures directly.
 - A tokenizer sprite's `cattorch text` started as `0`, so tokenizing before
   setting it tokenized "0"; it starts empty.
