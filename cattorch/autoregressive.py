@@ -1302,6 +1302,25 @@ class SequenceStepModule(torch.fx.GraphModule):
     def __init__(self, root, graph):
         super().__init__(root, graph, "SequenceStepModule")
 
+    def __deepcopy__(self, memo):
+        # ``GraphModule`` copies only what its graph reads; the copy keeps
+        # which parameter elements its position tables hold (see
+        # ``quantization._storage_sources``). A parameter the step holds is
+        # named as the copy holds it; any other is the model's own, which
+        # the quantization report knows it by.
+        result = super().__deepcopy__(memo)
+        sources = self.__dict__.get("_cattorch_storage_sources")
+        if sources is not None:
+            held = {id(value) for value in (*self.parameters(), *self.buffers())}
+            result._cattorch_storage_sources = {
+                name: (
+                    memo.get(id(parameter), parameter) if id(parameter) in held else parameter,
+                    positions,
+                )
+                for name, (parameter, positions) in sources.items()
+            }
+        return result
+
     def cache_buffers(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
         """``(block index, k_cache, v_cache)`` per attention block, in order."""
         layers = sorted(
