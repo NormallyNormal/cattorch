@@ -457,6 +457,13 @@ Python:
   units), booleans (`"0"` and `"false"` are false), list positions (`last`,
   `all`, `0x2`), `mod` with infinities, `pick random` bounds, costume
   switching by number, and `for each` counts read before every iteration.
+- The emulator's `round`, `mathop`, repeat counts and costume numbers could
+  differ from Scratch in the last bit, or raise where Scratch gives NaN:
+  `round` of 0.49999999999999994 gave 1, `sin` of 1e308 raised, and `ln`,
+  `log`, `e ^`, `10 ^`, the trigonometric functions and their inverses used
+  Python's C library where Scratch uses V8's own versions of them. It now
+  computes them as V8 does, `-0` included, checked against scratch-vm bit
+  for bit.
 - Mistakes that ended in an internal exception raise one naming the
   problem: a `model` that isn't a module or `example_inputs` that are a dict
   or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a
