@@ -185,9 +185,10 @@ def _stored_values_model(
 
 
 _USES_LENGTH = (
-    "The model probably uses the length itself, for example torch.arange or a "
-    "position table sliced to it, which dynamic= can't follow; a "
-    "GenerationProgram handles variable-length token sequences"
+    "One possible cause is that the model uses the length itself, for example "
+    "torch.arange or a position table sliced to it, which dynamic= can't follow "
+    "(a GenerationProgram handles variable-length token sequences); if it "
+    "doesn't, please report the model"
 )
 
 
@@ -260,9 +261,9 @@ def check_lengths(
         found, matches = error(report(length))
         if not matches or (not exact and found > 10 * baseline + 1e-4):
             raise UnsupportedModelError(
-                f"with {length} items along the dynamic dimension the sprite doesn't "
-                f"match the model (largest difference {found:.3g}), though it does with "
-                f"{lengths[0]}. {_USES_LENGTH}"
+                f"with {length} items along the dynamic dimension the export gives "
+                f"different numbers from the model (largest difference {found:.3g}), "
+                f"though it matches with {lengths[0]}. {_USES_LENGTH}"
             )
 
 
@@ -433,10 +434,11 @@ def check_entry_lengths(
             if not matches or (not exact and found > 10 * baseline + 1e-4):
                 raise UnsupportedModelError(
                     f"entry point {entry.name!r} with {described((what, length) for what, _, length in check)} "
-                    f"doesn't match the method in the sprite (largest difference {found:.3g}), "
-                    "though it does with its example inputs and the states' initial values. "
-                    f"The method computes something from that length that the sprite can't "
-                    f"follow, {examples}"
+                    f"gives different numbers in the sprite from the method (largest "
+                    f"difference {found:.3g}), though it matches with its example inputs and "
+                    "the states' initial values. One possible cause is that the method "
+                    f"computes something from that length that the sprite can't follow, "
+                    f"{examples}; if it doesn't, please report the model"
                 )
 
 

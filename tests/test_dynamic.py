@@ -45,6 +45,12 @@ def test_a_variable_batch_has_a_bounded_interface(tmp_path):
     assert result.output.max_numel == 48
 
 
+def _written(value, write):
+    result = value * 1.0
+    write(result)
+    return result
+
+
 ROW_BY_ROW = {
     "sum": lambda x: x.sum(-1),
     "topk": lambda x: x.topk(2, -1).values,
@@ -53,6 +59,12 @@ ROW_BY_ROW = {
     "slice": lambda x: x[:, 1:4],
     "cumsum": lambda x: x.cumsum(-1),
     "cat": lambda x: torch.cat([x, x * 2], -1),
+    "cat of three": lambda x: torch.cat([x, x * 2, x + 1], -1),
+    "cat of four, unequal": lambda x: torch.cat([x[:, :2], x * 2, x + 1, x[:, 3:]], 1),
+    "column write": lambda x: _written(x, lambda y: y.__setitem__((slice(None), 1), x[:, 2])),
+    "columns write": lambda x: _written(
+        x, lambda y: y.__setitem__((Ellipsis, slice(1, 3)), x[..., 3:5] * 2),
+    ),
     "group norm": lambda x: F.group_norm(x.unsqueeze(-1), 2),
     "rms norm": lambda x: F.rms_norm(x, (6,)),
 }
@@ -90,7 +102,11 @@ def test_a_model_using_the_length_itself_is_rejected(tmp_path):
         def forward(self, tokens):
             return self.tokens(tokens) + self.positions(torch.arange(tokens.shape[1]))
 
-    with pytest.raises(UnsupportedModelError, match="uses the length itself"):
+    with pytest.raises(
+        UnsupportedModelError,
+        match="export gives different numbers from the model.*One possible cause is "
+        "that the model uses the length itself",
+    ):
         transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
 
 

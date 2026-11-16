@@ -267,7 +267,8 @@ cattorch traces the model with one item, and again with two to tell bounds
 like `x[-1]` and `x[0]` apart. It then checks the sprite against the model at
 several lengths during export. A model that builds something from the length,
 such as `torch.arange(tokens.shape[1])` for positions or a `cumsum`, fails
-that check. With lossy storage (`quantization=`, float16 storage, `sig_figs`),
+that check, as does a write to a fixed item, such as `x[0] = 1`. The error
+says at which length the export's numbers differ from the model's. With lossy storage (`quantization=`, float16 storage, `sig_figs`),
 the sprite is checked against a copy of the model holding the values it
 stores, so the check is as strict as for an exact export; with
 `optimization="fast"` or GPTQ, whose effect it can't reproduce, it allows the

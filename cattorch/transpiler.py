@@ -1596,15 +1596,18 @@ class _Compiler:
                 cat_inputs,
             )
 
+            # Under a row loop each pair runs once per row: a running result
+            # holds that many items per row of the variable-length axis.
+            row_axis = self.graph.dynamic_axes.get(node.name) if pair_idx > 1 else None
             cat_args = [
-                Argument(cur_list, cur_shape),
+                Argument(cur_list, cur_shape, dynamic_axis=row_axis),
                 Argument(next_list, next_shape),
                 Argument("C_num_outer", torch.Size([]), value=num_outer),
                 Argument("C_chunk_1", torch.Size([]), value=chunk_1),
                 Argument("C_chunk_2", torch.Size([]), value=chunk_2),
             ]
             instruction = self._kernel_instruction(CAT_KERNEL, cat_target, *cat_args)
-            self._emit(instruction, cat_inputs, cat_target)
+            self._emit(instruction, cat_inputs, cat_target, output_row=output_size)
 
             out_shape = list(cur_shape)
             out_shape[dim] = cur_shape[dim] + next_shape[dim]
@@ -1926,10 +1929,14 @@ class _Compiler:
             self._static_tensor_names[identity] = name
         return name
 
-    def _emit(self, instruction, input_lists, target_list):
-        """Generate Scratch blocks for an instruction and merge into sprite."""
+    def _emit(self, instruction, input_lists, target_list, *, output_row=None):
+        """Generate Scratch blocks for an instruction and merge into sprite.
+
+        ``output_row`` is the items per row the instruction writes under a row
+        loop, when that isn't its node's (one step of a multiway ``cat``).
+        """
         if self.active_node in self.graph.row_loops:
-            data = self._row_looped(instruction, input_lists, target_list)
+            data = self._row_looped(instruction, input_lists, target_list, output_row)
         else:
             data = instruction.finalize()
 
@@ -1956,7 +1963,7 @@ class _Compiler:
         else:
             self.sprite = combine(self.sprite, data, in_place=True)
 
-    def _row_looped(self, instruction, input_lists, target_list) -> dict:
+    def _row_looped(self, instruction, input_lists, target_list, output_row=None) -> dict:
         """Run a one-row kernel once per row of its runtime-length inputs."""
         from cattorch.util.instruction.row_loop import captured_programs, row_loop
 
@@ -1993,7 +2000,9 @@ class _Compiler:
                 "its kernel can't run once per row of a variable-length input",
             )
         output = f"T{len(tensor_lists) + 1}"
-        return row_loop(programs[0], rows, output, math.prod(_get_shape(node))).compile()
+        if output_row is None:
+            output_row = math.prod(_get_shape(node))
+        return row_loop(programs[0], rows, output, output_row).compile()
 
     @staticmethod
     def _is_full_slice(node) -> bool:
