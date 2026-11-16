@@ -1964,7 +1964,6 @@ def _reject_in_place_updates(nodes, entry_point=None, state_inputs=None) -> None
     one.
     """
     names = {}
-    candidates = []
     if entry_point is not None:
         for kind, named in (
             ("parameter", entry_point.model.named_parameters()),
@@ -1973,7 +1972,6 @@ def _reject_in_place_updates(nodes, entry_point=None, state_inputs=None) -> None
             for name, value in named:
                 names.setdefault(id(value), f"the {kind} self.{name}")
                 names.setdefault(value.data_ptr(), f"the {kind} self.{name}")
-                candidates.append((f"the {kind} self.{name}", value.detach()))
     for node in nodes:
         if node.op != "call_function" or str(node.target) != "aten.copy_.default":
             continue
@@ -1986,15 +1984,9 @@ def _reject_in_place_updates(nodes, entry_point=None, state_inputs=None) -> None
             value = (state_inputs or {}).get(base.name)
             written = None
             if isinstance(value, torch.Tensor):
+                # By identity only: the update has already changed the
+                # tensor's values, which may then equal another's by chance.
                 written = names.get(id(value)) or names.get(value.data_ptr())
-                # The trace may hold a copy: the one tensor with its values.
-                alike = {
-                    description for description, candidate in candidates
-                    if candidate.shape == value.shape and candidate.dtype == value.dtype
-                    and torch.equal(candidate, value)
-                }
-                if written is None and len(alike) == 1:
-                    (written,) = alike
             detail = (
                 f"the entry point updates {written or 'a tensor of the model'} in "
                 "place, but it isn't one of its states, so the sprite would keep its "

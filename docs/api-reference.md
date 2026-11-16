@@ -210,7 +210,9 @@ checks correctness, not speed. It works for every kind of export:
 - **Programs** (`ExportProgram` or `@entrypoint` markers): `calls` is a
   sequence of `ProgramCall`s run in order, keeping state between them in both
   PyTorch and Scratch; by default each entry point once with its example
-  inputs.
+  inputs, then, with several entry points, again in reverse order from a
+  fresh sprite and model, so each entry point runs both before and after
+  every other one.
 - **Generation** (`GenerationProgram` or `RecurrentGenerationProgram`):
   the program must be the one the sprite was exported with (a different
   `max_context` or `top_k` raises `ValueError`). `calls` names the calls `"prefill"`, `"decode"` and `"reset"` with their

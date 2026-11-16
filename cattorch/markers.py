@@ -347,7 +347,9 @@ class _ReadBuffers(dict):
     """A module's ``_buffers`` that records which buffers are read."""
 
     def __init__(self, values, names, reads):
-        super().__init__(values)
+        # ``dict.items``, not ``values.items``: another wrapper's overrides
+        # would count the copy as a read.
+        super().__init__(dict.items(values))
         self._names, self._reads = names, reads
 
     def _read(self, key) -> None:
@@ -466,20 +468,109 @@ def _describe(snapshot) -> str:
     return f"a {kind}"
 
 
-def _check_attributes(probe, method_name, arguments, before) -> None:
-    """Reject tensors and Python values an entry point changes outside its buffers.
+def _holds_tensor(snapshot) -> bool:
+    """Whether an attribute's snapshot is, or contains, a tensor."""
+    if snapshot is None:
+        return False
+    kind, value = snapshot
+    if kind in {"tensor", "parameter"}:
+        return True
+    if kind in {"list", "tuple"}:
+        return any(_holds_tensor(item) for item in value)
+    if kind == "dict":
+        return any(_holds_tensor(item) for item in value.values())
+    return False
 
-    The trace bakes them in as constants, so the sprite would keep the values
-    they had when it was traced. A tensor attribute or parameter that changes
-    is rejected; a Python value that changes again on a second call is too.
-    One that changes on the first call only, such as a cache filled once, is
-    reported with a warning, since the sprite always runs as that first call.
+
+def _other_arguments(arguments: tuple) -> tuple:
+    """Arguments like ``arguments`` with other values, in the range they use.
+
+    A second call with the example's own values can't tell a change made on
+    every call from one made on the first call only, when the value changed
+    is copied from an input.
+    """
+    from cattorch.dynamic import varied_at_length
+
+    others = []
+    for value in arguments:
+        if not value.numel():
+            others.append(value)
+        elif not value.ndim:
+            others.append(varied_at_length(value.reshape(1), 0, 1, seed=1).reshape(()))
+        else:
+            others.append(varied_at_length(value, 0, value.shape[0], seed=1))
+    return tuple(others)
+
+
+def _effect(model: nn.Module, method_name: str, arguments: tuple):
+    """What one call does: ``(tensor results, buffers after)``, or the
+    exception's type if it raises. ``model`` is changed by the call."""
+    try:
+        with torch.no_grad():
+            result = getattr(model, method_name)(*copy.deepcopy(arguments))
+    except Exception as error:  # noqa: BLE001 - compared, not reported
+        return type(error)
+    buffers = {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+    return [leaf.detach().clone() for leaf in _tensor_leaves(result)], buffers
+
+
+def _same_tensor(old: torch.Tensor, new: torch.Tensor) -> bool:
+    if old.shape != new.shape or old.dtype != new.dtype:
+        return False
+    if old.is_floating_point() or old.is_complex():
+        # Another path to the same numbers may round differently.
+        return torch.allclose(old, new, rtol=1e-5, atol=1e-7, equal_nan=True)
+    return torch.equal(old, new)
+
+
+def _same_effect(expected, found) -> bool:
+    if isinstance(expected, type) or isinstance(found, type):
+        return expected is found
+    (results, buffers), (others, other_buffers) = expected, found
+    return (
+        len(results) == len(others) and all(map(_same_tensor, results, others))
+        and buffers.keys() == other_buffers.keys()
+        and all(_same_tensor(buffers[name], other_buffers[name]) for name in buffers)
+    )
+
+
+def _with_buffers_of(model: nn.Module, source: nn.Module) -> nn.Module | None:
+    """A copy of ``model`` holding ``source``'s buffers, or ``None`` if their
+    modules differ. Tensors registered under several names stay one."""
+    copied = copy.deepcopy(model)
+    clones: dict[int, torch.Tensor] = {}
+    try:
+        for name, buffer in source.named_buffers(remove_duplicate=False):
+            value = clones.setdefault(id(buffer), buffer.detach().clone())
+            owner, leaf = _buffer_owner(copied, name)
+            if leaf not in owner._buffers:
+                return None
+            owner._buffers[leaf] = value
+    except AttributeError:
+        return None
+    return copied
+
+
+def _check_attributes(initial, probe, method_name, arguments, before, entries) -> None:
+    """Reject changes outside the buffers that a sprite can't reproduce.
+
+    ``probe`` is ``initial`` after one call of the method, and ``before``
+    the snapshot of ``initial``'s attributes. The trace bakes attributes in
+    as constants, and the sprite runs every call of every entry point as a
+    first call, from the initial values. So a change to a parameter, or one
+    the method makes again on a second call with other inputs, fails the
+    export. A change on the first call only, such as a cache filled once,
+    must leave the later calls of every entry point in ``entries``
+    (``(method name, example arguments)``) giving what they would give from
+    the initial values; it then gives a warning, and otherwise fails too.
     """
     after = _attributes(probe)
-    changed = [
+    changed = sorted(
         name for name in {**before, **after}
         if not _same(before.get(name), after.get(name))
-    ]
+    )
+    if not changed:
+        return
     for name in changed:
         old = before.get(name)
         if old is not None and old[0] == "parameter":
@@ -488,39 +579,66 @@ def _check_attributes(probe, method_name, arguments, before) -> None:
                 "sprite keeps as a constant. Only buffers become state: register the "
                 f"tensor with self.register_buffer({name.rpartition('.')[2]!r}, ...) instead"
             )
-        if old is not None and old[0] == "tensor":
+    leaf_of = {name: name.rpartition(".")[2].split("[")[0] for name in changed}
+    again = None
+    for candidate in (_other_arguments(arguments), arguments):
+        second = copy.deepcopy(probe)
+        try:
+            with torch.no_grad():
+                getattr(second, method_name)(*copy.deepcopy(candidate))
+        except Exception:  # noqa: BLE001 - tried again with the example
+            continue
+        third = _attributes(second)
+        again = [name for name in changed if not _same(after.get(name), third.get(name))]
+        break
+    if again is None:
+        # A second call that fails tells nothing more.
+        again = changed
+    for name in again:
+        if _holds_tensor(before.get(name)) or _holds_tensor(after.get(name)):
             raise UnsupportedModelError(
                 f"@entrypoint {method_name} changes self.{name}, a tensor attribute that "
-                "isn't a buffer, so the sprite would keep its first value. Only buffers "
+                "isn't a buffer (or a list or dictionary holding tensors), on every call, "
+                "so the sprite would keep the value it had when traced. Only buffers "
                 "become state: register it with "
-                f"self.register_buffer({name.rpartition('.')[2]!r}, ...) in __init__"
+                f"self.register_buffer({leaf_of[name]!r}, ...) in __init__, with a "
+                "tensor as its initial value"
             )
-    if not changed:
-        return
-    second = _attributes(probe)
-    try:
-        with torch.no_grad():
-            getattr(probe, method_name)(*copy.deepcopy(arguments))
-    except Exception:  # noqa: BLE001 - a second call that fails tells nothing more
-        again = changed
-    else:
-        third = _attributes(probe)
-        again = [name for name in changed if not _same(second.get(name), third.get(name))]
-    for name in again:
         raise UnsupportedModelError(
             f"@entrypoint {method_name} changes self.{name} on every call (from "
             f"{_describe(before.get(name))} to {_describe(after.get(name))} on the "
             "first), but a Python value is fixed when cattorch traces the method, so "
             "the sprite would keep the value it had then. Keep a value that changes "
             "between calls in a tensor buffer, such as "
-            f"self.register_buffer({name.rpartition('.')[2].split('[')[0]!r}, torch.tensor(0))"
+            f"self.register_buffer({leaf_of[name]!r}, torch.tensor(0))"
         )
+    names = ", ".join(f"self.{name}" for name in changed)
+    for entry_name, entry_arguments in entries:
+        for candidate in (_other_arguments(entry_arguments), entry_arguments):
+            fresh = _with_buffers_of(initial, probe)
+            if fresh is None:
+                break
+            expected = _effect(fresh, entry_name, candidate)
+            if isinstance(expected, type):
+                continue
+            if not _same_effect(expected, _effect(copy.deepcopy(probe), entry_name, candidate)):
+                later = (
+                    "its own later calls give" if entry_name == method_name
+                    else f"later calls of @entrypoint {entry_name} give"
+                )
+                raise UnsupportedModelError(
+                    f"@entrypoint {method_name} changes {names} on its first call, and "
+                    f"{later} other results because of it. The sprite runs every call "
+                    "as a first call, from the initial values, so it can't follow that. "
+                    "Keep a value that changes in a buffer: a tensor registered with "
+                    f"self.register_buffer({leaf_of[changed[0]]!r}, ...) becomes state"
+                )
+            break
     warn(
-        f"@entrypoint {method_name} changes "
-        + ", ".join(f"self.{name}" for name in sorted(changed))
-        + " on its first call only. The sprite runs every call as that first call "
-        "traced from the initial values; if later calls take another path because "
-        "of the change, it won't follow them",
+        f"@entrypoint {method_name} changes {names} on its first call only. The sprite "
+        "runs every call as a first call, from the initial values; later calls with "
+        "other inputs gave the same results that way, but if a later call takes "
+        "another path because of the change, the sprite won't follow it",
         stacklevel=4,
     )
 
@@ -537,9 +655,50 @@ def _call_method(probe, method_name: str, arguments: tuple, shown: tuple, *, aga
         raise UnsupportedModelError(model_failure(caller, error, shown)) from error
 
 
-def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
-    """Run a method on a copy: the buffers it changed and read, and its outputs."""
+def _buffer_slots(model: nn.Module) -> dict[str, torch.Tensor | None]:
+    """Every registered buffer by name, those set to ``None`` included."""
+    return {
+        f"{prefix}.{key}" if prefix else key: value
+        for prefix, module in model.named_modules()
+        for key, value in module._buffers.items()
+    }
+
+
+def _reject_none_buffers(method_name: str, before: dict, after: dict) -> None:
+    """Refuse a buffer that a method sets from ``None``, or to ``None``.
+
+    ``named_buffers`` skips a ``None`` buffer, so neither change would be
+    seen as one to a state, and the sprite would keep the traced value.
+    """
+    for name in sorted(before.keys() | after.keys()):
+        old, new = before.get(name), after.get(name)
+        if (old is None) == (new is None):
+            continue
+        if new is not None:
+            start = "starts as None" if name in before else "isn't registered before the call"
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} sets buffer {name!r}, which {start}, to a "
+                "tensor. A state is a list of numbers from the start, so the buffer needs "
+                "an initial tensor value: register it as one, such as torch.zeros(3), and "
+                "keep whether it has been set in another buffer, such as torch.tensor(False)"
+            )
+        gone = "to None" if name in after else "away"
+        raise UnsupportedModelError(
+            f"@entrypoint {method_name} sets buffer {name!r} {gone}. A state is a list of "
+            "numbers and can't become None: keep the buffer a tensor, and keep whether "
+            "it holds a value in another buffer, such as torch.tensor(False)"
+        )
+
+
+def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple, entries=()):
+    """Run a method on a copy: the buffers it changed and read, and its outputs.
+
+    ``entries`` are every entry point's ``(method name, example arguments)``,
+    for checking the method's changes outside its buffers.
+    """
     probe = copy.deepcopy(model).eval()
+    initial = copy.deepcopy(probe)
+    slots = _buffer_slots(probe)
     attributes = _attributes(probe)
     before = {
         name: (buffer, buffer._version, buffer.detach().clone())
@@ -559,6 +718,7 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
     finally:
         for module in probe.modules():
             module.__dict__["_buffers"] = dict(dict.items(module.__dict__["_buffers"]))
+    _reject_none_buffers(method_name, slots, _buffer_slots(probe))
     for name, registered in aliases.items():
         if len({id(_get_buffer(probe, alias)) for alias in registered}) > 1:
             raise UnsupportedModelError(
@@ -568,9 +728,12 @@ def _changed_buffers(model: nn.Module, method_name: str, arguments: tuple):
                 "place (self.mem.mul_(0.5).add_(x)), which keeps the names together"
             )
     after = dict(probe.named_buffers())
-    # Buffers are compared below; a second call (for Python values) runs on
-    # a copy, so it doesn't change what is compared.
-    _check_attributes(copy.deepcopy(probe), method_name, arguments, attributes)
+    # Buffers are compared below; the later calls that check attributes run
+    # on copies, so they don't change what is compared.
+    _check_attributes(
+        initial, probe, method_name, arguments, attributes,
+        tuple(entries) or ((method_name, arguments),),
+    )
     changed = {}
     for name, (buffer, version, values) in before.items():
         current = after.get(name)
@@ -591,14 +754,9 @@ def _rewritten_rows(model: nn.Module, method_name: str, arguments: tuple, names)
     state, often empty, can't show whether the method also rewrites or
     shifts the old rows, as ``cat([decay * old, new])`` or prepending does.
     """
-    from cattorch.dynamic import varied_at_length
-
     probe = copy.deepcopy(model).eval()
     # Other values the second time, so the rows it adds look different.
-    others = tuple(
-        varied_at_length(value, 0, value.shape[0], seed=1) if value.ndim else value + 1
-        for value in arguments
-    )
+    others = _other_arguments(arguments)
     _call_method(probe, method_name, copy.deepcopy(arguments), arguments)
     first = {name: _get_buffer(probe, name).detach().clone() for name in names}
     _call_method(probe, method_name, others, others, again=True)
@@ -620,6 +778,34 @@ def _memory_span(value: torch.Tensor) -> tuple[int, int, int] | None:
     return value.untyped_storage().data_ptr(), start, start + extent * size
 
 
+_EXACT_OVERLAP_LIMIT = 1 << 22
+
+
+def _element_bytes(value: torch.Tensor) -> torch.Tensor:
+    """The byte offset in its storage of each element of ``value``, sorted."""
+    offsets = torch.tensor([value.storage_offset()], dtype=torch.int64)
+    for length, step in zip(value.shape, value.stride()):
+        offsets = (offsets.unsqueeze(-1) + torch.arange(length, dtype=torch.int64) * step).flatten()
+    return torch.unique(offsets * value.element_size())
+
+
+def _overlap(first: torch.Tensor, second: torch.Tensor, spans) -> tuple[bool, bool]:
+    """``(whether two tensors share an element, whether ``first``'s are all
+    ``second``'s)``. Strided views can interleave without sharing one, as
+    the columns ``base[:, 0]`` and ``base[:, 1]`` do."""
+    mine, other = spans
+    if not (other[1] < mine[2] and mine[1] < other[2]):
+        return False, False
+    if (
+        first.element_size() == second.element_size()
+        and first.numel() + second.numel() <= _EXACT_OVERLAP_LIMIT
+    ):
+        own, others = _element_bytes(first), _element_bytes(second)
+        shared = torch.isin(own, others)
+        return bool(shared.any()), bool(shared.all())
+    return True, other[1] <= mine[1] and mine[2] <= other[2]
+
+
 def _reject_shared_memory(model: nn.Module, state_names) -> None:
     """Reject a state whose memory another buffer or parameter also uses.
 
@@ -633,6 +819,7 @@ def _reject_shared_memory(model: nn.Module, state_names) -> None:
         for name, value in named
     ]
     spans = {name: _memory_span(value) for _, name, value in tensors}
+    values = {name: value for _, name, value in tensors}
     for state in state_names:
         mine = spans.get(state)
         if mine is None:
@@ -641,8 +828,8 @@ def _reject_shared_memory(model: nn.Module, state_names) -> None:
             other = spans[name]
             if name == state or other is None or other[0] != mine[0]:
                 continue
-            if other[1] < mine[2] and mine[1] < other[2]:
-                inside = other[1] <= mine[1] and mine[2] <= other[2]
+            shared, inside = _overlap(values[state], values[name], (mine, other))
+            if shared:
                 inner, outer = (state, name) if inside else (name, state)
                 raise UnsupportedModelError(
                     f"buffer {state!r} shares memory with {kind} {name!r} ({inner!r} is a "
@@ -695,7 +882,8 @@ def marked_program(model: nn.Module) -> MarkedProgram:
     plans = []
     modes: dict[str, str] = {}
     capacities: dict[str, int] = {}
-    for method_name, function, options in methods:
+    examples = {}
+    for method_name, _, options in methods:
         source = options["example_inputs"]
         if source is None and method_name == "forward":
             source = marker(type(model), "example") and marker(type(model), "example")["inputs"]
@@ -704,9 +892,11 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                 f"@entrypoint {method_name} needs example_inputs=, the arguments to "
                 "export it with"
             )
-        arguments = _arguments(source)
-        if any(not isinstance(value, torch.Tensor) for value in arguments):
+        examples[method_name] = _arguments(source)
+        if any(not isinstance(value, torch.Tensor) for value in examples[method_name]):
             raise UnsupportedModelError(f"@entrypoint {method_name}'s example arguments must be tensors")
+    for method_name, function, options in methods:
+        arguments = examples[method_name]
         parameters = [
             parameter.name for parameter in inspect.signature(function).parameters.values()
         ][1:]
@@ -716,7 +906,9 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                 f"@entrypoint {method_name} has {len(input_names)} input_names for "
                 f"{len(arguments)} example inputs"
             )
-        changed, reads, result = _changed_buffers(model, method_name, arguments)
+        changed, reads, result = _changed_buffers(
+            model, method_name, arguments, tuple(examples.items()),
+        )
         for name in options["capacity"]:
             if name not in buffers:
                 raise UnsupportedModelError(
@@ -777,6 +969,12 @@ def marked_program(model: nn.Module) -> MarkedProgram:
                     + ", ".join(dropped) + ")",
                     stacklevel=3,
                 )
+        if not outputs and not set(changed) & set(buffers):
+            raise UnsupportedModelError(
+                f"@entrypoint {method_name} returns no tensor and changes no buffer, so its "
+                "block would do nothing. Return a tensor, or update a buffer, which "
+                "becomes state"
+            )
         output_names = options["output_names"] or tuple(
             output_name(index) for index in range(len(outputs))
         )
@@ -840,7 +1038,9 @@ class _GuardedBuffers(dict):
     """
 
     def __init__(self, values, forbidden, method_name):
-        super().__init__(values)
+        # ``dict.items``, not ``values.items``: copying another guard through
+        # its overrides would refuse every guarded key.
+        super().__init__(dict.items(values))
         self._forbidden, self._method = forbidden, method_name
 
     def _refuse(self, key) -> None:
@@ -893,7 +1093,10 @@ def _entry_method(method_name: str, inputs: int, states, changed, aliases, unuse
         for name, names in unused.items():
             for alias in names:
                 owner, leaf = _buffer_owner(self, alias)
-                guarded.setdefault(id(owner), (owner, {}))[1][leaf] = name
+                # By the module's ``__dict__``: while PyTorch traces, one
+                # module reached under two names (self.a = self.b = Counter())
+                # comes back as two objects sharing it.
+                guarded.setdefault(id(owner.__dict__), (owner, {}))[1][leaf] = name
         for owner, forbidden in guarded.values():
             owner.__dict__["_buffers"] = _GuardedBuffers(owner._buffers, forbidden, method_name)
         try:

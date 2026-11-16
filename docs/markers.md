@@ -97,16 +97,29 @@ named after its parameter (`NAME add value`) and a list per output
   tensor registered under several names, by the model and a submodule, is
   one state, as long as the method updates it in place; reassigning it
   under one of its names fails the export.
-- Only buffers become state. An entry point that changes a parameter, a
-  tensor kept as a plain attribute (`self.total = torch.zeros(3)` in
-  `__init__`, then `self.total = self.total + x`), or a tensor in a list or
-  dictionary attribute, of the model or a submodule, fails the export:
-  register the tensor with `register_buffer` instead. So does one that
-  changes a Python value on every call, such as `self.count += 1` with an
-  `int` or appending to a list, since a Python value is fixed when the method
-  is traced; keep it in a buffer such as `torch.tensor(0)`. A Python value
-  changed on the first call only, such as a cache filled once, gives a
-  warning: the sprite runs every call as that first call.
+- A state is a list of numbers from the start: a buffer registered as
+  `None` that a method sets to a tensor, or one a method sets to `None`,
+  fails the export. Give the buffer an initial tensor, and keep whether it
+  has been set in another buffer, such as `torch.tensor(False)`. A method
+  that returns no tensor and changes no buffer fails too, since its block
+  would do nothing.
+- Only buffers become state. Every entry point is traced from the model as
+  you gave it, so the sprite runs every call of every entry point as a
+  first call, from the initial values of everything else. An entry point
+  that changes a parameter fails the export, and so does one that changes,
+  on every call, a tensor kept as a plain attribute
+  (`self.total = torch.zeros(3)` in `__init__`, then
+  `self.total = self.total + x`), a tensor in a list or dictionary
+  attribute, or a Python value such as `self.count += 1` with an `int` or
+  appending to a list, of the model or a submodule; cattorch calls the
+  method a second time, with other inputs, to tell. Register a tensor with
+  `register_buffer` instead, and keep a number in a buffer such as
+  `torch.tensor(0)`. A change made on the first call only, such as a cache
+  filled once, or the weight old-style `nn.utils.spectral_norm` computes on
+  its first forward, is allowed if later calls of every entry point give
+  what they would give from the initial values, with a warning; one that
+  changes their results, as `self.scale = 2.0` read by another entry point
+  does, fails the export.
 
 `marked_program(model)` returns a `MarkedProgram`: the export copy of the
 model and the
