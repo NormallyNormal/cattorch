@@ -10,7 +10,6 @@ import hashlib
 import random
 import statistics
 import tempfile
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,21 +25,21 @@ from cattorch.storage import StorageConfig
 from cattorch.quantization import QuantizationConfig
 from cattorch.program import GenerationProgram, RecurrentGenerationProgram
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.procedures import _add_warp_procedure, _merge_lists_by_name
 from cattorch.transpiler import transpile
 from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
-    Program, append, broadcast_and_wait, change_var, clear, join, repeat, reset_timer, set_var,
-    timer, var,
+    Program, append, broadcast_and_wait, change_var, clear, for_each, join, length, repeat,
+    reset_timer, set_var, timer, var,
 )
+from cattorch.util.scratch.dsl import item as item_of
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.archive import (
     PROJECT_JSON, read_archive, read_user_archive, write_archive,
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
-from cattorch.util.scratch.interface import (
-    logical_list_chunks, read_logical_list, write_sprite_list,
-)
+from cattorch.util.scratch.globals import install
+from cattorch.util.scratch.interface import read_logical_list
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 from cattorch.interface import input_name
 from cattorch.interface import TOKEN_IDS
 
@@ -55,11 +54,13 @@ STORAGE_SIZES = "cattorch storage sizes"
 REPEATS = "cattorch benchmark repeats"
 WARMUPS = "cattorch benchmark warmups"
 COMPARISON = "cattorch benchmark comparison"
-# Internal names: the broadcasts and blocks that run each variant.
-_PAIRED_EXACT = "_cattorch benchmark exact"
-_PAIRED_FAST = "_cattorch benchmark fast"
-_BENCHMARK_DECODE = "_cattorch benchmark decode"
-_RESTORE_INPUT = "_cattorch restore benchmark input"
+# The internal stage lists a storage benchmark restores each case's inputs
+# from, and a generation benchmark its prompts.
+_SAVED_INPUT = "_cattorch benchmark saved {}"
+_PROMPT = "_cattorch benchmark prompt {}"
+_COPY_INDEX = "_cattorch benchmark copy index"
+# The sprites of a paired benchmark.
+_PAIRED_NAMES = {"exact": "cattorch exact", "fast": "cattorch fast"}
 STORAGE_VARIANTS = (
     "plain-f32", "base92-f32", "base92-f16", "base92-int8", "base92-int6",
     "base92-int4-huffman",
@@ -70,98 +71,71 @@ def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
     return read_archive(path)
 
 
-def _set_inputs(sprite: dict, example_inputs: tuple[torch.Tensor, ...]) -> None:
+def _input_values(sprite_name: str, example_inputs: tuple[torch.Tensor, ...]) -> dict:
+    """The values the sprite's input globals start with, shard by shard, by name."""
+    values = {}
     for index, tensor in enumerate(example_inputs):
-        write_sprite_list(
-            sprite, input_name(index),
-            tensor.detach().cpu().flatten().tolist(),
+        flat = tensor.detach().cpu().flatten().tolist()
+        name = interface.global_name(sprite_name, input_name(index))
+        for position in range(max(1, -(-len(flat) // SCRATCH_LIST_LIMIT))):
+            values[interface.shard_name(name, position)] = (
+                flat[position * SCRATCH_LIST_LIMIT:(position + 1) * SCRATCH_LIST_LIMIT]
+            )
+    return values
+
+
+def _calls(sprite_name: str, actions) -> dict:
+    """The stage statements each ``(label, block)`` runs: a ``broadcast and wait`` of its message."""
+    return {
+        label: (broadcast_and_wait(interface.message(sprite_name, block)),)
+        for label, block in actions
+    }
+
+
+def _copy_list(source: str, target: str) -> tuple:
+    return (
+        clear(target),
+        for_each(_COPY_INDEX, length(source), (append(target, item_of(source, var(_COPY_INDEX))),)),
+    )
+
+
+class _Project:
+    """A benchmark project's stage, sprites and assets as they are added."""
+
+    def __init__(self) -> None:
+        self.stage, self.stage_md5ext, self.stage_bytes = _stage_target({}, {}, {})
+        self.sprites: list[dict] = []
+        self.assets: dict[str, bytes] = {}
+
+    def add(self, sprite: dict, assets: dict[str, bytes], values=None) -> None:
+        """Add an exported sprite, declaring its globals on the stage, hidden."""
+        install(self.stage, sprite, values)
+        sprite["visible"] = False
+        sprite["layerOrder"] = len(self.sprites) + 1
+        self.sprites.append(sprite)
+        self.assets.update(assets)
+
+    def stage_list(self, name: str, values=()) -> str:
+        identifier = f"cattorch_benchmark_list_{len(self.stage['lists'])}"
+        self.stage["lists"][identifier] = [name, list(values)]
+        return identifier
+
+    def finish(self, statements, variables=None) -> None:
+        """Give the stage its green-flag script and its own variables."""
+        self.stage["variables"].update(variables or {})
+        self.stage["variables"]["cattorch_benchmark_copy_index"] = [_COPY_INDEX, 0]
+        self.stage["blocks"] = _stage_blocks(
+            statements,
+            {name: identifier for identifier, name in self.stage["broadcasts"].items()},
+            {entry[0]: identifier for identifier, entry in self.stage["lists"].items()},
+            {entry[0]: identifier for identifier, entry in self.stage["variables"].items()},
         )
 
-
-def _add_input_restore_procedure(
-    sprite: dict,
-    example_inputs: tuple[torch.Tensor, ...],
-) -> None:
-    """Add an untimed benchmark-only procedure that restores model inputs."""
-    from cattorch.util.scratch.dsl import Program, append, clear, for_each, item, length, var
-
-    values = {
-        input_name(index): tensor.detach().cpu().flatten().tolist()
-        for index, tensor in enumerate(example_inputs)
-    }
-    body = []
-    data = {entry[0]: entry[1] for entry in sprite.get("lists", {}).values()}
-    backups = {}
-    used_lists = set()
-    index = "_cattorch benchmark restore index"
-    for name, items in values.items():
-        for physical, chunk in logical_list_chunks(data, name, items):
-            backup = f"_cattorch benchmark saved {physical}"
-            backups[backup] = chunk
-            used_lists.update((physical, backup))
-            body.extend((
-                clear(physical),
-                for_each(index, length(backup), (append(physical, item(backup, var(index))),)),
-            ))
-    _add_warp_procedure(
-        sprite,
-        _RESTORE_INPUT,
-        Program(
-            "restore_benchmark_input", lists=used_lists,
-            variables=(index,), body=body,
-        ),
-        x=640,
-        y=800,
-    )
-    _merge_lists_by_name(sprite, used_lists)
-    for name, items in backups.items():
-        write_sprite_list(sprite, name, items)
-
-
-def _add_cached_decode_procedure(sprite: dict, token: int) -> None:
-    """Install a benchmark decode call with a valid one-token model input."""
-    from cattorch.util.scratch.dsl import Program, append, call, clear
-
-    _add_warp_procedure(
-        sprite,
-        _BENCHMARK_DECODE,
-        Program(
-            "cached_benchmark_decode",
-            lists=(TOKEN_IDS,),
-            body=(
-                clear(TOKEN_IDS),
-                append(TOKEN_IDS, int(token)),
-                call("cattorch decode"),
-            ),
-        ),
-        x=640,
-        y=960,
-    )
-    _merge_lists_by_name(sprite, {TOKEN_IDS})
-
-
-def _add_broadcast_entry(
-    sprite: dict,
-    message: str,
-    broadcast_id: str,
-    procedure: str = interface.FORWARD,
-) -> None:
-    prefix = f"cattorch_benchmark_{uuid.uuid4().hex[:8]}"
-    event_id = f"{prefix}_event"
-    call_id = f"{prefix}_call"
-    sprite["blocks"][event_id] = {
-        "opcode": "event_whenbroadcastreceived", "next": call_id, "parent": None,
-        "inputs": {}, "fields": {"BROADCAST_OPTION": [message, broadcast_id]},
-        "shadow": False, "topLevel": True, "x": 640, "y": 0,
-    }
-    sprite["blocks"][call_id] = {
-        "opcode": "procedures_call", "next": None, "parent": event_id,
-        "inputs": {}, "fields": {}, "shadow": False, "topLevel": False,
-        "mutation": {
-            "tagName": "mutation", "children": [],
-            "proccode": procedure, "argumentids": "[]",
-        },
-    }
+    def write(self, output_path: Path, description: str, monitors=None) -> Path:
+        return _write_project(
+            output_path, self.stage, self.sprites, self.assets,
+            (self.stage_md5ext, self.stage_bytes), description, monitors=monitors,
+        )
 
 
 def _stage_blocks(
@@ -198,18 +172,19 @@ def _timed(label: str) -> object:
 
 def _paired_statements(warmups: int, repeats: int) -> list:
     """Alternate the exact and fast sprites, recording each forward's time."""
-    exact, fast = _PAIRED_EXACT, _PAIRED_FAST
+    exact = broadcast_and_wait(interface.message(_PAIRED_NAMES["exact"], interface.FORWARD))
+    fast = broadcast_and_wait(interface.message(_PAIRED_NAMES["fast"], interface.FORWARD))
     statements = [
         clear(EXACT_TIMINGS), clear(FAST_TIMINGS),
-        repeat(warmups, (broadcast_and_wait(exact), broadcast_and_wait(fast))),
+        repeat(warmups, (exact, fast)),
     ]
     for index in range(repeats):
         order = (
             ((exact, EXACT_TIMINGS), (fast, FAST_TIMINGS)) if index % 2 == 0
             else ((fast, FAST_TIMINGS), (exact, EXACT_TIMINGS))
         )
-        for message, timings in order:
-            statements += [reset_timer(), broadcast_and_wait(message), append(timings, timer())]
+        for call, timings in order:
+            statements += [reset_timer(), call, append(timings, timer())]
     return statements
 
 
@@ -218,13 +193,13 @@ def _suite_statements(cases: list[dict], repeats: int, warmups: int, variants) -
     statements = [clear(SUITE_RESULTS)]
     for case in cases:
         for variant in variants:
-            messages = case[variant]
-            statements.append(broadcast_and_wait(messages["init"]))
+            calls = case[variant]
+            statements += calls["init"]
             if warmups:
-                statements.append(repeat(warmups, (broadcast_and_wait(messages["forward"]),)))
+                statements.append(repeat(warmups, calls["forward"]))
             statements += [
                 reset_timer(),
-                repeat(repeats, (broadcast_and_wait(messages["forward"]),)),
+                repeat(repeats, calls["forward"]),
                 append(SUITE_RESULTS, _timed(f"{case['name']} {variant}")),
             ]
     return statements
@@ -239,24 +214,21 @@ def _storage_statements(cases: list[dict], repeats: int, warmups: int) -> list:
     statements = [clear(SUITE_RESULTS)]
     for case in cases:
         for variant in STORAGE_VARIANTS:
-            messages = case[variant]
+            calls = case[variant]
             total = _storage_total(case, variant)
             statements += [
                 set_var(total, 0),
                 repeat(repeats, (
-                    broadcast_and_wait(messages["prepare"]),
+                    *calls["prepare"],
                     reset_timer(),
-                    broadcast_and_wait(messages["init"]),
+                    *calls["init"],
                     change_var(total, timer()),
                 )),
                 append(SUITE_RESULTS, join(f"{case['name']} {variant} init: ", var(total))),
-                broadcast_and_wait(messages["restore"]),
-                *(
-                    (repeat(warmups, (broadcast_and_wait(messages["forward"]),)),)
-                    if warmups else ()
-                ),
+                *calls["restore"],
+                *((repeat(warmups, calls["forward"]),) if warmups else ()),
                 reset_timer(),
-                repeat(repeats, (broadcast_and_wait(messages["forward"]),)),
+                repeat(repeats, calls["forward"]),
                 append(SUITE_RESULTS, _timed(f"{case['name']} {variant} forward")),
             ]
     return statements
@@ -380,18 +352,20 @@ def _check_counts(repeats: int, warmups: int) -> None:
 
 
 def _export_variant(
-    model, example_inputs, base: Path, *, optimization: str, options: dict, extra_kernels=(),
+    model, example_inputs, base: Path, *, name: str, optimization: str, options: dict,
+    extra_kernels=(),
 ) -> tuple[dict, dict[str, bytes]]:
-    """Export one variant of a case and load its sprite, inputs filled in."""
+    """Export one variant of a case as the sprite ``name`` and load it.
+
+    The sprite's messages and globals are named after it, so the project
+    keeps the name.
+    """
     options = dict(options)
     if optimization != "fast":
         options.pop("fast_config")
     options["kernels"] = (*options["kernels"], *extra_kernels)
-    transpile(model, example_inputs, str(base), optimization=optimization, **options)
-    sprite, assets = _load_sprite(base.with_suffix(".sprite3"))
-    if not isinstance(example_inputs, (GenerationProgram, RecurrentGenerationProgram)):
-        _set_inputs(sprite, example_inputs)
-    return sprite, assets
+    transpile(model, example_inputs, str(base), name=name, optimization=optimization, **options)
+    return _load_sprite(base.with_suffix(".sprite3"))
 
 
 def _stage_settings(repeats: int, warmups: int, comparison: str | None = None) -> dict:
@@ -517,49 +491,35 @@ def _build_suite(
     _check_names([case[0] for case in normalized_cases])
     output_path = Path(output_file(output_path, ".sb3"))
 
-    broadcasts: dict[str, str] = {}
+    project = _Project()
     controller_cases: list[dict] = []
-    sprites: list[dict] = []
-    assets: dict[str, bytes] = {}
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
         for index, (name, model, example_inputs, case_options) in enumerate(normalized_cases):
             controller_case = {"name": name}
             for variant, optimization, extra_kernels in variants:
+                sprite_name = f"{name} {variant}"
                 sprite, sprite_assets = _export_variant(
-                    model, example_inputs, temp / f"case_{index}_{variant}",
+                    model, example_inputs, temp / f"case_{index}_{variant}", name=sprite_name,
                     optimization=optimization, options=case_options,
                     extra_kernels=extra_kernels,
                 )
-                sprite["name"] = f"{name} {variant}"
-                sprite["layerOrder"] = len(sprites) + 1
-                sprite["visible"] = False
-                controller_case[variant] = _add_entries(
-                    sprite, broadcasts, f"suite {index} {variant}",
-                    (("init", interface.INIT), ("forward", interface.FORWARD)),
+                project.add(sprite, sprite_assets, _input_values(sprite_name, example_inputs))
+                controller_case[variant] = _calls(
+                    sprite_name, (("init", interface.INIT), ("forward", interface.FORWARD)),
                 )
-                sprites.append(sprite)
-                assets.update(sprite_assets)
             controller_cases.append(controller_case)
 
-    results_id = "cattorch_benchmark_suite_results"
-    stage_blocks = _stage_blocks(
+    results_id = project.stage_list(SUITE_RESULTS)
+    project.finish(
         _suite_statements(
-            controller_cases, repeats, warmups,
-            tuple(variant for variant, _, _ in variants),
+            controller_cases, repeats, warmups, tuple(variant for variant, _, _ in variants),
         ),
-        broadcasts, {SUITE_RESULTS: results_id},
-    )
-    stage, stage_md5ext, stage_bytes = _stage_target(
-        stage_blocks,
-        broadcasts,
-        {results_id: [SUITE_RESULTS, []]},
         _stage_settings(repeats, warmups, variants[-1][0]),
     )
-    return _write_project(
-        output_path, stage, sprites, assets, (stage_md5ext, stage_bytes),
-        "Benchmark suite", monitors=[_results_monitor(results_id, SUITE_RESULTS, [])],
+    return project.write(
+        output_path, "Benchmark suite", monitors=[_results_monitor(results_id, SUITE_RESULTS, [])],
     )
 
 
@@ -568,18 +528,10 @@ def _check_names(names: list) -> None:
         raise ValueError("benchmark case names must be non-empty strings")
     if len(set(names)) != len(names):
         raise ValueError("benchmark case names must be unique")
-
-
-def _add_entries(sprite: dict, broadcasts: dict[str, str], prefix: str, actions) -> dict:
-    """Run each ``(label, procedure)`` on a broadcast of its own; return the messages."""
-    messages = {}
-    for label, procedure in actions:
-        message = f"_cattorch {prefix} {label}"
-        identifier = "cattorch_" + "_".join(message.split()[1:])
-        broadcasts[message] = identifier
-        _add_broadcast_entry(sprite, message, identifier, procedure)
-        messages[label] = message
-    return messages
+    for name in names:
+        # Each case's sprites are named "NAME VARIANT", after which their
+        # globals and messages are named.
+        interface.check_export_name(name)
 
 
 def _generation_baseline(model, program, tokens: torch.Tensor):
@@ -667,10 +619,8 @@ def build_generation_benchmark_suite(
             )
     _check_names([case[0] for case in cases])
     output_path = Path(output_file(output_path, ".sb3"))
-    broadcasts: dict[str, str] = {}
+    project = _Project()
     controller_cases = []
-    sprites = []
-    assets: dict[str, bytes] = {}
     optimization = "fast" if fast_config is not None else "exact"
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -680,55 +630,47 @@ def build_generation_benchmark_suite(
             token = int(prompt[0, -1])
             tokens = torch.cat((prompt, prompt[:, -1:]), dim=1)
             controller = {"name": name}
+            cached_name, stateless_name = f"{name} cached", f"{name} stateless"
             # The program first: a model it can't export fails with the
             # export's own message.
             cached, cached_assets = _export_variant(
-                model, program, temp / f"generation_{index}_cached",
+                model, program, temp / f"generation_{index}_cached", name=cached_name,
                 optimization=optimization, options=options,
             )
             stateless, stateless_assets = _export_variant(
                 _generation_baseline(model, program, tokens), (tokens,),
-                temp / f"generation_{index}_stateless", optimization=optimization,
-                options=options,
+                temp / f"generation_{index}_stateless", name=stateless_name,
+                optimization=optimization, options=options,
             )
-            stateless["name"] = f"{name} stateless"
-            stateless["visible"] = False
-            stateless["layerOrder"] = len(sprites) + 1
-            controller["stateless"] = _add_entries(
-                stateless, broadcasts, f"generation {index} stateless",
-                (("init", interface.INIT), ("forward", interface.FORWARD)),
+            project.add(stateless, stateless_assets, _input_values(stateless_name, (tokens,)))
+            controller["stateless"] = _calls(
+                stateless_name, (("init", interface.INIT), ("forward", interface.FORWARD)),
             )
-            sprites.append(stateless)
-            assets.update(stateless_assets)
-
-            write_sprite_list(cached, TOKEN_IDS, prompt.flatten().tolist())
-            _add_cached_decode_procedure(cached, token)
-            cached["name"] = f"{name} cached"
-            cached["visible"] = False
-            cached["layerOrder"] = len(sprites) + 1
+            project.add(cached, cached_assets)
+            ids = interface.global_name(cached_name, TOKEN_IDS)
+            saved = _PROMPT.format(index)
+            project.stage_list(saved, prompt.flatten().tolist())
             # The prefill, which decodes the weights, is outside the timer.
-            controller["cached"] = _add_entries(
-                cached, broadcasts, f"generation {index} cached",
-                (("init", interface.PREFILL), ("forward", _BENCHMARK_DECODE)),
-            )
-            sprites.append(cached)
-            assets.update(cached_assets)
+            controller["cached"] = {
+                "init": (
+                    *_copy_list(saved, ids),
+                    broadcast_and_wait(interface.message(cached_name, interface.PREFILL)),
+                ),
+                "forward": (
+                    clear(ids), append(ids, token),
+                    broadcast_and_wait(interface.message(cached_name, interface.DECODE)),
+                ),
+            }
             controller_cases.append(controller)
 
-    results_id = "cattorch_generation_benchmark_results"
-    stage_blocks = _stage_blocks(
+    results_id = project.stage_list(SUITE_RESULTS)
+    project.finish(
         _suite_statements(controller_cases, repeats, warmups, ("stateless", "cached")),
-        broadcasts, {SUITE_RESULTS: results_id},
-    )
-    stage, stage_md5ext, stage_bytes = _stage_target(
-        stage_blocks,
-        broadcasts,
-        {results_id: [SUITE_RESULTS, []]},
         _stage_settings(repeats, warmups, "cached"),
     )
-    return _write_project(
-        output_path, stage, sprites, assets, (stage_md5ext, stage_bytes),
-        "Generation benchmark suite", monitors=[_results_monitor(results_id, SUITE_RESULTS, [])],
+    return project.write(
+        output_path, "Generation benchmark suite",
+        monitors=[_results_monitor(results_id, SUITE_RESULTS, [])],
     )
 
 
@@ -783,10 +725,8 @@ def build_storage_benchmark_suite(
             StorageConfig(compression=True), QuantizationConfig(bits=4),
         ),
     }
-    broadcasts: dict[str, str] = {}
+    project = _Project()
     controller_cases = []
-    sprites = []
-    assets: dict[str, bytes] = {}
     sizes = []
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -795,8 +735,9 @@ def build_storage_benchmark_suite(
             controller = {"name": name, "index": index}
             for variant, (variant_storage, variant_quantization) in variants.items():
                 base = temp / f"storage_{index}_{variant}"
+                sprite_name = f"{name} {variant}"
                 sprite, sprite_assets = _export_variant(
-                    model, example_inputs, base, optimization=optimization,
+                    model, example_inputs, base, name=sprite_name, optimization=optimization,
                     options={
                         **options, "storage": variant_storage,
                         "quantization": variant_quantization,
@@ -804,53 +745,40 @@ def build_storage_benchmark_suite(
                 )
                 sprite_path = base.with_suffix(".sprite3")
                 sizes.append(f"{name} {variant}: {sprite_path.stat().st_size} bytes")
-                _add_input_restore_procedure(sprite, example_inputs)
-                sprite["name"] = f"{name} {variant}"
-                sprite["visible"] = False
-                sprite["layerOrder"] = len(sprites) + 1
-                controller[variant] = _add_entries(
-                    sprite, broadcasts, f"storage {index} {variant}",
-                    (
+                values = _input_values(sprite_name, example_inputs)
+                project.add(sprite, sprite_assets, values)
+                # The inputs are copied back from saved lists before the
+                # forwards, as they were when the sprite was exported.
+                restore: list = []
+                for physical, chunk in values.items():
+                    saved = _SAVED_INPUT.format(physical)
+                    project.stage_list(saved, chunk)
+                    restore += _copy_list(saved, physical)
+                controller[variant] = {
+                    **_calls(sprite_name, (
                         ("prepare", interface.PREPARE_FOR_SAVE),
                         ("init", interface.INIT),
-                        ("restore", _RESTORE_INPUT),
                         ("forward", interface.FORWARD),
-                    ),
-                )
-                sprites.append(sprite)
-                assets.update(sprite_assets)
+                    )),
+                    "restore": tuple(restore),
+                }
             controller_cases.append(controller)
 
-    results_id = "cattorch_storage_benchmark_results"
-    sizes_id = "cattorch_storage_benchmark_sizes"
+    results_id = project.stage_list(SUITE_RESULTS)
+    sizes_id = project.stage_list(STORAGE_SIZES, sizes)
     totals = {
         _storage_total(case, variant): f"cattorch_storage_total_{case['index']}_{variant}"
         for case in controller_cases
         for variant in variants
     }
-    stage_blocks = _stage_blocks(
-        _storage_statements(controller_cases, repeats, warmups), broadcasts,
-        {SUITE_RESULTS: results_id, STORAGE_SIZES: sizes_id}, totals,
-    )
     stage_variables = {identifier: [name, 0] for name, identifier in totals.items()}
     stage_variables.update(_stage_settings(repeats, warmups))
-    stage, stage_md5ext, stage_bytes = _stage_target(
-        stage_blocks,
-        broadcasts,
-        {
-            results_id: [SUITE_RESULTS, []],
-            sizes_id: [STORAGE_SIZES, sizes],
-        },
-        stage_variables,
-    )
+    project.finish(_storage_statements(controller_cases, repeats, warmups), stage_variables)
     monitors = [
         _results_monitor(results_id, SUITE_RESULTS, [], height=250, x=10),
         _results_monitor(sizes_id, STORAGE_SIZES, sizes, height=250, x=480),
     ]
-    return _write_project(
-        output_path, stage, sprites, assets, (stage_md5ext, stage_bytes),
-        "Storage benchmark suite", monitors=monitors,
-    )
+    return project.write(output_path, "Storage benchmark suite", monitors=monitors)
 
 
 def build_paired_benchmark(
@@ -888,40 +816,20 @@ def build_paired_benchmark(
     example_inputs = _normalise_inputs(model, example_inputs)
     output_path = Path(output_file(output_path, ".sb3"))
 
+    project = _Project()
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
-        exact, exact_assets = _export_variant(
-            model, example_inputs, temp / "exact", optimization="exact", options=options,
-        )
-        fast, fast_assets = _export_variant(
-            model, example_inputs, temp / "fast", optimization="fast", options=options,
-        )
-
-    messages = {_PAIRED_EXACT: "cattorch_broadcast_exact", _PAIRED_FAST: "cattorch_broadcast_fast"}
-    _add_broadcast_entry(exact, _PAIRED_EXACT, messages[_PAIRED_EXACT])
-    _add_broadcast_entry(fast, _PAIRED_FAST, messages[_PAIRED_FAST])
-    exact["name"] = "cattorch exact"
-    fast["name"] = "cattorch fast"
-    exact["layerOrder"] = 1
-    fast["layerOrder"] = 2
-
-    timing_ids = {
-        EXACT_TIMINGS: "cattorch_benchmark_exact_timings",
-        FAST_TIMINGS: "cattorch_benchmark_fast_timings",
-    }
-    stage, stage_md5ext, stage_bytes = _stage_target(
-        _stage_blocks(_paired_statements(warmups, repeats), messages, timing_ids),
-        messages,
-        {
-            timing_ids[EXACT_TIMINGS]: [EXACT_TIMINGS, []],
-            timing_ids[FAST_TIMINGS]: [FAST_TIMINGS, []],
-        },
-        _stage_settings(repeats, warmups, "fast"),
-    )
-    return _write_project(
-        output_path, stage, [exact, fast], {**exact_assets, **fast_assets},
-        (stage_md5ext, stage_bytes), "Paired benchmark",
-    )
+        for variant in ("exact", "fast"):
+            name = _PAIRED_NAMES[variant]
+            sprite, assets = _export_variant(
+                model, example_inputs, temp / variant, name=name, optimization=variant,
+                options=options,
+            )
+            project.add(sprite, assets, _input_values(name, example_inputs))
+    for list_name in (EXACT_TIMINGS, FAST_TIMINGS):
+        project.stage_list(list_name)
+    project.finish(_paired_statements(warmups, repeats), _stage_settings(repeats, warmups, "fast"))
+    return project.write(output_path, "Paired benchmark")
 
 
 @dataclass(frozen=True)
@@ -1014,10 +922,19 @@ def _project_identity(path: str | Path) -> dict:
     }
 
 
-def _target_output(target: dict) -> list[float]:
-    output = read_logical_list(
-        {entry[0]: entry[1] for entry in target.get("lists", {}).values()}, "output",
-    )
+def _target_output(target: dict, stage: dict) -> list[float]:
+    """The values a case's sprite left in its output: the global ``NAME output``.
+
+    A project from before 1.0 has them in the sprite's own ``output`` list.
+    """
+    stage_lists = {entry[0]: entry[1] for entry in stage.get("lists", {}).values()}
+    name = interface.global_name(target.get("name", ""), "output")
+    if name in stage_lists:
+        output = read_logical_list(stage_lists, name)
+    else:
+        output = read_logical_list(
+            {entry[0]: entry[1] for entry in target.get("lists", {}).values()}, "output",
+        )
     try:
         return [float(item) for item in output]
     except (TypeError, ValueError) as error:
@@ -1038,7 +955,9 @@ def _setting(variables: dict, *names: str) -> int | None:
     return None
 
 
-def _compare_outputs(name, baseline, candidate, targets, baseline_variant, candidate_variant):
+def _compare_outputs(
+    name, baseline, candidate, targets, stage, baseline_variant, candidate_variant,
+):
     """The fields of a ``BenchmarkCase`` that compare the two sprites."""
     baseline_target = targets.get(f"{name} {baseline_variant}", {}) if name else targets.get(
         f"cattorch {baseline_variant}", {},
@@ -1046,8 +965,8 @@ def _compare_outputs(name, baseline, candidate, targets, baseline_variant, candi
     candidate_target = targets.get(f"{name} {candidate_variant}", {}) if name else targets.get(
         f"cattorch {candidate_variant}", {},
     )
-    baseline_output = _target_output(baseline_target)
-    candidate_output = _target_output(candidate_target)
+    baseline_output = _target_output(baseline_target, stage)
+    candidate_output = _target_output(candidate_target, stage)
     output_error = None
     output_length_match = None
     if baseline_output or candidate_output:
@@ -1112,7 +1031,8 @@ def _analyze_suite(path, project: dict, stage: dict, entries: list) -> Benchmark
             baseline_seconds=baseline,
             candidate_seconds=candidate,
             **_compare_outputs(
-                name, baseline, candidate, targets, baseline_variant, candidate_variant,
+                name, baseline, candidate, targets, stage, baseline_variant,
+                candidate_variant,
             ),
         ))
     return BenchmarkAnalysis(
@@ -1223,7 +1143,8 @@ def _analyze_paired(path, project: dict, stage: dict, by_name: dict) -> Benchmar
         candidate_timings=tuple(candidate),
         speedup_95_percent_interval=interval,
         **_compare_outputs(
-            "", baseline_median, candidate_median, targets, baseline_name, candidate_name,
+            "", baseline_median, candidate_median, targets, stage, baseline_name,
+            candidate_name,
         ),
     )
     return BenchmarkAnalysis(

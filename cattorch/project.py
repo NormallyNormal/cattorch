@@ -1,13 +1,16 @@
 """Assemble exported sprites into a complete, runnable Scratch project.
 
 ``build_project`` takes the results of ``transpile`` and ``transpile_tokenizer``
-and writes an ``.sb3`` with the sprites wired together. Each model or
-tokenizer sprite gets bridge scripts: a ``when I receive`` script per
-operation that copies global (stage) lists into the sprite's own lists, runs
-the operation, and copies the results back, so any sprite can drive it with
-``broadcast and wait``. A demo on top of the bridges makes the project
-runnable on its own: list monitors and a green-flag run for a model, or a
-prompt-and-continue loop for a text generator with its tokenizer.
+and writes an ``.sb3`` with the sprites in it. An exported sprite already
+has the interface a project uses: its messages (``NAME forward``, ...) and
+its global lists and variables (``NAME input``, ``NAME status``, ...), which
+the project declares on the stage, as uploading the sprite would, starting
+from the example inputs. A small Demo sprite, the one selected when the
+project opens (a model sprite is slow to show in the editor), makes the
+project runnable on its own: list monitors and a green-flag run for a model,
+or a prompt-and-continue loop for a text generator with its tokenizer, and
+holds the project's own extras: a classifier's ``NAME predict`` and a
+generator's ``NAME sample``.
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ from cattorch.results import (
 )
 from cattorch.procedures import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.tokenizer import TEXT_VARIABLE, TOKEN_IDS_LIST
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive
 from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
@@ -37,7 +39,6 @@ from cattorch.util.scratch.dsl import (
     append,
     ask,
     broadcast_and_wait,
-    call,
     change_var,
     clear,
     div,
@@ -60,28 +61,22 @@ from cattorch.util.scratch.dsl import (
     var,
 )
 from cattorch.util.scratch.finalize_scratch import online_json_size_warning
+from cattorch.util.scratch.globals import global_references, install
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 from cattorch import interface
-from cattorch.interface import (
-    STATUS_VARIABLE, bridge_procedure, completion, project_name, shard_name,
-)
+from cattorch.interface import STATUS_VARIABLE, completion, global_name, message, shard_name
 
 
-_INDEX = "_cattorch bridge index"
-_BEST = "_cattorch bridge best"
-# Set once the generation bridge has decoded the model's weights.
-_READY = "_cattorch bridge ready"
-_TOTAL = "_cattorch bridge total"
-_PICK = "_cattorch bridge pick"
+_INDEX = "_cattorch demo index"
+_BEST = "_cattorch demo best"
+_TOTAL = "_cattorch demo total"
+_PICK = "_cattorch demo pick"
+_DEMO = "Demo"
 _BACKDROP = (
     b'<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360">'
     b'<rect width="480" height="360" fill="#ffffff"/></svg>'
 )
-
-
-def _load_sprite(path: Path) -> tuple[dict, dict[str, bytes]]:
-    return read_archive(path)
 
 
 def _copy(source: str, target: str) -> tuple:
@@ -150,35 +145,77 @@ class _Builder:
         }
         self.sprites: list[dict] = []
         self.monitors: list[dict] = []
+        # The project's public messages, in order: each sprite's, then the
+        # project's own, each with its completion broadcast.
         self.messages: list[str] = []
         self.global_lists: dict[str, list] = {}
         self.global_variables: dict[str, object] = {}
+        # Who uses each global and sends each message, for the collision checks.
+        self._global_owners: list[tuple[str, str]] = []
+        self._message_owners: list[tuple[str, str]] = []
 
     # ── targets ────────────────────────────────────────────────────────────
 
-    def add_sprite(self, path: Path, *, visible: bool) -> dict:
-        sprite, assets = _load_sprite(path)
-        names = {target["name"] for target in self.sprites}
-        base, index = sprite["name"], 2
+    def add_sprite(self, path: Path, *, visible: bool, values=None) -> dict:
+        """Add an exported sprite, declaring its globals on the stage as an upload would.
 
-        def taken(name):
-            # Global data is named "<sprite> <list>", so a sprite called
-            # "cattorch" would collide with the sprites' own "cattorch ..."
-            # names. "Demo" is the demo sprite's name.
-            return (
-                name in names or name in {"Stage", "Demo"}
-                or name == "cattorch" or name.startswith(("cattorch ", "_cattorch"))
+        The sprite keeps its name, which its globals and messages start
+        with. ``values`` are the values its globals start with, by name; a
+        status and a tokenizer's text start empty.
+        """
+        sprite, assets = read_archive(path)
+        name = sprite["name"]
+        if name in {target["name"] for target in self.sprites} or name == "Stage":
+            raise ValueError(
+                f"two of the project's sprites would be named {name!r}; export one with "
+                "another name="
             )
-
-        while taken(sprite["name"]):
-            sprite["name"] = f"{base}{index}"
-            index += 1
-        sprite.update(visible=visible, layerOrder=len(self.sprites) + 1)
+        owner = f"sprite {name!r}"
+        references = global_references(sprite)
+        for section in ("variables", "lists"):
+            self._global_owners += [(owner, used) for used in references[section].values()]
+        sent = set(references["broadcasts"].values())
+        self._message_owners += [(owner, text) for text in sorted(sent)]
+        interface.check_global_names(self._global_owners)
+        interface.check_messages(
+            (owner, text) for owner, text in self._message_owners
+            if text not in interface.SHARED_MESSAGES
+        )
+        starting = {
+            global_name(name, STATUS_VARIABLE): interface.INITIAL_STATUS,
+            global_name(name, interface.TEXT): "",
+            **(values or {}),
+        }
+        used = install(self.stage, sprite, starting)
+        for list_name in used["lists"]:
+            entry = next(entry for entry in self.stage["lists"].values() if entry[0] == list_name)
+            self.global_lists.setdefault(list_name, entry[1])
+        for variable in used["variables"]:
+            entry = next(
+                entry for entry in self.stage["variables"].values() if entry[0] == variable
+            )
+            self.global_variables.setdefault(variable, entry[1])
+        calls = sorted(
+            text for text in sent
+            if text not in interface.SHARED_MESSAGES and not text.endswith(" complete")
+        )
+        for text in calls:
+            self.messages += [text, completion(text)]
+        if interface.SHARED_PREPARE_FOR_SAVE in sent and (
+            interface.SHARED_PREPARE_FOR_SAVE not in self.messages
+        ):
+            self.messages.append(interface.SHARED_PREPARE_FOR_SAVE)
+        sprite.update(visible=visible)
         self.sprites.append(sprite)
         self.assets.update(assets)
         return sprite
 
-    def add_demo_sprite(self, name: str) -> dict:
+    def add_demo_sprite(self) -> dict:
+        """The project's own small sprite, first among the sprites so that it opens selected."""
+        taken = {target["name"] for target in self.sprites}
+        name, index = _DEMO, 2
+        while name in taken:
+            name, index = f"{_DEMO}{index}", index + 1
         costume = next((TEMPLATE_DIR / "sprite").glob("*.svg"))
         data = costume.read_bytes()
         asset = hashlib.md5(data).hexdigest()
@@ -191,23 +228,28 @@ class _Builder:
                 "assetId": asset, "md5ext": f"{asset}.svg",
                 "rotationCenterX": 48, "rotationCenterY": 50,
             }],
-            "sounds": [], "volume": 100, "layerOrder": len(self.sprites) + 1,
+            "sounds": [], "volume": 100, "layerOrder": 1,
             "visible": True, "x": -150, "y": -100, "size": 100, "direction": 90,
             "draggable": False, "rotationStyle": "all around",
         }
-        self.sprites.append(sprite)
+        self.sprites.insert(0, sprite)
         return sprite
 
     # ── global data ────────────────────────────────────────────────────────
 
     def global_list(self, name: str, values=()) -> str:
+        """A global list of the project's own, declared on the stage when a script uses it."""
         if name not in self.global_lists:
             self.global_lists[name] = list(values)
+            self._global_owners.append(("the project", name))
+            interface.check_global_names(self._global_owners)
         return name
 
     def global_variable(self, name: str, value: object = 0) -> str:
         if name not in self.global_variables:
             self.global_variables[name] = value
+            self._global_owners.append(("the project", name))
+            interface.check_global_names(self._global_owners)
         return name
 
     def _bind(self, target: dict, data: dict, section: str) -> None:
@@ -264,7 +306,7 @@ class _Builder:
             name.replace(" ", "_"), lists=lists, variables=variables, body=body,
         )
         before = {section: set(target.get(section, {})) for section in ("lists", "variables")}
-        _add_warp_procedure(target, name, program, x=-800, y=200 * len(self.messages))
+        _add_warp_procedure(target, name, program, x=-800, y=200 * len(target["blocks"]) % 4000)
         added = {
             section: {
                 identifier: entry for identifier, entry in target[section].items()
@@ -289,20 +331,25 @@ class _Builder:
         }
         self._merge(target, data)
 
-    def receiver(self, target: dict, message: str, body, *, lists=(), variables=()) -> None:
-        """Run ``body`` in a warp procedure whenever ``message`` is broadcast.
+    def receiver(self, target: dict, text: str, body, *, lists=(), variables=()) -> None:
+        """One of the project's own messages: run ``body`` whenever ``text`` is broadcast.
 
-        The procedure, ``cattorch bridge MESSAGE``, ends with a ``broadcast
-        and wait`` of ``MESSAGE complete``.
+        The body runs in a warp procedure, ``_cattorch demo TEXT``, and ends
+        with a ``broadcast and wait`` of ``TEXT complete``.
         """
-        procedure = bridge_procedure(message)
-        body = (*body, broadcast_and_wait(completion(message)))
+        self._message_owners.append(("the project", text))
+        interface.check_messages(
+            (owner, sent) for owner, sent in self._message_owners
+            if sent not in interface.SHARED_MESSAGES
+        )
+        procedure = f"_cattorch demo {text}"
+        body = (*body, broadcast_and_wait(completion(text)))
         self.procedure(target, procedure, body, lists=lists, variables=variables)
         self.script(target, {
             "opcode": "event_whenbroadcastreceived",
-            "fields": {"BROADCAST_OPTION": [message, f"cattorch_message_{message}"]},
-        }, (call(procedure),), y=200 * len(self.messages))
-        self.messages.append(message)
+            "fields": {"BROADCAST_OPTION": [text, f"cattorch_message_{text}"]},
+        }, (*_call(procedure),), y=200 * len(self.messages))
+        self.messages += [text, completion(text)]
 
     # ── output ─────────────────────────────────────────────────────────────
 
@@ -320,9 +367,10 @@ class _Builder:
             "width": 0, "height": 0, "x": x, "y": y, "visible": True, **extra,
         })
 
-    def note(self, text: str) -> None:
-        self.stage["comments"]["cattorch_project_note"] = {
-            "blockId": None, "x": -400, "y": -300, "width": 400, "height": 240,
+    def note(self, target: dict, text: str) -> None:
+        """A comment on ``target``'s canvas: the Demo's is what the project opens on."""
+        target["comments"]["cattorch_project_note"] = {
+            "blockId": None, "x": -400, "y": -300, "width": 400, "height": 280,
             "minimized": False, "text": text,
         }
 
@@ -330,18 +378,20 @@ class _Builder:
         """Give each message one ID, declared on the stage as Scratch expects."""
         canonical: dict[str, tuple[str, str]] = {}
 
-        def identify(message: str) -> str:
-            key = message.lower()
+        def identify(text: str) -> str:
+            key = text.lower()
             if key not in canonical:
-                canonical[key] = (f"cattorch_message_{len(canonical) + 1}", message)
+                canonical[key] = (f"cattorch_message_{len(canonical) + 1}", text)
             return canonical[key][0]
 
         for target in (self.stage, *self.sprites):
             remap = {
-                identifier: identify(message)
-                for identifier, message in target.get("broadcasts", {}).items()
+                identifier: identify(text)
+                for identifier, text in target.get("broadcasts", {}).items()
             }
             for block in target["blocks"].values():
+                if not isinstance(block, dict):
+                    continue
                 option = block.get("fields", {}).get("BROADCAST_OPTION")
                 if option is not None:
                     option[1] = identify(option[0])
@@ -355,10 +405,14 @@ class _Builder:
 
     def write(self, path: Path) -> list[str]:
         self._unify_broadcasts()
-        for identifier, entry in self.stage["lists"].items():
-            entry[1] = list(self.global_lists[entry[0]])
-        for identifier, entry in self.stage["variables"].items():
-            entry[1] = self.global_variables[entry[0]]
+        for entry in self.stage["lists"].values():
+            if entry[0] in self.global_lists:
+                entry[1] = list(self.global_lists[entry[0]])
+        for entry in self.stage["variables"].values():
+            if entry[0] in self.global_variables:
+                entry[1] = self.global_variables[entry[0]]
+        for position, sprite in enumerate(self.sprites):
+            sprite["layerOrder"] = position + 1
         project = {
             "targets": [self.stage, *self.sprites], "monitors": self.monitors,
             "extensions": [],
@@ -370,6 +424,12 @@ class _Builder:
         return [] if warning is None else [warning]
 
 
+def _call(procedure: str) -> tuple:
+    from cattorch.util.scratch.dsl import call
+
+    return (call(procedure),)
+
+
 def _example_values(spec, example) -> list:
     if example is not None:
         return example.detach().flatten().tolist()
@@ -379,49 +439,24 @@ def _example_values(spec, example) -> list:
     return [0] * count
 
 
-def _shards(sprite: dict, list_name: str) -> list[str]:
-    """A public list's physical lists in the sprite: ``LIST``, ``LIST shard 2``, ..."""
-    names = {entry[0] for entry in sprite.get("lists", {}).values()}
+def _shards(builder, list_name: str) -> list[str]:
+    """A global list's physical lists in the project: ``LIST``, ``LIST shard 2``, ..."""
     shards = [list_name]
-    while shard_name(list_name, len(shards)) in names:
+    while shard_name(list_name, len(shards)) in builder.global_lists:
         shards.append(shard_name(list_name, len(shards)))
     return shards
 
 
-def _bridge_operation(builder, sprite, message, procedure, inputs, outputs, examples):
-    """Copy global inputs in, call ``procedure``, and copy outputs back out.
-
-    The sprite's status goes to the global ``NAME status``, and the outputs
-    only when it is ok, as a block that fails writes no output. A list split
-    into shards is bridged shard by shard, each to a global list named after
-    it (``NAME output``, ``NAME output shard 2``, ...), since a global list
-    has the same length limit. Returns the global lists, inputs first.
-    """
-    name = sprite["name"]
-    status = builder.global_variable(project_name(name, STATUS_VARIABLE), interface.INITIAL_STATUS)
-    lists, body, shown = [], [], []
-    for spec, example in zip(inputs, examples):
-        values = _example_values(spec, example)
-        for position, shard in enumerate(_shards(sprite, spec.list_name)):
-            chunk = values[position * SCRATCH_LIST_LIMIT:(position + 1) * SCRATCH_LIST_LIMIT]
-            source = builder.global_list(project_name(name, shard), chunk)
-            lists += [source, shard]
-            body += _copy(source, shard)
-            shown.append(source)
-    body += [call(procedure), set_var(status, var(STATUS_VARIABLE))]
-    copies: list = []
-    for spec in outputs:
-        for shard in _shards(sprite, spec.list_name):
-            target = builder.global_list(project_name(name, shard))
-            lists += [shard, target]
-            copies += _copy(shard, target)
-            shown.append(target)
-    if copies:
-        body.append(if_(eq(var(STATUS_VARIABLE), interface.OK), tuple(copies)))
-    builder.receiver(
-        sprite, message, body, lists=lists, variables=(_INDEX, status, STATUS_VARIABLE),
-    )
-    return shown
+def _starting_values(specs, examples) -> dict:
+    """The values input globals start with, shard by shard, by global name."""
+    values = {}
+    for spec, example in zip(specs, examples):
+        flat = _example_values(spec, example)
+        for position in range(max(1, math.ceil(len(flat) / SCRATCH_LIST_LIMIT))):
+            values[shard_name(spec.list_name, position)] = (
+                flat[position * SCRATCH_LIST_LIMIT:(position + 1) * SCRATCH_LIST_LIMIT]
+            )
+    return values
 
 
 def _layout(builder, names: list[str]) -> None:
@@ -429,15 +464,23 @@ def _layout(builder, names: list[str]) -> None:
         builder.monitor(list_name, kind="list", x=5 + 120 * (position % 4), y=5 + 180 * (position // 4))
 
 
+_FLAG = {"opcode": "event_whenflagclicked", "fields": {}}
+
+
 def _forward_project(builder, result, example_inputs, labels) -> None:
-    sprite = builder.add_sprite(result.path, visible=False)
-    name = sprite["name"]
-    message = project_name(name, "run")
     examples = list(example_inputs) + [None] * (len(result.inputs) - len(example_inputs))
-    shown = _bridge_operation(
-        builder, sprite, message, interface.FORWARD, result.inputs, result.outputs, examples,
+    sprite = builder.add_sprite(
+        result.path, visible=False, values=_starting_values(result.inputs, examples),
     )
+    demo = builder.add_demo_sprite()
+    name = sprite["name"]
+    shown = [
+        shard for spec in (*result.inputs, *result.outputs)
+        for shard in _shards(builder, spec.list_name)
+    ]
     _layout(builder, shown)
+    forward = message(name, interface.FORWARD)
+    predict = global_name(name, "predict")
     if labels is not None:
         output = result.outputs[0]
         if output.numel is None:
@@ -450,43 +493,54 @@ def _forward_project(builder, result, example_inputs, labels) -> None:
                 f"labels has {len(labels)} entries but output {output.list_name!r} "
                 f"has {output.numel} values"
             )
-        table = builder.global_list(project_name(name, "labels"), [str(label) for label in labels])
-        prediction = builder.global_variable(project_name(name, "prediction"), "")
-        builder.receiver(sprite, project_name(name, "predict"), (
+        table = builder.global_list(global_name(name, "labels"), [str(label) for label in labels])
+        prediction = builder.global_variable(global_name(name, "prediction"), "")
+        builder.receiver(demo, predict, (
             *_argmax(output.list_name),
             set_var(prediction, item(table, var(_BEST))),
         ), lists=(output.list_name, table), variables=(_INDEX, _BEST, prediction))
         builder.monitor(prediction, kind="large", x=5, y=320)
-    run: tuple = (broadcast_and_wait(message),)
+    run: tuple = (broadcast_and_wait(forward),)
     if labels is not None:
-        run += (broadcast_and_wait(project_name(name, "predict")),)
-    builder.script(builder.stage, {"opcode": "event_whenflagclicked", "fields": {}}, run)
-    builder.script(builder.stage, {
+        run += (broadcast_and_wait(predict),)
+    builder.script(demo, _FLAG, run)
+    builder.script(demo, {
         "opcode": "event_whenkeypressed", "fields": {"KEY_OPTION": ["space", None]},
     }, run, y=200)
-    inputs = ", ".join(project_name(name, spec.list_name) for spec in result.inputs)
+    inputs = ", ".join(spec.list_name for spec in result.inputs)
     builder.note(
+        demo,
         f"Edit {inputs}, then click the green flag or press space to run {name}.\n\n"
-        f"Other sprites can fill the same lists and broadcast \"{message}\" and wait; "
-        f"the outputs are then in the {name} output lists."
+        f"Any sprite can fill the same lists, then broadcast \"{forward}\" and wait, "
+        f"and read \"{global_name(name, STATUS_VARIABLE)}\": when it is ok, the outputs "
+        f"are in {', '.join(spec.list_name for spec in result.outputs)}."
+        + (
+            f" Broadcast \"{predict}\" and wait to put the label of the largest output "
+            f"in \"{global_name(name, 'prediction')}\"."
+            if labels is not None else ""
+        )
+        + f"\n\nYou never need to open {name}: a large model is slow to show in the editor."
     )
 
 
 def _program_project(builder, result) -> None:
     sprite = builder.add_sprite(result.path, visible=False)
+    demo = builder.add_demo_sprite()
     name = sprite["name"]
     shown, lines = [], []
     for entry in result.entrypoints:
-        message = project_name(name, entry.procedure)
-        shown += _bridge_operation(
-            builder, sprite, message, entry.procedure, entry.inputs, entry.outputs,
-            [None] * len(entry.inputs),
-        )
-        lines.append(f"broadcast \"{message}\" and wait")
+        shown += [
+            shard for spec in (*entry.inputs, *entry.outputs)
+            for shard in _shards(builder, spec.list_name)
+        ]
+        lines.append(f"broadcast \"{entry.broadcast}\" and wait")
     _layout(builder, list(dict.fromkeys(shown)))
     builder.note(
+        demo,
         "Fill an entry point's input lists, then:\n" + "\n".join(lines)
-        + f"\n\nState is kept inside {name} between calls."
+        + f"\nand read \"{global_name(name, STATUS_VARIABLE)}\": when it is ok, its outputs "
+        f"are in its output lists.\n\nState is kept in {name}'s state lists between calls. "
+        f"You never need to open {name}."
     )
 
 
@@ -494,54 +548,24 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
                         prompt) -> None:
     model = builder.add_sprite(result.path, visible=False)
     words = builder.add_sprite(tokenizer.path, visible=False)
+    demo = builder.add_demo_sprite()
     name, tokenizer_name = model["name"], words["name"]
-    tokens = builder.global_list(project_name(name, interface.TOKEN_IDS))
-    status = builder.global_variable(project_name(name, STATUS_VARIABLE), interface.INITIAL_STATUS)
-    next_token = builder.global_variable(project_name(name, "next token"), 0)
-    heat = builder.global_variable(project_name(name, "temperature"), float(temperature))
-    for operation in (interface.PREFILL, interface.DECODE):
-        builder.receiver(model, project_name(name, operation), (
-            if_(eq(var(_READY), 0), (call(interface.INIT), set_var(_READY, 1))),
-            *_copy(tokens, interface.TOKEN_IDS),
-            call(operation),
-            set_var(status, var(STATUS_VARIABLE)),
-            if_(eq(var(STATUS_VARIABLE), interface.OK), (
-                *_sample(interface.LOGITS, heat),
-                set_var(next_token, sub(var(_BEST), 1)),
-            )),
-        ), lists=(tokens, interface.TOKEN_IDS, interface.LOGITS),
-            variables=(
-                _INDEX, _BEST, _TOTAL, _PICK, _READY, status, next_token, heat, STATUS_VARIABLE,
-            ))
+    tokens = global_name(name, interface.TOKEN_IDS)
+    logits = global_name(name, interface.LOGITS)
+    status = global_name(name, STATUS_VARIABLE)
+    next_token = builder.global_variable(global_name(name, "next token"), 0)
+    heat = builder.global_variable(global_name(name, "temperature"), float(temperature))
+    sample = global_name(name, "sample")
+    # The project's sampler: the next token from the logits the last
+    # prefill or decode wrote.
+    builder.receiver(demo, sample, (
+        *_sample(logits, heat),
+        set_var(next_token, sub(var(_BEST), 1)),
+    ), lists=(logits,), variables=(_INDEX, _BEST, _TOTAL, _PICK, next_token, heat))
 
-    # Decode the weights again after a restart, in case they were cleared
-    # for saving.
-    builder.script(model, {"opcode": "event_whenflagclicked", "fields": {}},
-                   (set_var(_READY, 0),), variables=(_READY,))
-    text = builder.global_variable(project_name(tokenizer_name, TEXT_VARIABLE), "")
-    ids = builder.global_list(project_name(tokenizer_name, TOKEN_IDS_LIST))
-    words_status = builder.global_variable(
-        project_name(tokenizer_name, STATUS_VARIABLE), interface.INITIAL_STATUS,
-    )
-    ok = eq(var(STATUS_VARIABLE), interface.OK)
-    builder.receiver(words, project_name(tokenizer_name, interface.TOKENIZE), (
-        set_var(TEXT_VARIABLE, var(text)),
-        call(interface.TOKENIZE),
-        set_var(words_status, var(STATUS_VARIABLE)),
-        if_(ok, _copy(TOKEN_IDS_LIST, ids)),
-    ), lists=(TOKEN_IDS_LIST, ids), variables=(
-        TEXT_VARIABLE, text, _INDEX, words_status, STATUS_VARIABLE,
-    ))
-    builder.receiver(words, project_name(tokenizer_name, interface.DETOKENIZE), (
-        *_copy(ids, TOKEN_IDS_LIST),
-        call(interface.DETOKENIZE),
-        set_var(words_status, var(STATUS_VARIABLE)),
-        if_(ok, (set_var(text, var(TEXT_VARIABLE)),)),
-    ), lists=(TOKEN_IDS_LIST, ids), variables=(
-        TEXT_VARIABLE, text, _INDEX, words_status, STATUS_VARIABLE,
-    ))
-
-    demo = builder.add_demo_sprite("Demo")
+    text = global_name(tokenizer_name, interface.TEXT)
+    ids = global_name(tokenizer_name, interface.TOKEN_IDS)
+    words_status = global_name(tokenizer_name, STATUS_VARIABLE)
     generated = "_cattorch demo generated"
     count, done, seed = "_cattorch demo count", "_cattorch demo done", "_cattorch demo prompt"
     problem = "_cattorch demo problem"
@@ -554,12 +578,16 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
     def failed(who: str, operation: str, status_variable: str, *, normal=()) -> tuple:
         """Report ``who``'s status after ``operation`` unless it is ok (or ``normal``)."""
         report: tuple = (
-            set_var(problem, join(f"{project_name(who, operation)}: ", var(status_variable))),
+            set_var(problem, join(f"{message(who, operation)}: ", var(status_variable))),
             say(var(problem)),
         )
         for status_value in normal:
             report = (if_(not_(eq(var(status_variable), status_value)), report),)
         return (if_(not_(eq(var(status_variable), interface.OK)), report),)
+
+    def sampled() -> tuple:
+        """Sample the next token after a call that ended ok."""
+        return (if_(eq(var(status), interface.OK), (broadcast_and_wait(sample),)),)
 
     check = (
         set_var(done, 0),
@@ -581,27 +609,29 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
             set_var(seed, answer()),
             set_var(text, answer()),
             set_var(problem, ""),
-            broadcast_and_wait(project_name(tokenizer_name, interface.TOKENIZE)),
+            broadcast_and_wait(message(tokenizer_name, interface.TOKENIZE)),
             *failed(tokenizer_name, interface.TOKENIZE, words_status),
             if_(eq(var(problem), ""), (
-                call("_cattorch demo prompt tokens"),
+                *_call("_cattorch demo prompt tokens"),
                 say(join(var(seed), "...")),
-                broadcast_and_wait(project_name(name, interface.PREFILL)),
+                broadcast_and_wait(message(name, interface.PREFILL)),
                 *failed(name, interface.PREFILL, status),
+                *sampled(),
                 clear(generated),
                 set_var(count, 0),
                 *check,
                 repeat_until(eq(var(done), 1), (
                     append(generated, var(next_token)),
-                    call("_cattorch demo generated tokens"),
-                    broadcast_and_wait(project_name(tokenizer_name, interface.DETOKENIZE)),
+                    *_call("_cattorch demo generated tokens"),
+                    broadcast_and_wait(message(tokenizer_name, interface.DETOKENIZE)),
                     *failed(tokenizer_name, interface.DETOKENIZE, words_status),
                     if_(eq(var(problem), ""), (
                         say(join(var(seed), var(text))),
                         clear(tokens),
                         append(tokens, var(next_token)),
-                        broadcast_and_wait(project_name(name, interface.DECODE)),
+                        broadcast_and_wait(message(name, interface.DECODE)),
                         *failed(name, interface.DECODE, status, normal=(interface.CONTEXT_FULL,)),
+                        *sampled(),
                         change_var(count, 1),
                     )),
                     *check,
@@ -610,22 +640,25 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
             ask_again,
         )),
     )
-    builder.script(demo, {"opcode": "event_whenflagclicked", "fields": {}}, body,
+    builder.script(demo, _FLAG, body,
                    lists=(generated, tokens), variables=(count, done, seed, text, status,
                                                          next_token, words_status, problem))
     builder.monitor(heat, kind="slider", x=5, y=5, sliderMin=0, sliderMax=2, isDiscrete=False)
     builder.note(
-        f"Click the green flag and type a prompt. The Demo sprite continues it with "
+        demo,
+        f"Click the green flag and type a prompt. This sprite continues it with "
         f"{name}, up to {max_new_tokens} tokens"
         + ("" if eos_token_id is None else f" or until token {eos_token_id}")
         + ". The temperature slider sets how random the choices are; 0 always picks "
         f"the likeliest token.\n\n"
-        f"To drive the sprites yourself: set \"{tokenizer_name} text\" and broadcast "
-        f"\"{tokenizer_name} tokenize\" to fill \"{tokenizer_name} token ids\"; fill "
-        f"\"{name} token ids\" and broadcast \"{name} prefill\" (a prompt) or "
-        f"\"{name} decode\" (one token) to get \"{name} next token\" and "
-        f"\"{name} status\"; and broadcast \"{tokenizer_name} detokenize\" to turn "
-        f"\"{tokenizer_name} token ids\" back into \"{tokenizer_name} text\"."
+        f"To drive the sprites yourself, broadcast each message and wait, then read the "
+        f"status: set \"{text}\" and broadcast \"{message(tokenizer_name, interface.TOKENIZE)}\" "
+        f"to fill \"{ids}\"; fill \"{tokens}\" and broadcast "
+        f"\"{message(name, interface.PREFILL)}\" (a prompt) or "
+        f"\"{message(name, interface.DECODE)}\" (one token), which write \"{logits}\" and "
+        f"\"{status}\"; broadcast \"{sample}\" to pick \"{next_token}\" from them; and "
+        f"broadcast \"{message(tokenizer_name, interface.DETOKENIZE)}\" to turn \"{ids}\" "
+        f"back into \"{text}\". You never need to open {name} or {tokenizer_name}."
     )
 
 
@@ -773,12 +806,16 @@ def build_project(
     replaces the question it asks. For any other model, the project shows the
     input and output lists, starting from ``example_inputs`` or zeros, and runs
     the model on the green flag or space key; ``labels`` names the outputs of a
-    classifier and shows the predicted label. A model with entry points gets a
-    bridge for each, with no demo.
+    classifier and shows the predicted label (``NAME predict``). A model
+    with entry points gets list monitors and a note on how to call them.
 
-    In every case each operation is also bridged to global lists, so other
-    sprites can run it with ``broadcast and wait``; ``ProjectResult`` lists
-    the broadcasts and data. Warnings are also emitted as ``CattorchWarning``.
+    The exported sprites keep their names and interface: any sprite can run
+    them with ``broadcast [NAME OP] and wait`` and read ``NAME status``. The
+    project declares their globals on the stage, and a small Demo sprite,
+    selected when the project opens, holds the demo and the project's own
+    messages. ``ProjectResult`` lists the broadcasts and data. Raises
+    ``ValueError`` if two sprites, globals or broadcasts would be the same to
+    Scratch. Warnings are also emitted as ``CattorchWarning``.
     """
     if not isinstance(model, (TranspileResult, ProgramResult, GenerationResult)):
         raise TypeError(
@@ -805,15 +842,13 @@ def build_project(
             )
         else:
             _forward_project(builder, model, tuple(example_inputs), labels)
-        for message in builder.write(output_path):
-            warn(message)
+        for written in builder.write(output_path):
+            warn(written)
     project_warnings = list(collected)
     return ProjectResult(
         path=output_path,
         sprites=tuple(sprite["name"] for sprite in builder.sprites),
-        broadcasts=tuple(
-            name for message in builder.messages for name in (message, completion(message))
-        ),
+        broadcasts=tuple(builder.messages),
         lists=tuple(builder.global_lists),
         variables=tuple(builder.global_variables),
         warnings=tuple(project_warnings),

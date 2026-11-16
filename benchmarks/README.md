@@ -55,10 +55,13 @@ everything sprites said:
 node benchmarks/run_project_vm.cjs build/rhyme.sb3 --answer=twinkle
 ```
 
+`--sprite=FILE.sprite3` uploads an exported sprite into the project first,
+as the editor's Upload Sprite does (creating the globals it uses on the
+stage), and the JSON's `editing` names the sprite selected at the end.
 `--list=NAME=JSON` and `--var=NAME=VALUE` set stage data before the green
-flag, and `--no-flag` skips it. `--broadcast=MESSAGE` then sends a bridge
-message and waits for it; a `--list` after a broadcast is set before the next
-one, so each call can get its own inputs. `--out=FILE` writes the JSON to a
+flag, and `--no-flag` skips it. `--broadcast=MESSAGE` then sends a message,
+such as a sprite's `NAME forward`, and waits for it; a `--list` after a
+broadcast is set before the next one, so each call can get its own inputs. `--out=FILE` writes the JSON to a
 file. `tests/test_real_vm.py` uses this runner to compare exported sprites
 with PyTorch in the VM; run `npm ci` here first, and CI sets
 `CATTORCH_REQUIRE_VM=1` so those tests fail instead of skipping.
@@ -76,7 +79,7 @@ script unless another name is shown.
 
 | Script | Measures |
 |---|---|
-| `build_suite.py` | The main suite (`cattorch_suite.sb3`), with an exact and a fast variant of every case. Each variant runs `cattorch init` untimed, then 100 timed forwards, and adds `name variant: seconds` to the results list. The analyzer can also read results from older projects that compared the legacy backend with exact mode. |
+| `build_suite.py` | The main suite (`cattorch_suite.sb3`), with an exact and a fast variant of every case. Each variant runs `NAME init` untimed, then 100 timed forwards, and adds `name variant: seconds` to the results list. The analyzer can also read results from older projects that compared the legacy backend with exact mode. |
 | `build_kernel_suite.py` | Only the 39 operator-level cases. |
 | `build_full_suite.py` | The 39 operator cases plus eight matrix and language-model cases in one project (`full_suite.sb3`, 94 results). |
 | `build_fast_suite.py` | Fast mode's arithmetic approximations only, with no pruning or low-rank transforms (`fast_suite.sb3`). |
