@@ -2206,6 +2206,8 @@ def quantize_model(
                 if region.pointer == pointer and not region.remaining
                 for view in region.views
             ))
+            if bool(taken.all()):
+                continue  # every element belongs to a region of its uses
             matrices = (
                 [((), parameter)] if parameter.ndim == 2 else [
                     (index, parameter[index])
