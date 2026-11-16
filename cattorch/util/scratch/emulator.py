@@ -237,6 +237,26 @@ def _deep_reporters():
         sys.setrecursionlimit(limit)
 
 
+def _data_references(blocks: dict):
+    """``(kind, id, name)`` for every variable and list reference in ``blocks``."""
+    for block in blocks.values():
+        if isinstance(block, list):
+            if len(block) >= 3 and block[0] in (12, 13):
+                yield ("variable" if block[0] == 12 else "list"), block[2], block[1]
+            continue
+        fields = block.get("fields", {})
+        for key, kind in (("VARIABLE", "variable"), ("LIST", "list")):
+            field = fields.get(key)
+            if field is not None and len(field) >= 2 and field[1] is not None:
+                yield kind, field[1], field[0]
+        for value in block.get("inputs", {}).values():
+            if not isinstance(value, list):
+                continue
+            for part in value[1:]:
+                if isinstance(part, list) and len(part) >= 3 and part[0] in (12, 13):
+                    yield ("variable" if part[0] == 12 else "list"), part[2], part[1]
+
+
 class _StopScript(Exception):
     """``stop this script``: ends the procedure running it, or the script."""
 
@@ -286,6 +306,7 @@ class ScratchEmulator:
     """
 
     def __init__(self, sprite: dict, *, stage: "ScratchEmulator | None" = None):
+        self.name = sprite.get("name", "")
         self.blocks = sprite["blocks"]
         self._procedures = self._find_procedures()
         # The argument values of the procedure calls running, innermost last.
@@ -326,9 +347,86 @@ class ScratchEmulator:
         for name, ids in (stage._list_name_to_ids if stage else {}).items():
             self._list_name_to_ids.setdefault(name, []).extend(ids)
 
+        if stage is None and not sprite.get("isStage"):
+            self._add_unresolved_globals()
+
         # Public name-based views for test convenience
         self.variables = _NameView(self._vars, self._var_name_to_ids)
         self.lists = _NameView(self._lists, self._list_name_to_ids)
+
+    def _add_unresolved_globals(self) -> None:
+        """Create the variables and lists the blocks use without defining, as globals.
+
+        A sprite loaded on its own is like one uploaded into an empty project:
+        scratch-vm creates on the stage each variable or list its blocks
+        refer to that neither it nor the stage defines (by its ID and name, a
+        variable holding 0 and a list empty), and binds other references of
+        the same name and type to it.
+        """
+        created: dict[tuple[str, str], str] = {}
+        remap: dict[str, str] = {}
+        for kind, identifier, name in _data_references(self.blocks):
+            if identifier in (self._vars if kind == "variable" else self._lists):
+                continue
+            winner = created.setdefault((kind, name), identifier)
+            if winner != identifier:
+                remap[identifier] = winner
+                continue
+            if kind == "variable":
+                self._vars[identifier] = 0
+                self._var_name_to_ids.setdefault(name, []).append(identifier)
+            else:
+                self._lists[identifier] = []
+                self._list_name_to_ids.setdefault(name, []).append(identifier)
+        if remap:
+            from cattorch.util.scratch.remap import remap_ids
+
+            self.blocks = remap_ids(self.blocks, remap)
+
+    # ── The interface of an exported sprite ──────────────────────────────
+
+    def public(self, name: str, *, is_list: bool = True) -> str:
+        """The name a project uses for this exported sprite's ``name``, as built.
+
+        A public list (``input``, ``cattorch token ids``) and a run-time
+        variable (``cattorch status``) are globals, ``NAME input``,
+        ``NAME status``; an internal name (``_...``), a constant
+        (``cattorch max context``), and a name already global are as given.
+        """
+        from cattorch import interface
+
+        if name.startswith((interface.INTERNAL_PREFIX, f"{self.name} ")):
+            return name
+        if is_list or name in interface.RUNTIME_VARIABLES:
+            return interface.global_name(self.name, name)
+        return name
+
+    def call(self, block: str) -> None:
+        """Run an exported sprite's ``block`` (``cattorch forward``) as a project does.
+
+        It broadcasts ``NAME forward`` and waits: the ``when I receive``
+        scripts run to their end.
+        """
+        from cattorch import interface
+
+        message = interface.message(self.name, block)
+        if not self._receivers(message):
+            raise ValueError(f"nothing in sprite {self.name!r} receives {message!r}")
+        self.broadcast(message)
+
+    def _receivers(self, message: str) -> list[dict]:
+        key = message.lower()
+        return [
+            block for block in self.blocks.values()
+            if block.get("opcode") == "event_whenbroadcastreceived" and block.get("topLevel")
+            and str(block["fields"]["BROADCAST_OPTION"][0]).lower() == key
+        ]
+
+    def broadcast(self, message: str) -> None:
+        """Run this sprite's ``when I receive [message]`` scripts, one after another, to their end."""
+        for hat in self._receivers(str(message)):
+            with _deep_reporters():
+                self._exec_script(hat.get("next"))
 
     def run(self, root_index: int = 0):
         """Run a top-level block stack.
@@ -639,6 +737,8 @@ class ScratchEmulator:
                 # Receivers run to completion, as ``broadcast and wait`` does.
                 if self.on_broadcast is not None:
                     self.on_broadcast(str(sent))
+                else:
+                    self.broadcast(str(sent))
 
         elif opcode == "sensing_askandwait":
             question = value_of(inputs["QUESTION"])

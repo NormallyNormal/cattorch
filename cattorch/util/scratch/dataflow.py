@@ -34,10 +34,14 @@ _ITEM_READS = frozenset({"data_itemoflist"})
 _COMPILED_LIST = re.compile(r"T\d+|W_.+")
 
 
-def check_list_dataflow(sprite: dict, public_data_names: frozenset[str] = frozenset()) -> None:
+def check_list_dataflow(
+    sprite: dict, public_data_names: frozenset[str] = frozenset(), *, export: str | None = None,
+) -> None:
     """Raise an internal error if a block reads a missing or never-filled list.
 
-    It looks at each list once, so it costs one pass over the blocks.
+    It looks at each list once, so it costs one pass over the blocks. A
+    sprite already finished as the export ``export`` reads its global lists
+    (``NAME ...``) without having them, as Scratch expects.
     """
     lists = sprite.get("lists", {})
     written: set[str] = set()
@@ -68,6 +72,11 @@ def check_list_dataflow(sprite: dict, public_data_names: frozenset[str] = frozen
                 if isinstance(entry, list) and len(entry) >= 3 and entry[0] == 13:
                     if entry[2] not in lists:
                         missing.setdefault(entry[2], entry[1])
+    if export is not None:
+        missing = {
+            identifier: name for identifier, name in missing.items()
+            if not name.startswith(f"{export} ")
+        }
     if missing:
         names = ", ".join(sorted(repr(name) for name in missing.values()))
         raise RuntimeError(

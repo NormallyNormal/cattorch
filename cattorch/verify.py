@@ -46,11 +46,19 @@ def _normalise_inputs(example_inputs):
 
 
 def _set_logical_list(emulator: ScratchEmulator, name: str, values: list) -> None:
-    write_logical_list(emulator.lists, name, values)
+    """Fill an exported sprite's public list ``name`` (as built), shard by shard."""
+    write_logical_list(emulator.lists, emulator.public(name), values)
 
 
 def _get_logical_list(emulator: ScratchEmulator, name: str) -> list:
-    return read_logical_list(emulator.lists, name)
+    return read_logical_list(emulator.lists, emulator.public(name))
+
+
+def _status(emulator: ScratchEmulator) -> str:
+    """How the exported sprite's last call ended: its ``NAME status``."""
+    return str(emulator.variables.get(
+        emulator.public(STATUS_VARIABLE, is_list=False), "missing runtime status",
+    ))
 
 
 def _compare_values(
@@ -425,8 +433,8 @@ def _verify_program(
                 emulator, f"cattorch {entry.name} {binding.name}",
                 value.detach().cpu().flatten().tolist(),
             )
-        emulator.run_procedure(f"cattorch {entry.name}")
-        status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
+        emulator.call(f"cattorch {entry.name}")
+        status = _status(emulator)
         output_results = []
         if status == OK:
             from cattorch.experts import _expert_family_context
@@ -600,10 +608,9 @@ def _verify_generation(
     project = _sprite_json(sprite, GenerationResult, "a generation")
     path = getattr(sprite, "path", sprite)
     emulator = ScratchEmulator(project)
-    names = {entry[0] for entry in project.get("lists", {}).values()}
-    if interface.LOGITS not in names:
+    if emulator.public(interface.LOGITS) not in emulator.lists:
         raise ValueError(f"{path} is not a generation sprite: it has no {interface.LOGITS!r} list")
-    top_k = interface.TOP_K_VALUES in names
+    top_k = emulator.public(interface.TOP_K_VALUES) in emulator.lists
     _check_generation_program(project, sprite, program, top_k)
     registry = default_registry().for_export(adapters=adapters)
     reference = _GenerationReference(
@@ -644,10 +651,10 @@ def _verify_generation(
                 raise ValueError(f"ProgramCall({block!r}, ...) takes one tensor of token IDs")
             values = invocation.inputs[0].detach().cpu().flatten().tolist()
             _set_logical_list(emulator, interface.TOKEN_IDS, values)
-        emulator.run_procedure(f"cattorch {block}")
-        status = str(emulator.variables.get(STATUS_VARIABLE, "missing runtime status"))
+        emulator.call(f"cattorch {block}")
+        status = _status(emulator)
         expected_status = _expected_generation_status(
-            block, values, len(tokens), vocabulary, reference.max_context,
+            emulator.public(interface.TOKEN_IDS), block, values, len(tokens), vocabulary, reference.max_context,
         )
         if expected_status == OK:
             tokens = (
@@ -721,14 +728,13 @@ def _check_generation_program(project: dict, sprite, program, top_k: bool) -> No
 
 
 def _expected_generation_status(
-    block: str, values: list, cached: int, vocabulary: int, max_context: int | None,
+    tokens: str, block: str, values: list, cached: int, vocabulary: int, max_context: int | None,
 ) -> str:
-    """The ``cattorch status`` a generation block should end with."""
+    """The status a generation block should end with; ``tokens`` is its token IDs' global."""
     from cattorch import interface
 
     if block == "reset":
         return OK
-    tokens = interface.TOKEN_IDS
     if block == "decode" and len(values) != 1:
         return interface.wrong_number_of_items(tokens)
     if block == "prefill":
@@ -818,7 +824,7 @@ def _verify_tensors(
     for index, value in enumerate(flat_example_inputs(inputs, example_kwargs)):
         name = input_name(index)
         _set_logical_list(emulator, name, value.detach().cpu().flatten().tolist())
-    emulator.run_procedure(FORWARD)
+    emulator.call(FORWARD)
 
     reference = _tensor_reference(
         model, inputs, example_kwargs, adapters=adapters, quantization=quantization,
@@ -833,9 +839,11 @@ def _verify_tensors(
         ) from raised
     leaves = tensor_output_leaves(expected, warn=False)
     output_names = tuple(output_name(index) for index in range(len(leaves)))
+    prefix = f"{emulator.name} "
     actual_names = {
-        entry[0] for entry in project.get("lists", {}).values()
-        if re.fullmatch(r"output(?:_[1-9][0-9]*)?", entry[0])
+        name.removeprefix(prefix) for name in emulator._list_name_to_ids
+        if name.startswith(prefix)
+        and re.fullmatch(r"output(?:_[1-9][0-9]*)?", name.removeprefix(prefix))
     }
     if actual_names != set(output_names):
         raise UnsupportedModelError(

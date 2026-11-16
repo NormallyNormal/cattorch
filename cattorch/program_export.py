@@ -311,7 +311,6 @@ def _interface_renames(
     defaults: dict[str, dict[str, str]] = {}
     for entrypoint in program.entrypoints:
         defaults[f"cattorch {entrypoint.name}"] = procedures
-        defaults[f"cattorch {entrypoint.name} complete"] = broadcasts
         for binding in (*entrypoint.arguments, *entrypoint.returns):
             if isinstance(binding, (Input, Output)):
                 defaults[_input_list(entrypoint.name, binding.name)] = lists
@@ -322,6 +321,9 @@ def _interface_renames(
             raise ValueError(f"_public_names[{old!r}] must be a non-empty string")
         if new != old:
             defaults[old][old] = new
+    # A block's completion broadcast is named after it.
+    for old, new in procedures.items():
+        broadcasts[interface.completion(old)] = interface.completion(new)
     if private_states:
         for state in program.states:
             lists[_state_list(state.name)] = f"_cattorch state {state.name}"
@@ -644,11 +646,11 @@ def transpile_program(
       may add procedures, lists and variables that use them; ``assembly``
       (a ``ProgramAssembly``) gives the names, and takes the capacities and
       public names of what the callback adds.
-    - ``_public_names`` renames entry point procedures (``cattorch <entry>``),
-      their input and output lists (``cattorch <entry> <binding>``) and
-      completion broadcasts (``cattorch <entry> complete``), keyed by the
-      default name. A new name starting with ``_`` is private: it is left out
-      of the public interface and ``ProgramResult.procedures``, and may be
+    - ``_public_names`` renames entry point procedures (``cattorch <entry>``)
+      and their input and output lists (``cattorch <entry> <binding>``),
+      keyed by the default name; a block's completion broadcast follows its
+      name. A new name starting with ``_`` is private: it is left out of the
+      public interface and ``ProgramResult.broadcasts``, and may be
       compacted, so the entry point results then name it only as built.
     - ``_private_states`` names state lists ``_cattorch state <name>`` and
       leaves them out of the public interface and of the result's states.
@@ -709,19 +711,26 @@ def transpile_program(
         sig_figs=sig_figs, adapters=adapters,
     )
     output_path = Path(output_file(output_path, ".sprite3"))
-    sprite_name = output_path.stem if name is None else name
+    sprite_name = interface.check_export(
+        output_path.stem if name is None else name,
+        (*interface.PROGRAM_LIFECYCLE,
+         *(interface.entry_procedure(entry.name) for entry in program.entrypoints)),
+    )
     codegen = codegen or CodegenConfig()
     registry = default_registry().for_export(adapters=adapters, kernels=kernels)
 
     states = {state.name: state for state in program.states}
     # A state that starts as one constant is refilled by a loop on reset,
-    # with no stored copy of its initial value. A private state's own list
-    # is saved empty too, and filled by the first call or init. A public
-    # state's list keeps its stored value: other sprites may read it before
-    # any call, and a project has no hook that runs on load to fill it.
+    # with no stored copy of its initial value; any other is copied from its
+    # stored initial value. A public state's list is global: the sprite
+    # doesn't hold it, and Scratch creates it empty when the sprite is
+    # uploaded, so the first call or init fills it while it is still empty
+    # (a project that kept its values, saved or bound to an existing global,
+    # keeps them). A private state's own list is saved empty too when it
+    # starts as one constant, and filled the same way.
     fills = {state.name: _constant_fill(state) for state in program.states}
     empty_on_load = {
-        name for name, value in fills.items() if value is not None and _private_states
+        name for name, value in fills.items() if value is not None or not _private_states
     }
     any_filled = bool(empty_on_load)
     calls = tuple(calibration_calls or ())
@@ -961,7 +970,7 @@ def transpile_program(
         )
         entry_results.append(EntryPointResult(
             name=entrypoint.name,
-            procedure=interface.entry_procedure(entrypoint.name),
+            broadcast=interface.entry_procedure(entrypoint.name),
             completion_broadcast=interface.completion(interface.entry_procedure(entrypoint.name)),
             inputs=public_inputs,
             outputs=output_specs,
@@ -995,14 +1004,13 @@ def transpile_program(
     sub_warnings.extend(storage_warnings)
     _deduplicate_program_payloads(combined, payload_names)
     for state in program.states:
-        if state.name in empty_on_load:
-            # Filled by a loop at run time instead.
-            _set_list_contents(combined, _state_list(state.name), [])
-            continue
         values = state.initial.detach().cpu().flatten().tolist()
-        _set_list_contents(combined, _state_list(state.name), values)
         if fills[state.name] is None:
             _set_list_contents(combined, f"_cattorch initial state {state.name}", values)
+        # Filled at run time instead.
+        _set_list_contents(
+            combined, _state_list(state.name), [] if state.name in empty_on_load else values,
+        )
 
     lifecycle_lists = {_state_list(state.name) for state in program.states} | {
         f"_cattorch initial state {state.name}"
@@ -1031,17 +1039,29 @@ def transpile_program(
         reset_body.append(set_var(_STATES_FILLED, 1))
         lifecycle_variables.add(_STATES_FILLED)
         fill_empty = tuple(
-            if_(eq(length(_state_list(state.name)), 0), (call(_fill_procedure(index)),))
+            if_(eq(length(_state_list(state.name)), 0), (
+                (call(_fill_procedure(index)),) if fills[state.name] is not None
+                else _copy_list(
+                    f"_cattorch initial state {state.name}", _state_list(state.name),
+                    f"_cattorch reset {index}",
+                )
+            ))
             for index, state in enumerate(program.states)
             if state.name in empty_on_load
         )
+        ensure_lists = lifecycle_lists
+        ensure_variables = {
+            f"_cattorch reset {index}" for index, state in enumerate(program.states)
+            if state.name in empty_on_load and fills[state.name] is None
+        }
         # The first call or init fills the constant states still empty in a
         # freshly loaded project. Later, as before, only reset refills them.
         if _guard_overlaps:
             # Not over states a stopped or running call left busy.
             ensure = Program(
-                "program_ensure_states", variables={_STATES_FILLED, _BUSY, _EPOCH},
-                lists={_state_list(state.name) for state in program.states},
+                "program_ensure_states",
+                variables={_STATES_FILLED, _BUSY, _EPOCH, *ensure_variables},
+                lists=ensure_lists,
                 body=(if_(eq(add(var(_STATES_FILLED), var(_BUSY)), 0), (
                     set_var(_BUSY, 1), *fill_empty, set_var(_STATES_FILLED, 1),
                     if_else(_epoch_current(), (set_var(_BUSY, 0),), (set_var(_BUSY, 1),)),
@@ -1052,8 +1072,8 @@ def transpile_program(
             )
         else:
             ensure = Program(
-                "program_ensure_states", variables={_STATES_FILLED},
-                lists={_state_list(state.name) for state in program.states},
+                "program_ensure_states", variables={_STATES_FILLED, *ensure_variables},
+                lists=ensure_lists,
                 body=(if_(eq(var(_STATES_FILLED), 0), (
                     *fill_empty, set_var(_STATES_FILLED, 1),
                 )),),
@@ -1151,7 +1171,7 @@ def transpile_program(
     entry_results = [
         replace(
             entry_result,
-            procedure=name_of(entry_result.procedure),
+            broadcast=name_of(entry_result.broadcast),
             completion_broadcast=name_of(entry_result.completion_broadcast),
             inputs=tuple(
                 replace(value, list_name=name_of(value.list_name)) for value in entry_result.inputs
@@ -1263,10 +1283,29 @@ def transpile_program(
         public_data_names=frozenset(public_data_names),
         public_procedures=frozenset(public_procedures),
     )
+
+    def public(built: str) -> str:
+        """The name a project uses for a public name as built; internal ones as built."""
+        return built if built.startswith("_") else interface.global_name(sprite_name, built)
+
+    entry_results = [
+        replace(
+            entry_result,
+            broadcast=public(entry_result.broadcast),
+            completion_broadcast=public(entry_result.completion_broadcast),
+            inputs=tuple(
+                replace(value, list_name=public(value.list_name)) for value in entry_result.inputs
+            ),
+            outputs=tuple(
+                replace(value, list_name=public(value.list_name)) for value in entry_result.outputs
+            ),
+        )
+        for entry_result in entry_results
+    ]
     state_results = () if _private_states else tuple(
         StateResult(
             name=state.name,
-            list_name=_state_list(state.name),
+            list_name=public(_state_list(state.name)),
             mode=state.mode,
             shape=tuple(state.initial.shape),
             dtype=str(state.initial.dtype).removeprefix("torch."),
@@ -1274,8 +1313,8 @@ def transpile_program(
         )
         for state in program.states
     )
-    procedures = tuple(
-        name for name in (*lifecycle_procedures, *entry_procedures)
+    broadcasts = tuple(
+        interface.message(sprite_name, name) for name in (*entry_procedures, *lifecycle_procedures)
         if not name.startswith("_")
     )
     result = ProgramResult(
@@ -1286,7 +1325,7 @@ def transpile_program(
         block_count=len(combined.get("blocks", {})),
         list_count=len(combined.get("lists", {})),
         sharded_lists=tuple(sorted(
-            name for name in sharded_names
+            public(name) for name in sharded_names
             if is_public_data(name, frozenset(public_data_names))
         )),
         warnings=tuple(dict.fromkeys((
@@ -1295,7 +1334,7 @@ def transpile_program(
         ))),
         entrypoints=tuple(entry_results),
         states=state_results,
-        procedures=procedures,
+        broadcasts=broadcasts,
         quantization=quantization_report,
         fallback_operations=tuple(sorted(fallbacks.items())),
         approximate_operations=tuple(sorted(approximations.items())),

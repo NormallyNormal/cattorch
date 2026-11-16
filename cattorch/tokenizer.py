@@ -418,9 +418,9 @@ class _TokenizerBase(ABC):
 
         uniquify_data_ids(sprite)
         output_path = Path(output_file(output_path, ".sprite3"))
-        sprite_name = output_path.stem if name is None else name
-        if not isinstance(sprite_name, str) or not sprite_name.strip():
-            raise ValueError("name must be a non-empty string")
+        sprite_name = interface.check_export(
+            output_path.stem if name is None else name, (interface.TOKENIZE, interface.DETOKENIZE),
+        )
         finalized = finalize_sprite(
             sprite, output_path, sprite_name=sprite_name, codegen=codegen,
             costume_names=self._costume_names,
@@ -436,6 +436,10 @@ class _TokenizerBase(ABC):
             warnings=finalized.warnings,
             tokenizer_type=self.kind,
             token_count=len(tokens),
+            broadcasts=tuple(
+                interface.message(sprite_name, block)
+                for block in (interface.TOKENIZE, interface.DETOKENIZE)
+            ),
         )
 
 
@@ -1817,6 +1821,7 @@ class SentencePieceBPETokenizer(_TokenizerBase):
             warnings=result.warnings + warning,
             tokenizer_type=result.tokenizer_type,
             token_count=result.token_count,
+            broadcasts=result.broadcasts,
         )
 
 

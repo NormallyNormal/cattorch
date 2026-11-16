@@ -3,6 +3,7 @@
 from cattorch.adapters import ModuleAdapter
 from cattorch.codegen import CodegenConfig
 from cattorch.fast import FastConfig
+from cattorch.interface import check_export_name
 from cattorch.quantization import QuantizationConfig
 from cattorch.storage import StorageConfig
 
@@ -20,8 +21,8 @@ def validate_export_options(
     example_kwargs=None,
     calibration=None,
 ) -> None:
-    if name is not None and (not isinstance(name, str) or not name.strip()):
-        raise ValueError("name must be a non-empty string")
+    if name is not None:
+        check_export_name(name)
     if optimization not in {"exact", "fast"}:
         raise ValueError(f"optimization must be 'exact' or 'fast', got {optimization!r}")
     if optimization != "fast" and fast_config is not None:

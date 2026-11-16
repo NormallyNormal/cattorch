@@ -333,8 +333,8 @@ def check_entry_lengths(
         bindings = [binding for binding in entry.arguments if isinstance(binding, Input)]
         for binding, value in zip(bindings, inputs):
             _set_logical_list(emulator, f"cattorch {entry.name} {binding.name}", value.flatten().tolist())
-        emulator.run_procedure(f"cattorch {entry.name}")
-        status = str(emulator.variables.get(STATUS_VARIABLE, ""))
+        emulator.call(f"cattorch {entry.name}")
+        status = str(emulator.variables.get(emulator.public(STATUS_VARIABLE, is_list=False), ""))
         try:
             with _expert_family_context(registry.expert_families):
                 leaves = replay.run(ProgramCall(entry.name, tuple(inputs)))

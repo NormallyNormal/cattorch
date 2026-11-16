@@ -3,12 +3,31 @@
 ``docs/scratch-interface.md`` is the contract; this module is where the code
 takes every public name and status value from, so that each is written once.
 
-A name in a finished sprite is public when it starts with ``cattorch `` or
-is one of a model's ``input``/``output`` lists; every other name starts with
-``_`` and is internal. ``is_public_data`` decides it for lists and
-variables, and finalization prefixes the rest (``internal_name``). Within an
-interface version no public name is renamed or removed, and its meaning,
-and each status value's, doesn't change; new ones may be added.
+Each export has a NAME, its sprite's name. A project uses an exported sprite
+without opening it: it broadcasts ``NAME OP`` (``message``) and reads and
+writes global lists and variables named ``NAME ...`` (``global_name``). The
+sprite is built with the names below (``cattorch forward``, ``input``,
+``cattorch status``, ...), and finalization (``globalize`` in
+``cattorch.util.scratch.globals``) turns them into that interface:
+
+- The public blocks become internal procedures (``_cattorch forward``),
+  each run by a ``when I receive [NAME forward]`` script, and every
+  completion broadcast becomes ``NAME OP complete``.
+- The data that changes while a project runs (``is_global_data``: every
+  public list, and the variables in ``RUNTIME_VARIABLES``) becomes global:
+  the sprite refers to ``NAME input``, ``NAME status``, ... without defining
+  them, and Scratch creates them on the stage when the sprite is uploaded.
+- The other public variables (``cattorch interface version``, the storage
+  descriptors, ``cattorch max context``, shard counts, and
+  ``cattorch initialized``) stay sprite-local, under their own names, for
+  other sprites to read with ``[VAR] of [SPRITE]``. Weights and working
+  lists are internal and local.
+
+Every other name starts with ``_`` and is internal; ``is_public_data``
+tells the public names from the rest as built, and finalization prefixes
+the rest (``internal_name``). Within an interface version no public name is
+renamed or removed, and its meaning, and each status value's, doesn't
+change; new ones may be added.
 """
 
 from __future__ import annotations
@@ -73,6 +92,13 @@ def completion(block: str) -> str:
 # fault. Every block sets the status when it ends; a sprite starts with the
 # initial value, before any block has ended.
 INITIAL_STATUS = ""
+# Set as a call's ``when I receive`` script starts, and replaced by how the
+# call ended when it ends. A call another broadcast of the same message
+# restarts (Scratch then stops the running script and starts it again) never
+# ends, so the script whose ``broadcast and wait`` it ended reads this
+# rather than an earlier call's status; so does anything reading the status
+# while a call runs, or after the stop sign stopped one.
+NOT_FINISHED = "not finished"
 OK = "ok"
 CONTEXT_FULL = "context full"
 OVERTAKEN = "another call ran during this one"
@@ -218,21 +244,131 @@ def final_data_name(
     return name if is_public_data(name, extra, is_list=is_list) else internal_name(name)
 
 
-# Projects from ``build_project``. Their global lists, variables and
-# messages are named after the sprite they are for.
-def project_name(sprite: str, name: str) -> str:
-    """A project's global list, variable or message for a sprite's ``name``.
+# Only what a project reads or writes to use a sprite is global: every
+# public list (``is_global_data``) and, of the variables, these. The other
+# public variables stay in the sprite, where other sprites read them with
+# ``[VAR] of [SPRITE]``: the constants fixed at export, and
+# ``cattorch initialized``, which only says whether the next call decodes
+# the weights first.
+RUNTIME_VARIABLES = frozenset({STATUS_VARIABLE, CACHE_LENGTH, TEXT})
+# The one broadcast every model, generation and program sprite answers, under
+# this name whatever the sprite's: it runs the sprite's prepare for save, so
+# that one ``broadcast and wait`` prepares a whole project for saving. It
+# sends no completion broadcast of its own (each sprite still sends its
+# ``NAME prepare for save complete``); ``broadcast and wait`` returns once
+# every sprite is done.
+SHARED_PREPARE_FOR_SAVE = "cattorch prepare for save"
+SHARED_MESSAGES = (SHARED_PREPARE_FOR_SAVE,)
 
-    It is the sprite's name, a space, and ``name`` without the ``cattorch ``
-    it may start with: ``points input``, ``story token ids``,
-    ``story status``, ``story prefill``.
+
+def global_name(export: str, name: str) -> str:
+    """The global list or variable, or the message, for an export's ``name``.
+
+    It is the export's NAME, a space, and ``name`` without the ``cattorch ``
+    it may start with: ``points input``, ``points output shard 2``,
+    ``story token ids``, ``story status``, ``story prefill``,
+    ``story prefill complete``.
     """
-    return f"{sprite} {name.removeprefix(PUBLIC_PREFIX)}"
+    return f"{export} {name.removeprefix(PUBLIC_PREFIX)}"
 
 
-def bridge_procedure(message: str) -> str:
-    """The block, in the model's or tokenizer's sprite, that a bridge message runs."""
-    return f"cattorch bridge {message}"
+def message(export: str, block: str) -> str:
+    """The broadcast that runs an export's ``block``: ``NAME forward`` for ``cattorch forward``."""
+    return global_name(export, block)
+
+
+def is_global_data(name: str, extra: frozenset[str] = frozenset(), *, is_list: bool = True) -> bool:
+    """Whether a public list or variable, as built, becomes global in the finished sprite.
+
+    Every public list does, and the variables in ``RUNTIME_VARIABLES``; the
+    other public variables are constants that stay in the sprite.
+    """
+    if is_list:
+        return is_public_data(name, extra)
+    return name in RUNTIME_VARIABLES
+
+
+# Names Scratch keeps for its own menus (``go to [_mouse_]``,
+# ``([x position] of [_stage_])``): a sprite can't be named one of them.
+RESERVED_SPRITE_NAMES = frozenset({"_mouse_", "_stage_", "_edge_", "_myself_", "_random_"})
+
+
+def check_export_name(name: object) -> str:
+    """``name`` if it can name an export (its sprite, globals and messages), else ``ValueError``.
+
+    It must be text that isn't empty or only spaces, nor a name Scratch
+    keeps for its menus (``RESERVED_SPRITE_NAMES``). A NAME whose messages
+    Scratch would match with a shared message (``SHARED_MESSAGES``) is
+    refused where the messages are known (``check_messages``).
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must be a non-empty string")
+    if name in RESERVED_SPRITE_NAMES:
+        raise ValueError(f"name {name!r} is reserved by Scratch for its menus; choose another")
+    return name
+
+
+def check_export(name: object, blocks) -> str:
+    """Check an export's NAME before exporting it, for its public ``blocks`` as built.
+
+    As ``check_export_name``, and its messages (``NAME OP`` and
+    ``NAME OP complete``) must not be the same to Scratch as each other or
+    as a shared message. Returns the name.
+    """
+    name = check_export_name(name)
+    owner = f"sprite {name!r}"
+    check_messages(
+        (owner, text) for block in blocks
+        for text in (message(name, block), completion(message(name, block)))
+    )
+    return name
+
+
+def check_messages(messages, *, shared=SHARED_MESSAGES) -> None:
+    """Refuse broadcasts that Scratch, which matches them ignoring case, can't tell apart.
+
+    ``messages`` are ``(owner, message)`` pairs, the owner saying where the
+    message comes from for the error (``"sprite 'points'"``). No two may be
+    equal ignoring case unless they are the same message of the same owner,
+    and none may equal one of ``shared``, which every sprite answers.
+    """
+    seen: dict[str, tuple[str, str]] = {
+        broadcast_key(text): ("cattorch", text) for text in shared
+    }
+    for owner, text in messages:
+        key = broadcast_key(text)
+        if key not in seen:
+            seen[key] = (owner, text)
+            continue
+        other_owner, other = seen[key]
+        if (other_owner, other) == (owner, text):
+            continue
+        if other_owner == "cattorch":
+            raise ValueError(
+                f"{owner}'s broadcast {text!r} is the message {other!r} that every exported "
+                "sprite answers, which Scratch matches ignoring case; choose another name"
+            )
+        raise ValueError(
+            f"{owner}'s broadcast {text!r} and {other_owner}'s {other!r} are the same message to "
+            "Scratch, which matches broadcasts ignoring case; rename one"
+        )
+
+
+def check_global_names(names) -> None:
+    """Refuse two global lists or variables with the same name.
+
+    ``names`` are ``(owner, name)`` pairs. Scratch keeps lists and variables
+    apart, but two globals of one name, even a list and a variable, would
+    be the same name in a project's palette and monitors, and two of a kind
+    the same global.
+    """
+    seen: dict[str, str] = {}
+    for owner, name in names:
+        if name in seen and seen[name] != owner:
+            raise ValueError(
+                f"{owner} and {seen[name]} would both use the global {name!r}; rename one"
+            )
+        seen.setdefault(name, owner)
 
 
 # What a block checks an input list's items for, before it runs.

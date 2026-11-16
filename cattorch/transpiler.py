@@ -2793,9 +2793,15 @@ def _transpile(
     ``_finalize_sprite`` takes.
     """
     output_path = Path(output_file(output_path, ".sprite3"))
-    sprite_name = output_path.stem if name is None else name
-    if not isinstance(sprite_name, str) or not sprite_name.strip():
-        raise ValueError("name must be a non-empty string")
+    sprite_name = interface.check_export(
+        output_path.stem if name is None else name,
+        (
+            (interface.INIT, interface.RESET, interface.PREFILL, interface.DECODE,
+             interface.PREPARE_FOR_SAVE)
+            if generation is not None
+            else (interface.INIT, interface.FORWARD, interface.PREPARE_FOR_SAVE)
+        ),
+    )
     codegen = codegen or CodegenConfig()
     compiled = _compile_sprite(
         model,
@@ -3449,10 +3455,21 @@ def _finalize_sprite(
         expanded_json_bytes=finalized.expanded_json_bytes,
         block_count=len(sprite.get("blocks", {})),
         list_count=len(sprite.get("lists", {})),
-        sharded_lists=tuple(name for name in compiled.sharded_lists if is_public_data(name)),
-        inputs=compiled.inputs,
-        outputs=compiled.outputs,
-        procedures=compiled.procedures,
+        sharded_lists=tuple(
+            interface.global_name(sprite_name, name)
+            for name in compiled.sharded_lists if is_public_data(name)
+        ),
+        inputs=tuple(
+            replace(spec, list_name=interface.global_name(sprite_name, spec.list_name))
+            for spec in compiled.inputs
+        ),
+        outputs=tuple(
+            replace(spec, list_name=interface.global_name(sprite_name, spec.list_name))
+            for spec in compiled.outputs
+        ),
+        broadcasts=tuple(
+            interface.message(sprite_name, procedure) for procedure in compiled.procedures
+        ),
         warnings=finalized.warnings + compiled.warnings,
         quantization=compiled.quantization,
         fallback_operations=compiled.fallback_operations,

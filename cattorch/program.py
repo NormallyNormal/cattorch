@@ -182,10 +182,10 @@ class EntryPoint:
                 interface.completion(block),
             ) == interface.broadcast_key(interface.completion(lifecycle)):
                 raise ValueError(
-                    f"entry point name {self.name!r} is reserved: its block {block!r} or "
-                    f"broadcast {interface.completion(block)!r} would be the program's own "
-                    f"{lifecycle!r} or {interface.completion(lifecycle)!r}, which Scratch "
-                    "matches ignoring case"
+                    f"entry point name {self.name!r} is reserved: its broadcast "
+                    f"{interface.message('NAME', block)!r} would be the program's own "
+                    f"{interface.message('NAME', lifecycle)!r}, which Scratch matches "
+                    "ignoring case"
                 )
         if re.search(r"%[snb]", self.name):
             raise ValueError("entry point names can't contain Scratch argument placeholders")
@@ -216,9 +216,9 @@ def _check_messages(entry_names: list[str]) -> None:
     """Refuse entry points whose broadcasts Scratch can't tell apart.
 
     Scratch matches broadcasts ignoring case, so ``step`` and ``Step`` would
-    share ``cattorch step complete``. A project's bridge for entry point E
-    is the message ``NAME E``, and it ends with ``NAME E complete``, so an
-    entry point named ``E complete`` would also run when E's bridge ends.
+    share ``NAME step complete``. Entry point E is called by the message
+    ``NAME E``, and its call ends with ``NAME E complete``, so an entry
+    point named ``E complete`` would also run when E's call ends.
     Block, variable and list names are matched exactly, and the exact
     checks elsewhere cover them.
     """
@@ -228,8 +228,7 @@ def _check_messages(entry_names: list[str]) -> None:
         if key in seen:
             raise ValueError(
                 f"entry points {seen[key]!r} and {name!r} differ only in case, and Scratch "
-                f"matches their broadcasts ({interface.completion(interface.entry_procedure(name))!r}) "
-                "ignoring case; rename one"
+                f"matches their broadcasts ('NAME {name}') ignoring case; rename one"
             )
         seen[key] = name
     for name in entry_names:
@@ -237,9 +236,9 @@ def _check_messages(entry_names: list[str]) -> None:
         if key in seen:
             raise ValueError(
                 f"entry point {seen[key]!r} is named like entry point {name!r}'s completion: "
-                f"in a project, {name!r}'s bridge ends by broadcasting "
+                f"{name!r}'s call ends by broadcasting "
                 f"'NAME {interface.completion(name)}', which would also run "
-                f"{seen[key]!r}'s bridge; rename one"
+                f"{seen[key]!r}; rename one"
             )
 
 

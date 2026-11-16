@@ -251,17 +251,31 @@ def _max_abs_error(check) -> float:
 
 
 def _summary(result) -> dict:
-    """A result's fields, by their Python names, for the JSON summary."""
+    """A result's fields, by their Python names, for the JSON summary.
+
+    ``lists`` adds the global lists a project uses the sprite through, as
+    ``broadcasts`` gives the messages that run it.
+    """
     fields = [
         "path", "sprite_name", "archive_bytes", "expanded_json_bytes", "block_count",
         "list_count", "sharded_lists", "warnings", "max_context", "vocabulary_size", "top_k",
         "tokenizer_type", "token_count", "fallback_operations", "approximate_operations",
+        "broadcasts",
     ]
     report = {}
     for field in fields:
         if hasattr(result, field):
             value = getattr(result, field)
             report[field] = str(value) if isinstance(value, Path) else value
+    lists = [spec.list_name for spec in (*getattr(result, "inputs", ()), *getattr(result, "outputs", ()))]
+    for entry in getattr(result, "entrypoints", ()):
+        lists += [spec.list_name for spec in (*entry.inputs, *entry.outputs)]
+    lists += [state.list_name for state in getattr(result, "states", ())]
+    if hasattr(result, "tokenizer_type"):
+        from cattorch import interface
+
+        lists.append(interface.global_name(result.sprite_name, interface.TOKEN_IDS))
+    report["lists"] = list(dict.fromkeys(lists))
     return report
 
 
