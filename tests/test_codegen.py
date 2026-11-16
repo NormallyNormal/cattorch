@@ -13,6 +13,7 @@ from cattorch.util.scratch.ids import (
 )
 from cattorch.util.scratch.remap import remap_ids
 from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
+from cattorch.util.scratch.globals import global_references
 from sprite_helpers import SpriteEmulator, load_sprite
 
 
@@ -253,7 +254,11 @@ def test_internal_name_compaction_preserves_public_interface(tmp_path):
         for section in ("variables", "lists")
         for entry in sprite[section].values()
     }
-    assert {"input", "output"} <= data_names
+    # The globals keep their names, and aren't in the sprite.
+    assert {"compact_names input", "compact_names output"} <= set(
+        global_references(sprite)["lists"].values(),
+    )
+    assert not {"input", "output"} & data_names
     assert any(name.startswith("_l") for name in data_names)
     assert all(
         block.get("shadow") is True or "shadow" not in block

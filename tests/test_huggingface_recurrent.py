@@ -120,9 +120,9 @@ def test_prefill_and_decode_match_the_stateless_forward(exported):
     assert emulator.variables["cattorch cache length"] == len(TOKENS)
     assert emulator.variables["cattorch max context"] == "Infinity"
     assert result.outputs[0].numel == result.vocabulary_size == VOCAB
-    assert result.procedures == (
-        "cattorch init", "cattorch reset", "cattorch prefill", "cattorch decode",
-        "cattorch prepare for save",
+    assert result.broadcasts == tuple(
+        f"{result.sprite_name} {block}"
+        for block in ("init", "reset", "prefill", "decode", "prepare for save")
     )
 
 
@@ -202,7 +202,9 @@ def test_max_context_limits_the_tokens_between_resets(tmp_path):
     assert emulator.variables["cattorch max context"] == 3
     assert run(emulator, "cattorch prefill", TOKENS[:3]) == "ok"
     assert run(emulator, "cattorch decode", [TOKENS[3]]) == interface.CONTEXT_FULL
-    assert run(emulator, "cattorch prefill", TOKENS[:4]) == interface.too_many_items(interface.TOKEN_IDS)
+    assert run(emulator, "cattorch prefill", TOKENS[:4]) == interface.too_many_items(
+        emulator.public(interface.TOKEN_IDS),
+    )
 
 
 def test_rescaled_rwkv_layers_follow_transformers_without_changing_the_model(tmp_path):

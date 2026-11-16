@@ -443,14 +443,17 @@ def test_other_flags_reject_values_that_are_only_truthy():
         Kernel(torch.ops.aten.mish.default, lambda ctx: (), approximate=1)
 
 
-def test_tokenizer_text_starts_empty(tmp_path):
+def test_tokenizer_text_is_global_and_a_project_starts_it_empty(tmp_path):
     from sprite_helpers import load_emulator
 
     from cattorch import CharTokenizer
 
     result = CharTokenizer(_char_tokenizer()).save(tmp_path / "t")
     emulator = load_emulator(result.path)
-    assert emulator.variables["cattorch text"] == ""
+    # Uploaded, Scratch creates "t text" holding 0, as it creates every
+    # variable; a project from build_project starts it empty.
+    assert emulator.variables["cattorch text"] == 0
+    emulator.variables["cattorch text"] = ""
     emulator.run_procedure("cattorch tokenize")
     assert emulator.lists["cattorch token ids"] == []
 

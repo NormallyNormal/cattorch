@@ -1077,11 +1077,14 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
         "_cattorch token step for epoch %s", "_cattorch init", "_cattorch reset",
         "_cattorch prefill", "_cattorch decode",
     } <= set(emulator._procedures)
-    assert set(sprite["broadcasts"].values()) == {
-        "cattorch init complete", "cattorch reset complete",
-        "cattorch prefill complete", "cattorch decode complete",
-        "cattorch prepare for save complete",
-    }
+    # Messages are the stage's: the sprite sends and answers them.
+    assert sprite["broadcasts"] == {}
+    name = sprite["name"]
+    assert set(global_references(sprite)["broadcasts"].values()) == {
+        f"{name} {block}{suffix}"
+        for block in ("init", "reset", "prefill", "decode", "prepare for save")
+        for suffix in ("", " complete")
+    } | {"cattorch prepare for save"}
     assert emulator.variables["cattorch max context"] == 5
     assert emulator.variables["cattorch cache length"] == 0
 
@@ -1091,8 +1094,9 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     prompt = [1, 3, 5]
     emulator.lists[TOKEN_IDS] = prompt
     emulator.run_procedure("cattorch prefill")
+    # Each call sends its own completion broadcast, and only that.
     assert emulator.broadcasts == [
-        "cattorch init complete", "cattorch prefill complete",
+        "cached_generation init complete", "cached_generation prefill complete",
     ]
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
@@ -1148,12 +1152,16 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
 
     emulator.lists[TOKEN_IDS] = []
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == interface.too_few_items(interface.TOKEN_IDS)
+    assert emulator.variables["cattorch status"] == interface.too_few_items(
+        emulator.public(interface.TOKEN_IDS),
+    )
     assert emulator.variables["cattorch cache length"] == 0
 
     emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == interface.too_many_items(interface.TOKEN_IDS)
+    assert emulator.variables["cattorch status"] == interface.too_many_items(
+        emulator.public(interface.TOKEN_IDS),
+    )
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["cattorch logits"] == []
 

@@ -524,7 +524,11 @@ def _forward_project(builder, result, example_inputs, labels) -> None:
 
 
 def _program_project(builder, result) -> None:
-    sprite = builder.add_sprite(result.path, visible=False)
+    # The entry points' inputs start at zeros, as a model's do.
+    inputs = [spec for entry in result.entrypoints for spec in entry.inputs]
+    sprite = builder.add_sprite(
+        result.path, visible=False, values=_starting_values(inputs, [None] * len(inputs)),
+    )
     demo = builder.add_demo_sprite()
     name = sprite["name"]
     shown, lines = [], []

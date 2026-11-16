@@ -1,5 +1,7 @@
 """Regression coverage for program boundaries and shared export infrastructure."""
 
+import dataclasses
+
 from cattorch import interface
 
 import pytest
@@ -29,7 +31,7 @@ from cattorch.util.scratch.interface import (
     rename_list,
     write_logical_list,
 )
-from sprite_helpers import SpriteEmulator, load_emulator
+from sprite_helpers import load_emulator
 
 
 class SharedBatchNorm(nn.Module):
@@ -101,9 +103,9 @@ def test_program_shards_inputs_and_outputs_after_binding_names(
     result = verify(model, program, artifact)
     assert result.passed, result
     for name in ("first", "second"):
-        assert f"cattorch {name} x" in artifact.sharded_lists
-        assert f"cattorch {name} y" in artifact.sharded_lists
-    assert "input" not in artifact.sharded_lists
+        assert f"shards {name} x" in artifact.sharded_lists
+        assert f"shards {name} y" in artifact.sharded_lists
+    assert "shards input" not in artifact.sharded_lists
 
 
 def test_program_shards_dynamic_alias_outputs_and_state(tmp_path, small_list_limit):
@@ -129,7 +131,7 @@ def test_program_shards_dynamic_alias_outputs_and_state(tmp_path, small_list_lim
     )
     result = verify(Model().eval(), program, artifact)
     assert result.passed, result
-    assert "cattorch read values" in artifact.sharded_lists
+    assert "dynamic-shards read values" in artifact.sharded_lists
 
 
 @pytest.mark.parametrize("compression", [False, True])
@@ -201,10 +203,12 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
         ),
     )
     em = load_emulator(transpile(Model().eval(), program, tmp_path / "append"))
-    # An append state holds at least its initial row.
+    # An append state holds at least its initial row. (The first call fills
+    # a state still empty, as Scratch creates the global, so init first.)
+    em.run_procedure("cattorch init")
     em.lists["cattorch state source"] = []
     em.run_procedure("cattorch copy")
-    assert em.variables["cattorch status"] == interface.too_few_items("cattorch state source")
+    assert em.variables["cattorch status"] == interface.too_few_items("append state source")
     assert em.lists["cattorch state destination"] == [0.0]
     for rows, expected in (([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
         em.lists["cattorch state source"] = rows
@@ -213,7 +217,7 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
         assert em.lists["cattorch state destination"] == expected
     em.lists["cattorch state source"] = [9.0]
     em.run_procedure("cattorch copy")
-    assert em.variables["cattorch status"] == interface.state_full("cattorch state destination")
+    assert em.variables["cattorch status"] == interface.state_full("append state destination")
     assert em.lists["cattorch state destination"] == [0.0, 1.0, 2.0, 3.0]
     assert em.lists["cattorch copy value"] == [12.0, 13.0]
     em.run_procedure("cattorch reset")
@@ -257,7 +261,7 @@ def test_verification_fails_rejected_call_and_resumes_from_unmodified_state(tmp_
     )
     assert not result.passed
     assert not result.calls[0].passed
-    assert result.calls[0].status == interface.wrong_number_of_items("cattorch step x")
+    assert result.calls[0].status == interface.wrong_number_of_items("status step x")
     assert result.calls[1].passed
     assert result.calls[1].status == "ok"
 
@@ -572,7 +576,10 @@ def test_analysis_reports_bounded_output_shape_and_public_name(tmp_path):
     report = analyze(model, program)
     artifact = transpile(model, program, tmp_path / "analysis")
     assert not report.entrypoints[0].unsupported_operations
-    assert report.entrypoints[0].outputs == artifact.entrypoints[0].outputs
+    assert [
+        dataclasses.replace(spec, list_name=spec.list_name.replace("NAME", "analysis", 1))
+        for spec in report.entrypoints[0].outputs
+    ] == list(artifact.entrypoints[0].outputs)
 
 
 def test_shared_logical_list_helpers_clear_stale_shards_and_rename_references():
@@ -591,31 +598,21 @@ def test_shared_logical_list_helpers_clear_stale_shards_and_rename_references():
     assert sprite["variables"]["v"][0] == "cattorch run x shard count"
 
 
-def test_benchmark_input_restore_and_output_read_are_shard_aware():
-    from cattorch.benchmark import _add_input_restore_procedure, _set_inputs, _target_output
+def test_benchmark_input_values_and_output_read_are_shard_aware():
+    from cattorch.benchmark import _input_values, _target_output
 
-    sprite = {
-        "lists": {"a": ["input", []], "b": ["input shard 2", []]},
-        "variables": {},
-        "blocks": {},
-        "broadcasts": {},
-    }
     x = torch.zeros(200_001)
     x[-1] = 7
-    _set_inputs(sprite, (x,))
-    assert len(sprite["lists"]["a"][1]) == 200_000
-    assert sprite["lists"]["b"][1] == [7.0]
-    _add_input_restore_procedure(sprite, (x,))
-    assert len(sprite["blocks"]) < 100
-    em = SpriteEmulator(sprite)
-    em.lists["input"] = []
-    em.lists["input shard 2"] = []
-    em.run_procedure("_cattorch restore benchmark input")
-    assert read_logical_list(em.lists, "input") == x.tolist()
-    assert _target_output({"lists": {"a": ["output", [1.0]], "b": ["output shard 2", [2.0]]}}) == [
-        1.0,
-        2.0,
-    ]
+    values = _input_values("case exact", (x,))
+    assert list(values) == ["case exact input", "case exact input shard 2"]
+    assert len(values["case exact input"]) == 200_000
+    assert values["case exact input shard 2"] == [7.0]
+    # The output is the global named after the sprite, shard by shard...
+    stage = {"lists": {"a": ["case exact output", [1.0]], "b": ["case exact output shard 2", [2.0]]}}
+    assert _target_output({"name": "case exact", "lists": {}}, stage) == [1.0, 2.0]
+    # ... or, in a project from before 1.0, the sprite's own list.
+    old = {"name": "case exact", "lists": {"a": ["output", [1.0]], "b": ["output shard 2", [2.0]]}}
+    assert _target_output(old, {"lists": {}}) == [1.0, 2.0]
 
 
 @pytest.mark.parametrize("optimization", ["exact", "fast"])

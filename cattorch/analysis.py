@@ -6,6 +6,8 @@ import math
 from collections import Counter
 from dataclasses import dataclass, replace
 
+from cattorch import interface
+
 from torch import nn
 
 from cattorch.adapters import ModuleAdapter
@@ -27,7 +29,12 @@ from cattorch.storage import StorageConfig
 
 @dataclass(frozen=True)
 class EntryPointAnalysis:
-    """Capture and lowering summary for one callable entrypoint."""
+    """Capture and lowering summary for one callable entrypoint.
+
+    ``outputs`` names each output list as a project sees it, with ``NAME``
+    standing for the export's name, which ``analyze`` doesn't know:
+    ``NAME ENTRY OUTPUT``.
+    """
 
     name: str
     method: str
@@ -207,7 +214,9 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
             specs = graph.output_specs()
             validate_entry_outputs(program, entrypoint, specs)
             outputs = tuple(
-                replace(spec, list_name=f"cattorch {entrypoint.name} {binding.name}")
+                replace(spec, list_name=interface.global_name(
+                    "NAME", interface.entry_list(entrypoint.name, binding.name),
+                ))
                 for binding, spec in zip(entrypoint.returns, specs)
                 if isinstance(binding, Output)
             )

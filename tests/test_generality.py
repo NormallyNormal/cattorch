@@ -462,7 +462,7 @@ def test_tensor_keyword_becomes_next_input(tmp_path):
     kwargs = {"mask": mask, "scale": 2.0, "label": "ignored"}
     model = KeywordMask().eval()
     result = transpile(model, (x,), tmp_path / "model", example_kwargs=kwargs)
-    assert [spec.list_name for spec in result.inputs] == ["input", "input_1"]
+    assert [spec.list_name for spec in result.inputs] == ["model input", "model input_1"]
     assert tuple(result.inputs[1].shape) == (1, 4)
     assert verify(model, (x,), result, example_kwargs=kwargs).passed
 
