@@ -30,7 +30,7 @@ def _first_call(result, entry_name, inputs):
     entry = next(entry for entry in result.entrypoints if entry.name == entry_name)
     for spec, value in zip(entry.inputs, inputs):
         emulator.lists[spec.list_name] = value.flatten().tolist()
-    emulator.run_procedure(entry.procedure)
+    emulator.run_procedure(entry.broadcast)
     assert emulator.variables["cattorch status"] == "ok"
     return [
         torch.tensor([float(value) for value in emulator.lists[spec.list_name]])

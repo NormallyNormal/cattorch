@@ -101,7 +101,7 @@ named after its parameter (`NAME add value`) and a list per output
   `None` that a method sets to a tensor, or one a method sets to `None`,
   fails the export. Give the buffer an initial tensor, and keep whether it
   has been set in another buffer, such as `torch.tensor(False)`. A method
-  that returns no tensor and changes no buffer fails too, since its block
+  that returns no tensor and changes no buffer fails too, since its call
   would do nothing.
 - Only buffers become state. Every entry point is traced from the model as
   you gave it, so the sprite runs every call of every entry point as a
