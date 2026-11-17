@@ -1024,7 +1024,7 @@ def verify(
     ``"prefill"``, ``"decode"`` and ``"reset"`` with their token IDs, such as
     ``ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),))``; by default a
     prefill and a few decodes. Each call's logits and top-k lists are
-    compared with the model's next-token logits, and its ``cattorch status``
+    compared with the model's next-token logits, and its ``NAME status``
     with the status its input should give, such as ``context full``. Both
     return a ``ProgramVerifyResult``.
 
