@@ -18,7 +18,7 @@ import logging
 import math
 import weakref
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Callable, Literal, cast
 
 import numpy as np
 import torch
@@ -75,6 +75,7 @@ def _deduplicate_static_tensors(
     *,
     effective_ndims: dict[str, int] | None = None,
     shared: dict[str, str] | None = None,
+    cost: Callable[[str, torch.Tensor], float] | None = None,
 ) -> dict[str, torch.Tensor | None]:
     """Share bit-identical flattened tensors before storage and sharding.
 
@@ -84,16 +85,23 @@ def _deduplicate_static_tensors(
     so this transform remains exact even for NaNs and signed zeroes.
     ``shared`` receives each dropped tensor's key with the key of the
     tensor that stands in for it.
+
+    Storage decides each list on its own shape, so identical lists of
+    different shapes may be decided differently: one may be on an integer
+    grid that another's rows cut across. The one that stands in for the
+    others is the one storage stores in the fewest bits per value, by
+    ``cost`` (``_static_storage_cost``), then the first: every list of the
+    group then holds exactly what storage stores of that one, whichever
+    order the compiler made them in.
     """
-    winners: dict[tuple[str, int, int, bytes], tuple[str, torch.Tensor]] = {}
-    aliases: dict[str, str] = {}
-    kept: dict[str, torch.Tensor | None] = {}
+    groups: dict[tuple[str, int, int, bytes], list[list[tuple[str, torch.Tensor]]]] = {}
+    order: list[str] = []
     # A tensor that no block reads, such as one a fast-mode kernel replaced,
     # can't stand in for the others: its list isn't in the sprite.
     in_sprite = {entry[0] for entry in sprite.get("lists", {}).values()}
     for key, tensor in static_tensors.items():
+        order.append(key)
         if not isinstance(tensor, torch.Tensor) or f"W_{key}" not in in_sprite:
-            kept[key] = tensor
             continue
         contiguous = tensor.detach().cpu().contiguous()
         # The bytes in place, not a copy of every weight held until the end.
@@ -103,15 +111,35 @@ def _deduplicate_static_tensors(
             (effective_ndims or {}).get(key, tensor.ndim),
             hashlib.sha256(raw.numpy()).digest(),
         )
-        previous = winners.get(identity)
-        if previous is not None and torch.equal(previous[1], raw):
-            aliases[f"W_{key}"] = f"W_{previous[0]}"
-            if shared is not None:
-                shared[key] = previous[0]
-            log.info("Sharing identical static tensor W_%s -> W_%s", key, previous[0])
+        candidates = groups.setdefault(identity, [])
+        same = next(
+            (members for members in candidates if torch.equal(members[0][1], raw)), None,
+        )
+        if same is None:
+            candidates.append([(key, raw)])
         else:
-            winners[identity] = (key, raw)
-            kept[key] = tensor
+            same.append((key, raw))
+    aliases: dict[str, str] = {}
+    for candidates in groups.values():
+        for members in candidates:
+            if len(members) < 2:
+                continue
+            winner = members[0][0]
+            if cost is not None:
+                winner = min(
+                    (key for key, _ in members),
+                    key=lambda key: cast(float, cost(key, cast(torch.Tensor, static_tensors[key]))),
+                )
+            for key, _ in members:
+                if key == winner:
+                    continue
+                aliases[f"W_{key}"] = f"W_{winner}"
+                if shared is not None:
+                    shared[key] = winner
+                log.info("Sharing identical static tensor W_%s -> W_%s", key, winner)
+    kept = {
+        key: static_tensors[key] for key in order if f"W_{key}" not in aliases
+    }
     if not aliases:
         return kept
 
@@ -260,6 +288,24 @@ def _static_storage_decision(
     if finite.numel() and float(finite.abs().max()) > 65504:
         return "float32", reason
     return "float16", reason
+
+
+def _static_storage_cost(
+    tensor: torch.Tensor | None,
+    storage: StorageConfig,
+    effective_ndim: int | None = None,
+    interleave_segments: tuple[tuple[int, int, int], ...] = (),
+    source_numel: int | None = None,
+) -> float:
+    """The bits per value storage stores ``tensor`` in, scales included."""
+    precision = _static_storage_precision(
+        tensor, storage, effective_ndim, interleave_segments, source_numel,
+    )
+    if precision not in _INTEGER_BITS:
+        return {"float32": 32.0, "float16": 16.0}[precision]
+    group_size = _static_storage_group_size(tensor, storage, interleave_segments)
+    scale_bits = 32 if storage.scale_precision == "float32" else 16
+    return _INTEGER_BITS[precision] + scale_bits / group_size
 
 
 def _integer_encodings(

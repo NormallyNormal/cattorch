@@ -54,6 +54,7 @@ from cattorch.quantization import (
     QuantizationConfig,
     QuantizationReport,
     _StaticSourceRecorder,
+    _quantized_list_sources,
     _storage_quantization_report,
     effective_group_size,
     expert_bank_effective_ndims,
@@ -88,6 +89,7 @@ from cattorch.static_storage import (
     _apply_static_storage,
     _apply_tied_static_aliases,
     _deduplicate_static_tensors,
+    _static_storage_cost,
     _static_storage_shard_limits,
 )
 from cattorch import interface
@@ -3000,6 +3002,18 @@ def _compile_sprite(
         sprite = compiler.compile()
     if static_sources is not None:
         static_sources.finish()
+        if storage.precision in {"int8", "int6", "int4"}:
+            assert quantization_report is not None
+            # A small list of a large quantized weight is stored as the
+            # weight is (see ``_quantized_list_sources``).
+            for key, size in _quantized_list_sources(
+                quantization_report, compiler.static_lists, recorder=static_sources,
+                model=model, minimum=storage.min_quantized_values,
+                effective_ndims=compiler.static_effective_ndims,
+            ).items():
+                compiler.static_source_numels[key] = max(
+                    compiler.static_source_numels.get(key, 0), size,
+                )
     before_sharing = dict(compiler.static_lists)
     # Lists storage shares with an identical one: key -> that one's key.
     shared_lists: dict[str, str] = {}
@@ -3008,6 +3022,11 @@ def _compile_sprite(
         compiler.static_lists,
         effective_ndims=compiler.static_effective_ndims,
         shared=shared_lists,
+        cost=lambda key, tensor: _static_storage_cost(
+            tensor, storage, compiler.static_effective_ndims.get(key),
+            compiler.interleaved_static_layouts.get(key, ()),
+            compiler.static_source_numels.get(key),
+        ),
     )
 
     # Layout-specialized kernels may replace an original static tensor with

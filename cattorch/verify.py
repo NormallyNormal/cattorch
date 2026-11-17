@@ -143,8 +143,6 @@ def round_as_stored(
     model computes from parameters as quantization stored them are read
     the same way.
     """
-    from cattorch.static_storage import _static_storage_precision
-
     if quantization is not None:
         storage = quantized_storage(storage, quantization, report)
     effective_ndims = expert_bank_effective_ndims(model)
@@ -154,6 +152,13 @@ def round_as_stored(
     for key, value in tensors.items():
         if value.is_floating_point() and value.ndim >= 2:
             originals[key] = value.detach().clone()
+    # What the uses quantization observed read, by tensor name.
+    names = {tensor.untyped_storage().data_ptr(): key for key, tensor in tensors.items()}
+    reads = tuple(
+        (names[pointer], *rest) for pointer, *rest in (report._reads if report is not None else ())
+        if pointer in names
+    )
+    uses = _StoredUses(storage, sig_figs, originals, reads)
     with torch.no_grad():
         for value in (*model.parameters(), *model.buffers()):
             if not value.is_floating_point():
@@ -163,22 +168,32 @@ def round_as_stored(
             # used on the right of a matmul, and bilinear weights, are
             # stored transposed, so check that layout too.
             layout = value
-            precision = _static_storage_precision(layout, storage, ndim)
+            name = names.get(value.untyped_storage().data_ptr())
+            precision, decided = uses.precision(value, layout, ndim, name)
             if precision == "float16" and value.ndim >= 2:
                 layout = value.transpose(-1, -2).contiguous()
-                precision = _static_storage_precision(layout, storage, ndim)
+                precision, decided = uses.precision(value, layout, ndim, name)
                 if precision == "float16":
-                    layout = value
+                    layout = decided = value
             if quantization is not None and value.numel() < quantization.min_quantized_values:
-                precision = "float16"
+                precision, decided = "float16", layout
             if sig_figs is None and precision not in {"float16"}:
                 continue
             stored = torch.tensor(
-                _stored_values(layout, precision, storage, sig_figs), dtype=value.dtype,
+                _stored_values(decided, precision, storage, sig_figs), dtype=value.dtype,
             ).reshape(layout.shape)
             value.copy_(stored if layout is value else stored.transpose(-1, -2))
     if originals and storage.precision != "float32":
-        model._cattorch_stored_uses = _StoredUses(storage, sig_figs, originals)
+        model._cattorch_stored_uses = uses
+        if isinstance(model, torch.fx.GraphModule):
+            # A copy of a ``GraphModule`` keeps only what its graph reads,
+            # and the attributes its ``meta`` names; ``dynamic=`` checks a
+            # copy of the reference at each length.
+            from torch.fx.graph_module import _USER_PRESERVED_ATTRIBUTES_KEY
+
+            model.meta.setdefault(_USER_PRESERVED_ATTRIBUTES_KEY, {})[
+                "_cattorch_stored_uses"
+            ] = uses
 
 
 def _stored_values(layout: torch.Tensor, precision: str, storage, sig_figs) -> list:
@@ -220,13 +235,52 @@ class _StoredUses:
     """What each matrix use of a model rounded by ``round_as_stored`` reads.
 
     ``originals`` are the matrices' values before rounding, by
-    ``_stored_tensors`` name.
+    ``_stored_tensors`` name, and ``reads`` what the uses quantization
+    observed read of them (``QuantizationReport._reads``, by that name).
     """
 
-    def __init__(self, storage, sig_figs, originals: dict[tuple, torch.Tensor]):
+    def __init__(self, storage, sig_figs, originals: dict[tuple, torch.Tensor], reads=()):
         self.storage = storage
         self.sig_figs = sig_figs
         self.originals = originals
+        self.reads: dict[tuple, list[tuple]] = {}
+        for name, *read in reads:
+            self.reads.setdefault(name, []).append(tuple(read))
+
+    def precision(
+        self, tensor: torch.Tensor, layout: torch.Tensor, ndim: int | None = None,
+        name: tuple | None = None,
+    ) -> tuple[str, torch.Tensor]:
+        """The precision storage keeps the list of ``tensor``'s values
+        ``layout`` holds in, and the list it decides that on.
+
+        Storage decides each list on its own shape, and shares lists that
+        hold the same values: the one it stores in the fewest bits stands in
+        for the others (see ``static_storage._deduplicate_static_tensors``).
+        So the list is decided as the cheapest of the lists the observed
+        uses read of ``tensor`` (``name``, its ``_stored_tensors`` name)
+        that hold exactly ``layout``'s values. ``min_quantized_values``
+        applies to ``tensor`` as a whole, as it does in export.
+        """
+        from cattorch.quantization import _storage_numel
+        from cattorch.static_storage import _static_storage_cost, _static_storage_precision
+
+        storage, source = self.storage, _storage_numel(tensor)
+        candidates = [layout]
+        original = self.originals.get(name) if name is not None else None
+        if original is not None and original.is_contiguous() and tensor.is_contiguous():
+            flat = original.as_strided((source,), (1,), 0)
+            values = layout.detach().reshape(-1)
+            for offset, shape, stride, transposed in self.reads.get(cast(tuple, name), ()):
+                view = flat.as_strided(shape, stride, offset)
+                stored = (view.T if transposed else view).contiguous()
+                if stored.ndim == layout.ndim and torch.equal(stored.reshape(-1), values):
+                    candidates.append(stored)
+        decided = candidates[0] if len(candidates) == 1 else min(
+            candidates,
+            key=lambda item: _static_storage_cost(item, storage, ndim, (), source),
+        )
+        return _static_storage_precision(decided, storage, ndim, (), source), decided
 
 
 class _StoredUseMode(TorchDispatchMode):
@@ -237,9 +291,9 @@ class _StoredUseMode(TorchDispatchMode):
         self.registry = registry
         self.uses = uses
         tensors = _stored_tensors(model)
-        # Storage -> (current tensor, values before rounding).
+        # Storage -> (current tensor, values before rounding, its name).
         self.by_storage = {
-            tensor.untyped_storage().data_ptr(): (tensor, uses.originals[key])
+            tensor.untyped_storage().data_ptr(): (tensor, uses.originals[key], key)
             for key, tensor in tensors.items() if key in uses.originals
             and uses.originals[key].shape == tensor.shape
         }
@@ -249,7 +303,6 @@ class _StoredUseMode(TorchDispatchMode):
 
     def _substitute(self, weight: torch.Tensor, orientation: str) -> torch.Tensor | None:
         from cattorch.quantization import _canonical_spec, _storage_numel
-        from cattorch.static_storage import _static_storage_precision
 
         pointer = weight.untyped_storage().data_ptr()
         found = self.by_storage.get(pointer)
@@ -258,7 +311,7 @@ class _StoredUseMode(TorchDispatchMode):
         key = (pointer, _canonical_spec(weight), orientation)
         if key in self.substitutes:
             return self.substitutes[key]
-        tensor, original = found
+        tensor, original, name = found
         flat_original = original.as_strided(
             (_storage_numel(tensor),), (1,), 0,
         ) if original.is_contiguous() and tensor.is_contiguous() else None
@@ -269,11 +322,9 @@ class _StoredUseMode(TorchDispatchMode):
             # reads it, output-major.
             transposed = orientation == "rhs_matmul" and view.ndim == 2
             layout = (view.T if transposed else view).contiguous()
-            precision = _static_storage_precision(
-                layout, self.uses.storage, source_numel=layout.numel(),
-            )
+            precision, decided = self.uses.precision(tensor, layout, name=name)
             stored = torch.tensor(
-                _stored_values(layout, precision, self.uses.storage, self.uses.sig_figs),
+                _stored_values(decided, precision, self.uses.storage, self.uses.sig_figs),
                 dtype=tensor.dtype,
             ).reshape(layout.shape)
             if transposed:

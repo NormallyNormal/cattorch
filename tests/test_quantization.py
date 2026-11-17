@@ -98,8 +98,10 @@ def test_gptq_captures_functional_linear_and_stacked_weight_views():
 
 def test_unobserved_stacked_experts_fall_back_independently():
     class OneExpert(_StackedExperts):
+        # The bank is read whole, as an expert family's operation reads it,
+        # so export stores every expert; only the first one is observed.
         def forward(self, value):
-            return F.linear(value, self.weight[0])
+            return F.linear(value, self.weight[0]) + (self.weight * value.mean()).sum()
 
     model = OneExpert().eval()
     report = quantize_model(

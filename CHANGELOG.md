@@ -350,7 +350,8 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   record of each list it stored, with `name[float16]` and `name[remaining]`
   entries and `TensorQuantizationReport.sources` and `override`. A
   program's entry points are reported together, and a position table read
-  at constant positions has an entry for the rows stored.
+  at constant positions has an entry for the rows stored, with or without
+  layer sharing.
 
 ### Command line and projects
 
@@ -563,6 +564,23 @@ Python:
   stored in float16 without a warning, `min_quantized_values` was applied to
   each list of a split weight, vector parameters were quantized like
   matrices, and sliced weights were quantized twice.
+- Quantization: parameters the export never reads, such as a submodule
+  `forward` doesn't call or the rows of `weight[:256]` past 256, were
+  quantized, reported and counted in `quantized_values`; they are neither
+  now. A weight above `min_quantized_values` read in slices below it was
+  rounded to integers and then stored in float16; the slices are stored in
+  integers, as the whole weight would be. A table gathered by token whose
+  first rows a matrix product also read, as `h @ embedding[:16]` does, was
+  quantized in the product's layout for those rows, so the whole table was
+  stored in float16 with its other rows rounded to integers; the gather now
+  decides the table's layout and the product reads a float16 copy. A
+  float16 list holding values of several report entries says so, instead of
+  claiming each was quantized along another axis.
+- `verify` with `quantization=` failed on a correct sprite whose storage
+  shares one list between a weight and a view of it with another shape,
+  such as `w` and `w.view(1024, 32)`. Storage now stores such a list in the
+  fewest bits any of its shapes allows, whichever use comes first, and
+  `verify` reads it for every use.
 - GPTQ errors name the calibration item that failed, whatever the model
   raised, and calibration items are checked before calibration: a token
   sequence longer than `max_context` or not `[1, length]`, or a tensor item
@@ -609,7 +627,8 @@ Python:
   decode it as SentencePiece does (` ⁇ ` by default).
 - `QuantizationConfig`'s GPTQ-only `damp_percent`, `block_size` and
   `min_calibration_rows` were ignored with `method="symmetric"`; setting
-  them raises `ValueError`. A `FastLayerConfig` rank at or above a weight's
+  them raises `ValueError`. A GPTQ config that sets them can still give
+  some weights `QuantizationOverride(method="symmetric")`. A `FastLayerConfig` rank at or above a weight's
   full rank was skipped silently; it warns, as other skipped
   factorizations do.
 - An `output_path` that names no file (empty, ending in a separator, only an

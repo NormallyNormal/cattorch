@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import math
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Iterable, Literal, Mapping, cast
 
 import numpy as np
@@ -120,9 +120,7 @@ class QuantizationConfig:
         ):
             raise ValueError("damp_percent must be a positive finite number")
         if self.method != "gptq":
-            for name, default in (
-                ("damp_percent", 0.01), ("block_size", 128), ("min_calibration_rows", 128),
-            ):
+            for name, default in _gptq_defaults().items():
                 if getattr(self, name) != default:
                     raise ValueError(
                         f"{name} applies to method='gptq'; a {self.method} config doesn't use it"
@@ -238,6 +236,14 @@ class QuantizationConfig:
         )
 
 
+def _gptq_defaults() -> dict[str, Any]:
+    """The defaults of the settings only GPTQ uses."""
+    return {
+        item.name: item.default for item in fields(QuantizationConfig)
+        if item.name in {"damp_percent", "block_size", "min_calibration_rows"}
+    }
+
+
 # The ``TensorQuantizationReport.override`` of an output head whose settings
 # ``QuantizationConfig.head_bits`` chose.
 HEAD_BITS = "head_bits"
@@ -263,10 +269,13 @@ class _WeightSettings:
         if (self.bits, self.method, self.group_size) == (base.bits, base.method, base.group_size):
             return base
         assert self.bits is not None
+        # A weight a GPTQ config quantizes symmetrically doesn't use the
+        # config's GPTQ settings, which a symmetric config refuses.
+        gptq_settings = _gptq_defaults() if self.method != "gptq" else {}
         return replace(
             base, bits=cast(Literal[4, 6, 8], self.bits),
             method=cast(Literal["symmetric", "gptq"], self.method),
-            group_size=self.group_size, overrides={},
+            group_size=self.group_size, overrides={}, **gptq_settings,
         )
 
 
@@ -325,6 +334,11 @@ class QuantizationReport:
     _copies: dict = field(default_factory=dict, repr=False, compare=False)
     # Every (precision, maximum group size) the quantized weights use.
     _integer_formats: tuple = field(default=(), repr=False, compare=False)
+    # What the observed uses read, as export stores a list of each:
+    # (storage, offset, shape, strides, whether the list is the transpose).
+    # Storage shares identical lists, and verify's reference reads what it
+    # stores of them together (see ``verify._StoredUseMode``).
+    _reads: tuple = field(default=(), repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -390,6 +404,8 @@ class _StorageFindings:
 STORED_AS_VECTOR = "vector"
 STORED_BELOW_MINIMUM = "below minimum"
 STORED_OFF_GRID = "off grid"
+# An off-grid list holding values of several report entries.
+_STORED_MIXED = "mixed"
 # What that means for quantized values the list holds.
 _FLOAT_STORAGE_REASONS: dict[str | None, str] = {
     STORED_OFF_GRID: (
@@ -399,6 +415,11 @@ _FLOAT_STORAGE_REASONS: dict[str | None, str] = {
     STORED_BELOW_MINIMUM: (
         "storage reads them from a list of fewer than min_quantized_values={minimum} "
         "values, which it keeps in float16"
+    ),
+    _STORED_MIXED: (
+        "storage reads them from a list that also holds values quantized in other "
+        "groups, and no integer encoding of the whole list reproduces both, so it keeps "
+        "the list in float16"
     ),
     STORED_AS_VECTOR: "storage reads them as a vector, which it keeps in float16",
     None: "storage keeps the list that holds them in float16",
@@ -454,6 +475,12 @@ def _stored_quantization_report(
                 if overlap:
                     share = sum(int(value.sum()) for value in held.values())
                     capacity += count * overlap / share
+                    if stored_reason == STORED_OFF_GRID and (
+                        len(held) > 1 or bool((held[region.pointer] & ~mask).any())
+                    ):
+                        # The list holds other quantized values too, which may
+                        # be what puts it off the grid of these.
+                        stored_reason = _STORED_MIXED
                     why[stored_reason] = why.get(stored_reason, 0) + overlap
             if only + copies > capacity:
                 scale = capacity / (only + copies)
@@ -653,6 +680,15 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # known at export, such as ``weight_norm``'s weight.
         self.direct_reads: set[int] = set()
         self.derivations: set[int] = set()
+        # What an operation that also reads an input reads of parameters
+        # other than as a matrix (see ``__torch_dispatch__``), such as a
+        # table it gathers rows of: the views of their storages, by
+        # ``_storage_key``, and parameters read through a tensor of its own
+        # at positions not known, all of whose elements count as read.
+        self.read_views: dict[tuple, torch.Tensor] = {}
+        self.read_whole: set[int] = set()
+        # Operands of a matrix product other than the matrices it reads.
+        self.covered_views: dict[tuple, torch.Tensor] = {}
         # With ``follow_products``: each tensor computed at run time -> the
         # storages of the weights whose matrix products last computed it.
         # A product with a weight replaces its inputs' weights with its own;
@@ -825,6 +861,10 @@ class _GPTQCaptureMode(TorchDispatchMode):
         # selected-expert activations without recursively observing themselves.
         with torch._C._DisableTorchDispatch():
             observations = self.registry.observe(target, func, args, kwargs, result)
+            inputs = [
+                (item, self._static_entry(item)) for item in pytree.tree_leaves((args, kwargs))
+                if isinstance(item, torch.Tensor) and item.is_floating_point()
+            ]
             # An operation on known tensors alone is folded at export: it
             # computes another weight, and reads no matrix at run time.
             folded = self._track_static(func, target, args, kwargs, result)
@@ -834,12 +874,43 @@ class _GPTQCaptureMode(TorchDispatchMode):
                 if isinstance(value, torch.Tensor) and isinstance(weight, torch.Tensor)
                 and not folded
             ]
+            if not folded:
+                self._record_reads(inputs, observations)
         for value, view, orientation in views:
             if view is not None:
                 self._record(value, view, orientation)
         if self.products is not None:
             self._follow_products(args, kwargs, result, views)
         return result
+
+    def _record_reads(self, inputs, observations) -> None:
+        """Record what an operation that also reads an input reads of
+        parameters, other than the matrices ``observations`` say it reads.
+
+        Export stores each tensor known before any input arrives that such
+        an operation reads, as it is, so a view of a parameter, such as a
+        table gathered by token, is stored as that view.
+        """
+        matrices: dict[int, set[tuple]] = {}
+        for _, weight, _ in observations:
+            if isinstance(weight, torch.Tensor):
+                matrices.setdefault(weight.untyped_storage().data_ptr(), set()).add(
+                    _storage_key(weight),
+                )
+        for item, entry in inputs:
+            # Only values the operation reads unchanged: a weight computed
+            # from parameters is followed as a weight of its own.
+            if entry is None or not entry[2]:
+                continue
+            pointer = item.untyped_storage().data_ptr()
+            if pointer not in self.parameters:
+                self.read_whole.update(entry[1])
+            elif pointer not in matrices:
+                self.read_views.setdefault(_storage_key(item), item.detach())
+            elif _storage_key(item) not in matrices[pointer]:
+                # An operand some of whose matrices the operation reads, such
+                # as an expert bank, which export stores whole.
+                self.covered_views.setdefault(_storage_key(item), item.detach())
 
     def _follow_products(self, args, kwargs, result, views) -> None:
         products = self.products
@@ -971,6 +1042,11 @@ def _symmetric_matrix(
         values = torch.from_numpy(codes * np.repeat(scales, group)[:codes.size])
         reconstructed[start:start + step] = values.to(matrix.dtype).reshape(rows.shape)
     return reconstructed.to(device=matrix.device), group, counts
+
+
+# Why a GPTQ config quantizes a weight symmetrically that no matrix product
+# reads with activations GPTQ could calibrate it with.
+_NO_STATISTICS = "no compatible linear activation statistics"
 
 
 @dataclass(frozen=True)
@@ -1270,12 +1346,17 @@ def _region_masks(regions: Iterable[_Region]) -> dict[int, torch.Tensor]:
 
 @dataclass
 class _Use:
-    """One matrix region of a parameter, with every use that reads it so."""
+    """One matrix region of a parameter, with every use that reads it so.
+
+    ``observed`` is false for a region only read other than by a matrix
+    product, which has no activation statistics.
+    """
 
     stat: _ActivationStats
     logical: torch.Tensor
     group_width: int | None
     mask: torch.Tensor
+    observed: bool = True
 
 
 def _quantize_remaining(
@@ -1981,9 +2062,13 @@ def quantize_model(
     how each matrix is read: as a linear weight, on the right of a matmul,
     or as convolution kernels. Each region of a parameter that a use reads
     is quantized once, grouped over the inputs of that use, the layout
-    Scratch storage uses for it. Elements no such use reads are grouped
-    along the parameter's last dimension. Without observation, matrices
-    keep their stored orientation.
+    Scratch storage uses for it; a matrix read other than by a matrix
+    product, such as a gathered table, is read grouped along its rows.
+    Elements read only in other ways, such as the experts of a bank read
+    whole, are grouped along the parameter's last dimension, and elements
+    no observed call reads, which export doesn't store, are left as they
+    are and not reported. Without observation, matrices keep their stored
+    orientation.
     ``call_kwargs`` are passed to every observed model call.
     ``_calibration_name`` is the caller's name for ``calibration_inputs``,
     for its errors. ``_names_from`` is the module whose parameter names the
@@ -2105,6 +2190,13 @@ def quantize_model(
         if config.method == "symmetric":
             batches = 0
 
+    # The lists export stores of what each observed use reads, as the
+    # model's tensors hold them (see ``QuantizationReport._reads``).
+    stored_reads: list[tuple] = []
+    for stat in capture.stats.values():
+        if stat.orientation in {"linear", "rhs_matmul"} and stat.weight.ndim == 2:
+            stored_reads.append((*_storage_key(stat.weight), stat.orientation == "rhs_matmul"))
+    stored_reads.extend((*key, False) for key in capture.read_views)
     reports: list[TensorQuantizationReport] = []
     regions: list[_Region] = []
     gptq = config.method == "gptq"
@@ -2154,6 +2246,29 @@ def quantize_model(
                     continue
             stats[key] = stat
         capture.stats = stats
+        # So are its other reads, such as rows gathered from it.
+        def parameter_views(views: dict[tuple, torch.Tensor]) -> dict[tuple, torch.Tensor]:
+            found_views: dict[tuple, torch.Tensor] = {}
+            for key, view in views.items():
+                copied = copies.get(view.untyped_storage().data_ptr())
+                if copied is None:
+                    found_views[key] = view
+                    continue
+                found = _strided_view(copied[2].as_strided(
+                    view.shape, view.stride(), view.storage_offset(),
+                ))
+                if found is None:
+                    capture.read_whole.add(copied[1])
+                    continue
+                offset, shape, strides = found
+                weight = base_parameters[copied[1]][1].detach().as_strided(
+                    shape, strides, offset,
+                )
+                found_views.setdefault(_storage_key(weight), weight)
+            return found_views
+
+        capture.read_views = parameter_views(capture.read_views)
+        capture.covered_views = parameter_views(capture.covered_views)
     # A computed weight read as a matrix is quantized like a parameter, and
     # takes the settings of the parameters it is computed from.
     read = {stat.weight.untyped_storage().data_ptr() for stat in capture.stats.values()}
@@ -2190,12 +2305,60 @@ def quantize_model(
         # Every region of a parameter that a use reads as a matrix. Uses that
         # read the same elements the same way share one region; regions that
         # share elements but group them differently can't all be stored in
-        # integers, so the largest, then the first used, is quantized.
+        # integers, so the largest, then the first used, is quantized. A
+        # matrix read other than by a matrix product, such as a table rows
+        # are gathered from, is stored as it is read, grouped along its rows
+        # as a linear weight is, so it is a use too, without statistics.
         uses_by_storage: dict[int, list[_Use]] = {}
-        for stat in capture.stats.values():
+        # Every element of each parameter that some use or other read reads
+        # (see ``_GPTQCaptureMode.read_views``): export stores no other.
+        read_masks: dict[int, torch.Tensor] = {}
+
+        def mark_read(pointer: int, view: torch.Tensor | None) -> torch.Tensor:
+            numel = _storage_numel(base_parameters[pointer][1])
+            mask = read_masks.setdefault(pointer, torch.zeros(numel, dtype=torch.bool))
+            if view is None:
+                mask.fill_(True)
+            else:
+                mask.as_strided(view.shape, view.stride(), view.storage_offset()).fill_(True)
+            return mask
+
+        direct_stats: list[_ActivationStats] = []
+        for view in capture.read_views.values():
+            pointer = view.untyped_storage().data_ptr()
+            if pointer not in base_parameters:
+                continue
+            mark_read(pointer, view)
+            parameter = base_parameters[pointer][1]
+            if (
+                view.ndim == 2 and _is_weight_matrix(parameter, effective_ndim(parameter))
+                and all(stride > 0 for stride in view.stride())
+                and int(_view_mask(_storage_numel(parameter), (_canonical_spec(view),)).sum())
+                == view.numel()
+            ):
+                suffix = ""
+                if view.storage_offset() or view.numel() != _storage_numel(parameter):
+                    suffix = f"[offset={view.storage_offset()},shape={tuple(view.shape)}]"
+                direct_stats.append(_ActivationStats(
+                    name=f"{base_parameters[pointer][0]}{suffix}", weight=view,
+                    orientation="linear", hessian=torch.empty(0),
+                ))
+        for view in capture.covered_views.values():
+            if view.untyped_storage().data_ptr() in base_parameters:
+                mark_read(view.untyped_storage().data_ptr(), view)
+        for pointer in capture.read_whole:
+            if pointer in base_parameters:
+                mark_read(pointer, None)
+        for stat, direct in (
+            *((stat, False) for stat in capture.stats.values()),
+            *((stat, True) for stat in direct_stats),
+        ):
             pointer = stat.weight.untyped_storage().data_ptr()
             base = base_parameters.get(pointer)
-            if base is None or base[1].numel() < config.min_quantized_values:
+            if base is None:
+                continue
+            mark_read(pointer, stat.weight)
+            if base[1].numel() < config.min_quantized_values:
                 continue
             logical = _logical_matrix(stat.weight, stat.orientation)
             group_width = _storage_group_width(stat.weight, stat.orientation)
@@ -2212,7 +2375,7 @@ def quantize_model(
                 None,
             )
             if same is not None:
-                if gptq and same.stat.hessian.numel():
+                if gptq and same.stat.hessian.numel() and stat.hessian.numel():
                     same.stat.hessian += stat.hessian
                 same.stat.rows += stat.rows
                 continue
@@ -2223,6 +2386,7 @@ def quantize_model(
                 ),
                 logical=logical, group_width=group_width,
                 mask=_view_mask(numel, (_canonical_spec(stat.weight),)),
+                observed=not direct,
             ))
 
         quantized_storage: set[int] = set()
@@ -2249,8 +2413,13 @@ def quantize_model(
                 weight_config = settings.config(config)
                 outcome = _named(name, lambda: _quantize_matrix(
                     use.logical, weight_config, use.group_width,
-                    stat if weight_config.method == "gptq" else None,
+                    stat if weight_config.method == "gptq" and use.observed else None,
                 ))
+                if (
+                    weight_config.method == "gptq" and not use.observed
+                    and outcome.reconstructed is not None
+                ):
+                    outcome = replace(outcome, reason=_NO_STATISTICS)
                 if outcome.reconstructed is None:
                     report(replace(kept_float16(
                         stat.name, stat.weight.numel(), str(outcome.reason), rows,
@@ -2298,6 +2467,12 @@ def quantize_model(
                 continue
             if pointer in quantized_storage and pointer not in uses_by_storage:
                 continue
+            # Observed, the export stores only elements something reads: a
+            # parameter no observed call reads, or the rows of one no use
+            # reads, is neither quantized nor reported.
+            read_mask = read_masks.get(pointer) if observing else None
+            if observing and read_mask is None:
+                continue
             quantized_storage.add(pointer)
             settings = settings_by_storage[pointer]
             numel = _storage_numel(parameter)
@@ -2306,8 +2481,10 @@ def quantize_model(
                 if region.pointer == pointer and not region.remaining
                 for view in region.views
             ))
+            if read_mask is not None:
+                taken |= ~read_mask
             if bool(taken.all()):
-                continue  # every element belongs to a region of its uses
+                continue  # every element read belongs to a region of its uses
             matrices = (
                 [((), parameter)] if parameter.ndim == 2 else [
                     (index, parameter[index])
@@ -2354,10 +2531,7 @@ def quantize_model(
                     values=count,
                     calibration_rows=0,
                     effective_group_size=outcome.group,
-                    fallback_reason=(
-                        "no compatible linear activation statistics"
-                        if weight_config.method == "gptq" else None
-                    ),
+                    fallback_reason=_NO_STATISTICS if weight_config.method == "gptq" else None,
                     override=settings.key,
                 ), pointer, (spec,), remaining=remaining)
 
@@ -2385,6 +2559,8 @@ def quantize_model(
             if (
                 parameter.numel() < config.min_quantized_values
                 and name not in reported_names
+                # Observed, only a matrix the export reads is stored.
+                and (not observing or pointer in read_masks)
                 and (
                     pointer in used_storage
                     or _is_weight_matrix(parameter, effective_ndim(parameter))
@@ -2432,6 +2608,7 @@ def quantize_model(
         },
         _computed={pointer: weight.tensor for pointer, (weight, _, _) in computed.items()},
         _integer_formats=tuple(formats),
+        _reads=tuple(dict.fromkeys(stored_reads)),
     )
 
 
@@ -2749,28 +2926,11 @@ def _parameter_elements(
     return parameter, (ids & ((1 << _POSITION_BITS) - 1)).contiguous()
 
 
-def _storage_quantization_report(
-    report: QuantizationReport,
-    *,
-    stored: dict,
-    storage,
-    effective_ndims: dict[str, int],
-    recorder: _StaticSourceRecorder,
-    model: torch.nn.Module,
-) -> tuple[tuple[str, ...], QuantizationReport]:
-    """Warnings and the report for what storage stored of quantized weights.
-
-    ``stored`` is storage's own record of every list it stored
-    (``StoredList``, by key), made as it stored them: the report says what
-    it holds, not what storage would be expected to choose. Storage keeps a
-    list in integers only when it is on the integer grid along its own last
-    dimension, so quantized values it reads grouped another way, or a weight
-    computed from parameters at export, are kept in float16. Each stored
-    list is traced back through the graph to the parameter elements it
-    holds, and every report entry then says how its values are stored.
-    """
-    if storage.precision not in {"int8", "int6", "int4"}:
-        return _stored_quantization_report(report)
+def _report_provenance(
+    report: QuantizationReport, recorder: _StaticSourceRecorder, model: torch.nn.Module,
+) -> tuple[_GraphProvenance, dict[int, str]]:
+    """The provenance of the graph's values in the parameters ``report``'s
+    quantization saw, and the parameters' names, by storage."""
     names_module = _unwrapped(model)
     parameter_names: dict[int, str] = {}
     parameters: dict[int, torch.Tensor] = {}
@@ -2793,6 +2953,73 @@ def _storage_quantization_report(
             for pointer, (parameter, positions) in sources_of.items()
         },
     )
+    return provenance, parameter_names
+
+
+def _quantized_list_sources(
+    report: QuantizationReport,
+    lists: Mapping[str, torch.Tensor | None],
+    *,
+    recorder: _StaticSourceRecorder,
+    model: torch.nn.Module,
+    minimum: int,
+    effective_ndims: Mapping[str, int],
+) -> dict[str, int]:
+    """For each matrix list smaller than ``minimum`` that holds values of a
+    weight quantization quantized, the size of that weight, by key.
+
+    ``min_quantized_values`` applies to a weight, as quantization applies
+    it: a list storage reads part of a large weight from, such as one of
+    the slices a model reads it in, holds quantized values, and storage
+    decides it as it decides the whole weight (``StoredList`` size alone
+    would keep it in float16 and lose the integer grid it is on).
+    """
+    sizes: dict[int, int] = {}
+    for region in report._regions:
+        sizes[region.pointer] = max(sizes.get(region.pointer, 0), region.numel)
+    if not any(size >= minimum for size in sizes.values()):
+        return {}
+    provenance = None
+    found: dict[str, int] = {}
+    for key, tensor in lists.items():
+        if (
+            not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point()
+            or tensor.numel() >= minimum or effective_ndims.get(key, tensor.ndim) < 2
+        ):
+            continue
+        if provenance is None:
+            provenance, _ = _report_provenance(report, recorder, model)
+        masks, _ = provenance.elements(recorder.graph_values(key, tensor))
+        provenance.traced.clear()
+        size = max((sizes.get(pointer, 0) for pointer in masks), default=0)
+        if size >= minimum:
+            found[key] = size
+    return found
+
+
+def _storage_quantization_report(
+    report: QuantizationReport,
+    *,
+    stored: dict,
+    storage,
+    effective_ndims: dict[str, int],
+    recorder: _StaticSourceRecorder,
+    model: torch.nn.Module,
+) -> tuple[tuple[str, ...], QuantizationReport]:
+    """Warnings and the report for what storage stored of quantized weights.
+
+    ``stored`` is storage's own record of every list it stored
+    (``StoredList``, by key), made as it stored them: the report says what
+    it holds, not what storage would be expected to choose. Storage keeps a
+    list in integers only when it is on the integer grid along its own last
+    dimension, so quantized values it reads grouped another way, or a weight
+    computed from parameters at export, are kept in float16. Each stored
+    list is traced back through the graph to the parameter elements it
+    holds, and every report entry then says how its values are stored.
+    """
+    if storage.precision not in {"int8", "int6", "int4"}:
+        return _stored_quantization_report(report)
+    provenance, parameter_names = _report_provenance(report, recorder, model)
     region_pointers = {region.pointer for region in report._regions}
 
     findings = _StorageFindings()

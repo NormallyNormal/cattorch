@@ -442,7 +442,7 @@ def test_layers_quantized_differently_are_not_banked_together(tmp_path, override
         )
     emitted = [str(item.message) for item in caught if issubclass(item.category, CattorchWarning)]
     assert not shared_procedure(result)
-    assert len(emitted) == 1 and "is stored differently from" in emitted[0], emitted
+    assert len(emitted) == 1 and "are stored in different formats" in emitted[0], emitted
     # Every layer keeps the storage the configuration asks for.
     assert not any(item.name.endswith("[float16]") for item in result.quantization.tensors)
     assert verify(model, value, result, quantization=quantization).passed
