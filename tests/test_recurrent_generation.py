@@ -100,7 +100,10 @@ def test_reset_restores_the_initial_states(exported):
     run(emulator, "cattorch prefill", [2, 3, 4])
     assert states(emulator, model) != initial
     assert run(emulator, "cattorch reset") == "ok"
-    assert states(emulator, model) == pytest.approx(initial)
+    restored = states(emulator, model)
+    assert restored.keys() == initial.keys()
+    for name, values in initial.items():
+        assert restored[name] == pytest.approx(values), name
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["cattorch logits"] == []
     assert emulator.lists["cattorch top k ids"] == []
