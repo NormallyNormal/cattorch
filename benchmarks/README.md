@@ -88,13 +88,6 @@ script unless another name is shown.
 | `build_generation_suite.py` | Stateless forward versus KV-cached decoding. Cached cases prefill before the timer starts. |
 | `build_storage_suite.py` | Startup and forward time for uncompressed float32 and Base92-encoded float32, float16, 8-bit, 6-bit, and 4-bit weights. Ten timed init calls, then ten forwards. A second list records each sprite's size. |
 
-Model-level builds:
-
-| Script | Builds |
-|---|---|
-| `build_tinystories_complete.py` | The processor used by the [published TinyStories project](https://scratch.mit.edu/projects/1374224416/): cached model, SentencePiece tokenizer, and sampler, with a checksum and size manifest. Uses `add_tinystories_sampler.py` and `combine_sprites.py`. |
-| `build_catgpt3_complete.py` | The same for the CatGPT3 MoE checkpoint. |
-
 ### Custom suites
 
 The same comparisons can be built from Python with your own models:
