@@ -53,7 +53,7 @@ BASE92_ALPHABET = "".join(
     chr(code) for code in range(33, 127) if chr(code) not in {'"', "\\"}
 )
 assert len(BASE92_ALPHABET) == 92 and len(set(BASE92_ALPHABET)) == 92
-_BASE92_CODES = np.frombuffer(BASE92_ALPHABET.encode("ascii"), dtype=np.uint8)
+_BASE92_CODES: npt.NDArray[np.uint8] = np.frombuffer(BASE92_ALPHABET.encode("ascii"), dtype=np.uint8)
 
 
 @dataclass(frozen=True)
@@ -144,10 +144,10 @@ def _encode_bytes(raw: bytes) -> str:
     Each group is two 52-bit halves of eight digits each.
     """
     padding = (-len(raw)) % 13
-    data = np.frombuffer(raw + bytes(padding), dtype=np.uint8).reshape(-1, 13)
+    data: npt.NDArray[np.uint8] = np.frombuffer(raw + bytes(padding), dtype=np.uint8).reshape(-1, 13)
     parts = [BASE92_ALPHABET[padding]]
     for start in range(0, len(data), _BASE92_CHUNK_GROUPS):
-        chunk = data[start:start + _BASE92_CHUNK_GROUPS].astype(np.uint64)
+        chunk: npt.NDArray[np.uint64] = data[start:start + _BASE92_CHUNK_GROUPS].astype(np.uint64)
         high: npt.NDArray[np.uint64] = np.zeros(len(chunk), dtype=np.uint64)
         for column in range(7):
             high = (high << np.uint64(8)) | chunk[:, column]
