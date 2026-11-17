@@ -87,16 +87,6 @@ script unless another name is shown.
 | `build_matmul_swiglu_suite.py` | Matrix multiply with the same `prune50` and `rank25` settings, and SwiGLU fused into one loop (`swiglu_fused`) versus computed in separate steps (`swiglu_materialized`). |
 | `build_generation_suite.py` | Stateless forward versus KV-cached decoding. Cached cases prefill before the timer starts. |
 | `build_storage_suite.py` | Startup and forward time for uncompressed float32 and Base92-encoded float32, float16, 8-bit, 6-bit, and 4-bit weights. Ten timed init calls, then ten forwards. A second list records each sprite's size. |
-| `build_next_optimization_suite.py` | 30 kernel candidates from an audit of the Scratch VM. See [candidate kernels](#candidate-kernels-august-21). |
-| `build_mythic_kernel_suite.py` | Techniques from MythicGPT, another transformer written in Scratch: its four-output linear loop at all three transformer matrix shapes, integer weights scaled after the dot product, exact and lookup-table softmax, and its base-66 int8 weight decoding versus cattorch's Base92 float16. 27 timings; every output list is kept. |
-| `build_mythic_append_suite.py` | Whether MythicGPT's four-output linear loop can append to its output list instead of writing into a preallocated one. 14 timings. |
-| `build_grouped_linear_whole_suite.py` | The previous exact linear kernel versus the grouped exact kernel on a complete transformer. |
-| `build_grouped_linear_network_suite.py` | The same comparison on the 998K-parameter CatGPT2 checkpoint. Its 13.2 MB of JSON may be too large for the browser editor, so run it in the VM. |
-| `build_costume_codec_suite.py` | Weight decoders that read data from costume names: the old Base64 decoder, a packed-loop Base64 decoder, and experimental Base85 decoders. Decide this one in the browser; see [costume decoders](#costume-decoders). |
-| `build_json_size_suite.py` | JSON size and speed of layer sharing and compaction on the TinyStories checkpoint. |
-| `build_cached_layer_sharing_suite.py` | Layer sharing with KV-cached generation on a 6M-parameter MoE model. |
-| `build_top_k_size_suite.py` | Size and speed of the loop-based and unrolled top-k selectors. |
-| `build_rope_redteam_suite.py` | The RoPE matrix expression versus more direct loops, at CatGPT size. |
 
 Model-level builds:
 
@@ -104,8 +94,6 @@ Model-level builds:
 |---|---|
 | `build_tinystories_complete.py` | The processor used by the [published TinyStories project](https://scratch.mit.edu/projects/1374224416/): cached model, SentencePiece tokenizer, and sampler, with a checksum and size manifest. Uses `add_tinystories_sampler.py` and `combine_sprites.py`. |
 | `build_catgpt3_complete.py` | The same for the CatGPT3 MoE checkpoint. |
-| `tinystories_quant_experiment.py` | Storage precision versus accuracy on the TinyStories checkpoint. See [storage accuracy](#storage-accuracy-on-tinystories). |
-| `catgpt2_approx_experiment.py` | Accuracy and VM speed of low-rank and pruned CatGPT2 exports. |
 
 ### Custom suites
 
@@ -124,7 +112,8 @@ build_benchmark_suite(
 ## Recorded results
 
 Results below record one environment on one date. Rerun them before relying on
-them for a decision.
+them for a decision. The experiment scripts behind several of them were removed
+in 1.0; their results are kept as a record.
 
 ### Storage decoding (browser, August 21)
 
@@ -153,12 +142,7 @@ parameters now stay float16, so small models don't carry integer decoders. Set
 
 ### Storage accuracy on TinyStories
 
-```bash
-PYTHONPATH=../catgpt2/src:. ../catgpt2/.venv/bin/python \
-  benchmarks/tinystories_quant_experiment.py
-```
-
-This compares 256 held-out windows in PyTorch, then eight windows in
+This compared 256 held-out windows in PyTorch, then eight windows in
 `@scratch/scratch-vm` 15.0.1. Checkpoint SHA-256:
 `c53b7329fbe8ebf5163a15339de7b9884f65f5f6948a5496324c561829ad0d44`.
 
@@ -176,21 +160,15 @@ judge it on long generated text, not these eight windows. Reports and projects
 are in `artifacts/tinystories_quant/`, and each report records the checkpoint
 hash because the checkpoint is still being retrained.
 
-The same script also tested a learned 64-entry codebook for 6-bit weights. On a
+The same experiment also tested a learned 64-entry codebook for 6-bit weights. On a
 1,024-window run, symmetric int6 kept 94.53% top-1 agreement and the codebook
 kept 91.70%, with higher logit error, so the codebook was not added.
 
 ### Candidate kernels (August 21)
 
-`build_next_optimization_suite.py` times each candidate with the `days since
-2000` reporter instead of the timer, because the VM only updates the timer once
-per scheduler step. Cases are sized to take about a second. To check both timings and
-outputs of a saved project:
-
-```bash
-node benchmarks/run_next_optimization_vm.cjs \
-  benchmarks/artifacts/next_optimization_suite_benched.sb3
-```
+Each candidate was timed with the `days since 2000` reporter instead of the
+timer, because the VM only updates the timer once per scheduler step. Cases were
+sized to take about a second.
 
 In the VM, the whole suite took 27.3 seconds. The largest exact-mode gains were
 `for each` loops (about 15%), reading shards directly (about 35%), interleaved
@@ -201,12 +179,9 @@ faster. Neither of those two should ship based on this result alone.
 
 ### MythicGPT kernels
 
-To check outputs of a saved MythicGPT suite:
-
-```bash
-node benchmarks/run_mythic_kernel_vm.cjs \
-  benchmarks/artifacts/mythic_kernel_suite.sb3
-```
+The suite compared MythicGPT's four-output linear loop, integer weights scaled
+after the dot product, lookup-table softmax and base-66 int8 decoding with
+cattorch's kernels.
 
 ### Grouped linear on a whole transformer (browser)
 
