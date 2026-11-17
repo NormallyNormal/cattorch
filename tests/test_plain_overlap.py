@@ -324,7 +324,8 @@ def test_init_and_prepare_for_save_never_leave_wrong_outputs_reported_ok(
     stored, setup, first, second,
 ):
     plain = stored
-    if PREPARE not in SpriteEmulator(plain.sprite)._procedures and "prepare for save" in (
+    message = interface.message(plain.sprite["name"], "prepare for save")
+    if not SpriteEmulator(plain.sprite)._receivers(message) and "prepare for save" in (
         first, second,
     ):
         pytest.skip("this export has no prepare for save")
