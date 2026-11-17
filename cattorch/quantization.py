@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Iterable, Literal, Mapping, cast
 
 import numpy as np
+import numpy.typing as npt
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _pytree as pytree
@@ -1026,7 +1027,7 @@ def _symmetric_matrix(
     if not bool(torch.isfinite(source).all()):
         raise ValueError("integer weight quantization requires finite values")
     maximum_code = (1 << (config.bits - 1)) - 1
-    counts = np.zeros(2 * maximum_code + 1, dtype=np.int64)
+    counts: npt.NDArray[np.int64] = np.zeros(2 * maximum_code + 1, dtype=np.int64)
     reconstructed = torch.empty(source.shape, dtype=matrix.dtype)
     row_values = max(1, source[:1].numel())
     step = max(1, _SYMMETRIC_CHUNK_VALUES // row_values)
@@ -1382,7 +1383,7 @@ def _quantize_remaining(
     if not bool(torch.isfinite(rows[selected]).all()):
         raise ValueError("integer weight quantization requires finite values")
     maximum_code = (1 << (config.bits - 1)) - 1
-    counts = np.zeros(2 * maximum_code + 1, dtype=np.int64)
+    counts: npt.NDArray[np.int64] = np.zeros(2 * maximum_code + 1, dtype=np.int64)
     result = grouped.clone()
     if bool(full.any()):
         values = grouped[full]

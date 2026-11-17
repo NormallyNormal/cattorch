@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Literal, cast
 
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from cattorch.util.scratch.dsl import (
@@ -147,14 +148,14 @@ def _encode_bytes(raw: bytes) -> str:
     parts = [BASE92_ALPHABET[padding]]
     for start in range(0, len(data), _BASE92_CHUNK_GROUPS):
         chunk = data[start:start + _BASE92_CHUNK_GROUPS].astype(np.uint64)
-        high = np.zeros(len(chunk), dtype=np.uint64)
+        high: npt.NDArray[np.uint64] = np.zeros(len(chunk), dtype=np.uint64)
         for column in range(7):
             high = (high << np.uint64(8)) | chunk[:, column]
         low = high & np.uint64(0xF)
         high >>= np.uint64(4)
         for column in range(7, 13):
             low = (low << np.uint64(8)) | chunk[:, column]
-        digits = np.empty((len(chunk), 16), dtype=np.uint8)
+        digits: npt.NDArray[np.uint8] = np.empty((len(chunk), 16), dtype=np.uint8)
         for half, offset in ((high, 0), (low, 8)):
             for index in range(7, -1, -1):
                 digits[:, offset + index] = half % np.uint64(92)
