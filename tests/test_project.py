@@ -149,6 +149,11 @@ def test_a_text_generator_continues_each_prompt(generator):
         text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
         assert prompt + text in said
     assert len(emulator.questions) == 3
+    # Asking replaces the speech bubble, so each next question shows the
+    # finished continuation.
+    for prompt, question in zip(("hi", "the cat"), emulator.questions[1:]):
+        text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
+        assert question.startswith(prompt + text + "\n\n")
     # The prefill decoded the weights; nothing else ran init.
     model_sprite = emulator.sprites[result.sprite_name]
     assert "lm init complete" not in model_sprite.broadcasts

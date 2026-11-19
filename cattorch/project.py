@@ -602,10 +602,12 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
         if_(eq(var(next_token), stop), (set_var(done, 1),)),
     )
     question = prompt or "Type the start of some text (leave it empty to stop)"
-    # A failure (the model's or the tokenizer's) ends the continuation and
-    # starts the next question, which would hide a said message at once.
+    # The next question replaces whatever the sprite says, so it carries the
+    # finished continuation, or the failure that ended it.
     ask_again = if_else(
-        eq(var(problem), ""), (ask(question),), (ask(join(join(var(problem), ". "), question)),),
+        eq(var(problem), ""),
+        (ask(join(join(var(seed), var(text)), f"\n\n{question}")),),
+        (ask(join(join(var(problem), ". "), question)),),
     )
     body = (
         ask(question),
@@ -618,6 +620,7 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
             if_(eq(var(problem), ""), (
                 *_call("_cattorch demo prompt tokens"),
                 say(join(var(seed), "...")),
+                set_var(text, ""),
                 broadcast_and_wait(message(name, interface.PREFILL)),
                 *failed(name, interface.PREFILL, status),
                 *sampled(),
