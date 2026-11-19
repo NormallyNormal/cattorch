@@ -546,20 +546,21 @@ class _Compiler:
         self._tied_weights, self._grouped_tied_weights = self._find_tied_weights()
         self._compiled_output_lists: tuple[str, ...] = ()
 
-    def _row_shard_limit(self, weight: torch.Tensor, *, grouped: bool, tied: bool = False) -> int:
+    def _row_shard_limit(self, weight: torch.Tensor) -> int:
         """The most values in each row shard of an output-major ``weight``.
 
         Storage caps each physical list by its encoded size, which is below
-        Scratch's list limit for a weight it keeps in float16 or float32. A
-        grouped weight under integer storage is cut to that cap, so no
-        physical list ends inside a four-row group the codec must undo, and
-        so is a tied weight larger than a list, so the table, sharded at the
-        same row boundaries, can share the head's lists.
+        Scratch's list limit for a weight it keeps in float16 or float32.
+        Every weight is cut to that cap, at whole rows: a list the generic
+        sharder split instead would end mid-row, and the kernel would read
+        each weight as a sum over every shard, in its innermost loop. A
+        grouped weight under integer storage cut at the cap also never ends
+        a physical list inside a four-row group the codec must undo, and a
+        tied weight larger than a list is sharded at the same row boundaries
+        as the table, so the table can share the head's lists.
         """
-        if weight.numel() <= SCRATCH_LIST_LIMIT // 4 or not (
+        if weight.numel() <= SCRATCH_LIST_LIMIT // 4:
             # No storage caps a list below a quarter of the limit.
-            (grouped and self.row_aligned_weights) or (tied and weight.numel() > SCRATCH_LIST_LIMIT)
-        ):
             return SCRATCH_LIST_LIMIT
         # Cached by the tensor object, not its address: a transposed copy is
         # a temporary, and the next one can reuse the address.
@@ -573,7 +574,7 @@ class _Compiler:
             self._storage_shard_limits[id(weight)] = (weakref.ref(weight), limit)
         return limit if weight.numel() > limit else SCRATCH_LIST_LIMIT
 
-    def _row_shards(self, weight: torch.Tensor, *, tied: bool = False) -> _RowShards | None:
+    def _row_shards(self, weight: torch.Tensor) -> _RowShards | None:
         """How to cut the library Linear kernel's output-major ``weight`` into
         row shards, or ``None`` when no list holds a complete one.
 
@@ -585,7 +586,7 @@ class _Compiler:
         """
         columns, inner = weight.shape
         grouped = grouped_linear(columns, inner)
-        rows = self._row_shard_limit(weight, grouped=grouped, tied=tied) // inner
+        rows = self._row_shard_limit(weight) // inner
         if grouped:
             rows -= rows % 4
         if rows < (4 if grouped else 1):
@@ -652,7 +653,7 @@ class _Compiler:
         )
 
         def interleavable(tensor):
-            shards = self._row_shards(tensor, tied=True)
+            shards = self._row_shards(tensor)
             return shards is not None and shards.grouped
 
         readers: dict[tuple, set[str]] = {}
@@ -1379,8 +1380,14 @@ class _Compiler:
                 and rhs.ndim == 2
                 and rhs.is_floating_point()
                 # Quantization groups every matrix over its input width, so
-                # store quantized weights output-major like linear weights.
-                and (rhs.numel() > SCRATCH_LIST_LIMIT or self.row_aligned_weights)
+                # store quantized weights output-major like linear weights. A
+                # weight more than a stored list holds is cut into whole rows
+                # too, not split mid-row by the generic sharder.
+                and (
+                    self.row_aligned_weights
+                    or rhs.numel() > SCRATCH_LIST_LIMIT
+                    or self._row_shard_limit(rhs.T) < rhs.numel()
+                )
             ):
                 large = self._large_static_matmul(node, target_list, args[0], rhs)
                 if large is not None:
@@ -1770,7 +1777,7 @@ class _Compiler:
         identity = _tensor_identity(weight)
         table = input_lists[1] if input_lists[1].startswith("W_") else None
         tied = table is not None and identity in self._tied_weights
-        plan = self._row_shards(weight, tied=tied)
+        plan = self._row_shards(weight)
         if plan is None:
             # Not one complete row (four-row group) fits in a list. The kernel
             # reads the whole weight through the generic sharder instead.

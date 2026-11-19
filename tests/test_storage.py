@@ -391,7 +391,9 @@ def test_default_float32_export_shards_for_temporary_decode_limit(tmp_path):
         for name in emulator._list_name_to_ids
         if name.startswith("_W_")
     ]
-    assert weight_lengths == [50_000, 15_536]
+    # Float32 storage caps a list at 50,000 values: the Linear kernel cuts
+    # the weight at whole four-row groups below that, not mid-row.
+    assert weight_lengths == [49_152, 16_384]
     assert sum(weight_lengths) == model.weight.numel()
 
 

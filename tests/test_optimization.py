@@ -1,4 +1,5 @@
 from cattorch import interface
+import copy
 import json
 import zipfile
 
@@ -478,6 +479,48 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
         atol=1e-4,
         rtol=0,
     )
+
+
+class _RightMatmul(nn.Module):
+    def __init__(self, inner, outputs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(inner, outputs) / inner**0.5)
+
+    def forward(self, x):
+        return x @ self.weight
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+@pytest.mark.parametrize("outputs", [64, 63])
+@pytest.mark.parametrize("kind", ["linear", "matmul"])
+def test_weight_is_row_sharded_at_the_float_storage_cap(
+    tmp_path, small_list_limit, kind, precision, outputs,
+):
+    # Float storage caps each stored list below the list limit (float32 at a
+    # quarter of it), so a weight between the two must still be cut into
+    # whole rows by the kernel. Left to the generic sharder, its lists end
+    # mid-row and every weight read in the dot product is a sum of reads over
+    # every shard: a float32 TinyGPT (width 256) decoded at half the speed of
+    # the same model in int8.
+    limit = small_list_limit(4_000)
+    torch.manual_seed(0)
+    model = (nn.Linear(32, outputs) if kind == "linear" else _RightMatmul(32, outputs)).eval()
+    value = torch.randn(1, 32)
+    assert limit // 2 < model.weight.numel() <= limit
+    result = transpile(
+        model, value, tmp_path / f"{kind}_{precision}_{outputs}",
+        storage=StorageConfig(precision=precision),
+    )
+    names = [entry[0] for entry in load_sprite(result.path)["lists"].values()]
+    weights = [name for name in names if name.startswith(f"_W_{kind}_")]
+    assert len(weights) > 1
+    assert not any(" shard " in name for name in names)
+    # Storage rounds the weights to its precision before Scratch computes.
+    stored = copy.deepcopy(model)
+    with torch.no_grad():
+        for parameter in stored.parameters():
+            parameter.copy_(parameter.to(getattr(torch, precision)).float())
+    assert verify(stored, value, result).passed
 
 
 @pytest.mark.parametrize("inner,outputs", [(128, 128), (384, 129)])

@@ -429,9 +429,10 @@ def test_a_split_output_keeps_its_public_names(tmp_path):
 
 
 def test_sharded_lists_names_only_public_lists(tmp_path):
-    # The weight is split in four, but it is internal.
-    model = nn.Linear(1000, 250, bias=False).eval()
-    result = transpile(model, torch.randn(1, 1000), tmp_path / "weights")
+    # The weight is split in two, but it is internal. (Not one of its rows
+    # fits a float32 list, so the generic sharder splits it.)
+    model = nn.Linear(60_000, 2, bias=False).eval()
+    result = transpile(model, torch.randn(1, 60_000), tmp_path / "weights")
     sprite = load_sprite(result.path)
     names = {entry[0] for entry in sprite["lists"].values()}
     assert any(name.startswith("_W_") and name.endswith(" shard 2") for name in names)
