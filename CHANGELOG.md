@@ -402,6 +402,10 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   faster.
 - A token embedding tied to the output head is stored once even when it
   spans several lists.
+- A float16 or float32 weight larger than one stored list is cut at whole
+  rows, so each multiply reads one list item. It was cut mid-row, which
+  made a model such as a 3M-parameter transformer of `nn.TransformerEncoderLayer`s
+  run about twice as slowly in float32 as in int8.
 - A program state that starts as one value everywhere, such as zeros, no
   longer stores its initial copy.
 - Hidden prefill also skips the final layer's query, attention output and
