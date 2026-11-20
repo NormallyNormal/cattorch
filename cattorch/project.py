@@ -25,7 +25,7 @@ import os
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 import torch
 
@@ -872,7 +872,7 @@ def build_project(
 # ── adding sprites to a project of your own ─────────────────────────────────
 
 # A sprite given by its export's result, or by the path of its ``.sprite3``.
-SpriteSource = str | Path | TranspileResult | ProgramResult | GenerationResult | TokenizerResult
+SpriteSource: TypeAlias = str | Path | TranspileResult | ProgramResult | GenerationResult | TokenizerResult
 _RESULTS = (TranspileResult, ProgramResult, GenerationResult, TokenizerResult)
 # The sprite an empty project gets, so that a model isn't selected when it opens.
 _BLANK = "Sprite1"
