@@ -303,7 +303,8 @@ the project already uses gets new ones. `replace=True` replaces the
 project's sprite of an added sprite's name, in its place, keeping the
 stage's globals. Raises `ValueError` for a sprite name the project already
 has (without `replace`), two added sprites of one name, globals or
-broadcasts of two added sprites that Scratch can't tell apart, a project
+broadcasts of two added sprites that Scratch can't tell apart, or of an
+added sprite and an exported sprite already in the project, a project
 global of another kind than an added sprite uses, a global named like one
 of a sprite's own variables or lists, and a file that isn't a Scratch
 project or sprite. See

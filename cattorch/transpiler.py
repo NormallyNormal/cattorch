@@ -1848,7 +1848,12 @@ class _Compiler:
                 input_lists[4],
             ], ()
         hidden, inner = gate_weight.shape
-        rows_per_shard = SCRATCH_LIST_LIMIT // inner
+        # Cut at whole rows within what one stored list holds, as Linear
+        # weights are, so no list the generic sharder splits ends mid-row.
+        limit = self._row_shard_limit(gate_weight)
+        rows_per_shard = limit // inner
+        if rows_per_shard >= 4:
+            rows_per_shard -= rows_per_shard % 4
         if rows_per_shard < 1:
             return [
                 input_lists[0],
@@ -1857,7 +1862,7 @@ class _Compiler:
                 input_lists[2],
                 input_lists[4],
             ], ()
-        if gate_weight.numel() <= SCRATCH_LIST_LIMIT:
+        if gate_weight.numel() <= limit:
             return [
                 input_lists[0],
                 input_lists[1],

@@ -141,7 +141,10 @@ retraining a model, pass `replace=True`: the new sprite takes the old one's
 place in the sprite list and on the stage, and binds to the stage's globals
 by name, so your scripts keep working and the lists keep their values.
 `ValueError` is also raised for two sprites of one name, globals or
-broadcasts of two added sprites that Scratch can't tell apart, a global of
+broadcasts of two added sprites that Scratch can't tell apart, an added
+sprite's broadcast that Scratch can't tell apart from one of an exported
+sprite already in the project (`Net` added beside `net`: both would run on
+every call), a global of
 the project of another kind than the sprite needs (a variable `points input`
 where the sprite uses a list), a global named like one of a sprite's own
 variables, such as `cattorch interface version` (loading the project

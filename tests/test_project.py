@@ -150,10 +150,11 @@ def test_a_text_generator_continues_each_prompt(generator):
         assert prompt + text in said
     assert len(emulator.questions) == 3
     # Asking replaces the speech bubble, so each next question shows the
-    # finished continuation.
+    # finished continuation, after the question, which a long continuation
+    # can't push past Scratch's 330-character bubble.
     for prompt, question in zip(("hi", "the cat"), emulator.questions[1:]):
         text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
-        assert question.startswith(prompt + text + "\n\n")
+        assert question == emulator.questions[0] + "\n\n" + prompt + text
     # The prefill decoded the weights; nothing else ran init.
     model_sprite = emulator.sprites[result.sprite_name]
     assert "lm init complete" not in model_sprite.broadcasts

@@ -523,6 +523,41 @@ def test_weight_is_row_sharded_at_the_float_storage_cap(
     assert verify(stored, value, result).passed
 
 
+class _SwiGLU(nn.Module):
+    def __init__(self, inner, hidden):
+        super().__init__()
+        self.gate = nn.Linear(inner, hidden, bias=False)
+        self.up = nn.Linear(inner, hidden, bias=False)
+
+    def forward(self, x):
+        return nn.functional.silu(self.gate(x)) * self.up(x)
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+def test_swiglu_weights_are_row_sharded_at_the_float_storage_cap(
+    tmp_path, small_list_limit, precision,
+):
+    # The gate and value weights of a gated MLP are cut at whole rows within
+    # what one stored list holds, as a Linear's are, not left for the
+    # generic sharder to split mid-row.
+    limit = small_list_limit(4_000)
+    torch.manual_seed(0)
+    model = _SwiGLU(32, 64).eval()
+    value = torch.randn(1, 32)
+    assert limit // 2 < model.gate.weight.numel() <= limit
+    result = transpile(
+        model, value, tmp_path / f"swiglu_{precision}", storage=StorageConfig(precision=precision),
+    )
+    names = [entry[0] for entry in load_sprite(result.path)["lists"].values()]
+    assert sum("gate_weight" in name for name in names) > 1
+    assert not any(" shard " in name for name in names)
+    stored = copy.deepcopy(model)
+    with torch.no_grad():
+        for parameter in stored.parameters():
+            parameter.copy_(parameter.to(getattr(torch, precision)).float())
+    assert verify(stored, value, result).passed
+
+
 @pytest.mark.parametrize("inner,outputs", [(128, 128), (384, 129)])
 def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
     tmp_path, inner, outputs,

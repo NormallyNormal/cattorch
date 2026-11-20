@@ -14,6 +14,7 @@ from cattorch import ProjectResult, add_to_project, build_project, entrypoint, i
 from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive
 from cattorch.util.scratch.dsl import append, broadcast_and_wait, clear, for_each, item, length, var
 from cattorch.util.scratch.emulator import ProjectEmulator
+from cattorch.util.scratch.globals import _broadcast_inputs
 
 FLAG = {"opcode": "event_whenflagclicked", "fields": {}}
 
@@ -221,6 +222,12 @@ def test_added_ids_never_collide_with_the_projects(net, tmp_path):
     data, assets = read_archive(built.path, PROJECT_JSON)
     copied = next(target for target in data["targets"] if target["name"] == "net")
     copied["name"] = "copy"
+    # Its messages renamed too: two sprites answering "net forward" would
+    # both run on every call, which add_to_project refuses.
+    for reference in _broadcast_inputs(copied["blocks"]):
+        at = 1 if len(reference) == 3 else 0
+        if reference[at].startswith("net "):
+            reference[at] = "copy " + reference[at].removeprefix("net ")
     path = tmp_path / "copied.sb3"
     write_archive(path, data, assets, PROJECT_JSON)
     original = copy.deepcopy(copied)
@@ -266,6 +273,12 @@ def test_sprites_that_cant_share_a_project_are_refused(net, tmp_path):
     loud = transpile(small, value, tmp_path / "loud", name="NET")
     with pytest.raises(ValueError, match="'NET forward'.*same message"):
         add_to_project(path, [result, loud], tmp_path / "out", replace=True)
+    # ... and added one after the other: both would answer every call.
+    with_net = add_to_project(path, result, tmp_path / "with_net")
+    with pytest.raises(ValueError, match="'NET forward'.*sprite 'net' of the project"):
+        add_to_project(with_net, loud, tmp_path / "out")
+    with pytest.raises(ValueError, match="'NET forward'.*sprite 'net' of the project"):
+        add_to_project(with_net, loud, tmp_path / "out", replace=True)
     # Two sprites using one global: counter's "counter add input" is the
     # input of a model named "counter add".
     counter = transpile(Adder().eval(), None, tmp_path / "counter")

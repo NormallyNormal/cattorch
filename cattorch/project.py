@@ -610,10 +610,11 @@ def _generation_project(builder, result, tokenizer, *, max_new_tokens, temperatu
     )
     question = prompt or "Type the start of some text (leave it empty to stop)"
     # The next question replaces whatever the sprite says, so it carries the
-    # finished continuation, or the failure that ended it.
+    # finished continuation, or the failure that ended it. The question comes
+    # first: Scratch cuts a speech bubble at 330 characters.
     ask_again = if_else(
         eq(var(problem), ""),
-        (ask(join(join(var(seed), var(text)), f"\n\n{question}")),),
+        (ask(join(f"{question}\n\n", join(var(seed), var(text)))),),
         (ask(join(join(var(problem), ". "), question)),),
     )
     body = (
@@ -1074,7 +1075,9 @@ def add_to_project(
     global lists and variables the added sprites use. Raises ``ValueError``
     for a sprite name the project already has (without ``replace``), two
     added sprites of one name, globals or broadcasts of two added sprites
-    that would be the same to Scratch, or a global that would hide a
+    that would be the same to Scratch, an added sprite's broadcast the same
+    to Scratch as one of a sprite cattorch exported that the project already
+    has (both would answer it), or a global that would hide a
     sprite's own variable or list. Warnings are also emitted as
     ``CattorchWarning``.
     """
@@ -1131,6 +1134,20 @@ def add_to_project(
         assets.update(sprite_assets)
 
     replaced = {sprite["name"] for sprite in added if sprite["name"] in places}
+    # A sprite cattorch exported, already in the project, has messages of its
+    # own: an added sprite with one of them too (a name equal ignoring case)
+    # would run both on every call.
+    exported = [
+        (f"sprite {target['name']!r} of the project", text)
+        for target in targets
+        if not target.get("isStage") and target["name"] not in replaced
+        and interface.VERSION_VARIABLE in _names(target, "variables")
+        for text in sorted(set(global_references(target)["broadcasts"].values()))
+    ]
+    interface.check_messages(
+        (owner, text) for owner, text in (*exported, *message_owners)
+        if text not in interface.SHARED_MESSAGES
+    )
     old_sprites = {name: targets[places[name]] for name in replaced}
     users = [
         target for target in targets
