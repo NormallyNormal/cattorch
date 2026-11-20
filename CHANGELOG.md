@@ -360,6 +360,13 @@ Scratch interface (re-export a 0.5.0 sprite to get these):
   model, a classifier's `NAME predict`, a text generator's `NAME sample`
   and prompt-and-continue demo. It opens with its small Demo sprite
   selected, not a model's.
+- `add_to_project` (and `cattorch add PROJECT SPRITE... --output OUT`)
+  adds exported sprites to a project of your own without the editor, whose
+  Upload Sprite selects a sprite and can freeze or crash on a large one.
+  The sprites go after the project's own, so it still opens on its first
+  sprite; their globals and messages use the ones the project already has;
+  nothing of the project's changes; and `replace=True` (`--replace`) puts a
+  retrained model in its sprite's place.
 - The `cattorch` command: `cattorch export` exports and verifies a model from
   a Python file, module or `.pt`, `cattorch generate` exports a text
   generator and its tokenizer (also `--hf REPO`), and `--project` builds the

@@ -276,14 +276,47 @@ more, `eos_token_id` one of the model's token IDs, and `prompt` a non-empty
 string. A tokenizer with more or fewer token IDs than the model's vocabulary
 warns, since some IDs of one then mean nothing to the other.
 
+### `add_to_project`
+
+```text
+add_to_project(
+    project,
+    sprites,
+    output_path,
+    *,
+    replace=False,
+) -> ProjectResult
+```
+
+Add exported sprites to a Scratch project of your own and write it to
+`output_path`, adding `.sb3` if it's missing; it may be the project's own
+path. `project` is an `.sb3` path or a `ProjectResult`; `sprites` is one
+sprite or a sequence of them, each a `TranspileResult`, `ProgramResult`,
+`GenerationResult` or `TokenizerResult`, or a `.sprite3` path. The sprites
+go after the project's own, hidden, so the project still opens with its
+first sprite selected; a project with no sprites gets a blank `Sprite1`
+first. Their globals and messages are declared on the stage as uploading
+the sprites would, using a global of the same name and kind, and a
+broadcast equal ignoring case, that the project already has. The project's
+own sprites, scripts and IDs are kept as they are; an added sprite whose IDs
+the project already uses gets new ones. `replace=True` replaces the
+project's sprite of an added sprite's name, in its place, keeping the
+stage's globals. Raises `ValueError` for a sprite name the project already
+has (without `replace`), two added sprites of one name, globals or
+broadcasts of two added sprites that Scratch can't tell apart, a project
+global of another kind than an added sprite uses, a global named like one
+of a sprite's own variables or lists, and a file that isn't a Scratch
+project or sprite. See
+[add sprites to your own project](projects-and-cli.md#add-sprites-to-your-own-project).
+
 ### `ProjectResult`
 
 | Field | Meaning |
 |---|---|
 | `path` | Path of the written `.sb3`. |
-| `sprites` | Names of the project's sprites. |
-| `broadcasts` | The project's public broadcasts: each sprite's messages, each followed by its completion broadcast, such as `points forward`, `points forward complete`, the shared `cattorch prepare for save`, and the project's own, such as `points predict`. |
-| `lists`, `variables` | The project's global lists and variables: the sprites' and the project's own. |
+| `sprites` | Names of the project's sprites, in order: from `build_project` the Demo first, from `add_to_project` every sprite of the project, its own first. |
+| `broadcasts` | The public broadcasts: each exported sprite's messages, each followed by its completion broadcast, such as `points forward`, `points forward complete`, the shared `cattorch prepare for save`, and `build_project`'s own, such as `points predict`. |
+| `lists`, `variables` | The global lists and variables: from `build_project` the sprites' and the project's own; from `add_to_project` those the added sprites use, including ones the project already had, but not the project's others. |
 | `warnings` | Size warnings, and a tokenizer that doesn't match the model's vocabulary; each is also emitted as a `CattorchWarning`. |
 
 All names are Scratch names.

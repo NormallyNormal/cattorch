@@ -161,7 +161,9 @@ def test_every_option_has_help_and_shows_its_default(capsys):
             if isinstance(action, argparse._HelpAction):
                 continue
             assert action.help, (command, action.dest)
-            if action.option_strings and not isinstance(action, argparse._StoreTrueAction):
+            if action.option_strings and not action.required and not isinstance(
+                action, argparse._StoreTrueAction,
+            ):
                 text = parser._get_formatter()._expand_help(action)
                 assert "default" in text, (command, action.option_strings, text)
 
@@ -470,3 +472,39 @@ def test_an_entry_point_failing_on_its_example_exits_without_a_traceback(models,
     code, message = run(capsys, "export", "entry.py:EntryBad")
     assert code == 1 and "@entrypoint add raised RuntimeError" in message
     assert "Traceback" not in message
+
+
+def test_add_puts_sprites_after_the_projects_own(models, capsys):
+    from cattorch.project import _Builder
+
+    mine = _Builder()
+    game = mine.add_demo_sprite()
+    game["name"] = "Game"
+    mine.write(models / "mine.sb3")
+    code, report = run(capsys, "export", "models.py:Marked", "-o", "net")
+    assert code == 0
+    code, report = run(capsys, "export", "models.py:Marked", "-o", "other")
+    assert code == 0
+
+    code, report = run(capsys, "add", "mine.sb3", "net.sprite3", "other", "--output", "out")
+    assert code == 0
+    assert report["path"] == "out.sb3"
+    assert report["sprites"] == ["Game", "net", "other"]
+    assert report["lists"] == ["net input", "net output", "other input", "other output"]
+    assert report["variables"] == ["net status", "other status"]
+    assert "net forward" in report["broadcasts"] and report["warnings"] == []
+    with zipfile.ZipFile(models / "out.sb3") as archive:
+        targets = json.loads(archive.read("project.json"))["targets"]
+    assert [target["name"] for target in targets] == ["Stage", "Game", "net", "other"]
+
+    # A sprite the project has is refused, unless replaced; the output may
+    # be the project itself.
+    code, message = run(capsys, "add", "out.sb3", "net.sprite3", "-o", "out.sb3")
+    assert code == 2 and "already has a sprite named 'net'" in message and "--replace" in message
+    code, report = run(capsys, "add", "out.sb3", "net.sprite3", "-o", "out.sb3", "--replace")
+    assert code == 0 and report["sprites"] == ["Game", "net", "other"]
+    # --output is required, so that the project is never overwritten by default.
+    assert main(["add", "mine.sb3", "net.sprite3"]) == 2
+    assert "--output" in capsys.readouterr().err
+    code, message = run(capsys, "add", "net.sprite3", "net.sprite3", "-o", "x")
+    assert code == 2 and "not a Scratch project" in message

@@ -4,8 +4,9 @@
 
 An exported sprite is one piece of a Scratch project: something still has to
 fill its input list, broadcast its call, and show the result. `build_project`
-writes that project for you, and the `cattorch` command exports a model and
-builds its project in one step.
+writes that project for you, `add_to_project` puts sprites into a project of
+your own, and the `cattorch` command exports a model and builds its project
+in one step.
 
 ## Build a project
 
@@ -97,9 +98,70 @@ project. No two of a project's sprites may share a name, nor two of its
 globals or broadcasts: export the tokenizer under another name than the
 model, for one.
 
-To use the sprites in your own project, upload the `.sprite3` files into it
-(select another sprite after each upload), or start from a built project
-and add your own sprites.
+To use the sprites in your own project, add them with
+[`add_to_project`](#add-sprites-to-your-own-project), or start from a built
+project and add your own sprites. Uploading a small sprite works too
+(select another sprite after each upload).
+
+## Add sprites to your own project
+
+Uploading a sprite in the editor (**Upload Sprite**) selects it, so the
+editor shows all its blocks once, and for a large model that can freeze or
+crash it. `add_to_project` writes the sprites into your `.sb3` from Python
+instead, without the editor:
+
+```python
+result = cattorch.transpile(model, example, "build/points")
+project = cattorch.add_to_project("my game.sb3", result, "my game with points.sb3")
+print(project.sprites)  # ('Player', 'Enemy', 'points')
+```
+
+Load the result with **File > Load from your computer**. The added sprites
+go after your own, so the project opens with your first sprite selected, as
+before, and the model's is never shown. Their globals and messages are
+declared on the stage as uploading would: a global your project already has
+with the same name and kind (a list for a list), and a broadcast equal
+ignoring case, is used rather than duplicated, so scripts that already fill
+`points input` and `broadcast [points forward] and wait` run the model. A new
+`NAME status` and tokenizer's `NAME text` start empty, other new lists empty
+and new variables at 0. Nothing of yours changes: your sprites, scripts,
+stage values and their IDs stay as they are. The added sprites are hidden on
+the stage, and a project with no sprites at all gets a blank `Sprite1`
+first, so that it doesn't open on a model.
+
+`sprites` is one sprite or a list of them: `transpile` and
+`transpile_tokenizer` results, or `.sprite3` paths (a text generator and its
+tokenizer go in together). `project` is an `.sb3` path or a `build_project`
+result. `output_path` is required, so your project is never overwritten
+unless you say so: pass the project's own path to write over it. Like
+`build_project`'s, it gets `.sb3` unless it ends in it.
+
+A sprite named like one of the project's raises `ValueError`. After
+retraining a model, pass `replace=True`: the new sprite takes the old one's
+place in the sprite list and on the stage, and binds to the stage's globals
+by name, so your scripts keep working and the lists keep their values.
+`ValueError` is also raised for two sprites of one name, globals or
+broadcasts of two added sprites that Scratch can't tell apart, a global of
+the project of another kind than the sprite needs (a variable `points input`
+where the sprite uses a list), a global named like one of a sprite's own
+variables, such as `cattorch interface version` (loading the project
+keeps both, but Scratch renames the sprite's when the sprite is uploaded or
+pasted from the backpack, breaking the `([cattorch interface version] of
+[NAME])` block, and the sprite's palette would show two of that name), and a sprite of yours with its own list or variable
+named like a global the added sprites bring.
+
+`ProjectResult.sprites` lists every sprite of the written project, yours
+first. `broadcasts`, `lists` and `variables` list what the added sprites use,
+including globals your project already had, but not your project's other
+broadcasts and globals. `warnings` holds the
+[project size](storage.md#project-size) warning.
+
+From the terminal:
+
+```bash
+cattorch add "my game.sb3" build/points.sprite3 --output "my game with points.sb3"
+cattorch add story.sb3 build/lm.sprite3 build/lm_tokenizer.sprite3 -o story.sb3 --replace
+```
 
 ## The command line
 
@@ -111,6 +173,7 @@ cattorch export model.pt --shape 1,28,28 --labels "0,1,2,3,4,5,6,7,8,9" --projec
 cattorch generate my_models.py:TinyGPT --tokenizer path/to/tokenizer --project
 cattorch generate --hf some-user/tiny-model --max-context 64 --project
 cattorch generate --hf AntonV/mamba2-130m-hf --quantize 8 --project
+cattorch add game.sb3 model.sprite3 --output game_with_model.sb3
 ```
 
 `cattorch export MODEL` exports a model, checks it against PyTorch with
@@ -173,7 +236,19 @@ tokenizer's end token) for its project's demo, as `build_project` does. A
 tokenizer's end token past the model's token IDs, such as an added `</s>`,
 can never be generated, so the demo then has none, and a warning says so.
 These project options, and `--labels`, need `--project`: without it they
-are an error rather than ignored. `cattorch analyze-benchmark PROJECT` prints a saved
+are an error rather than ignored.
+
+`cattorch add PROJECT SPRITE [SPRITE ...] -o OUTPUT` adds exported
+`.sprite3` files to an `.sb3` with
+[`add_to_project`](#add-sprites-to-your-own-project). `-o`/`--output` is
+required and may name `PROJECT` itself; `--replace` replaces the project's
+sprite of the same name instead of refusing it. It prints the
+`ProjectResult` as JSON: `path`, `sprites`, `broadcasts`, `lists`,
+`variables` and `warnings`. A sprite name the project already has, a file
+that isn't a Scratch project or sprite, and the other refusals of
+`add_to_project` exit with status 2.
+
+`cattorch analyze-benchmark PROJECT` prints a saved
 [benchmark project's](verification-and-benchmarking.md) results as JSON, the
 fields of `analyze_benchmark`'s `BenchmarkAnalysis`. `cattorch --version`
 prints the installed version, which Python code can read as
@@ -211,4 +286,5 @@ project: an MLP that names a point's quadrant, a CNN that tells horizontal
 lines from vertical ones, and a character-level transformer and GRU that
 continue a nursery rhyme.
 
-Related: [getting started](getting-started.md), [API reference](api-reference.md#build_project).
+Related: [getting started](getting-started.md), [API reference](api-reference.md#build_project),
+[`add_to_project`](api-reference.md#add_to_project).

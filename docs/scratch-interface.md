@@ -15,8 +15,15 @@ model sprite makes the Scratch editor slow while it's selected, since the
 editor shows its blocks, so leave it alone and work from another sprite or
 the stage:
 
-1. Upload the sprite (Sprite menu, **Upload Sprite**). Scratch selects a
-   sprite you upload, so select another sprite, or the stage, right away.
+1. Put the sprite in your project. Scratch selects a sprite you upload
+   (Sprite menu, **Upload Sprite**), so the editor shows all its blocks
+   once, which can make it freeze or crash for a large model. For a large
+   sprite, add it from Python with
+   [`add_to_project`](projects-and-cli.md#add-sprites-to-your-own-project)
+   or from the terminal with `cattorch add`, which write your `.sb3` with
+   the sprite after your own sprites: the project opens with your first
+   sprite selected, and the model's never is. A small sprite you can
+   upload, then select another sprite, or the stage, right away.
 2. In your own scripts, fill the sprite's input lists, then
    `broadcast [NAME forward] and wait`.
 3. Read `NAME status`. When it's `ok`, the outputs are in the output lists;
@@ -43,6 +50,8 @@ The rule for names:
   has. Scratch creates a variable holding 0 and an empty list, so
   `NAME status` reads `0` until a call ends, and a program's state lists
   are empty until its first call or `NAME init` fills them.
+  `add_to_project` declares them the same way, except that a new
+  `NAME status` and `NAME text` start empty.
 - **The sprite's own:** what is fixed when it's exported (its interface
   version, how its weights are stored, a generator's
   `cattorch max context`, [shard counts](#long-lists)) and
@@ -383,6 +392,13 @@ The Demo sprite is named `Demo` (`Demo2` when an exported sprite is named
 every broadcast of the project, and its global lists and variables. No two
 of a project's sprites, globals or broadcasts may be the same to Scratch:
 `build_project` refuses a tokenizer named like its model, for one.
+
+[`add_to_project`](projects-and-cli.md#add-sprites-to-your-own-project)
+adds no names: it puts the exported sprites, as they are, after a project's
+own sprites and declares their globals and messages on its stage, using the
+ones the project already has. A project with no sprites also gets a blank
+`Sprite1` (`Sprite2` when an exported sprite is named `Sprite1`), first, so
+that it doesn't open on a model.
 
 ## Benchmark projects
 

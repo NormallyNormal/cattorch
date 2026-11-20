@@ -43,7 +43,7 @@ from cattorch.results import (
     TensorSpec, TokenizerResult, TranspileResult, VerifyResult, MultiOutputVerifyResult,
 )
 from cattorch.verify import verify
-from cattorch.project import build_project
+from cattorch.project import add_to_project, build_project
 
 
 _BENCHMARK_EXPORTS = {
@@ -79,7 +79,8 @@ __all__ = [
     "ArtifactResult", "EntryPointResult", "ProgramCallVerifyResult",
     "ProgramResult", "ProgramVerifyResult", "StateResult",
     "TensorSpec", "TokenizerResult", "TranspileResult", "GenerationResult",
-    "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project", "ProjectResult",
+    "VerifyResult", "MultiOutputVerifyResult", "verify", "build_project",
+    "add_to_project", "ProjectResult",
     "build_paired_benchmark", "build_benchmark_suite", "analyze_benchmark",
     "build_generation_benchmark_suite",
     "build_storage_benchmark_suite", "BenchmarkAnalysis", "BenchmarkCase",

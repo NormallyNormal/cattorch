@@ -78,7 +78,9 @@ slow while its sprite is selected. Use it from another sprite, or the stage.
    `.sprite3` file. Scratch creates the global lists and variables the
    sprite uses, here `two_layer_net input`, `two_layer_net output` and
    `two_layer_net status`, and selects the sprite: select another sprite,
-   or the stage, right away.
+   or the stage, right away. For a large model, add the sprite with
+   [`add_to_project`](projects-and-cli.md#add-sprites-to-your-own-project)
+   or `cattorch add` instead, so the editor never shows it.
 3. In a script of that other sprite, fill `two_layer_net input` with the
    model's input values, then `broadcast [two_layer_net forward] and wait`.
 4. Read `two_layer_net status`. When it's `ok`, the flattened result is in

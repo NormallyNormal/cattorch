@@ -33,7 +33,11 @@ print(artifact.path)  # build/model.sprite3
 
 Import the file using Scratch's **Upload Sprite** option, then select
 another sprite: you never need to open the model's sprite, which is slow to
-show in the editor when it's large. From any sprite, fill the global
+show in the editor when it's large. Uploading selects the sprite, so for a
+large one, add it to your project without the editor instead:
+`cattorch.add_to_project("game.sb3", artifact, "game_with_model.sb3")`, or
+`cattorch add game.sb3 build/model.sprite3 --output game_with_model.sb3`.
+From any sprite, fill the global
 `model input` list, `broadcast [model forward] and wait`, and read
 `model status` (`ok`) and `model output`. The lists and broadcasts are named
 after the export (`model`, from the file name, or `name=`). The first call

@@ -12,7 +12,7 @@ changed on the way to 1.0.
 - **The Python API:** every name in `cattorch.__all__`, with its documented
   parameters (their names, order, which are keyword-only, and defaults),
   fields, and behavior. This includes `transpile`, `verify`,
-  `build_project`, the tokenizers, the configuration classes, the result
+  `build_project`, `add_to_project`, the tokenizers, the configuration classes, the result
   types, the exceptions and `CattorchWarning`, programs (`ExportProgram`,
   `EntryPoint`, `Input`, `Output`, `State`, `StateInput`, `StateUpdate`,
   `ProgramCall`), `GenerationProgram` and `RecurrentGenerationProgram`, the

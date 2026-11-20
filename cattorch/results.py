@@ -319,16 +319,20 @@ class TokenizerResult(ArtifactResult):
 
 @dataclass(frozen=True)
 class ProjectResult:
-    """A project written by :func:`build_project`.
+    """A project written by :func:`build_project` or :func:`add_to_project`.
 
-    ``path`` is the ``.sb3`` written and ``sprites`` its sprites' names,
-    the Demo sprite first. ``broadcasts`` are its public broadcasts: each
-    exported sprite's messages, each followed by its completion broadcast
-    (``NAME forward``, ``NAME forward complete``, ...), the shared
-    ``cattorch prepare for save``, and the project's own (``NAME predict``,
-    ``NAME sample``). ``lists`` and ``variables`` are its global data, the
-    sprites' and the project's own, all by Scratch name. ``warnings`` are as
-    for ``ArtifactResult``.
+    ``path`` is the ``.sb3`` written and ``sprites`` its sprites' names, in
+    order: from ``build_project`` the Demo sprite first, from
+    ``add_to_project`` every sprite of the project, its own first.
+    ``broadcasts`` are the public broadcasts: each exported sprite's
+    messages, each followed by its completion broadcast (``NAME forward``,
+    ``NAME forward complete``, ...), the shared ``cattorch prepare for
+    save``, and ``build_project``'s own (``NAME predict``, ``NAME sample``).
+    ``lists`` and ``variables`` are the global data the exported sprites
+    (and ``build_project``'s Demo) use, by Scratch name; from
+    ``add_to_project`` that includes globals the project already had and
+    the added sprites now use, but not the project's other broadcasts and
+    globals. ``warnings`` are as for ``ArtifactResult``.
     """
 
     path: Path

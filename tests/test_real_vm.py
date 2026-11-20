@@ -296,6 +296,95 @@ def test_a_project_opens_with_its_demo_selected(tmp_path):
     assert run_vm(project, tmp_path, flag=False)["editing"] == "Demo"
 
 
+def users_project(tmp_path, scripts, lists=(), variables=()) -> SimpleNamespace:
+    """A project of the user's own: a Game sprite running ``scripts`` on the green flag,
+    then a Cat sprite. ``lists`` and ``variables`` are its globals, which the
+    scripts use: a project whose scripts use a sprite's interface already
+    has its globals."""
+    def build(builder):
+        for name in lists:
+            builder.global_list(name)
+        for name in variables:
+            builder.global_variable(name, "")
+        cat = builder.add_demo_sprite()
+        cat["name"] = "Cat"
+        game = builder.add_demo_sprite()
+        game["name"] = "Game"
+        for position, (body, used_lists, used_variables) in enumerate(scripts):
+            builder.script(game, FLAG, body, lists=used_lists,
+                           variables=(*used_variables, "_index"), y=400 * position)
+
+    return project_file(tmp_path, "mine", build)
+
+
+def test_a_model_added_to_a_project_runs_from_the_users_sprite(tmp_path):
+    from cattorch import add_to_project
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 3)).eval()
+    value = torch.randn(1, 4)
+    result = transpile(model, value, tmp_path / "net", name="net")
+    mine = users_project(tmp_path, [(
+        (
+            *fill("net input", value.flatten().tolist()),
+            # As the user typed it: Scratch matches messages ignoring case.
+            broadcast_and_wait("Net Forward"),
+            *copy_into("net output", "game result"),
+        ),
+        ("net input", "net output", "game result"), (),
+    )], lists=("net input", "net output", "game result"), variables=("net status",))
+    project = add_to_project(mine.path, result, tmp_path / "with net")
+    assert project.sprites == ("Game", "Cat", "net")
+    run = run_vm(project, tmp_path)
+    # Loading the project selects the user's first sprite, not the model.
+    assert run["editing"] == "Game"
+    stage = run["stage"]
+    assert stage["net status"] == "ok"
+    torch.testing.assert_close(values(stage, "game result"), model(value).detach().flatten(),
+                               atol=1e-5, rtol=1e-5)
+    # The user's globals were used: no second one of a name.
+    assert {name for name in stage if name.startswith("net ")} == {
+        "net input", "net output", "net status",
+    }
+
+
+def test_a_generator_and_tokenizer_added_together_run_from_the_users_sprite(tmp_path):
+    from cattorch import add_to_project
+    from cattorch.util.scratch.dsl import broadcast_and_wait
+    from shared_models import CHARACTERS, Language, char_tokenizer
+    from sprite_helpers import logits_of
+
+    torch.manual_seed(2)
+    model = Language().eval()
+    result = transpile(model, GenerationProgram(max_context=16, top_k=2), tmp_path / "lm")
+    words = CharTokenizer(char_tokenizer()).save(tmp_path / "chars")
+    lists = ("chars token ids", "lm token ids", "lm top k ids")
+    mine = users_project(tmp_path, [(
+        (
+            set_text("chars text", "the"),
+            broadcast_and_wait("chars tokenize"),
+            *copy_into("chars token ids", "lm token ids"),
+            broadcast_and_wait("lm prefill"),
+            *copy_into("lm top k ids", "chars token ids"),
+            broadcast_and_wait("chars detokenize"),
+        ),
+        lists, ("chars text",),
+    )], lists=lists, variables=("chars text",))
+    project = add_to_project(mine.path, [result, words], tmp_path / "story")
+    assert project.sprites == ("Game", "Cat", "lm", "chars")
+    run = run_vm(project, tmp_path)
+    assert run["editing"] == "Game"
+    stage = run["stage"]
+    assert stage["lm status"] == "ok" and stage["chars status"] == "ok"
+    prompt = [CHARACTERS.index(character) for character in "the"]
+    expected = logits_of(model, prompt)
+    torch.testing.assert_close(values(stage, "lm logits"), expected, atol=1e-4, rtol=0)
+    best = torch.topk(expected, 2).indices.tolist()
+    assert [int(float(token)) for token in stage["lm top k ids"]] == best
+    assert stage["chars text"] == "".join(CHARACTERS[index] for index in best)
+
+
 def test_a_restarted_call_never_reads_an_earlier_status(tmp_path):
     # A second broadcast of a message whose script is running restarts that
     # script in Scratch: the first call stops where it was, and the first

@@ -11,12 +11,17 @@ project runnable on its own: list monitors and a green-flag run for a model,
 or a prompt-and-continue loop for a text generator with its tokenizer, and
 holds the project's own extras: a classifier's ``NAME predict`` and a
 generator's ``NAME sample``.
+
+``add_to_project`` puts exported sprites into a project of your own instead:
+after its sprites, so that it opens with the sprite it opened with, their
+globals and messages declared on its stage, and nothing of yours changed.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
+import os
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -31,7 +36,9 @@ from cattorch.results import (
 )
 from cattorch.procedures import _add_warp_procedure
 from cattorch.templates.template import TEMPLATE_DIR
-from cattorch.util.scratch.archive import PROJECT_JSON, read_archive, write_archive
+from cattorch.util.scratch.archive import (
+    PROJECT_JSON, SPRITE_JSON, read_archive, read_user_archive, write_archive,
+)
 from cattorch.util.paths import output_file
 from cattorch.util.scratch.dsl import (
     Program,
@@ -859,4 +866,384 @@ def build_project(
         lists=tuple(builder.global_lists),
         variables=tuple(builder.global_variables),
         warnings=tuple(project_warnings),
+    )
+
+
+# ── adding sprites to a project of your own ─────────────────────────────────
+
+# A sprite given by its export's result, or by the path of its ``.sprite3``.
+SpriteSource = str | Path | TranspileResult | ProgramResult | GenerationResult | TokenizerResult
+_RESULTS = (TranspileResult, ProgramResult, GenerationResult, TokenizerResult)
+# The sprite an empty project gets, so that a model isn't selected when it opens.
+_BLANK = "Sprite1"
+# What a replaced sprite passes on to the one that takes its place.
+_KEPT_ON_REPLACE = (
+    "layerOrder", "visible", "x", "y", "size", "direction", "draggable", "rotationStyle",
+)
+
+
+def _user_file(source, suffix: str, document: str, *, parameter: str) -> Path:
+    """The file a path names, read as an export names its file, checked to be of its kind.
+
+    ``suffix`` is added unless the path ends in it, as ``transpile`` and
+    ``build_project`` name their files; the path exactly as given is read
+    when that file doesn't exist. A missing file or one of the wrong kind
+    raises ``ValueError``.
+    """
+    path = output_file(source, suffix, parameter=parameter)
+    if not path.exists() and Path(source).is_file():
+        path = Path(source)
+    read_user_archive(path, document, parameter=parameter)
+    return path
+
+
+def _project_path(project) -> Path:
+    if isinstance(project, ProjectResult):
+        read_user_archive(project.path, PROJECT_JSON, parameter="project")
+        return Path(project.path)
+    if isinstance(project, (str, os.PathLike)) and not isinstance(project, bytes):
+        return _user_file(project, ".sb3", PROJECT_JSON, parameter="project")
+    raise TypeError(
+        f"project must be a path or a ProjectResult, not a {type(project).__name__}"
+    )
+
+
+def _sprite_paths(sprites) -> list[Path]:
+    if isinstance(sprites, (*_RESULTS, str, os.PathLike)):
+        sprites = [sprites]
+    elif isinstance(sprites, (bytes, ProjectResult)) or not isinstance(sprites, Sequence):
+        raise TypeError(
+            "sprites must be a sprite (a transpile or transpile_tokenizer result, or a "
+            f".sprite3 path) or a sequence of them, not a {type(sprites).__name__}"
+        )
+    if not sprites:
+        raise ValueError("sprites is empty; give at least one sprite to add")
+    paths = []
+    for sprite in sprites:
+        if isinstance(sprite, _RESULTS):
+            paths.append(Path(sprite.path))
+        elif isinstance(sprite, (str, os.PathLike)) and not isinstance(sprite, bytes):
+            paths.append(_user_file(sprite, ".sprite3", SPRITE_JSON, parameter="sprite"))
+        else:
+            raise TypeError(
+                "each sprite must be a transpile or transpile_tokenizer result, or a "
+                f".sprite3 path, not a {type(sprite).__name__}"
+            )
+    return paths
+
+
+def _ids(target: dict) -> set[str]:
+    """Every ID ``target`` defines, and the global IDs its blocks refer to."""
+    taken: set[str] = set()
+    for section in ("blocks", "variables", "lists", "broadcasts", "comments"):
+        taken.update(target.get(section) or {})
+    for references in global_references(target).values():
+        taken.update(references)
+    return taken
+
+
+def _fresh_ids(sprite: dict, taken: set[str]) -> dict:
+    """``sprite`` with each of its IDs that ``taken`` already holds replaced by a new one."""
+    own = _ids(sprite)
+    mapping = {}
+    for identifier in sorted(own & taken):
+        while True:
+            fresh = f"{identifier}_{uuid.uuid4().hex[:8]}"
+            if fresh not in taken and fresh not in own:
+                break
+        mapping[identifier] = fresh
+        own.add(fresh)
+    return remap_ids(sprite, mapping) if mapping else sprite
+
+
+def _names(target: dict, section: str) -> dict[str, str]:
+    """``target``'s variables or lists, by name: ``{name: id}``."""
+    return {
+        entry[0]: identifier for identifier, entry in (target.get(section) or {}).items()
+        if isinstance(entry, list) and entry
+    }
+
+
+def _media(target: dict) -> set[str]:
+    """The files of ``target``'s costumes and sounds."""
+    return {
+        entry["md5ext"] for entry in (*target.get("costumes", ()), *target.get("sounds", ()))
+        if isinstance(entry, dict) and isinstance(entry.get("md5ext"), str)
+    }
+
+
+def _blank_sprite(name: str, assets: dict[str, bytes], layer: int, note: str) -> dict:
+    costume = next((TEMPLATE_DIR / "sprite").glob("*.svg"))
+    data = costume.read_bytes()
+    asset = hashlib.md5(data).hexdigest()
+    assets[f"{asset}.svg"] = data
+    return {
+        "isStage": False, "name": name, "variables": {}, "lists": {}, "broadcasts": {},
+        "blocks": {}, "currentCostume": 0,
+        "comments": {"cattorch_project_note": {
+            "blockId": None, "x": -400, "y": -300, "width": 400, "height": 280,
+            "minimized": False, "text": note,
+        }},
+        "costumes": [{
+            "name": "costume1", "bitmapResolution": 1, "dataFormat": "svg",
+            "assetId": asset, "md5ext": f"{asset}.svg",
+            "rotationCenterX": 48, "rotationCenterY": 50,
+        }],
+        "sounds": [], "volume": 100, "layerOrder": layer,
+        "visible": True, "x": 0, "y": 0, "size": 100, "direction": 90,
+        "draggable": False, "rotationStyle": "all around",
+    }
+
+
+def _check_kinds(stage: dict, owner: str, references: dict) -> None:
+    """A global the sprite uses as a list mustn't be the stage's variable, or the reverse."""
+    for section, other, kind, other_kind in (
+        ("lists", "variables", "list", "variable"), ("variables", "lists", "variable", "list"),
+    ):
+        own, others = _names(stage, section), _names(stage, other)
+        for name in sorted(set(references[section].values())):
+            if name in others and name not in own:
+                raise ValueError(
+                    f"{owner} uses the global {kind} {name!r}, but the project's stage has a "
+                    f"global {other_kind} of that name; rename or delete the project's "
+                    f"{other_kind}"
+                )
+
+
+def _check_local_names(stage: dict, users: list[dict], added: list[dict], new: dict) -> None:
+    """Refuse a sprite's own variable or list that a global of the same name and kind hides.
+
+    Loading a project keeps both (scratch-vm's ``installTargets`` only
+    reconciles references then), but Scratch renames a sprite's own
+    variable when the stage has a global of the same name and kind as the
+    sprite comes in (``fixUpVariableReferences``, on upload and backpack
+    paste), which breaks the ``([NAME] of [SPRITE])`` reads of an added
+    sprite's own variables, and the sprite's palette would show two of that
+    name. ``new`` holds the globals the
+    added sprites declare, ``{section: names}``, which mustn't be the name
+    of a variable of one of the project's own sprites (``users``) either.
+    """
+    for section, kind in (("variables", "variable"), ("lists", "list")):
+        stage_names = _names(stage, section)
+        for sprite in added:
+            for name in sorted(_names(sprite, section)):
+                if name in stage_names:
+                    raise ValueError(
+                        f"the project's stage has a global {kind} {name!r}, the name of one of "
+                        f"sprite {sprite['name']!r}'s own {kind}s: Scratch would rename the "
+                        f"sprite's, breaking the ([{name}] of [{sprite['name']}]) block; rename "
+                        f"or delete the project's {kind}"
+                    )
+        for sprite in users:
+            for name in sorted(set(_names(sprite, section)) & new[section]):
+                raise ValueError(
+                    f"sprite {sprite['name']!r} of the project has its own {kind} {name!r}, "
+                    f"the name of a global {kind} the added sprites use: its scripts would "
+                    f"use its own {kind}, not the global; rename or delete sprite "
+                    f"{sprite['name']!r}'s {kind}"
+                )
+
+
+def add_to_project(
+    project: str | Path | ProjectResult,
+    sprites: SpriteSource | Sequence[SpriteSource],
+    output_path: str | Path,
+    *,
+    replace: bool = False,
+) -> ProjectResult:
+    """Add exported sprites to a Scratch project of your own, and write it to ``output_path``.
+
+    ``project`` is an ``.sb3`` (a path, or a ``build_project`` result) and
+    ``sprites`` one sprite or a sequence of them, each a ``transpile`` or
+    ``transpile_tokenizer`` result or a ``.sprite3`` path. The sprites go
+    after the project's own, so it still opens with the sprite it opened
+    with selected (a model sprite is slow to show in the editor, and
+    uploading one selects it). Their globals and messages are declared on
+    the stage as uploading the sprites would: a global already on the stage
+    with the same name and kind, and a message equal ignoring case, is used,
+    so scripts that already use ``NAME input`` or ``NAME forward`` run the
+    added sprite. A new ``NAME status`` and tokenizer's ``NAME text`` start
+    empty. The project's own sprites, scripts and IDs are kept as they are.
+    A project without sprites gets a blank one first, ``Sprite1``.
+
+    ``output_path`` gets ``.sb3`` unless it ends in it; it may be the
+    project's own path. ``replace=True`` replaces a sprite of the project
+    with an added sprite of the same name, in its place, keeping the stage's
+    globals: the way to put a retrained model in. ``ProjectResult`` lists
+    every sprite of the written project, in order, and the broadcasts and
+    global lists and variables the added sprites use. Raises ``ValueError``
+    for a sprite name the project already has (without ``replace``), two
+    added sprites of one name, globals or broadcasts of two added sprites
+    that would be the same to Scratch, or a global that would hide a
+    sprite's own variable or list. Warnings are also emitted as
+    ``CattorchWarning``.
+    """
+    project_path = _project_path(project)
+    paths = _sprite_paths(sprites)
+    output = output_file(output_path, ".sb3")
+    if not isinstance(replace, bool):
+        raise TypeError(f"replace must be True or False, not {type(replace).__name__}")
+    data, assets = read_archive(project_path, PROJECT_JSON)
+    targets = data.get("targets") if isinstance(data, dict) else None
+    if not isinstance(targets, list) or not any(
+        isinstance(target, dict) and target.get("isStage") for target in targets
+    ):
+        raise ValueError(f"project {str(project_path)!r} is not a Scratch 3 project")
+    stage = next(target for target in targets if target.get("isStage"))
+    places = {
+        target["name"]: position for position, target in enumerate(targets)
+        if not target.get("isStage")
+    }
+
+    added: list[dict] = []
+    files: dict[str, Path] = {}
+    global_owners: list[tuple[str, str]] = []
+    message_owners: list[tuple[str, str]] = []
+    for path in paths:
+        sprite, sprite_assets = read_archive(path)
+        name = sprite["name"]
+        if name in files:
+            raise ValueError(
+                f"two of the sprites are named {name!r}, {str(files[name])!r} and "
+                f"{str(path)!r}; export one with another name="
+            )
+        if name in places and not replace:
+            raise ValueError(
+                f"project {str(project_path)!r} already has a sprite named {name!r}, and "
+                f"so does {str(path)!r}; pass replace=True (--replace) to replace the "
+                "project's, or export the sprite with another name="
+            )
+        files[name] = path
+        owner = f"sprite {name!r}"
+        references = global_references(sprite)
+        global_owners += [
+            (owner, used) for section in ("variables", "lists")
+            for used in references[section].values()
+        ]
+        message_owners += [(owner, text) for text in sorted(set(references["broadcasts"].values()))]
+        interface.check_global_names(global_owners)
+        interface.check_messages(
+            (owner, text) for owner, text in message_owners
+            if text not in interface.SHARED_MESSAGES
+        )
+        _check_kinds(stage, owner, references)
+        added.append(sprite)
+        assets.update(sprite_assets)
+
+    replaced = {sprite["name"] for sprite in added if sprite["name"] in places}
+    old_sprites = {name: targets[places[name]] for name in replaced}
+    users = [
+        target for target in targets
+        if not target.get("isStage") and target["name"] not in replaced
+    ]
+    taken: set[str] = {
+        identifier for target in targets
+        if target.get("isStage") or target["name"] not in replaced
+        for identifier in _ids(target)
+    }
+    taken.update(
+        monitor["id"] for monitor in data.get("monitors") or ()
+        if isinstance(monitor, dict) and isinstance(monitor.get("id"), str)
+    )
+    before = {section: set(_names(stage, section)) for section in ("variables", "lists")}
+    broadcasts: list[str] = []
+    lists: list[str] = []
+    variables: list[str] = []
+    with collect_warnings() as collected:
+        for position, sprite in enumerate(added):
+            sprite = added[position] = _fresh_ids(sprite, taken)
+            taken |= _ids(sprite)
+            name = sprite["name"]
+            starting = {
+                global_name(name, STATUS_VARIABLE): interface.INITIAL_STATUS,
+                global_name(name, interface.TEXT): "",
+            }
+            used = install(stage, sprite, starting)
+            lists += [list_name for list_name in used["lists"] if list_name not in lists]
+            variables += [variable for variable in used["variables"] if variable not in variables]
+            sent = set(global_references(sprite)["broadcasts"].values())
+            for text in sorted(
+                text for text in sent
+                if text not in interface.SHARED_MESSAGES and not text.endswith(" complete")
+            ):
+                broadcasts += [text, completion(text)]
+            if interface.SHARED_PREPARE_FOR_SAVE in sent and (
+                interface.SHARED_PREPARE_FOR_SAVE not in broadcasts
+            ):
+                broadcasts.append(interface.SHARED_PREPARE_FOR_SAVE)
+            sprite["visible"] = False
+        new = {
+            section: set(_names(stage, section)) - before[section]
+            for section in ("variables", "lists")
+        }
+        _check_local_names(stage, users, added, new)
+
+        layer = max(
+            (target.get("layerOrder", 0) for target in targets if not target.get("isStage")),
+            default=0,
+        )
+        monitors = data.get("monitors") or []
+        appended = []
+        if not users and not replaced:
+            names = [sprite["name"] for sprite in added]
+            blank, index = _BLANK, 2
+            while blank in names:
+                blank, index = f"{_BLANK.rstrip('1')}{index}", index + 1
+            layer += 1
+            appended.append(_blank_sprite(blank, assets, layer, (
+                f"This project uses {', '.join(names)} without opening "
+                f"{'it' if len(names) == 1 else 'them'}: fill the input lists, broadcast "
+                "a call such as \"NAME forward\" and wait, then read \"NAME status\" "
+                "(NAME being the sprite's name). When it is ok, the outputs are in the "
+                "output lists.\n\nA large model sprite is slow to show in the editor, so "
+                "work in this sprite or the stage."
+            )))
+        for sprite in added:
+            name = sprite["name"]
+            if name in replaced:
+                old = old_sprites[name]
+                sprite.update({key: old[key] for key in _KEPT_ON_REPLACE if key in old})
+                targets[places[name]] = sprite
+                own = set(sprite.get("variables") or {}) | set(sprite.get("lists") or {})
+                monitors = [
+                    monitor for monitor in monitors
+                    if not (
+                        isinstance(monitor, dict) and monitor.get("spriteName") == name
+                        and monitor.get("opcode") in ("data_variable", "data_listcontents")
+                        and monitor.get("id") not in own
+                    )
+                ]
+            else:
+                layer += 1
+                sprite["layerOrder"] = layer
+                appended.append(sprite)
+        targets += appended
+        # The replaced sprites' costumes and sounds go with them, unless
+        # another sprite still uses the same file.
+        kept = {file for target in targets for file in _media(target)}
+        for name in replaced:
+            for file in _media(old_sprites[name]) - kept:
+                assets.pop(file, None)
+        if "monitors" in data:
+            data["monitors"] = monitors
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Written beside the output and moved over it, so that a failure never
+        # leaves a half-written project in place of the one read.
+        partial = output.with_name(f".{output.name}.{uuid.uuid4().hex[:8]}.partial")
+        try:
+            text = write_archive(partial, data, assets, PROJECT_JSON)
+            os.replace(partial, output)
+        finally:
+            partial.unlink(missing_ok=True)
+        size = online_json_size_warning(len(text.encode("utf-8")), "project JSON")
+        if size is not None:
+            warn(size)
+    return ProjectResult(
+        path=output,
+        sprites=tuple(target["name"] for target in targets if not target.get("isStage")),
+        broadcasts=tuple(broadcasts),
+        lists=tuple(lists),
+        variables=tuple(variables),
+        warnings=tuple(collected),
     )

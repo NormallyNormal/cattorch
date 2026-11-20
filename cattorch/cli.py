@@ -3,7 +3,7 @@
 ``cattorch export MODEL`` exports a model and checks it against PyTorch;
 ``cattorch generate`` exports a text generator (a recurrent one for a Hugging
 Face Mamba, Mamba-2 or RWKV model), with its tokenizer and a demo project when
-it can. ``MODEL`` is ``module:name`` or ``path/to/file.py:name``
+it can; ``cattorch add PROJECT SPRITE...`` adds exported sprites to a project. ``MODEL`` is ``module:name`` or ``path/to/file.py:name``
 (a module, a class to construct without arguments, or a function returning a
 module), or a ``.pt`` file saved with ``torch.save(model)``.
 """
@@ -516,6 +516,18 @@ def _analyze(args) -> int:
     return EXIT_OK
 
 
+def _add(args) -> int:
+    import dataclasses
+
+    from cattorch.project import add_to_project
+
+    project = add_to_project(args.project, args.sprites, args.output, replace=args.replace)
+    report = dataclasses.asdict(project)
+    report["path"] = str(project.path)
+    print(dumps(report, indent=2))
+    return EXIT_OK
+
+
 class _Given(argparse._StoreAction):
     """Stores an option and records that it was given, for options with a default."""
 
@@ -667,6 +679,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     options(generate)
     generate.set_defaults(run=_generate)
+
+    add = commands.add_parser(
+        "add", help="add exported sprites to a Scratch project, after its own sprites",
+        formatter_class=_HelpFormatter,
+    )
+    add.add_argument("project", help="the .sb3 project to add the sprites to")
+    add.add_argument(
+        "sprites", nargs="+", metavar="SPRITE", help="a .sprite3 exported by cattorch",
+    )
+    add.add_argument(
+        "-o", "--output", required=True,
+        help="the .sb3 to write, with or without .sb3; it may be PROJECT itself",
+    )
+    add.add_argument(
+        "--replace", action="store_true",
+        help="replace the project's sprite of the same name instead of refusing",
+    )
+    add.set_defaults(run=_add)
 
     analyze = commands.add_parser(
         "analyze-benchmark", help="print a saved benchmark project's results as JSON",

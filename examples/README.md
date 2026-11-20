@@ -38,11 +38,15 @@ if <(quadrants status) = [ok]> then
 end
 ```
 
-To put a model in a project of your own, upload `build/quadrants.sprite3`
-(**Upload Sprite**), then select another sprite: Scratch creates the
-`quadrants ...` lists and variables, and the script above works, except
-`quadrants predict`, which the built project adds: pick the label of the
-largest item of `quadrants output` yourself. See
+To put a model in a project of your own, add it with
+`cattorch add "my project.sb3" build/quadrants.sprite3 --output "my project.sb3"`
+(or `cattorch.add_to_project` from Python), then load the project. The sprite
+goes after your own, so the project opens on your sprite, not the model's.
+Uploading `build/quadrants.sprite3` (**Upload Sprite**) works too for a
+model this small, but selects it: select another sprite afterwards. Either
+way the `quadrants ...` lists and variables are created on the stage, and the
+script above works, except `quadrants predict`, which the built project
+adds: pick the label of the largest item of `quadrants output` yourself. See
 [using a sprite without opening it](../docs/scratch-interface.md#using-a-sprite-without-opening-it).
 
 ## Options

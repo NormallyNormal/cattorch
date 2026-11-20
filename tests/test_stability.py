@@ -26,7 +26,7 @@ import cattorch
 import cattorch.experimental
 
 STABLE = {
-    "transpile", "transpile_tokenizer", "verify", "build_project",
+    "transpile", "transpile_tokenizer", "verify", "build_project", "add_to_project",
     "CharTokenizer", "BPETokenizer", "SentencePieceBPETokenizer",
     "FastConfig", "FastLayerConfig", "StorageConfig", "QuantizationConfig",
     "QuantizationOverride", "CodegenConfig",

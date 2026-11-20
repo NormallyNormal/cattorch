@@ -112,6 +112,20 @@ You never need to open the model's sprite, and a large one makes the editor
 slow while it's selected. Uploading a sprite selects it, so select another
 sprite afterwards.
 
+## The editor freezes or crashes after uploading a sprite
+
+Uploading a sprite (**Upload Sprite**) selects it, and the editor then shows
+all its blocks, which for a large model can take minutes, run out of memory,
+or crash the tab. Don't upload a large sprite: add it to your project outside
+the editor with [`add_to_project`](projects-and-cli.md#add-sprites-to-your-own-project)
+or `cattorch add PROJECT.sb3 SPRITE.sprite3 --output OUT.sb3`, then load
+`OUT.sb3` with **File > Load from your computer**. The sprite goes after your
+own, so the project opens on your first sprite and the model's is never shown.
+For a new project, [`build_project`](projects-and-cli.md#build-a-project)
+writes one that opens on its small Demo sprite. To put a retrained model in
+place of one you added, use `add_to_project(..., replace=True)`
+(`cattorch add --replace`) rather than uploading it.
+
 ## Preserve processor costumes
 
 If the model runs but gives wrong output, check whether the generated sprite's
