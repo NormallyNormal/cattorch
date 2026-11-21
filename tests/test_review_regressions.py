@@ -1,13 +1,15 @@
 """Regression coverage for program boundaries and shared export infrastructure."""
 
-import json
-import zipfile
+import dataclasses
+
+from cattorch import interface
 
 import pytest
 import torch
 from torch import nn
 
 from cattorch import (
+    CattorchError,
     CodegenConfig,
     FastConfig,
     GenerationProgram,
@@ -19,22 +21,17 @@ from cattorch import (
 )
 from cattorch import (
     EntryPoint, ExportProgram, Input, ModuleAdapter, Output, ProgramCall, State,
-    StateInput, StateUpdate,
+    StateInput, StateUpdate, entrypoint,
 )
 from cattorch.experimental import analyze
 from cattorch.graph_transforms import fold_eval_batch_norms
 from cattorch.operator_registry import default_registry
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.interface import (
     read_logical_list,
     rename_list,
     write_logical_list,
 )
-
-
-def emulator(artifact):
-    with zipfile.ZipFile(artifact.path) as archive:
-        return ScratchEmulator(json.loads(archive.read("sprite.json")))
+from sprite_helpers import load_emulator
 
 
 class SharedBatchNorm(nn.Module):
@@ -106,9 +103,9 @@ def test_program_shards_inputs_and_outputs_after_binding_names(
     result = verify(model, program, artifact)
     assert result.passed, result
     for name in ("first", "second"):
-        assert f"cattorch {name} x" in artifact.sharded_lists
-        assert f"cattorch {name} y" in artifact.sharded_lists
-    assert "input" not in artifact.sharded_lists
+        assert f"shards {name} x" in artifact.sharded_lists
+        assert f"shards {name} y" in artifact.sharded_lists
+    assert "shards input" not in artifact.sharded_lists
 
 
 def test_program_shards_dynamic_alias_outputs_and_state(tmp_path, small_list_limit):
@@ -134,7 +131,7 @@ def test_program_shards_dynamic_alias_outputs_and_state(tmp_path, small_list_lim
     )
     result = verify(Model().eval(), program, artifact)
     assert result.passed, result
-    assert "cattorch read values" in artifact.sharded_lists
+    assert "dynamic-shards read values" in artifact.sharded_lists
 
 
 @pytest.mark.parametrize("compression", [False, True])
@@ -205,15 +202,22 @@ def test_append_checks_actual_length_and_keeps_commits_transactional(tmp_path):
             ),
         ),
     )
-    em = emulator(transpile(Model().eval(), program, tmp_path / "append"))
-    for rows, expected in (([], [0.0]), ([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
+    em = load_emulator(transpile(Model().eval(), program, tmp_path / "append"))
+    # An append state holds at least its initial row. (The first call fills
+    # a state still empty, as Scratch creates the global, so init first.)
+    em.run_procedure("cattorch init")
+    em.lists["cattorch state source"] = []
+    em.run_procedure("cattorch copy")
+    assert em.variables["cattorch status"] == interface.too_few_items("append state source")
+    assert em.lists["cattorch state destination"] == [0.0]
+    for rows, expected in (([1.0], [0.0, 1.0]), ([2.0, 3.0], [0.0, 1.0, 2.0, 3.0])):
         em.lists["cattorch state source"] = rows
         em.run_procedure("cattorch copy")
         assert em.variables["cattorch status"] == "ok"
         assert em.lists["cattorch state destination"] == expected
     em.lists["cattorch state source"] = [9.0]
     em.run_procedure("cattorch copy")
-    assert em.variables["cattorch status"] == "state capacity exceeded: destination"
+    assert em.variables["cattorch status"] == interface.state_full("append state destination")
     assert em.lists["cattorch state destination"] == [0.0, 1.0, 2.0, 3.0]
     assert em.lists["cattorch copy value"] == [12.0, 13.0]
     em.run_procedure("cattorch reset")
@@ -257,7 +261,7 @@ def test_verification_fails_rejected_call_and_resumes_from_unmodified_state(tmp_
     )
     assert not result.passed
     assert not result.calls[0].passed
-    assert result.calls[0].status == "invalid length: cattorch step x"
+    assert result.calls[0].status == interface.wrong_number_of_items("status step x")
     assert result.calls[1].passed
     assert result.calls[1].status == "ok"
 
@@ -311,7 +315,7 @@ def test_gptq_replays_state_updates_before_later_calls(tmp_path, monkeypatch):
         quantization=QuantizationConfig(
             bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1
         ),
-        calibration_calls=(ProgramCall("step", (torch.ones(1, 2),)),) * 2,
+        calibration=(ProgramCall("step", (torch.ones(1, 2),)),) * 2,
     )
     torch.testing.assert_close(observed[0], torch.ones(1, 2))
     torch.testing.assert_close(observed[1], torch.full((1, 2), 2.0))
@@ -368,7 +372,7 @@ def test_gptq_replays_append_state_across_different_methods(tmp_path, monkeypatc
         quantization=QuantizationConfig(
             bits=4, method="gptq", min_quantized_values=1, min_calibration_rows=1
         ),
-        calibration_calls=(
+        calibration=(
             ProgramCall("write", (torch.ones(1, 2),)),
             ProgramCall("read", ()),
             ProgramCall("write", (torch.full((1, 2), 3.0),)),
@@ -439,7 +443,7 @@ def test_adapters_preserve_shared_module_references(tmp_path):
             EntryPoint("run", arguments=(Input("x", torch.zeros(1)),), returns=(Output("y"),)),
         )
     )
-    em = emulator(transpile(original, program, tmp_path / "adapters", adapters=(adapter,)))
+    em = load_emulator(transpile(original, program, tmp_path / "adapters", adapters=(adapter,)))
     em.lists["cattorch run x"] = [0.0]
     em.run_procedure("cattorch run")
     assert em.lists["cattorch run y"] == [0.0]
@@ -452,14 +456,14 @@ def test_lifecycle_names_are_reserved(name):
 
 
 def test_generated_interface_names_cannot_collide():
-    with pytest.raises(ValueError, match="collision"):
+    with pytest.raises(ValueError, match="two lists would both be named"):
         ExportProgram(
             entrypoints=(
                 EntryPoint("a b", arguments=(Input("c", torch.ones(1)),), returns=(Output("x"),)),
                 EntryPoint("a", arguments=(Input("b c", torch.ones(1)),), returns=(Output("y"),)),
             )
         )
-    with pytest.raises(ValueError, match="collision"):
+    with pytest.raises(ValueError, match="two lists would both be named"):
         ExportProgram(
             states=(State("s", torch.ones(1)),),
             entrypoints=(
@@ -572,7 +576,10 @@ def test_analysis_reports_bounded_output_shape_and_public_name(tmp_path):
     report = analyze(model, program)
     artifact = transpile(model, program, tmp_path / "analysis")
     assert not report.entrypoints[0].unsupported_operations
-    assert report.entrypoints[0].outputs == artifact.entrypoints[0].outputs
+    assert [
+        dataclasses.replace(spec, list_name=spec.list_name.replace("NAME", "analysis", 1))
+        for spec in report.entrypoints[0].outputs
+    ] == list(artifact.entrypoints[0].outputs)
 
 
 def test_shared_logical_list_helpers_clear_stale_shards_and_rename_references():
@@ -591,31 +598,21 @@ def test_shared_logical_list_helpers_clear_stale_shards_and_rename_references():
     assert sprite["variables"]["v"][0] == "cattorch run x shard count"
 
 
-def test_benchmark_input_restore_and_output_read_are_shard_aware():
-    from cattorch.benchmark import _add_input_restore_procedure, _set_inputs, _target_output
+def test_benchmark_input_values_and_output_read_are_shard_aware():
+    from cattorch.benchmark import _input_values, _target_output
 
-    sprite = {
-        "lists": {"a": ["input", []], "b": ["input shard 2", []]},
-        "variables": {},
-        "blocks": {},
-        "broadcasts": {},
-    }
     x = torch.zeros(200_001)
     x[-1] = 7
-    _set_inputs(sprite, (x,))
-    assert len(sprite["lists"]["a"][1]) == 200_000
-    assert sprite["lists"]["b"][1] == [7.0]
-    _add_input_restore_procedure(sprite, (x,))
-    assert len(sprite["blocks"]) < 100
-    em = ScratchEmulator(sprite)
-    em.lists["input"] = []
-    em.lists["input shard 2"] = []
-    em.run_procedure("cattorch restore benchmark input")
-    assert read_logical_list(em.lists, "input") == x.tolist()
-    assert _target_output({"lists": {"a": ["output", [1.0]], "b": ["output shard 2", [2.0]]}}) == [
-        1.0,
-        2.0,
-    ]
+    values = _input_values("case exact", (x,))
+    assert list(values) == ["case exact input", "case exact input shard 2"]
+    assert len(values["case exact input"]) == 200_000
+    assert values["case exact input shard 2"] == [7.0]
+    # The output is the global named after the sprite, shard by shard...
+    stage = {"lists": {"a": ["case exact output", [1.0]], "b": ["case exact output shard 2", [2.0]]}}
+    assert _target_output({"name": "case exact", "lists": {}}, stage) == [1.0, 2.0]
+    # ... or, in a project from before 1.0, the sprite's own list.
+    old = {"name": "case exact", "lists": {"a": ["output", [1.0]], "b": ["output shard 2", [2.0]]}}
+    assert _target_output(old, {"lists": {}}) == [1.0, 2.0]
 
 
 @pytest.mark.parametrize("optimization", ["exact", "fast"])
@@ -717,3 +714,135 @@ def test_sig_figs_keeps_integer_buffers_exact(tmp_path):
     inputs = (torch.randn(1, 300), torch.tensor([0, 299, 150]))
     result = transpile(model, inputs, tmp_path / "shuffle", sig_figs=2)
     assert verify(model, inputs, result).passed
+
+
+class Counting(nn.Module):
+    """A model whose methods change its state every time they run.
+
+    They reassign a buffer, which tracing leaves out of the graph, so the
+    export succeeds. ``broken`` updates the buffer in place and adds an FFT,
+    which cattorch can't export, so the export fails after running the model.
+    """
+
+    def __init__(self, broken=False, attention=True):
+        super().__init__()
+        self.attention = attention
+        self.embed = nn.Embedding(8, 4)
+        self.head = nn.Linear(4, 8)
+        self.register_buffer("calls", torch.zeros(1))
+        self.register_buffer("unused", torch.arange(3))
+        self.broken = broken
+
+    def logits(self, hidden):
+        if self.broken:
+            self.calls.add_(1)
+            hidden = hidden + torch.fft.rfft(hidden).abs().sum(-1, keepdim=True)
+        else:
+            self.calls = self.calls + 1
+        return self.head(hidden)
+
+    def forward(self, tokens):
+        hidden = self.embed(tokens)
+        if self.attention:
+            # Causal attention, for a GenerationProgram to cache.
+            hidden = hidden + torch.nn.functional.scaled_dot_product_attention(
+                hidden, hidden, hidden, is_causal=True,
+            )
+        return self.logits(hidden)
+
+    def accumulated(self, tokens):
+        return self.logits(self.embed(tokens).cumsum(1))
+
+    def step(self, token, hidden):
+        hidden = hidden + self.embed(token)[0, 0]
+        return self.logits(hidden), hidden
+
+
+class MarkedCounting(Counting):
+    def __init__(self, broken=False):
+        super().__init__(broken)
+        self.register_buffer("hidden", torch.zeros(4))
+
+    @entrypoint(example_inputs=lambda: (torch.tensor([[1]]),))
+    def advance(self, token):
+        logits, self.hidden = self.step(token, self.hidden)
+        return logits
+
+
+def _export_kinds():
+    from cattorch import RecurrentGenerationProgram
+
+    state = State("hidden", torch.zeros(4))
+    step = ExportProgram(
+        states=(state,),
+        entrypoints=(EntryPoint(
+            "step", method="step",
+            arguments=(Input("token", torch.tensor([[1]])), StateInput("hidden")),
+            returns=(Output("logits"), StateUpdate("hidden")),
+        ),),
+    )
+    tokens = torch.tensor([[1, 5, 2]])
+    return {
+        "plain": (Counting, tokens, {}),
+        "dynamic": (
+            lambda broken: Counting(broken, attention=False), tokens, {"dynamic": {0: {1: (1, 4)}}},
+        ),
+        "program": (Counting, step, {}),
+        "marked": (MarkedCounting, None, {}),
+        "generation": (Counting, GenerationProgram(max_context=4), {}),
+        "recurrent": (Counting, RecurrentGenerationProgram((state,), reference="accumulated"), {}),
+    }
+
+
+def _snapshot(model):
+    tensors = {
+        name: (value.detach().clone(), value.dtype, value.requires_grad)
+        for name, value in (*model.named_parameters(), *model.named_buffers())
+    }
+    return tensors, {name: module.training for name, module in model.named_modules()}
+
+
+def _assert_same(before, after):
+    (tensors, training), (tensors_after, training_after) = before, after
+    assert training == training_after
+    assert tensors.keys() == tensors_after.keys()
+    for name, (value, dtype, grad) in tensors.items():
+        value_after, dtype_after, grad_after = tensors_after[name]
+        assert (dtype, grad) == (dtype_after, grad_after), name
+        assert torch.equal(value, value_after), name
+
+
+@pytest.mark.parametrize("broken", [False, True])
+@pytest.mark.parametrize("kind", list(_export_kinds()))
+def test_an_export_never_changes_the_callers_model(tmp_path, kind, broken):
+    factory, interface, options = _export_kinds()[kind]
+    torch.manual_seed(0)
+    model = factory(broken).eval()
+    before = _snapshot(model)
+    if broken:
+        with pytest.raises(CattorchError):
+            transpile(model, interface, tmp_path / kind, **options)
+    else:
+        transpile(model, interface, tmp_path / kind, **options)
+    _assert_same(before, _snapshot(model))
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_a_hugging_face_recurrent_export_never_changes_the_callers_model(tmp_path, broken):
+    # RWKV rescales its weights in place on its first evaluation-mode forward.
+    transformers = pytest.importorskip("transformers")
+    from cattorch import RecurrentGenerationProgram
+
+    torch.manual_seed(0)
+    model = transformers.RwkvForCausalLM(transformers.RwkvConfig(
+        vocab_size=16, hidden_size=8, num_hidden_layers=2, attention_hidden_size=8,
+        intermediate_size=16, context_length=16, rescale_every=1,
+    )).eval()
+    before = _snapshot(model)
+    if broken:
+        # Fails after the step and the reference check have run.
+        with pytest.raises(ValueError, match="exceeds output size"):
+            transpile(model, RecurrentGenerationProgram(top_k=20), tmp_path / "rwkv")
+    else:
+        transpile(model, RecurrentGenerationProgram(), tmp_path / "rwkv")
+    _assert_same(before, _snapshot(model))

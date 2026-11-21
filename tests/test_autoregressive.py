@@ -10,152 +10,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch import UnsupportedModelError, UnsupportedOperationError
+from cattorch import UnsupportedModelError
 from cattorch.autoregressive import (
     analyze_sequence, build_generation_step, build_step_module,
     check_step_equivalence, prepare_sequence_model,
 )
 from cattorch.frontend import capture_model
-
-CONTEXT = 16
-VOCAB = 40
+from shared_models import CONTEXT, VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder
 
 
 def analyze(model, context=CONTEXT):
     return analyze_sequence(prepare_sequence_model(model.eval()), context)
-
-
-# ── Toy models ───────────────────────────────────────────────────────────────
-
-class NanoBlock(nn.Module):
-    """Separate q/k/v projections and a registered causal mask buffer."""
-
-    def __init__(self, width, heads, context, mix=None):
-        super().__init__()
-        self.heads = heads
-        self.ln1 = nn.LayerNorm(width)
-        self.q = nn.Linear(width, width)
-        self.k = nn.Linear(width, width)
-        self.v = nn.Linear(width, width)
-        self.proj = nn.Linear(width, width)
-        self.ln2 = nn.LayerNorm(width)
-        self.mlp = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width))
-        self.register_buffer("bias", torch.tril(torch.ones(context, context))[None, None])
-        self.mix = mix
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        h = self.ln1(x)
-        split = lambda t: t.view(batch, length, self.heads, -1).transpose(1, 2)
-        q, k, v = split(self.q(h)), split(self.k(h)), split(self.v(h))
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(k.shape[-1])
-        scores = scores.masked_fill(self.bias[:, :, :length, :length] == 0, float("-inf"))
-        out = F.softmax(scores, dim=-1) @ v
-        x = x + self.proj(out.transpose(1, 2).reshape(batch, length, width))
-        if self.mix is not None:
-            x = self.mix(x)
-        return x + self.mlp(self.ln2(x))
-
-
-class NanoGPT(nn.Module):
-    def __init__(self, layers=2, width=16, heads=2, context=CONTEXT, mix=None):
-        super().__init__()
-        self.wte = nn.Embedding(VOCAB, width)
-        self.wpe = nn.Embedding(context, width)
-        self.blocks = nn.ModuleList(NanoBlock(width, heads, context, mix) for _ in range(layers))
-        self.ln_f = nn.LayerNorm(width)
-        self.head = nn.Linear(width, VOCAB, bias=False)
-
-    def forward(self, tokens):
-        positions = torch.arange(0, tokens.shape[1])
-        x = self.wte(tokens) + self.wpe(positions)
-        for block in self.blocks:
-            x = block(x)
-        return self.head(self.ln_f(x))
-
-
-class MQABlock(NanoBlock):
-    """Broadcast multi-query attention: one k/v head against all q heads, no repeat_kv."""
-
-    def __init__(self, width, heads, context, mix=None):
-        super().__init__(width, heads, context, mix)
-        self.k = nn.Linear(width, width // heads)
-        self.v = nn.Linear(width, width // heads)
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        h = self.ln1(x)
-        q = self.q(h).view(batch, length, self.heads, -1).transpose(1, 2)
-        k = self.k(h).view(batch, length, 1, -1).transpose(1, 2)
-        v = self.v(h).view(batch, length, 1, -1).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(k.shape[-1])
-        scores = scores.masked_fill(self.bias[:, :, :length, :length] == 0, float("-inf"))
-        out = F.softmax(scores, dim=-1) @ v
-        x = x + self.proj(out.transpose(1, 2).reshape(batch, length, width))
-        return x + self.mlp(self.ln2(x))
-
-
-class NanoMQA(NanoGPT):
-    def __init__(self, layers=2, width=16, heads=2, context=CONTEXT):
-        super().__init__(layers, width, heads, context)
-        self.blocks = nn.ModuleList(MQABlock(width, heads, context) for _ in range(layers))
-
-
-def rotate_half(x):
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-class RopeBlock(nn.Module):
-    """Grouped-query attention with Hugging Face style ``repeat_kv`` and RoPE."""
-
-    def __init__(self, width, heads, kv_heads, **attention):
-        super().__init__()
-        self.heads, self.kv_heads = heads, kv_heads
-        self.dim = width // heads
-        self.q = nn.Linear(width, heads * self.dim, bias=False)
-        self.k = nn.Linear(width, kv_heads * self.dim, bias=False)
-        self.v = nn.Linear(width, kv_heads * self.dim, bias=False)
-        self.o = nn.Linear(heads * self.dim, width, bias=False)
-        self.attention = attention
-
-    def repeat(self, x):
-        batch, kv, length, dim = x.shape
-        groups = self.heads // self.kv_heads
-        x = x[:, :, None].expand(batch, kv, groups, length, dim)
-        return x.reshape(batch, kv * groups, length, dim)
-
-    def forward(self, x, cos, sin):
-        batch, length, _ = x.shape
-        q = self.q(x).view(batch, length, self.heads, self.dim).transpose(1, 2)
-        k = self.k(x).view(batch, length, self.kv_heads, self.dim).transpose(1, 2)
-        v = self.v(x).view(batch, length, self.kv_heads, self.dim).transpose(1, 2)
-        q = q * cos + rotate_half(q) * sin
-        k = k * cos + rotate_half(k) * sin
-        out = F.scaled_dot_product_attention(q, self.repeat(k), self.repeat(v), **self.attention)
-        return self.o(out.transpose(1, 2).reshape(batch, length, -1))
-
-
-class RopeLM(nn.Module):
-    def __init__(self, layers=2, width=16, heads=4, kv_heads=2, **attention):
-        super().__init__()
-        attention = attention or {"is_causal": True}
-        self.dim = width // heads
-        self.embed = nn.Embedding(VOCAB, width)
-        self.layers = nn.ModuleList(
-            RopeBlock(width, heads, kv_heads, **attention) for _ in range(layers)
-        )
-        self.head = nn.Linear(width, VOCAB, bias=False)
-        self.register_buffer("inv_freq", 1.0 / 100 ** (torch.arange(0, self.dim, 2) / self.dim))
-
-    def forward(self, tokens):
-        angles = torch.arange(tokens.shape[1])[:, None] * self.inv_freq[None]
-        angles = torch.cat((angles, angles), dim=-1)
-        cos, sin = angles.cos()[None, None], angles.sin()[None, None]
-        x = self.embed(tokens)
-        for layer in self.layers:
-            x = x + layer(x, cos, sin)
-        return self.head(x)
 
 
 # ── Plans ────────────────────────────────────────────────────────────────────
@@ -230,23 +95,6 @@ def test_rope_plan_with_grouped_query_attention():
 
 # ── Hugging Face decoders ────────────────────────────────────────────────────
 
-def tiny_decoder(kind, layers=2, heads=4, kv_heads=2):
-    transformers = pytest.importorskip("transformers")
-    torch.manual_seed(3)
-    if kind == "gpt2":
-        return transformers.GPT2LMHeadModel(transformers.GPT2Config(
-            n_embd=32, n_layer=layers, n_head=heads, vocab_size=64, n_positions=64,
-        ))
-    config = dict(
-        hidden_size=32, intermediate_size=64, num_hidden_layers=layers,
-        num_attention_heads=heads, num_key_value_heads=kv_heads, vocab_size=64,
-        max_position_embeddings=64,
-    )
-    if kind == "llama":
-        return transformers.LlamaForCausalLM(transformers.LlamaConfig(**config))
-    return transformers.Qwen2ForCausalLM(transformers.Qwen2Config(**config))
-
-
 @pytest.mark.parametrize("kind", ["gpt2", "llama", "qwen2"])
 def test_huggingface_decoder_plan(kind):
     plan = analyze(tiny_decoder(kind, layers=2), 24)
@@ -302,12 +150,13 @@ class Roll(nn.Module):
 
 @pytest.mark.parametrize("mixer", [CumSum(), SequenceMean(), Roll()], ids=["cumsum", "mean", "roll"])
 def test_token_mixing_outside_attention_is_rejected(mixer):
-    with pytest.raises(UnsupportedOperationError) as raised:
+    with pytest.raises(UnsupportedModelError) as raised:
         analyze(NanoGPT(layers=1, mix=mixer))
     message = str(raised.value)
     assert "over the sequence" in message
     assert "blocks.0.mix" in message
     assert "mixing tokens only in causal attention" in message
+    assert "aten." not in message
 
 
 def test_bert_is_rejected_as_non_causal():
@@ -343,7 +192,7 @@ def test_sliding_window_mask_becomes_a_window():
 
 
 def test_window_without_the_current_token_is_rejected():
-    with pytest.raises(UnsupportedModelError, match="isn't causal.*cannot attend to token 1"):
+    with pytest.raises(UnsupportedModelError, match="isn't causal.*can.t attend to token 1"):
         analyze(_windowed(3, offset=1), 12)
 
 
@@ -371,9 +220,12 @@ def test_length_dependent_branch_is_rejected():
                 return super().forward(tokens) * 2
             return super().forward(tokens)
 
-    with pytest.raises(UnsupportedModelError, match="changes with the sequence length") as raised:
+    with pytest.raises(
+        UnsupportedModelError, match="computes something else when the sequence is one token shorter",
+    ) as raised:
         analyze(Branching())
     assert "length-dependent Python" in str(raised.value)
+    assert "node" not in str(raised.value)
 
 
 def test_length_dependent_table_is_rejected():
@@ -387,7 +239,7 @@ def test_length_dependent_table_is_rejected():
             scale = (torch.arange(tokens.shape[1]) / tokens.shape[1])[None, :, None]
             return self.inner(tokens) + scale
 
-    with pytest.raises(UnsupportedOperationError, match="rows must not depend on the sequence length"):
+    with pytest.raises(UnsupportedModelError, match="rows must not depend on the sequence length"):
         analyze(Normalised())
 
 
@@ -504,6 +356,44 @@ def test_broken_table_trips_the_equivalence_check():
     with pytest.raises(UnsupportedModelError, match="disagrees with the model at output row 5") as raised:
         check_step_equivalence(adapted, step, plan)
     assert "max error" in str(raised.value)
+
+
+def test_a_branch_on_the_prompt_length_is_explained():
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(10, 8)
+            self.head = nn.Linear(8, 10)
+
+        def forward(self, tokens):
+            x = self.embed(tokens)
+            x = x + F.scaled_dot_product_attention(x, x, x, is_causal=True)
+            if tokens.shape[1] > 4:
+                x = x * 2
+            return self.head(x)
+
+    with pytest.raises(UnsupportedModelError, match=r"depends on the prompt's length.*shape\[1\]"):
+        build_generation_step(Branch().eval(), 8)
+
+
+@pytest.mark.parametrize("threshold", [40, 47])
+def test_a_branch_on_a_length_past_the_stepped_tokens_is_rejected(threshold):
+    # The step runs over 32 tokens; the length check reaches max_context.
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(10, 8)
+            self.head = nn.Linear(8, 10)
+
+        def forward(self, tokens):
+            x = self.embed(tokens)
+            x = x + F.scaled_dot_product_attention(x, x, x, is_causal=True)
+            if tokens.shape[1] <= threshold:
+                x = x * 2
+            return self.head(x)
+
+    with pytest.raises(UnsupportedModelError, match=r"length"):
+        build_generation_step(Branch().eval(), 48)
 
 
 def test_positions_scaled_by_the_prompt_length_are_rejected():

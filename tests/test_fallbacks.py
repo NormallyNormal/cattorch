@@ -53,6 +53,27 @@ def test_analyze_reports_fallbacks():
     assert any("aten.mish.default" in warning for warning in report.warnings)
 
 
+def test_programs_report_fallbacks_and_approximations_over_their_entry_points(tmp_path):
+    class Two(Mixed):
+        def gelu(self, x):
+            return F.gelu(F.mish(x))
+
+    program = ExportProgram(entrypoints=(
+        EntryPoint("forward", arguments=(Input("value", torch.randn(2, 4)),), returns=(Output("y"),)),
+        EntryPoint(
+            "gelu", method="gelu", arguments=(Input("value", torch.randn(2, 4)),),
+            returns=(Output("y"),),
+        ),
+    ))
+    torch.manual_seed(0)
+    result = transpile(Two().eval(), program, tmp_path / "two", optimization="fast")
+    assert result.fallback_operations == (
+        ("aten.hardsigmoid.default", 1), ("aten.mish.default", 3),
+    )
+    assert any("aten.mish.default (3 calls)" in warning for warning in result.warnings)
+    assert result.approximate_operations == (("aten.gelu.default", 1),)
+
+
 def test_addmm_with_a_bias_vector_is_a_linear_layer(tmp_path):
     """GPT-2's Conv1D calls ``addmm``; it should use the linear kernel."""
     torch.manual_seed(1)

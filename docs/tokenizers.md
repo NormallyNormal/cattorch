@@ -8,9 +8,9 @@ supported:
 
 | Exporter | Use for | Main requirement |
 |---|---|---|
-| `CharTokenizer` | Very small character vocabularies | Requires a valid unknown-token ID. |
-| `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`. |
-| `SentencePieceBPETokenizer` | Raw SentencePiece BPE with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
+| `CharTokenizer` | Very small character vocabularies | Single-character tokens (added tokens may be longer), read one character at a time, and a valid unknown-token ID. |
+| `BPETokenizer` | Raw-text Hugging Face BPE | No normalizer, pre-tokenizer, dropout, subword prefix or suffix, `fuse_unk`, or `byte_fallback`, and `ignore_merges` only if the merges build every vocabulary entry. |
+| `SentencePieceBPETokenizer` | Raw SentencePiece BPE (`model_type="bpe"`) with control tokens or ASCII byte fallback | Requires compatible normalization and preprocessing. |
 
 Hugging Face tokenizers need the optional dependencies:
 
@@ -28,23 +28,41 @@ result = BPETokenizer(tokenizer).save("build/my_tokenizer")
 result = transpile_tokenizer(tokenizer, "build/my_tokenizer")
 ```
 
+Other kinds of tokenizer are rejected with an error rather than exported with
+different token IDs: Hugging Face WordPiece (BERT), Unigram (T5, ALBERT,
+XLNet) and word-level tokenizers, and SentencePiece models trained with
+`model_type` `unigram`, `word` or `char`, or with user-defined symbols. A
+WordPiece, Unigram or word-level tokenizer whose tokens are all single
+characters is exported only if it really encodes text one character at a
+time; `CharTokenizer` checks this by encoding every vocabulary character, and
+rejects a normalizer or a pre-tokenizer, such as `Whitespace`, that changes
+the result.
+
 The returned `TokenizerResult` gives the saved path, size, and any warnings.
 As with `transpile`, parent directories are created, `.sprite3` is added if
 missing, and `name=` sets the sprite name.
 
-Every tokenizer sprite has two custom blocks, which run without screen
-refresh, and a clickable stack for each (see the
-[Scratch interface](scratch-interface.md#tokenizer-sprites)):
+A tokenizer sprite, named NAME (the `name=`, by default the file name),
+answers two broadcasts, and runs each without screen refresh (see the
+[Scratch interface](scratch-interface.md#tokenizer-sprites)). Use them from
+another sprite with `broadcast [...] and wait`; you never need to open the
+sprite:
 
-- `cattorch tokenize` reads the `cattorch text` variable and writes token IDs
-  to the `cattorch token ids` list.
-- `cattorch detokenize` reads `cattorch token ids` and writes the text to
-  `cattorch text`.
+- `NAME tokenize` reads the global `NAME text` variable and writes token IDs
+  to the global `NAME token ids` list.
+- `NAME detokenize` reads `NAME token ids` and writes the text to
+  `NAME text`. A token ID that isn't a whole number in the vocabulary
+  sets `NAME status` to `invalid item: NAME token ids`, and the text
+  is left as it was.
+
+Like every call, each sets `NAME status` when it ends and then broadcasts
+`NAME tokenize complete` or `NAME detokenize complete`. Read `NAME status`
+after the `broadcast and wait`, and use the result only when it's `ok`.
+`NAME text` holds 0 when Scratch creates it on upload; set it before
+tokenizing.
 
 Token IDs are zero-based, as in Python, even though Scratch list positions
-start at 1. The variables and lists belong to the tokenizer sprite; to use them
-from another sprite, see the
-[global-list bridge](getting-started.md#connect-another-sprite).
+start at 1.
 
 `CharTokenizer` maps each character to its ID. `BPETokenizer` applies the
 tokenizer's merges, in the tokenizer's order, to the whole input string,
@@ -53,19 +71,72 @@ if the tokenizer has one. `CharTokenizer` requires an unknown token. A raw
 Hugging Face BPE tokenizer without one drops unknown characters, and the
 exported sprite does the same.
 
-Scratch compares text without regard to ASCII case, so export fails if the
-vocabulary contains entries that differ only by case, such as `a` and `A`.
-For the same reason, a letter whose case is missing from the vocabulary is
-read as the other case: with only lowercase entries, `The` is encoded like
-`the` instead of starting with the unknown token.
-Export also fails on characters outside the Basic Multilingual Plane, such as
-emoji, because Scratch treats each one as two separate characters.
+### Added and special tokens
+
+Hugging Face tokenizers find their added tokens in the text before anything
+else: tokens from `add_tokens` and `add_special_tokens`, and a trainer's
+`special_tokens` such as `<unk>` or `</s>`. The character and BPE sprites do
+the same, so `the cat</s>` ends with the ID of `</s>`, and a multi-character
+added token such as `dog cat` is one ID wherever it appears. Matching follows
+the `tokenizers` library: case-sensitive, the longest token at the leftmost
+position first, tokens with `normalized=False` before those with
+`normalized=True`, and `lstrip` and `rstrip` taking the whitespace beside a
+match. The text between matches is tokenized on its own, so BPE merges never
+cross an added token. `CharTokenizer` accepts multi-character added tokens
+for this reason. The export checks the result against the tokenizer on texts
+where added tokens meet, overlap and touch whitespace, and raises
+`ValueError` if they differ. Added tokens with `single_word=True` are
+rejected: whether a match stands alone depends on whether its neighbours are
+letters or digits, which a sprite can't tell for every character.
+
+With `split_special_tokens=True` (transformers) or `encode_special_tokens`
+(a bare `tokenizers.Tokenizer`), the tokenizer reads its special tokens as
+ordinary text, and so does the sprite: a special token the model's
+vocabulary doesn't have becomes the unknown token. Exporting leaves the
+tokenizer's settings as they were.
+
+### Special tokens added around the text
+
+A tokenizer's post-processor can add tokens around every text it encodes,
+such as `<s>` before it: `tokenizer.encode("the cat")` then starts with the
+ID of `<s>`. `NAME tokenize` writes the same IDs as `encode(text)` with
+its default `add_special_tokens=True`, so a model trained on such sequences
+sees the prompts it was trained on. The sprite reproduces
+`TemplateProcessing` with one `$A` in its single-sequence template (such as
+`"<s> $A"` or `"<s> $A </s>"`), `BertProcessing`, `RobertaProcessing`,
+`ByteLevel` (which changes no IDs) and a `Sequence` of these; any other
+post-processor raises `ValueError`, and the export checks the result against
+`encode`. `NAME detokenize` writes these tokens' text too, as
+`decode(..., skip_special_tokens=False)` does.
+
+`NAME detokenize` writes every token's text, added and special tokens
+included, as `transformers`' `decode(..., skip_special_tokens=False)` keeps
+them, so detokenizing what tokenize wrote gives the text back.
+
+Characters are told apart by case, as the tokenizer does: `a` and `A` can
+both be tokens, and with only lowercase entries `The` starts with the unknown
+token. Scratch compares text without regard to case, so when the vocabulary
+has letters, the sprite gets a costume named after each character and finds
+a character by switching to its costume, since costume names match exactly.
+Don't rename, reorder, or delete a tokenizer sprite's costumes. A vocabulary
+without letters, such as digits and punctuation, is looked up with
+`item # of` and has one costume.
+
+Export fails on characters outside the Basic Multilingual Plane, such as
+emoji, in a single-character token or an added token, because Scratch treats
+each one as two separate characters. For the
+same reason an emoji in the text reads as two unknown characters.
 
 ## SentencePiece BPE
 
 The SentencePiece sprite keeps SentencePiece's token IDs, converts its `▁`
-space marker, skips control tokens when decoding, and supports byte fallback
-for ASCII.
+space marker, skips control tokens when decoding, decodes the unknown token
+as SentencePiece does (its `unk_surface`, ` ⁇ ` by default), and supports
+byte fallback for ASCII. Like SentencePiece, it doesn't read control tokens such as `<s>`
+from text: `<s>` in the text is three ordinary characters. A processor made
+with `add_bos=True` or `add_eos=True` adds the beginning or end token to
+every text it encodes, and so does the sprite; one made with `reverse=True`
+or `enable_sampling=True` raises `ValueError`.
 
 ```python
 from cattorch import SentencePieceBPETokenizer
@@ -85,8 +156,11 @@ transpile_tokenizer(
 ```
 
 Set `scratch_casefold=True` only if the SentencePiece model was trained with
-case-folding normalization. The sprite then relies on Scratch's
-case-insensitive comparisons, so you don't need to lowercase text first.
+case-folding normalization (`nfkc_cf`). The sprite then relies on Scratch's
+case-insensitive comparisons for ASCII letters, so you don't need to
+lowercase text first, and needs no character costumes. Any other model, with
+the `identity` normalizer, tells characters apart by case like the other
+tokenizers.
 
 The SentencePiece model must be trained with `add_dummy_prefix=False` and
 `remove_extra_whitespaces=False`, and use the `identity` or `nfkc_cf`
@@ -95,9 +169,12 @@ anything else. Any other normalization has to be done by your project before
 tokenizing.
 
 Scratch can't get a character's Unicode code point, so byte fallback only works
-for ASCII. ASCII text and characters that appear in the vocabulary tokenize
-normally. Other characters can't be encoded. When decoding, non-ASCII byte
-tokens are shown as `<0xNN>` rather than turned into wrong text.
+for ASCII. ASCII text, in either case, and characters that appear in the
+vocabulary tokenize as SentencePiece does. A non-ASCII character outside the
+vocabulary, which SentencePiece encodes as its UTF-8 bytes, becomes the
+unknown token instead, and the export result warns about this. When
+decoding, non-ASCII byte tokens are shown as `<0xNN>` rather than turned into
+wrong text.
 
 ## Compatibility
 

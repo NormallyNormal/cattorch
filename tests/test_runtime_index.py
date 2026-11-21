@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from cattorch import transpile, verify
+from cattorch import UnsupportedModelError, transpile, verify
 
 
 class TopKGather(nn.Module):
@@ -109,3 +109,63 @@ def test_input_dependent_indexing(tmp_path, name):
     inputs = (torch.randn(5, 5, 2), torch.randn(5))
     result = transpile(model, inputs, tmp_path / "indexing")
     assert verify(model, inputs, result).passed
+
+
+class Bags(nn.Module):
+    """``nn.EmbeddingBag`` with offsets fixed in the model or given as an input."""
+
+    def __init__(self, offsets=None, **options):
+        super().__init__()
+        self.bags = nn.EmbeddingBag(10, 4, **options)
+        self.offsets = offsets
+
+    def forward(self, indices, *inputs):
+        if self.offsets is not None:
+            inputs = (torch.tensor(self.offsets), *inputs)
+        return self.bags(indices, *inputs)
+
+
+INDICES = torch.tensor([1, 2, 0, 0, 5, 7, 2, 0, 3])
+BAGS = {
+    # Bags of one size reduce a reshaped lookup.
+    "2D max with padding": (dict(mode="max", padding_idx=0), (INDICES[:8].reshape(4, 2),)),
+    "2D mean with padding": (dict(mode="mean", padding_idx=0), (INDICES[:8].reshape(2, 4),)),
+    # Other offsets scatter each row into its bag, here with an empty bag.
+    "fixed offsets": (dict(mode="mean", offsets=[0, 2, 2, 5]), (INDICES,)),
+    "offsets input": (
+        dict(mode="sum", include_last_offset=True),
+        (INDICES, torch.tensor([0, 3, 3, 9]), torch.randn(9)),
+    ),
+    "offsets input mean with padding": (
+        dict(mode="mean", padding_idx=0), (INDICES, torch.tensor([0, 4, 4, 7])),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAGS))
+def test_embedding_bag(tmp_path, name):
+    torch.manual_seed(5)
+    options, inputs = BAGS[name]
+    model = Bags(**options).eval()
+    result = transpile(model, inputs, tmp_path / "bags")
+    assert verify(model, inputs, result).passed
+    assert not result.fallback_operations
+
+
+def test_embedding_bag_follows_a_variable_number_of_bags(tmp_path):
+    torch.manual_seed(6)
+    model = Bags(mode="mean").eval()
+    result = transpile(
+        model, torch.randint(0, 10, (3, 4)), tmp_path / "bags", dynamic={0: (1, 6)},
+    )
+    for count in (1, 6):
+        assert verify(model, torch.randint(0, 10, (count, 4)), result).passed
+
+
+@pytest.mark.parametrize(("options", "message"), [
+    (dict(max_norm=1.0, offsets=[0, 4]), "max_norm is not supported"),
+    (dict(offsets=[0, 3, 8], include_last_offset=True), "last offset must be"),
+])
+def test_unsupported_embedding_bag_options_are_named(tmp_path, options, message):
+    with pytest.raises(UnsupportedModelError, match=message):
+        transpile(Bags(**options).eval(), INDICES, tmp_path / "bags")

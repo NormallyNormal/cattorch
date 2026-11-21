@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 import itertools
 from dataclasses import dataclass
-from cattorch.util.scratch.interface import shard_name as physical_shard_name
+from cattorch.interface import shard_name as physical_shard_name, shard_variables
+from cattorch.util.scratch.tensor_adder import StaticValues
 
 
 SCRATCH_LIST_LIMIT = 200_000
@@ -43,7 +44,12 @@ class _BlockSharder:
             offset += shard.capacity
 
     def new_id(self, label: str) -> str:
-        return f"cattorch_shard_{label}_{next(self.counter)}"
+        # A program shards its interface lists in a second pass over blocks
+        # the first pass already created.
+        while True:
+            identifier = f"cattorch_shard_{label}_{next(self.counter)}"
+            if identifier not in self.blocks:
+                return identifier
 
     @staticmethod
     def _literal(value):
@@ -53,32 +59,45 @@ class _BlockSharder:
     def _reporter(identifier):
         return [3, identifier, [4, 0]]
 
-    def _set_parent(self, spec, parent):
-        if (
+    def _is_reporter(self, spec) -> bool:
+        return (
             isinstance(spec, list) and len(spec) > 1 and spec[0] == 3
             and isinstance(spec[1], str) and spec[1] in self.blocks
-        ):
+        )
+
+    def _set_parent(self, spec, parent):
+        if self._is_reporter(spec):
             self.blocks[spec[1]]["parent"] = parent
 
     def _clone_input(self, spec, parent):
         result = copy.deepcopy(spec)
-        if (
-            isinstance(spec, list) and len(spec) > 1 and spec[0] == 3
-            and isinstance(spec[1], str) and spec[1] in self.blocks
-        ):
+        if self._is_reporter(spec):
             result[1] = self._clone_reporter(spec[1], parent)
         return result
 
     def _clone_reporter(self, identifier, parent):
-        source = self.blocks[identifier]
-        clone_id = self.new_id("reporter")
-        clone = copy.deepcopy(source)
-        clone["parent"] = parent
-        clone["next"] = None
-        self.blocks[clone_id] = clone
-        for name, spec in list(clone.get("inputs", {}).items()):
-            clone["inputs"][name] = self._clone_input(spec, clone_id)
-        return clone_id
+        # A read of a list with hundreds of shards is a sum that deep, so walk
+        # the tree with a stack, in the order a recursive copy would.
+        root = None
+        pending = [(identifier, parent, None, None)]
+        while pending:
+            source, clone_parent, holder, name = pending.pop()
+            clone_id = self.new_id("reporter")
+            clone = copy.deepcopy(self.blocks[source])
+            clone["parent"] = clone_parent
+            clone["next"] = None
+            self.blocks[clone_id] = clone
+            if holder is None:
+                root = clone_id
+            else:
+                holder["inputs"][name][1] = clone_id
+            children = []
+            for input_name, spec in list(clone.get("inputs", {}).items()):
+                clone["inputs"][input_name] = copy.deepcopy(spec)
+                if self._is_reporter(spec):
+                    children.append((spec[1], clone_id, clone, input_name))
+            pending.extend(reversed(children))
+        return root
 
     def _shift_index(self, spec, offset, parent, *, clone):
         value = self._clone_input(spec, parent) if clone else spec
@@ -116,13 +135,15 @@ class _BlockSharder:
         return identifier
 
     def _sum_reporters(self, root_id, reporter_ids):
-        def build(identifier, values):
-            left = values[0]
-            if len(values) == 2:
-                right = values[1]
-            else:
-                right = self.new_id("sum")
-                build(right, values[1:])
+        """Replace ``root_id`` with ``a + (b + (c + ...))`` of the reporters."""
+        original_parent = self.blocks[root_id].get("parent")
+        last = len(reporter_ids) - 2
+        identifiers = [root_id, *(self.new_id("sum") for _ in range(last))]
+        # Innermost sum first, so each left operand still has its old parent.
+        for position in range(last, -1, -1):
+            identifier = identifiers[position]
+            left = reporter_ids[position]
+            right = reporter_ids[-1] if position == last else identifiers[position + 1]
             self.blocks[identifier] = {
                 "opcode": "operator_add", "next": None,
                 "parent": self.blocks[left]["parent"],
@@ -134,9 +155,6 @@ class _BlockSharder:
             }
             self.blocks[left]["parent"] = identifier
             self.blocks[right]["parent"] = identifier
-
-        original_parent = self.blocks[root_id].get("parent")
-        build(root_id, reporter_ids)
         self.blocks[root_id]["parent"] = original_parent
 
     def _rewrite_read(self, identifier, block, layout):
@@ -339,6 +357,13 @@ class _BlockSharder:
                 )
 
 
+def _piece(contents, start: int, stop: int):
+    """A shard's own copy of ``contents[start:stop]``; static values stay arrays."""
+    if isinstance(contents, StaticValues):
+        return contents[start:stop]
+    return list(contents[start:stop])
+
+
 def shard_sprite_lists(
     sprite: dict,
     logical_sizes: dict[str, int],
@@ -385,10 +410,10 @@ def shard_sprite_lists(
             if position:
                 lists[shard_id] = [
                     shard_name,
-                    list(contents[start:start + shard_limit]),
+                    _piece(contents, start, start + shard_limit),
                 ]
             else:
-                entry[1] = list(contents[:shard_limit])
+                entry[1] = _piece(contents, 0, shard_limit)
             shards.append(ListShard(shard_name, shard_id, capacity))
         layouts[name] = ListLayout(name, logical_size, tuple(shards))
 
@@ -399,11 +424,7 @@ def shard_sprite_lists(
         if len(layout.shards) < 2 or name.startswith("_"):
             continue
         safe = "".join(char if char.isalnum() else "_" for char in name)
-        label = name.removeprefix("cattorch ")
-        variables[f"cattorch_{safe}_shard_count"] = [
-            f"cattorch {label} shard count", len(layout.shards),
-        ]
-        variables[f"cattorch_{safe}_logical_length"] = [
-            f"cattorch {label} logical length", layout.logical_size,
-        ]
+        count, logical_length = shard_variables(name)
+        variables[f"cattorch_{safe}_shard_count"] = [count, len(layout.shards)]
+        variables[f"cattorch_{safe}_logical_length"] = [logical_length, layout.logical_size]
     return layouts

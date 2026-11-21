@@ -11,9 +11,22 @@ import torch
 
 
 ROOT = Path(__file__).parents[1]
-MARKDOWN_FILES = (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")))
+MARKDOWN_FILES = (
+    ROOT / "README.md", ROOT / "CHANGELOG.md", ROOT / "examples" / "README.md",
+    *sorted((ROOT / "benchmarks").glob("*.md")), *sorted((ROOT / "docs").glob("*.md")),
+)
 LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 PYTHON_FENCE_RE = re.compile(r"```python\s*\n(.*?)```", re.DOTALL)
+FENCE_RE = re.compile(r"^(```|~~~).*?^\1", re.DOTALL | re.MULTILINE)
+# Links to this repository on GitHub, as the README writes them for PyPI.
+REPOSITORY_URL = re.compile(
+    r"https://github\.com/NormallyNormal/cattorch/(?:blob|tree)/main/(.*)"
+)
+
+
+def _prose(path: Path) -> str:
+    """The file's text without its code blocks, whose ``#`` lines aren't headings."""
+    return FENCE_RE.sub("", path.read_text(encoding="utf-8"))
 
 
 def _heading_anchors(text: str) -> set[str]:
@@ -21,7 +34,8 @@ def _heading_anchors(text: str) -> set[str]:
     anchors: set[str] = set()
     counts: dict[str, int] = {}
     for heading in re.findall(r"^#{1,6}\s+(.+?)\s*$", text, re.MULTILINE):
-        plain = re.sub(r"[`*_~]", "", heading).lower()
+        heading = re.sub(r"\[([^]]*)\]\([^)]*\)", r"\1", heading)
+        plain = re.sub(r"[`*~]", "", heading).lower()
         anchor = re.sub(r"[^a-z0-9 _-]", "", plain)
         anchor = re.sub(r"[ ]+", "-", anchor).strip("-")
         count = counts.get(anchor, 0)
@@ -40,17 +54,28 @@ def test_markdown_python_fences_are_valid_python(path: Path) -> None:
             pytest.fail(str(error), pytrace=False)
 
 
-@pytest.mark.parametrize("path", MARKDOWN_FILES, ids=lambda path: path.name)
+@pytest.mark.parametrize(
+    "path", MARKDOWN_FILES, ids=lambda path: str(path.relative_to(ROOT)),
+)
 def test_local_markdown_links_resolve(path: Path) -> None:
-    for raw_target in LINK_RE.findall(path.read_text(encoding="utf-8")):
+    """Every link to a file of the repository, and to a heading in it, resolves.
+
+    That covers links within the page (``#heading``) and the README's
+    absolute GitHub links.
+    """
+    for raw_target in LINK_RE.findall(_prose(path)):
         target = raw_target.strip().strip("<>")
-        if "://" in target or target.startswith(("mailto:", "#")):
+        if (repository := REPOSITORY_URL.fullmatch(target)) is not None:
+            relative, _, fragment = repository.group(1).partition("#")
+            destination = ROOT / relative
+        elif "://" in target or target.startswith("mailto:"):
             continue
-        relative, _, fragment = target.partition("#")
-        destination = (path.parent / relative).resolve()
+        else:
+            relative, _, fragment = target.partition("#")
+            destination = (path.parent / relative).resolve() if relative else path
         assert destination.exists(), f"{path.relative_to(ROOT)} links to missing {target}"
         if fragment and destination.suffix == ".md":
-            anchors = _heading_anchors(destination.read_text(encoding="utf-8"))
+            anchors = _heading_anchors(_prose(destination))
             assert fragment in anchors, (
                 f"{path.relative_to(ROOT)} links to missing heading {target}"
             )
@@ -66,7 +91,7 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
     guide = (ROOT / "docs" / "verification-and-benchmarking.md").read_text(
         encoding="utf-8"
     )
-    assert '("decoder", decoder, stateless_input, prompt)' in guide
+    assert '("decoder", decoder, GenerationProgram(max_context=16), prompt)' in guide
 
 
 @pytest.mark.parametrize(
@@ -80,10 +105,14 @@ def test_generation_benchmark_documentation_uses_prompt_case() -> None:
         ("docs/custom-kernels.md", (0, 1, 2, 3)),
         ("docs/markers.md", (0,)),
         ("docs/projects-and-cli.md", (0,)),
+        ("docs/recurrent-generation.md", (0,)),
+        ("docs/verification-and-benchmarking.md", (0, 1, 2, 3, 4, 5)),
+        ("docs/generation.md", (1,)),
     ],
     ids=(
         "quick-start", "getting-started", "stateful-program", "sparse-moe",
-        "routed-experts", "custom-kernels", "markers", "projects",
+        "routed-experts", "custom-kernels", "markers", "projects", "recurrent-generation",
+        "verification-and-benchmarking", "verify-generation",
     ),
 )
 def test_documented_export_examples_run(

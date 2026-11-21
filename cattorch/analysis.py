@@ -6,11 +6,12 @@ import math
 from collections import Counter
 from dataclasses import dataclass, replace
 
-import torch
+from cattorch import interface
+
 from torch import nn
 
 from cattorch.adapters import ModuleAdapter
-from cattorch.export_options import validate_export_options
+from cattorch.export_options import validate_export_options, validate_model_and_inputs
 from cattorch.errors import UnsupportedModelError, UnsupportedOperationError
 from cattorch.fast import FastConfig
 from cattorch.frontend import capture_model, keep_operations
@@ -21,14 +22,21 @@ from cattorch.experts import (
 )
 from cattorch.operator_registry import default_registry
 from cattorch.program import ExportProgram, Output
-from cattorch.program_runtime import MethodModule, entry_examples, validate_entry_outputs
+from cattorch.program_runtime import (
+    MethodModule, ModuleState, entry_examples, validate_entry_outputs,
+)
 from cattorch.results import TensorSpec, fallback_warning
 from cattorch.storage import StorageConfig
 
 
 @dataclass(frozen=True)
 class EntryPointAnalysis:
-    """Capture and lowering summary for one callable entrypoint."""
+    """Capture and lowering summary for one callable entrypoint.
+
+    ``outputs`` names each output list as a project sees it, with ``NAME``
+    standing for the export's name, which ``analyze`` doesn't know:
+    ``NAME ENTRY OUTPUT``.
+    """
 
     name: str
     method: str
@@ -90,21 +98,62 @@ def _storage_density(storage: StorageConfig) -> float:
     }[storage.precision]
 
 
+def _forward_program(model: nn.Module, example_inputs) -> ExportProgram:
+    """``forward`` on tensor inputs, as a one-entry-point program."""
+    import torch
+
+    from cattorch.frontend import tensor_output_leaves
+    from cattorch.interface import input_name, output_name
+    from cattorch.program import EntryPoint, Input
+
+    inputs = (example_inputs,) if isinstance(example_inputs, torch.Tensor) else tuple(example_inputs)
+    if not inputs or any(not isinstance(value, torch.Tensor) for value in inputs):
+        raise TypeError(
+            "example_inputs must be a tensor, a tuple of tensors, an ExportProgram, or None"
+        )
+    import copy
+
+    with torch.no_grad():
+        leaves = tensor_output_leaves(copy.deepcopy(model).eval()(*inputs), warn=False)
+    return ExportProgram((EntryPoint(
+        "forward",
+        arguments=tuple(Input(input_name(index), value) for index, value in enumerate(inputs)),
+        returns=tuple(Output(output_name(index)) for index in range(len(leaves))),
+    ),))
+
+
 def analyze(
     model: nn.Module,
-    program: ExportProgram,
+    example_inputs=None,
     *,
     adapters: tuple[ModuleAdapter, ...] = (),
     storage: StorageConfig | None = None,
     optimization: str = "exact",
     kernels=(),
 ) -> AnalysisReport:
-    """Capture every entrypoint and report compatibility and approximate size.
+    """Capture every entry point and report compatibility and approximate size.
 
+    ``example_inputs`` is what ``transpile`` would take: tensors for
+    ``forward``, an ``ExportProgram``, or ``None`` for the model's markers
+    (its ``@entrypoint`` methods, or ``forward``'s ``@example_inputs``).
     ``kernels`` are the experimental ``Kernel`` lowerings the export would use.
     """
-    if not isinstance(program, ExportProgram):
-        raise TypeError("program must be an ExportProgram")
+    from cattorch.program import GenerationProgram, RecurrentGenerationProgram
+
+    validate_model_and_inputs(model, example_inputs)
+    if example_inputs is None:
+        from cattorch.transpiler import interface_from_markers
+
+        model, example_inputs = interface_from_markers(model)
+    if isinstance(example_inputs, (GenerationProgram, RecurrentGenerationProgram)):
+        raise TypeError(
+            f"analyze doesn't take a {type(example_inputs).__name__}; analyze the model's "
+            "forward with example token IDs instead"
+        )
+    program = (
+        example_inputs if isinstance(example_inputs, ExportProgram)
+        else _forward_program(model, example_inputs)
+    )
     validate_export_options(optimization=optimization, storage=storage, adapters=adapters)
     kernels = validate_kernels(kernels)
     with keep_operations(active_kernel_targets(
@@ -114,58 +163,41 @@ def analyze(
 
 
 def _analyze(model, program, adapters, storage, optimization, kernels) -> AnalysisReport:
-    registry = default_registry().clone()
-    for adapter in adapters:
-        registry.register_adapter(adapter)
-    for kernel in kernels:
-        registry.register_kernel(kernel)
+    registry = default_registry().for_export(adapters=adapters, kernels=kernels)
     owned = registry.adapt_model(
         model, state_names=frozenset(state.name for state in program.states),
     )
     generic_expert_errors = []
-    from cattorch.util.argument import Argument
-    from cattorch.util.instruction.optimized_moe import ExpertFamilyMoEInstruction
+    from cattorch.util.instruction.optimized_moe import expert_program
     probed = set()
     for path, module in owned.named_modules():
-        # A SparseMoE's family is probed with its routing; a family used
-        # through ``routed_experts`` takes its routes from the graph, and the
-        # expert program doesn't depend on ``top_k``.
+        # The expert program doesn't depend on how experts are routed.
         if isinstance(module, _BankedSparseMoE):
-            family, top_k, normalize = (
-                module.expert_family, module.top_k, module.normalize_selected,
-            )
+            family = module.expert_family
         elif isinstance(module, ExpertFamily):
-            family, top_k, normalize = module, 1, False
+            family = module
         else:
             continue
         if id(family) in probed:
             continue
         probed.add(id(family))
-        probe_args = [
-            Argument("value", family.example_input.shape),
-            Argument("selection", torch.Size((1, family.expert_count))),
-            Argument("combination", torch.Size((1, family.expert_count))),
-            *(
-                Argument(f"bank_{index}", bank.shape)
-                for index, bank in enumerate(family.unique_banks())
-            ),
-        ]
         try:
-            instruction = ExpertFamilyMoEInstruction(
-                "cattorch.expert_family_moe.default", "output", *probe_args,
-                family=family, top_k=top_k, normalize_selected=normalize,
+            expert_program(
+                family, [f"bank {index}" for index in range(len(family.unique_banks()))],
             )
-            instruction._expert_program()
         except ValueError as error:
             generic_expert_errors.append(
-                f"ExpertFamily at {path or '<root>'}: {error}"
+                f"ExpertFamily at {path!r}: {error}" if path else f"the top-level ExpertFamily: {error}"
             )
     entries = []
+    # Each entry point from the model as given, as the export traces it.
+    module_state = ModuleState(owned)
     for entrypoint in program.entrypoints:
+        module_state.restore()
         args, dynamic_inputs = entry_examples(program, entrypoint)
         wrapper = MethodModule(owned, entrypoint.method)
         with _expert_family_context(registry.expert_families):
-            captured = capture_model(wrapper, args, frontend="fx")
+            captured = capture_model(wrapper, args)
         counts = Counter(
             str(node.target) for node in captured.graph.nodes if node.op == "call_function"
         )
@@ -187,7 +219,9 @@ def _analyze(model, program, adapters, storage, optimization, kernels) -> Analys
             specs = graph.output_specs()
             validate_entry_outputs(program, entrypoint, specs)
             outputs = tuple(
-                replace(spec, list_name=f"cattorch {entrypoint.name} {binding.name}")
+                replace(spec, list_name=interface.global_name(
+                    "NAME", interface.entry_list(entrypoint.name, binding.name),
+                ))
                 for binding, spec in zip(entrypoint.returns, specs)
                 if isinstance(binding, Output)
             )

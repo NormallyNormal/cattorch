@@ -12,12 +12,15 @@ from functools import partial
 
 import torch
 
+from cattorch import interface
 from cattorch.kernel_api import Kernel, KernelContext
 from cattorch.util.instruction.generic import _reduction_layout
 from cattorch.util.instruction.optimized_common import (
     _broadcast_index,
     _static_unrolled_repeat,
     _unrolled_offset_dot_statements,
+    sigmoid_of,
+    tanh_of,
 )
 from cattorch.scratch import (
     add,
@@ -26,6 +29,7 @@ from cattorch.scratch import (
     clear,
     div,
     eq,
+    for_each,
     gt,
     if_,
     item,
@@ -241,7 +245,7 @@ def _emit_topk(ctx: KernelContext, *, values: bool):
 # kernels read the position from ``cattorch cache length``, which the
 # generation wrapper keeps equal to the number of cached tokens.
 
-_POSITION = "cattorch cache length"
+_POSITION = interface.CACHE_LENGTH
 
 
 def _attention_geometry(shapes):
@@ -534,6 +538,32 @@ def _validate_scatter_reduce(ctx: KernelContext) -> str | None:
     return _validate_runtime_index(ctx)
 
 
+def _emit_check_index(ctx: KernelContext):
+    """Copy indices the model computed, failing the call on one out of range.
+
+    ``cattorch::check_index``: an index outside ``low`` to ``high - 1`` sets
+    the status to ``invalid item`` for the input it came from, unless an
+    earlier one did, and the block then writes no output.
+    """
+    index = ctx.inputs["index"]
+    low, high = int(ctx.scalars["low"]), int(ctx.scalars["high"])
+    status = ctx.temp_var(interface.STATUS_VARIABLE)
+    position = ctx.temp_var("index")
+    invalid = interface.invalid_item(interface.input_name(int(ctx.scalars["position"])))
+    value = item(index.list, var(position))
+    out = ctx.output.list
+    return (
+        clear(out),
+        for_each(position, length(index.list), (
+            # Negative exactly when the index is outside low to high - 1.
+            if_(lt(mul(sub(value, low), sub(high - 1, value)), 0), (
+                if_(eq(var(status), interface.OK), (set_var(status, invalid),)),
+            )),
+            append(out, value),
+        )),
+    )
+
+
 def _emit_gather(ctx: KernelContext):
     """``gather`` whose indices are computed at run time: one read per output."""
     source, index = ctx.inputs["self"], ctx.inputs["index"]
@@ -672,12 +702,12 @@ _GATES = {"gru": 3, "lstm": 4, "rnn_tanh": 1, "rnn_relu": 1}
 
 
 def _sigmoid(value):
-    return div(1, add(1, mathop("e ^", mul(-1, value))))
+    return sigmoid_of(value)
 
 
 def _tanh(value):
     # Matches the elementwise tanh kernel.
-    return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+    return tanh_of(value)
 
 
 def _emit_recurrent_scan(ctx: KernelContext):
@@ -872,6 +902,29 @@ def _emit_runtime_length(ctx: KernelContext):
     _, extent, _ = _runtime_layout(value, int(ctx.scalars["dim"]) % len(value.shape))
     out = ctx.output.list
     return (clear(out), append(out, extent))
+
+
+def _emit_runtime_expand(ctx: KernelContext):
+    """Repeat a fixed tensor's one item along ``dim`` to a runtime extent."""
+    value, like = ctx.inputs["value"], ctx.inputs["like"]
+    dim = int(ctx.scalars["dim"]) % len(like.shape)
+    outer, extent, inner = _runtime_layout(like, dim)
+    base, position = ctx.temp_var("expand base"), ctx.temp_var("expand position")
+    out = ctx.output.list
+    return (
+        clear(out),
+        set_var(base, 1),
+        repeat(outer, (
+            repeat(extent, (
+                set_var(position, var(base)),
+                repeat(inner, (
+                    append(out, item(value.list, var(position))),
+                    change_var(position, 1),
+                )),
+            )),
+            change_var(base, inner),
+        )),
+    )
 
 
 def _emit_runtime_reduce(ctx: KernelContext):
@@ -1156,6 +1209,9 @@ BUILTIN_KERNELS = (
         "cattorch.runtime_reduce.default", _emit_runtime_reduce, name="runtime_reduce",
     ),
     Kernel(
+        "cattorch.runtime_expand.default", _emit_runtime_expand, name="runtime_expand",
+    ),
+    Kernel(
         "cattorch.runtime_softmax.default", _emit_runtime_softmax, name="runtime_softmax",
     ),
     Kernel(
@@ -1169,6 +1225,7 @@ BUILTIN_KERNELS = (
     Kernel(
         "cattorch.recurrent_final.default", _emit_recurrent_final, name="recurrent_final",
     ),
+    Kernel("cattorch.check_index.default", _emit_check_index, name="check_index"),
     Kernel(
         "aten.gather.default", _emit_gather, name="gather_runtime",
         validator=_validate_runtime_index,

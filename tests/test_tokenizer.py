@@ -5,11 +5,8 @@ Each test transpiles a tokenizer, runs encode/decode through the emulator,
 and compares against the HuggingFace tokenizer output.
 """
 
-import json
 import os
 import tempfile
-import zipfile
-from pathlib import Path
 
 import pytest
 from transformers import PreTrainedTokenizerFast
@@ -22,7 +19,7 @@ from cattorch.tokenizer import (
     transpile_tokenizer,
 )
 from cattorch.results import TokenizerResult
-from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import SpriteEmulator, load_emulator, load_sprite
 
 # One directory per process, so parallel test workers never share the file.
 SPRITE_PATH = os.path.join(tempfile.mkdtemp(prefix="cattorch-tokenizer-"), "tokenizer")
@@ -41,15 +38,14 @@ def _load_sprite() -> dict:
     """Transpile and load the sprite JSON, cleaning up the file."""
     sprite_path = SPRITE_PATH + ".sprite3"
     try:
-        with zipfile.ZipFile(sprite_path, "r") as z:
-            return json.loads(z.read("sprite.json"))
+        return load_sprite(sprite_path)
     finally:
         os.remove(sprite_path)
 
 
 def _encode(sprite: dict, text: str) -> list:
     """Run the encode block stack and return the token IDs."""
-    emu = ScratchEmulator(sprite)
+    emu = SpriteEmulator(sprite)
     emu.variables["cattorch text"] = text
     emu.run(root_index=0)
     return emu.lists["cattorch token ids"]
@@ -57,10 +53,37 @@ def _encode(sprite: dict, text: str) -> list:
 
 def _decode(sprite: dict, token_ids: list) -> str:
     """Run the decode block stack and return the output string."""
-    emu = ScratchEmulator(sprite)
+    emu = SpriteEmulator(sprite)
     emu.lists["cattorch token ids"] = list(token_ids)
     emu.run(root_index=1)
     return emu.variables["cattorch text"]
+
+
+_MIXED_CASE_CORPUS = [
+    "The quick brown Fox jumps over the lazy dog.", "the cat sat on the mat",
+    "A Cat and a DOG sat together, 12 times!", "Hello World: hello world?",
+    "Numbers 0 1 2 3 4 5 6 7 8 9 and 42.", "tabs\tand  double  spaces",
+] * 10
+
+
+def _mixed_case_strings(count: int) -> list[str]:
+    """Corpus fragments with flipped case, and random printable ASCII."""
+    import random
+
+    rng = random.Random(0)
+    alphabet = "".join(map(chr, range(32, 127))) + "\t\n☃"
+    texts = ["The Cat", "THE CAT", "Bb bB", "Q", "q", "1 01 10", "  x  "]
+    while len(texts) < count:
+        if rng.random() < 0.5:
+            line = rng.choice(_MIXED_CASE_CORPUS)
+            start = rng.randrange(len(line))
+            texts.append("".join(
+                c.swapcase() if rng.random() < 0.2 else c
+                for c in line[start:start + rng.randint(1, 20)]
+            ))
+        else:
+            texts.append("".join(rng.choice(alphabet) for _ in range(rng.randint(1, 20))))
+    return texts
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -184,17 +207,22 @@ class TestCharTokenizerRoundTrip:
         with pytest.raises(ValueError, match="unknown-token ID"):
             CharTokenizer(tokenizer).save(SPRITE_PATH)
 
-    def test_rejects_case_collisions_and_non_bmp_characters(self):
-        case_backend = Tokenizer(
-            models.WordLevel(vocab={"<unk>": 0, "a": 1, "A": 2}, unk_token="<unk>")
-        )
-        case_backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
-        case_tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=case_backend, unk_token="<unk>",
-        )
-        with pytest.raises(ValueError, match="Scratch compares as equal"):
-            CharTokenizer(case_tokenizer).save(SPRITE_PATH)
+    def test_tells_characters_apart_by_case(self):
+        # Scratch compares "a" and "A" as equal; costume names don't.
+        backend = Tokenizer(models.WordLevel(
+            vocab={"<unk>": 0, "a": 1, "A": 2, "b": 3, "7": 4, " ": 5}, unk_token="<unk>",
+        ))
+        backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+        CharTokenizer(tokenizer).save(SPRITE_PATH)
+        sprite = _load_sprite()
 
+        # "B" has no token of its own, and an unknown digit or whitespace
+        # must not select a costume by number.
+        for text in ("aAbB", "Aa", "B", "1 7 9", "\t a"):
+            assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text)
+
+    def test_rejects_non_bmp_characters(self):
         emoji_backend = Tokenizer(
             models.WordLevel(vocab={"<unk>": 0, "😀": 1}, unk_token="<unk>")
         )
@@ -320,15 +348,13 @@ class TestBPETokenizerEncode:
         for text in ("a1 1", "1", "01 0"):
             assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text)
 
-    def test_rejects_case_colliding_bpe_vocab(self):
-        backend = Tokenizer(models.BPE(
-            vocab={"<unk>": 0, "a": 1, "A": 2}, merges=[], unk_token="<unk>",
-        ))
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend, unk_token="<unk>",
-        )
-        with pytest.raises(ValueError, match="Scratch compares as equal"):
-            BPETokenizer(tokenizer).save(SPRITE_PATH)
+    def test_real_mixed_case_bpe_matches_hugging_face(self):
+        tokenizer = _make_bpe_tokenizer(_MIXED_CASE_CORPUS, vocab_size=120)
+        BPETokenizer(tokenizer).save(SPRITE_PATH)
+        sprite = _load_sprite()
+
+        for text in _mixed_case_strings(200):
+            assert [int(value) for value in _encode(sprite, text)] == tokenizer.encode(text), text
 
 
 class TestBPESettingsTheSpriteCantReproduce:
@@ -530,8 +556,7 @@ class _CasedBytesSentencePieceProcessor(_FakeSentencePieceProcessor):
 
 
 def _tokenize(result, text):
-    with zipfile.ZipFile(result.path) as archive:
-        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator = load_emulator(result.path)
     emulator.variables["cattorch text"] = text
     emulator.run_procedure("cattorch tokenize")
     return [int(value) for value in emulator.lists["cattorch token ids"]]
@@ -567,17 +592,16 @@ class TestSentencePieceBPE:
             tmp_path / "sentencepiece",
             scratch_casefold=True,
         )
-        assert result.tokenizer_type == "SentencePieceBPETokenizer"
+        assert result.tokenizer_type == "sentencepiece-bpe"
 
     def test_encode_casefold_ascii_fallback_and_merges(self, tmp_path):
         result = SentencePieceBPETokenizer(
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.variables["cattorch text"] = "AB_ab!"
         emulator.run_procedure("cattorch tokenize")
         assert [int(value) for value in emulator.lists["cattorch token ids"]] == [3, 2, 3, 8]
@@ -599,10 +623,9 @@ class TestSentencePieceBPE:
         result = SentencePieceBPETokenizer(
             _ManySplitSentencePieceProcessor(),
         ).save(tmp_path / "many_split_sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.variables["cattorch text"] = "aaaaaaaa"
         emulator.run_procedure("cattorch tokenize")
         assert [int(value) for value in emulator.lists["cattorch token ids"]] == [9]
@@ -612,28 +635,30 @@ class TestSentencePieceBPE:
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["cattorch token ids"] = [0, 1, 3, 2, 4, 8]
         emulator.run_procedure("cattorch detokenize")
-        assert emulator.variables["cattorch text"] == "ab_ ab!"
+        # The control token is skipped; the unknown token shows as
+        # SentencePiece decodes it.
+        assert emulator.variables["cattorch text"] == " \u2047 ab_ ab!"
 
     def test_exports_clickable_stacks_warp_procedures_and_warning(self, tmp_path):
         result = SentencePieceBPETokenizer(
             _FakeSentencePieceProcessor(),
             scratch_casefold=True,
         ).save(tmp_path / "sentencepiece")
-        with zipfile.ZipFile(result.path) as archive:
-            sprite = json.loads(archive.read("sprite.json"))
+        sprite = load_sprite(result.path)
 
-        emulator = ScratchEmulator(sprite)
-        assert set(emulator._procedures) == {
-            "cattorch tokenize",
-            "cattorch detokenize",
-        }
-        assert len(emulator._find_roots()) == 2
+        emulator = SpriteEmulator(sprite)
+        assert not {name for name in emulator._procedures if not name.startswith("_")}
+        assert {"_cattorch tokenize", "_cattorch detokenize"} <= set(emulator._procedures)
+        # A clickable broadcast of each message, and the scripts receiving them.
+        assert {
+            emulator.blocks[root]["opcode"] for root in emulator._find_roots()
+        } == {"event_broadcastandwait", "event_whenbroadcastreceived"}
+        assert len(emulator._find_roots()) == 4
         assert any("non-ASCII byte tokens" in warning for warning in result.warnings)
         prototypes = [
             block
@@ -652,9 +677,433 @@ def test_tokenizer_export_returns_metadata_and_separates_name(tmp_path):
     assert isinstance(result, TokenizerResult)
     assert result.path == tmp_path / "nested" / "tokenizer.sprite3"
     assert result.sprite_name == "Friendly tokenizer"
-    assert result.tokenizer_type == "CharTokenizer"
+    assert result.tokenizer_type == "char"
     assert result.token_count == 4
     assert result.archive_bytes == result.path.stat().st_size
-    with zipfile.ZipFile(result.path) as archive:
-        sprite = json.loads(archive.read("sprite.json"))
+    sprite = load_sprite(result.path)
     assert sprite["name"] == "Friendly tokenizer"
+
+
+# ── Tokenizer kinds the sprite can't reproduce ───────────────────────────────
+
+_CORPUS = ["the cat sat on the mat", "the dog sat on the log", "a big cat"] * 10
+
+
+def _train_sentencepiece(model_type="bpe", corpus=_CORPUS, **options):
+    import io
+
+    sentencepiece = pytest.importorskip("sentencepiece")
+    settings = dict(
+        vocab_size=30, add_dummy_prefix=False, remove_extra_whitespaces=False,
+        normalization_rule_name="identity", minloglevel=3, hard_vocab_limit=False,
+    )
+    settings.update(options)
+    model = io.BytesIO()
+    sentencepiece.SentencePieceTrainer.train(
+        sentence_iterator=iter(corpus), model_writer=model, model_type=model_type, **settings,
+    )
+    return sentencepiece.SentencePieceProcessor(model_proto=model.getvalue())
+
+
+@pytest.mark.parametrize("options", [
+    # Byte pieces for "B" and "b" used to be rejected as equal in Scratch.
+    dict(vocab_size=400, byte_fallback=True, character_coverage=0.98),
+    dict(vocab_size=120),
+], ids=["byte-fallback", "no-byte-fallback"])
+def test_real_mixed_case_sentencepiece_matches_sentencepiece(tmp_path, options):
+    processor = _train_sentencepiece(corpus=_MIXED_CASE_CORPUS, **options)
+    result = SentencePieceBPETokenizer(processor).save(tmp_path / "sentencepiece")
+    texts = _mixed_case_strings(300)
+    if options.get("byte_fallback"):
+        # SentencePiece encodes "☃" as UTF-8 bytes, which vanilla
+        # Scratch can't find; the sprite gives the unknown token and warns.
+        assert "☃" not in "".join(map(processor.id_to_piece, range(len(processor))))
+        assert _tokenize(result, "☃") == [processor.unk_id()]
+        assert any("encodes as the unknown token" in warning for warning in result.warnings)
+        texts = [text for text in texts if "☃" not in text]
+    for text in texts:
+        assert _tokenize(result, text) == processor.encode(text), text
+
+
+def test_objects_that_are_not_tokenizers_are_rejected_with_a_type_error(tmp_path):
+    for export in (
+        lambda: transpile_tokenizer(object(), tmp_path / "auto"),
+        lambda: CharTokenizer(object()),
+        lambda: BPETokenizer(object()),
+    ):
+        with pytest.raises(TypeError, match="needs a Hugging Face tokenizer.*not object"):
+            export()
+
+
+@pytest.mark.parametrize("model_type", ["unigram", "word", "char"])
+def test_sentencepiece_models_other_than_bpe_are_rejected(tmp_path, model_type):
+    processor = _train_sentencepiece(model_type)
+    for export in (
+        lambda: transpile_tokenizer(processor, tmp_path / "auto"),
+        lambda: SentencePieceBPETokenizer(processor).save(tmp_path / "bpe"),
+    ):
+        with pytest.raises(ValueError, match=f"is a {model_type} model.*model_type='bpe'"):
+            export()
+
+
+def test_sentencepiece_user_defined_symbols_are_rejected():
+    processor = _train_sentencepiece(user_defined_symbols=["<cat>"])
+    with pytest.raises(ValueError, match="user-defined symbols such as '<cat>'"):
+        SentencePieceBPETokenizer(processor)
+
+
+def _word_tokenizers():
+    from tokenizers import normalizers
+
+    wordpiece = Tokenizer(models.WordPiece(unk_token="[UNK]"))
+    wordpiece.normalizer = normalizers.BertNormalizer(lowercase=True)
+    wordpiece.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    wordpiece.train_from_iterator(
+        _CORPUS, trainers.WordPieceTrainer(vocab_size=60, special_tokens=["[UNK]"]),
+    )
+    unigram = Tokenizer(models.Unigram())
+    unigram.train_from_iterator(
+        _CORPUS,
+        trainers.UnigramTrainer(vocab_size=30, special_tokens=["<unk>"], unk_token="<unk>"),
+    )
+    words = Tokenizer(models.WordLevel({"[UNK]": 0, "the": 1, "cat": 2}, unk_token="[UNK]"))
+    words.pre_tokenizer = pre_tokenizers.Whitespace()
+    # Single-character vocabularies whose models still don't read one
+    # character at a time.
+    spaced = Tokenizer(models.WordLevel(
+        {character: index for index, character in enumerate("?thecasdoglm ")}, unk_token="?",
+    ))
+    spaced.pre_tokenizer = pre_tokenizers.Whitespace()
+    pieces = Tokenizer(models.WordPiece(
+        {character: index for index, character in enumerate("?thecasdoglm ")}, unk_token="?",
+    ))
+    return {
+        "wordpiece": (wordpiece, "[UNK]", "WordPiece tokenizers"),
+        "unigram": (unigram, "<unk>", "Unigram tokenizers"),
+        "wordlevel": (words, "[UNK]", "WordLevel tokenizers"),
+        "wordlevel-characters": (spaced, "?", "one character at a"),
+        "wordpiece-characters": (pieces, "?", "one character at a"),
+    }
+
+
+@pytest.mark.parametrize("kind", list(_word_tokenizers()))
+def test_hugging_face_models_other_than_bpe_and_characters_are_rejected(kind):
+    backend, unknown, message = _word_tokenizers()[kind]
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token=unknown)
+    with pytest.raises(ValueError, match=message):
+        transpile_tokenizer(tokenizer, SPRITE_PATH)
+    with pytest.raises(ValueError, match="single characters|one character at a"):
+        CharTokenizer(tokenizer).save(SPRITE_PATH)
+
+
+# ── Added tokens ────────────────────────────────────────────────────────────
+
+def _added_tokens_list():
+    from tokenizers import AddedToken
+
+    # Special and ordinary, matched before (normalized=False) or after
+    # (normalized=True) the other pass, stripping whitespace on either side,
+    # overlapping each other, and differing from text only in case.
+    return [
+        AddedToken("<eos>", special=True, normalized=False),
+        AddedToken("<s>", special=True, normalized=False, rstrip=True),
+        AddedToken("Dog", normalized=True),
+        AddedToken("dog cat", normalized=True),
+        AddedToken("[M]", special=True, normalized=False, lstrip=True),
+        AddedToken("og", normalized=False),
+        AddedToken("zz", normalized=True, lstrip=True, rstrip=True),
+    ]
+
+
+ADDED_TOKEN_PIECES = [
+    "<eos>", "<s>", "Dog", "dog", "DOG", "cat", " ", "  ", "\t", "[M]", "og", "zz", "z", "<",
+    "s>", "the", "a", "　", "é", "Q", "1",
+]
+
+
+def added_token_texts(count: int, seed: int = 0) -> list[str]:
+    import random
+
+    rng = random.Random(seed)
+    return [
+        "".join(rng.choice(ADDED_TOKEN_PIECES) for _ in range(rng.randint(0, 8)))
+        for _ in range(count)
+    ]
+
+
+def char_tokenizer_with_added_tokens():
+    tokenizer = _make_char_tokenizer("?abcdefghijklmnopqrstuvwxyz <>[]DM")
+    tokenizer.unk_token = "?"
+    tokenizer.add_tokens(_added_tokens_list())
+    return tokenizer
+
+
+def bpe_tokenizer_with_added_tokens():
+    corpus = ["the cat sat on the mat", "the dog sat on the log", "a zebra ate grass"] * 5
+    backend = Tokenizer(models.BPE(unk_token="<unk>"))
+    backend.train_from_iterator(
+        corpus, trainers.BpeTrainer(vocab_size=70, special_tokens=["<unk>"]),
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    tokenizer.add_tokens(_added_tokens_list())
+    return tokenizer
+
+
+@pytest.mark.parametrize("kind", ["char", "bpe"])
+def test_added_tokens_are_matched_in_the_text_as_hugging_face_does(tmp_path, kind):
+    if kind == "char":
+        tokenizer, exporter = char_tokenizer_with_added_tokens(), CharTokenizer
+    else:
+        tokenizer, exporter = bpe_tokenizer_with_added_tokens(), BPETokenizer
+    result = exporter(tokenizer).save(tmp_path / kind)
+    assert result.warnings == ()
+    emulator = load_emulator(result.path)
+    for text in added_token_texts(250) + ["dog cat", "the cat<eos>", "x [M]", "<s>  a"]:
+        emulator.variables["cattorch text"] = text
+        emulator.run_procedure("cattorch tokenize")
+        ids = [int(value) for value in emulator.lists["cattorch token ids"]]
+        assert ids == tokenizer.encode(text, add_special_tokens=False), text
+        # Detokenize writes every token's text, added and special ones too.
+        emulator.run_procedure("cattorch detokenize")
+        assert emulator.variables["cattorch text"] == "".join(
+            tokenizer.convert_ids_to_tokens(ids)
+        )
+
+
+def test_transpile_tokenizer_detects_a_character_tokenizer_with_added_tokens(tmp_path):
+    result = transpile_tokenizer(char_tokenizer_with_added_tokens(), tmp_path / "t")
+    assert result.tokenizer_type == "char"
+
+
+def test_single_word_added_tokens_are_rejected(tmp_path):
+    from tokenizers import AddedToken
+
+    for build, exporter in (
+        (char_tokenizer_with_added_tokens, CharTokenizer),
+        (bpe_tokenizer_with_added_tokens, BPETokenizer),
+    ):
+        tokenizer = build()
+        tokenizer.add_tokens([AddedToken("cat", single_word=True)])
+        with pytest.raises(ValueError, match="single_word=True, such as 'cat'"):
+            exporter(tokenizer).save(tmp_path / "t")
+
+
+def test_added_tokens_the_sprite_would_match_differently_are_rejected(tmp_path, monkeypatch):
+    # A tokenizer whose matching the sprite's algorithm doesn't reproduce is
+    # caught by the export's probe, rather than exported with other IDs.
+    from cattorch import tokenizer as module
+
+    monkeypatch.setattr(module, "_match_added", lambda text, tokens: [(None, text)] if text else [])
+    with pytest.raises(ValueError, match="can't reproduce how this tokenizer matches"):
+        BPETokenizer(bpe_tokenizer_with_added_tokens()).save(tmp_path / "t")
+
+
+def test_sentencepiece_unknown_token_decodes_as_sentencepiece_does(tmp_path):
+    processor = _train_sentencepiece()
+    result = SentencePieceBPETokenizer(processor).save(tmp_path / "sp")
+    emulator = load_emulator(result.path)
+    for text in ("the Qcat", "\u2603", "a\u2603\u2603b"):
+        ids = processor.encode(text)
+        assert processor.unk_id() in ids
+        emulator.lists["cattorch token ids"] = list(ids)
+        emulator.run_procedure("cattorch detokenize")
+        assert emulator.variables["cattorch text"] == processor.decode(ids)
+
+
+# ── Matching what the tokenizer does, case by case ──────────────────────────
+
+def _sprite_ids(result, text):
+    emulator = load_emulator(result.path)
+    emulator.variables["cattorch text"] = text
+    emulator.run_procedure("cattorch tokenize")
+    return [int(value) for value in emulator.lists["cattorch token ids"]]
+
+
+def _plain_bpe_tokenizer():
+    corpus = ["the cat sat on the mat", "the dog sat on the log", "a zebra ate grass"] * 5
+    backend = Tokenizer(models.BPE(unk_token="<unk>"))
+    backend.train_from_iterator(
+        corpus, trainers.BpeTrainer(vocab_size=70, special_tokens=["<unk>"]),
+    )
+    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+
+
+def _tokenizer_with(kind, added=(), special=()):
+    """A small character or BPE tokenizer with ``added`` and ``special`` tokens."""
+    if kind == "char":
+        tokenizer = _make_char_tokenizer("?abc <>")
+        tokenizer.unk_token = "?"
+    else:
+        tokenizer = _plain_bpe_tokenizer()
+    if added:
+        tokenizer.add_tokens(list(added))
+    if special:
+        tokenizer.add_special_tokens({"additional_special_tokens": list(special)})
+    return tokenizer
+
+
+def _exporter(kind):
+    return CharTokenizer if kind == "char" else BPETokenizer
+
+
+@pytest.mark.parametrize("kind", ["char", "bpe"])
+def test_one_character_added_tokens_next_to_stripping_tokens_match(tmp_path, kind):
+    # Matching " " ends the whitespace lstrip takes, and tokenizers emits a
+    # "\n" inside what rstrip took, so the sprite matches them even though
+    # its character lookup gives the same IDs.
+    from tokenizers import AddedToken
+
+    tokenizer = _tokenizer_with(kind, added=[
+        AddedToken(" ", normalized=False), AddedToken("\n", normalized=False),
+        AddedToken("ab", lstrip=True), AddedToken("ca", rstrip=True),
+    ], special=[AddedToken("</s>", rstrip=True)])
+    result = _exporter(kind)(tokenizer).save(tmp_path / "t")
+    texts = [" ab", "a ab", "ca ", "ca  b", "ca\n", "</s>\n", "x </s>\nca \nab", "  ab  ca  "]
+    for text in texts:
+        assert _sprite_ids(result, text) == tokenizer.encode(text, add_special_tokens=False), text
+
+
+def test_the_export_checks_the_tables_the_sprite_uses(tmp_path, monkeypatch):
+    # The check compares the tokenizer with the sprite's own tables, so a
+    # sprite that would leave out a token the tokenizer matches is caught.
+    from tokenizers import AddedToken
+    from cattorch import tokenizer as module
+
+    real = module._sprite_matching
+
+    def without_one_character_tokens(*args, **kwargs):
+        matching = real(*args, **kwargs)
+        added = tuple(token for token in matching.added if len(token.content) > 1)
+        return module._Matching(
+            matching.characters, matching.character_ids, added, matching.probes,
+        )
+
+    monkeypatch.setattr(module, "_sprite_matching", without_one_character_tokens)
+    tokenizer = _tokenizer_with("char", added=[AddedToken(" "), AddedToken("ab", lstrip=True)])
+    with pytest.raises(ValueError, match="can't reproduce how this tokenizer matches"):
+        CharTokenizer(tokenizer).save(tmp_path / "t")
+
+
+@pytest.mark.parametrize("token", ["<🙂>", "a😀"])
+def test_added_tokens_outside_the_bmp_are_rejected(tmp_path, token):
+    special = token.startswith("<")
+    tokenizer = _tokenizer_with(
+        "char", added=() if special else [token], special=[token] if special else (),
+    )
+    with pytest.raises(ValueError, match="non-BMP character, in .*UTF-16 surrogate"):
+        CharTokenizer(tokenizer).save(tmp_path / "t")
+
+
+@pytest.mark.parametrize("kind", ["char", "bpe"])
+def test_split_special_tokens_reads_special_tokens_as_text(tmp_path, kind):
+    # "!" isn't in the model's vocabulary, so read as text it is unknown.
+    base = _tokenizer_with(kind)
+    backend = base.backend_tokenizer
+    backend.add_special_tokens(["!"])
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token=base.unk_token, split_special_tokens=True,
+        additional_special_tokens=["!"],
+    )
+    result = _exporter(kind)(tokenizer).save(tmp_path / "t")
+    for text in ("ab!", "the cat!", "!!"):
+        assert _sprite_ids(result, text) == tokenizer.encode(text, add_special_tokens=False)
+    assert _sprite_ids(result, "ab!")[-1] == tokenizer.unk_token_id
+
+
+def test_split_special_tokens_is_read_from_transformers_not_the_last_call(tmp_path):
+    tokenizer = _tokenizer_with("char", special=["<x>"])
+    # transformers sets the backend's flag from this call and leaves it.
+    tokenizer("a<x>", split_special_tokens=True)
+    assert tokenizer.backend_tokenizer.encode_special_tokens
+    result = CharTokenizer(tokenizer).save(tmp_path / "t")
+    assert _sprite_ids(result, "a<x>b") == tokenizer.encode("a<x>b", add_special_tokens=False)
+    assert len(_sprite_ids(result, "a<x>b")) == 3
+
+
+def test_export_leaves_the_tokenizer_as_it_was(tmp_path):
+    tokenizer = _tokenizer_with("char", special=["<x>"])
+    backend = tokenizer.backend_tokenizer
+    backend.encode_special_tokens = True
+    backend.enable_truncation(max_length=5)
+    backend.enable_padding(length=7, pad_id=0, pad_token="?")
+    before = (backend.encode_special_tokens, backend.truncation, backend.padding)
+    CharTokenizer(tokenizer).save(tmp_path / "t")
+    assert (backend.encode_special_tokens, backend.truncation, backend.padding) == before
+
+
+def test_ignore_merges_is_exported_only_when_it_changes_nothing(tmp_path):
+    vocab = {"<unk>": 0, "a": 1, "b": 2, "c": 3, "ab": 4, "bc": 5, "abc": 6}
+    backend = Tokenizer(models.BPE(
+        vocab=vocab, merges=[("b", "c"), ("a", "b")], unk_token="<unk>", ignore_merges=True,
+    ))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    assert tokenizer.encode("abc") == [6]
+    with pytest.raises(ValueError, match=r"ignore_merges=True.*'abc'.*\[1, 5\]"):
+        BPETokenizer(tokenizer).save(tmp_path / "t")
+
+    trained = Tokenizer(models.BPE(unk_token="<unk>", ignore_merges=True))
+    trained.train_from_iterator(
+        _CORPUS, trainers.BpeTrainer(vocab_size=40, special_tokens=["<unk>"]),
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=trained, unk_token="<unk>")
+    result = BPETokenizer(tokenizer).save(tmp_path / "trained")
+    for text in [*tokenizer.get_vocab(), *_CORPUS[:3], "the cat sat on the log"]:
+        assert _sprite_ids(result, text) == tokenizer.encode(text), text
+
+
+@pytest.mark.parametrize("kind", ["char", "bpe"])
+@pytest.mark.parametrize("processor", ["template", "bert", "roberta", "sequence"])
+def test_tokens_a_post_processor_adds_are_written_too(tmp_path, kind, processor):
+    from tokenizers import processors
+
+    tokenizer = _tokenizer_with(kind)
+    tokenizer.add_special_tokens({"bos_token": "<s>", "eos_token": "</s>"})
+    bos, eos = tokenizer.convert_tokens_to_ids(["<s>", "</s>"])
+    template = processors.TemplateProcessing(
+        single="<s> $A </s>", special_tokens=[("<s>", bos), ("</s>", eos)],
+    )
+    tokenizer.backend_tokenizer.post_processor = {
+        "template": template,
+        "bert": processors.BertProcessing(("</s>", eos), ("<s>", bos)),
+        "roberta": processors.RobertaProcessing(("</s>", eos), ("<s>", bos)),
+        "sequence": processors.Sequence([processors.ByteLevel(trim_offsets=False), template]),
+    }[processor]
+    result = _exporter(kind)(tokenizer).save(tmp_path / "t")
+    for text in ("", "ab", "the cat", "a <s> b"):
+        assert _sprite_ids(result, text) == tokenizer.encode(text), text
+    assert _sprite_ids(result, "ab")[0] == bos
+
+
+def test_post_processors_the_sprite_cant_reproduce_are_rejected():
+    from cattorch.tokenizer import _post_processor_wrap
+
+    with pytest.raises(ValueError, match="can't reproduce this tokenizer's Mystery post-processor"):
+        _post_processor_wrap({"type": "Mystery"}, "BPETokenizer")
+    two = {"type": "TemplateProcessing", "single": [
+        {"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+    ], "special_tokens": {}}
+    with pytest.raises(ValueError, match="TemplateProcessing post-processor"):
+        _post_processor_wrap(two, "BPETokenizer")
+
+
+def test_sentencepiece_processor_adding_bos_and_eos(tmp_path):
+    import io
+
+    sentencepiece = pytest.importorskip("sentencepiece")
+    model = io.BytesIO()
+    sentencepiece.SentencePieceTrainer.train(
+        sentence_iterator=iter(_CORPUS), model_writer=model, model_type="bpe", vocab_size=30,
+        add_dummy_prefix=False, remove_extra_whitespaces=False,
+        normalization_rule_name="identity", minloglevel=3, hard_vocab_limit=False,
+    )
+    processor = sentencepiece.SentencePieceProcessor(
+        model_proto=model.getvalue(), add_bos=True, add_eos=True,
+    )
+    result = SentencePieceBPETokenizer(processor).save(tmp_path / "sp")
+    for text in ("", "the cat", "a big log"):
+        assert _sprite_ids(result, text) == processor.encode(text), text
+    reversed_processor = sentencepiece.SentencePieceProcessor(
+        model_proto=model.getvalue(), reverse=True,
+    )
+    with pytest.raises(ValueError, match="reverse=True"):
+        SentencePieceBPETokenizer(reversed_processor).save(tmp_path / "reversed")

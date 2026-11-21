@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -11,13 +9,12 @@ import torch.nn as nn
 
 from cattorch import GenerationProgram, UnsupportedModelError, transpile, verify
 from cattorch import (
-    ProgramCall, adapter, entrypoint, example, export_forward, generate, marked_program,
+    ProgramCall, adapter, entrypoint, example_inputs, export_forward, generate, marked_program,
     moe,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite, nano, prefill_and_decode  # noqa: E402
+from shared_models import nano
+from sprite_helpers import SpriteEmulator, load_sprite, prefill_and_decode
 
 
 class Accumulator(nn.Module):
@@ -27,18 +24,18 @@ class Accumulator(nn.Module):
         self.register_buffer("history", torch.zeros(0, 2))
         self.project = nn.Linear(2, 2)
 
-    @entrypoint(example=lambda: (torch.ones(2),), outputs=("doubled",))
+    @entrypoint(example_inputs=lambda: (torch.ones(2),), output_names=("doubled",))
     def add(self, value):
         self.total += value
         return self.total * 2
 
-    @entrypoint(example=lambda: (torch.ones(2),), capacity={"history": 4})
+    @entrypoint(example_inputs=lambda: (torch.ones(2),), capacity={"history": 4})
     def remember(self, row):
         projected = self.project(row).reshape(1, 2)
         self.history = torch.cat([self.history, projected])
         return projected.sum()
 
-    @entrypoint(name="recall", example=lambda: (torch.ones(2),))
+    @entrypoint(name="recall", example_inputs=lambda: (torch.ones(2),))
     def read_history(self, weights):
         return torch.relu(self.history @ weights)
 
@@ -53,8 +50,8 @@ def test_entrypoints_with_state_export_and_verify(tmp_path):
     result = transpile(model, None, tmp_path / "accumulator")
     entries = {entry.name: entry for entry in result.entrypoints}
     assert set(entries) == {"add", "remember", "recall"}
-    assert [spec.list_name for spec in entries["add"].inputs] == ["cattorch add value"]
-    assert [spec.list_name for spec in entries["add"].outputs] == ["cattorch add doubled"]
+    assert [spec.list_name for spec in entries["add"].inputs] == ["accumulator add value"]
+    assert [spec.list_name for spec in entries["add"].outputs] == ["accumulator add doubled"]
     assert entries["add"].state_updates == ("total",)
     assert entries["remember"].state_updates == ("history",)
     assert {state.name: state.mode for state in result.states} == {
@@ -73,6 +70,54 @@ def test_entrypoints_with_state_export_and_verify(tmp_path):
     assert model.add(torch.ones(2)).tolist() == [2.0, 2.0]
 
 
+class Decaying(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.project = nn.Linear(4, 6)
+        self.register_buffer("memory", torch.zeros(6))
+
+    @entrypoint(example_inputs=lambda: (torch.ones(2, 4),), dynamic={"rows": (1, 3)})
+    def step(self, rows):
+        self.memory = 0.5 * self.memory + self.project(rows).sum(0)
+        return self.memory.clone()
+
+
+def test_a_quantized_entry_point_that_assigns_its_buffer(tmp_path):
+    # Quantization calibrates under inference mode; the buffers the entry
+    # point assigns there must not stay inference tensors, which the length
+    # check and verify then update in place.
+    from cattorch import QuantizationConfig
+
+    quantization = QuantizationConfig(bits=8, min_quantized_values=1)
+    torch.manual_seed(0)
+    model = Decaying().eval()
+    result = transpile(model, None, tmp_path / "decaying", quantization=quantization)
+    calls = (ProgramCall("step", (torch.randn(3, 4),)), ProgramCall("step", (torch.randn(1, 4),)))
+    assert verify(model, None, result, calls=calls, quantization=quantization).passed
+
+
+def test_an_entry_point_without_arguments(tmp_path):
+    # It computes from weights alone; nothing requires an input or state.
+    class Summary(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(3, 2)
+
+        @entrypoint(example_inputs=())
+        def norms(self):
+            return self.linear.weight.norm(dim=1) + self.linear.bias
+
+        @entrypoint(example_inputs=lambda: (torch.ones(3),))
+        def apply(self, x):
+            return self.linear(x)
+
+    torch.manual_seed(0)
+    model = Summary().eval()
+    result = transpile(model, None, tmp_path / "summary")
+    calls = (ProgramCall("norms", ()), ProgramCall("apply", (torch.randn(3),)))
+    assert verify(model, None, result, calls=calls).passed
+
+
 def test_marked_program_builds_the_explicit_form():
     exported, program = marked_program(Accumulator().eval())
     assert {entry.name for entry in program.entrypoints} == {"add", "recall", "remember"}
@@ -86,7 +131,7 @@ def test_growing_a_buffer_needs_a_capacity():
             super().__init__()
             self.register_buffer("rows", torch.zeros(0, 2))
 
-        @entrypoint(example=lambda: (torch.ones(2),))
+        @entrypoint(example_inputs=lambda: (torch.ones(2),))
         def push(self, row):
             self.rows = torch.cat([self.rows, row.reshape(1, 2)])
             return row
@@ -101,7 +146,7 @@ def test_a_capacity_for_a_buffer_that_never_grows_is_an_error():
             super().__init__()
             self.register_buffer("rows", torch.zeros(1, 2))
 
-        @entrypoint(example=lambda: (torch.ones(2),), capacity={"rows": 4})
+        @entrypoint(example_inputs=lambda: (torch.ones(2),), capacity={"rows": 4})
         def read(self, value):
             return self.rows.sum(0) + value
 
@@ -110,14 +155,14 @@ def test_a_capacity_for_a_buffer_that_never_grows_is_an_error():
 
 
 def test_example_marker_supplies_forward_inputs(tmp_path):
-    @example(lambda: (torch.randn(2, 4),))
+    @example_inputs(lambda: (torch.randn(2, 4),))
     class Net(nn.Sequential):
         pass
 
     torch.manual_seed(1)
     model = Net(nn.Linear(4, 3), nn.ReLU()).eval()
     assert verify(model, None, transpile(model, None, tmp_path / "net")).passed
-    with pytest.raises(ValueError, match="no @example"):
+    with pytest.raises(ValueError, match="no @example_inputs"):
         transpile(nn.Linear(2, 2).eval(), None, tmp_path / "plain")
 
 
@@ -201,7 +246,7 @@ def test_generate_marker_picks_the_generation_method(tmp_path):
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / "chat")
     with torch.no_grad():
         prefill_and_decode(
-            ScratchEmulator(load_sprite(result.path)), model.decoder, [1, 2, 3], [4],
+            SpriteEmulator(load_sprite(result.path)), model.decoder, [1, 2, 3], [4],
         )
 
 
@@ -225,19 +270,19 @@ def test_adapter_builds_a_scoped_module_adapter(tmp_path):
 
 
 def test_markers_are_inherited_and_can_be_overridden():
-    @example(lambda: (torch.zeros(1),))
+    @example_inputs(lambda: (torch.zeros(1),))
     class Base(nn.Module):
         pass
 
-    @example(lambda: (torch.zeros(2),))
+    @example_inputs(lambda: (torch.zeros(2),))
     class Child(Base):
         pass
 
-    from cattorch.markers import example_inputs
+    from cattorch.markers import marked_example_inputs
 
-    assert example_inputs(Base())[0].shape == (1,)
-    assert example_inputs(Child())[0].shape == (2,)
-    assert example_inputs(type("Grandchild", (Child,), {})())[0].shape == (2,)
+    assert marked_example_inputs(Base())[0].shape == (1,)
+    assert marked_example_inputs(Child())[0].shape == (2,)
+    assert marked_example_inputs(type("Grandchild", (Child,), {})())[0].shape == (2,)
 
 
 def test_an_entry_points_non_tensor_results_are_skipped_with_a_warning(tmp_path):
@@ -246,14 +291,14 @@ def test_an_entry_points_non_tensor_results_are_skipped_with_a_warning(tmp_path)
             super().__init__()
             self.register_buffer("total", torch.zeros(2))
 
-        @entrypoint(example=lambda: (torch.ones(2),))
+        @entrypoint(example_inputs=lambda: (torch.ones(2),))
         def add(self, value):
             self.total += value
             return self.total.sum(), None, {"count": 3}
 
     with pytest.warns(UserWarning, match=r"@entrypoint add: ignoring non-tensor results \(NoneType, int\)"):
         result = transpile(Totals().eval(), None, tmp_path / "totals")
-    assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["cattorch add output"]
+    assert [spec.list_name for spec in result.entrypoints[0].outputs] == ["totals add output"]
 
 
 class _Decaying(nn.Module):
@@ -261,14 +306,14 @@ class _Decaying(nn.Module):
         super().__init__()
         self.register_buffer("seen", torch.zeros(0, 1))
 
-    @entrypoint(example=lambda: (torch.ones(1),), capacity={"seen": 8})
+    @entrypoint(example_inputs=lambda: (torch.ones(1),), capacity={"seen": 8})
     def remember(self, row):
         self.seen = torch.cat([self.seen * 0.5, row.reshape(1, 1)])
         return self.seen.sum(0)
 
 
 class _Prepending(_Decaying):
-    @entrypoint(example=lambda: (torch.ones(1),), capacity={"seen": 8})
+    @entrypoint(example_inputs=lambda: (torch.ones(1),), capacity={"seen": 8})
     def remember(self, row):
         self.seen = torch.cat([row.reshape(1, 1), self.seen])
         return self.seen.sum(0)
@@ -292,13 +337,13 @@ def test_a_buffer_under_two_names_is_one_state(tmp_path):
             self.writer.register_buffer("memory", memory)
             self.reader.register_buffer("memory", memory)
 
-        @entrypoint(example=lambda: (torch.ones(2),))
+        @entrypoint(example_inputs=lambda: (torch.ones(2),))
         def step(self, value):
             self.writer.memory += value
             return self.reader.memory * 1
 
     result = transpile(Shared().eval(), None, tmp_path / "shared")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     eager = Shared().eval()
     for _ in range(3):
         emulator.lists["cattorch step value"] = [1.0, 2.0]
@@ -313,13 +358,13 @@ def test_prepare_for_save_keeps_program_state(tmp_path):
             super().__init__()
             self.register_buffer("total", torch.zeros(2))
 
-        @entrypoint(example=lambda: (torch.ones(2),))
+        @entrypoint(example_inputs=lambda: (torch.ones(2),))
         def add(self, value):
             self.total += value
             return self.total * 1
 
     result = transpile(Counter().eval(), None, tmp_path / "counter")
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     for expected in ([1.0, 1.0], None, [2.0, 2.0]):
         if expected is None:
             emulator.run_procedure("cattorch prepare for save")

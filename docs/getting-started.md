@@ -54,99 +54,109 @@ assert check.passed, check
 ```
 
 `transpile` creates missing parent directories and appends `.sprite3` if the
-path does not already have that suffix. The Scratch sprite name defaults to
-the output filename stem; pass `name="My model"` to choose it independently.
+path does not already have that suffix; a path that names no file, such as
+an existing directory, raises `ValueError`. The export's name, NAME below,
+defaults to the output filename stem (`two_layer_net` here); pass
+`name="My model"` to choose it. It is the sprite's name in Scratch, and
+every list, variable and broadcast a project uses the sprite through starts
+with it.
 
-The returned `TranspileResult` describes the sprite's input/output lists,
-size, and warnings. See the [result-type reference](api-reference.md#result-types)
-for all fields.
+The returned `TranspileResult` names the sprite's input and output lists
+and its broadcasts, and gives its size and warnings. See the
+[result-type reference](api-reference.md#result-types) for all fields.
 
 > **Before distribution:** inspect `artifact.warnings`, run `verify`, and test
 > an import/run/save cycle in the same Scratch client the project will use.
 
-## Import and run the sprite
+## Use the sprite in a project
+
+You never need to open the sprite: a large model makes the Scratch editor
+slow while its sprite is selected. Use it from another sprite, or the stage.
 
 1. Open the target Scratch 3 project.
 2. Choose **Upload Sprite** from the sprite chooser and select the generated
-   `.sprite3` file.
-3. Select the imported sprite. Its Code area has the `cattorch init` and
-   `cattorch forward` My Block definitions, plus a clickable block for each.
-4. Show the sprite-local `input` list and replace its contents with the model
-   input values.
-5. Click the `cattorch forward` call stack.
-6. Read the flattened result from the sprite-local `output` list.
+   `.sprite3` file. Scratch creates the global lists and variables the
+   sprite uses, here `two_layer_net input`, `two_layer_net output` and
+   `two_layer_net status`, and selects the sprite: select another sprite,
+   or the stage, right away. For a large model, add the sprite with
+   [`add_to_project`](projects-and-cli.md#add-sprites-to-your-own-project)
+   or `cattorch add` instead, so the editor never shows it.
+3. In a script of that other sprite, fill `two_layer_net input` with the
+   model's input values, then `broadcast [two_layer_net forward] and wait`.
+4. Read `two_layer_net status`. When it's `ok`, the flattened result is in
+   `two_layer_net output`; otherwise the status says why the call failed,
+   such as an input list with the wrong number of items.
 
-For multiple model arguments, later flattened tensors use `input_1`,
-`input_2`, and so on. Values are flattened in normal PyTorch contiguous order;
-`artifact.inputs` records the original shapes and dtypes. Scratch list
-positions are one-based, but integer values such as embedding token IDs remain
-the zero-based values expected by PyTorch.
-
-Models returning multiple tensors use `output`, `output_1`, and so on in
-PyTorch's nested-container leaf order, recorded in `artifact.outputs`.
-If an input or output exceeds 200,000 values, use all its
-[shard lists](storage.md#list-sharding) when copying data.
-
-`cattorch forward` initializes the sprite on its first call. Call
-`cattorch init` yourself to load the weights ahead of time, for example
-before timing a run. Both blocks run without screen refresh, and when each
-finishes it sets `cattorch status` to `ok` and broadcasts
-`cattorch forward complete` or `cattorch init complete`. The
-[Scratch interface](scratch-interface.md) lists every name a sprite offers;
-they won't change within cattorch 1.x.
-
-## Connect another sprite
-
-My Blocks and sprite-local lists belong to one Scratch sprite. A controller
-sprite cannot call `cattorch forward` or directly read the generated local
-`input` and `output` lists.
-
-[`build_project`](projects-and-cli.md) writes a project with these bridges
-already in place: `broadcast [NAME run] and wait` after filling the global
-`NAME input` list, then read `NAME output`. To build a bridge by hand, go
-through global lists:
-
-1. Create global input and output lists with your own names.
-2. On the generated processor sprite, add a `when I receive` script.
-3. In that receiver, copy the global input into local `input`, call
-   `cattorch forward`, then copy local `output` to the global output list.
-4. From the controller, use `broadcast [run model] and wait`. When it returns,
-   the global output is ready.
-
-In Scratch-like pseudocode, the receiver is:
+In Scratch-like pseudocode:
 
 ```text
-when I receive [run model]
-delete all of [input]
-copy every item of [my global input] to [input]
-cattorch forward
-delete all of [my global output]
-copy every item of [output] to [my global output]
+when green flag clicked
+delete all of [two_layer_net input]
+add (0.5) to [two_layer_net input]   // ... one item per input value
+broadcast [two_layer_net forward] and wait
+if <(two_layer_net status) = [ok]> then
+  say (item (1) of [two_layer_net output])
+end
 ```
 
-Don't make a new list named `input` or `output` to replace the generated one.
-Generated blocks refer to lists by ID, not by name, so they will keep using the
-original.
+For multiple model arguments, later flattened tensors use `NAME input_1`,
+`NAME input_2`, and so on. Values are flattened in normal PyTorch contiguous order;
+`artifact.inputs` records each list's name and the original shapes and
+dtypes. Scratch list positions are one-based, but integer values such as
+embedding token IDs remain the zero-based values expected by PyTorch.
 
-Tokenizer sprites have the same locality rule. See
-[tokenizer integration](tokenizers.md) and
-[cached generation](generation.md) for their additional procedures.
+Models returning multiple tensors use `NAME output`, `NAME output_1`, and so
+on in PyTorch's nested-container leaf order, recorded in `artifact.outputs`.
+If an input or output exceeds 200,000 values, use all its
+[shard lists](storage.md#list-sharding).
+
+`NAME forward` decodes the weights on its first call. Broadcast
+`NAME init` yourself to decode them ahead of time, for example before
+timing a run. Calls run without screen refresh. While one runs,
+`NAME status` is `not finished`; when it ends, `NAME status` says how, and
+the call broadcasts `NAME forward complete` (or `NAME init complete`), for
+scripts that react to events rather than wait. A forward that fails writes
+no output. The [Scratch interface](scratch-interface.md) lists every name a
+sprite offers and every status; they won't change within cattorch 1.x.
+
+To use two copies of one model in a project, export them with different
+`name`s: two sprites of one name share their lists and both answer the
+same broadcasts.
+
+### Overlapping calls
+
+Call the sprite from one script at a time, and let each call end before
+starting another. A call that another call overlaps, or that is stopped
+part way, reports it in `NAME status`, and a sprite with state can then
+refuse some calls until it is reset, which ones depending on the kind of
+sprite; see [overlapping calls](scratch-interface.md#overlapping-calls).
+
+[`build_project`](projects-and-cli.md) writes a complete project around a
+sprite, with the globals declared and a small Demo sprite that runs it.
+Tokenizer and generation sprites work the same way; see
+[tokenizer integration](tokenizers.md) and [cached generation](generation.md)
+for their calls.
 
 ## Prepare the project for saving
 
-Before saving a project that has run, call `cattorch prepare for save`. It
-clears the decoded weights and working data but keeps the compressed weights,
-so the saved project doesn't store both. Input lists and a program's state are
-kept. The next forward call initializes the
-sprite again.
+Before saving a project that has run, `broadcast [cattorch prepare for save]
+and wait`: every model, generation and program sprite answers it (each
+also has its own `NAME prepare for save`). It clears the decoded weights
+and working data but keeps the compressed weights, so the saved project
+doesn't store both. Input and output lists and a program's state are kept.
+The next call decodes the weights again.
 
-Don't edit the generated sprite's costumes: they store the compressed weights.
-See [preserve processor costumes](storage.md#preserve-processor-costumes).
+Don't edit the generated sprite's costumes. The weights are stored in lists,
+but the costumes are named after the characters of their encoding, and the
+sprite decodes the weights by looking characters up among them. See
+[preserve processor costumes](storage.md#preserve-processor-costumes).
 
 ## Add export options
 
+This continues the example above:
+
 ```python
-from cattorch import StorageConfig, transpile
+from cattorch import StorageConfig, transpile, verify
 
 artifact = transpile(
     model,

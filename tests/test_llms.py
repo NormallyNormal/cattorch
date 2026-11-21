@@ -5,57 +5,12 @@ Each test transpiles a small language model block, runs the resulting Scratch
 sprite through the emulator, and compares the output against PyTorch.
 """
 
-import json
-import os
-import tempfile
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch.transpiler import transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
-
-TOLERANCE = 1e-4
-# One directory per process, so parallel test workers never share the file.
-_OUTPUT_DIRECTORY = tempfile.mkdtemp(prefix="cattorch-llms-")
-
-
-def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
-    """Transpile a model, run through emulator, return (expected, actual)."""
-    model = model.eval()
-    with torch.no_grad():
-        expected = model(x).flatten().tolist()
-
-    path = os.path.join(_OUTPUT_DIRECTORY, "output")
-    transpile(model, x, path)
-
-    sprite_path = path + ".sprite3"
-    try:
-        with zipfile.ZipFile(sprite_path, "r") as z:
-            project = json.loads(z.read("sprite.json"))
-    finally:
-        os.remove(sprite_path)
-
-    emu = ScratchEmulator(project)
-    emu.lists["input"] = [float(v) for v in x.flatten().tolist()]
-    emu.run()
-    actual = [float(v) for v in emu.lists.get("output", [])]
-    return expected, actual
-
-
-def _assert_close(expected: list[float], actual: list[float], tolerance=TOLERANCE):
-    assert len(expected) == len(actual), (
-        f"Length mismatch: expected {len(expected)}, got {len(actual)}"
-    )
-    for i, (e, a) in enumerate(zip(expected, actual)):
-        if e == a:
-            continue
-        assert abs(e - a) < tolerance, (
-            f"Index {i}: expected {e:.6f}, got {a:.6f}"
-        )
+from sprite_helpers import assert_outputs_close, run_sprite
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -273,40 +228,40 @@ def seed():
 def test_simple_causal_lm():
     model = SimpleCausalLM(vocab_size=16, d_model=8, seq_len=4, d_ff=16)
     x = torch.tensor([0, 5, 12, 3])
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_multi_head_attention():
     model = MultiHeadAttentionBlock(d_model=8, n_heads=2)
     x = torch.randn(4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_combined_qkv():
     model = CombinedQKVBlock(d_model=6)
     x = torch.randn(3, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_rope_attention():
     model = RoPEAttentionBlock(d_model=8, max_len=16)
     x = torch.randn(4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_llama_block():
     model = LLaMABlock(d_model=8, d_ff=16, max_len=16)
     x = torch.randn(4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_gpt_block():
     model = GPTBlock(d_model=8, n_heads=2, d_ff=16)
     x = torch.randn(4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)

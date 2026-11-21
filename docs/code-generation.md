@@ -48,14 +48,59 @@ All three options are off by default.
   lists, and custom blocks. The documented input, output, and lifecycle names
   don't change.
 - `compact_schema=True` leaves redundant fields out of the saved block data.
-- `layer_sharing="auto"` generates one copy of the code for repeated
-  transformer layers named `blocks.N` and shares it across them. For cached
-  generation, every layer must also have the same cache width. Layers that
-  don't fit keep their own code.
+- `layer_sharing=True` generates one copy of the code for repeated layers
+  and calls it once per layer, with each layer's weights. See
+  [layer sharing](#layer-sharing).
 
-Schema compaction and layer sharing are newer. After enabling either, run
-`verify` and check that the project imports, edits, runs, and saves in your
-Scratch client.
+Schema compaction and layer sharing are tested less widely than the
+defaults. After enabling either, run `verify` and check that the project
+imports, edits, runs, and saves in your Scratch client.
+
+### Layer sharing
+
+Layer sharing looks for submodules named `blocks.0`, `blocks.1`, and so on,
+such as the items of an `nn.ModuleList` attribute called `blocks`. It shares
+them when:
+
+- they are in one `blocks` list, numbered consecutively from `blocks.0`, and
+  run one after another, with no code between them: code that the model's
+  loop runs between two layers, such as `y = side(x)` after `blocks[0]`,
+  keeps the model unshared even when it reads no layer's output;
+- each layer passes one tensor on: it reads the previous layer's output
+  (`blocks.0`: its input) and otherwise only the same tensors from before the
+  layers, such as a mask, and nothing reads its tensors but the next layer
+  (the last layer: the rest of the model). A layer that takes or returns two
+  tensors, a skip connection across layers, a layer reading the model's
+  input at every layer, or returning every layer's output keeps the model
+  unshared. So does an elementwise operation fused with a layer's last
+  operation, such as `x * 2` right after the last layer or at the start of
+  each layer; a normalization or linear layer there is fine;
+- every layer computes the same operations, with the same shapes and
+  constants, and weights of the same sizes, stored the same way: a layer
+  whose weights are quantized differently (another `QuantizationConfig`
+  override, group size, or none) keeps the model unshared, since one bank
+  holds every layer's weights in one format. Layers with a
+  [mixture of experts](programs-and-moe.md#mixture-of-experts) block aren't
+  shared, since each layer's experts are an expert family of their own;
+- for [cached generation](generation.md#layer-sharing), every attention block
+  sits in its own layer and every layer's cache has the same width.
+
+The layers can be anywhere in the model, including at its start, where they
+read the input list; the input list keeps the values you put in it. Code
+outside the layers may read a layer's weight, such as an output head tied to
+a layer's weight or a tensor with the same values: it reads that layer's
+rows of the bank. The quantization report lists every layer's weights with
+the storage the bank gives them.
+
+Sharing is all or nothing: if any layer doesn't fit, the model is exported
+without sharing. Whenever `layer_sharing=True` shares nothing, the export
+warns once, in `result.warnings` and as a `CattorchWarning`, and the warning
+says why, such as which layer differs from `blocks.0`. A model with no
+`blocks.N` layers warns too, since the option had no effect. In a
+[program](programs-and-moe.md), each entry point is shared on its own: an
+entry point without repeated layers, such as one that resets state, isn't
+reported, an entry point whose layers couldn't be shared is reported by
+name, and a program in which no entry point has repeated layers warns once.
 
 ## Reproducible exports and multiple sprites
 
@@ -72,6 +117,8 @@ don't collide. `id_namespace=""` makes IDs shorter, but only use it when the
 sprite is the only generated sprite in the project.
 
 `transpile_tokenizer` and the tokenizer `.save()` methods accept the same
-`codegen=` argument.
+`codegen=` argument. A tokenizer has no layers or loops, so `layer_sharing`
+and `unrolling` raise `ValueError` there; the size target, IDs and compaction
+apply.
 
 Related: [`CodegenConfig` reference](api-reference.md#codegenconfig).

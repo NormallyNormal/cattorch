@@ -14,7 +14,7 @@ from cattorch import (
     transpile,
     verify,
 )
-from cattorch.sprite import _static_storage_shard_limits
+from cattorch.static_storage import _static_storage_shard_limits
 from cattorch.storage import (
     BASE92_ALPHABET,
     EncodedList,
@@ -33,13 +33,13 @@ from cattorch.storage import (
     rounded_values,
 )
 from cattorch.util.scratch.dsl import Program, append, delete, item, length, replace
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.finalize_scratch import (
     SCRATCH_ONLINE_JSON_LIMIT,
     SCRATCH_ONLINE_JSON_WARN_SIZE,
     online_json_size_warning,
 )
 from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT, shard_sprite_lists
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 class TinyLinear(torch.nn.Module):
@@ -51,16 +51,38 @@ class TinyLinear(torch.nn.Module):
         return self.linear(value)
 
 
-def _load(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
-
-
 def _codec_sprite(program):
     sprite = program.compile()
     sprite["currentCostume"] = 0
     sprite["costumes"] = [{"name": character} for character in BASE92_ALPHABET]
     return sprite
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_integer_codec_grid_checks_every_chunk_and_notices_changes(monkeypatch, dtype):
+    import cattorch.static_storage as static_storage
+    from cattorch import QuantizationConfig
+    from cattorch.storage import StorageConfig as Storage, quantized_storage
+
+    monkeypatch.setattr(static_storage, "_CODEC_GRID_CHUNK_GROUPS", 2)
+    storage = quantized_storage(Storage(), QuantizationConfig(bits=8, group_size=4))
+    torch.manual_seed(0)
+    # Codes with a 127 in every group at a power-of-two scale: exact in every
+    # format, so on the grid whatever the dtype.
+    codes = torch.randint(-126, 127, (8 * 3, 4))
+    codes[:, 0] = 127
+    codes[4:6] = 0
+    tensor = (codes.reshape(8, 12) * 2.0**-3).to(dtype)
+    assert static_storage._on_integer_codec_grid(tensor, storage) is True
+    # The four-row physical order is undone before checking.
+    physical = tensor.reshape(2, 4, 12).transpose(1, 2).reshape(8, 12).contiguous()
+    assert static_storage._on_integer_codec_grid(physical, storage, ((0, 8, 12),)) is True
+    # A value off the grid in the last chunk only; the cached answer follows
+    # an in-place change.
+    tensor[-1, -1] = 0.3
+    assert static_storage._on_integer_codec_grid(tensor, storage) is False
+    assert static_storage._on_integer_codec_grid(torch.ones(8, 12).log(), storage) is True
+    assert static_storage._on_integer_codec_grid(torch.full((8, 12), float("inf")), storage) is False
 
 
 def test_base92_uses_all_safe_costume_digits_and_exact_52_bit_groups():
@@ -119,7 +141,7 @@ def test_scratch_base92_decoder_round_trips_ieee_values(precision, values):
     program = build_unpack_program([
         EncodedList("weights", "payload", payload, precision),
     ])
-    emulator = ScratchEmulator(_codec_sprite(program))
+    emulator = SpriteEmulator(_codec_sprite(program))
     emulator.run()
     expected = rounded_values(values, precision)
     actual = emulator.lists["weights"]
@@ -145,7 +167,7 @@ def test_scratch_integer_decoder_dequantizes_groups_once(precision):
             scale_payload=scale_payload,
         ),
     ])
-    emulator = ScratchEmulator(_codec_sprite(program))
+    emulator = SpriteEmulator(_codec_sprite(program))
     emulator.run()
     assert emulator.lists["weights"] == rounded_values(values, precision, group_size)
     assert emulator.lists["scales"] == []
@@ -163,7 +185,7 @@ def test_costume_base92_decoder_handles_partial_byte_groups(count):
             scale_payload=scale_payload,
         ),
     ])
-    emulator = ScratchEmulator(_codec_sprite(program))
+    emulator = SpriteEmulator(_codec_sprite(program))
     emulator.run()
     assert emulator.lists["weights"] == rounded_values(values, "int8", count)
 
@@ -199,9 +221,9 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
     value = torch.randn(2, 3)
     path = tmp_path / "compressed"
     transpile(model, value, str(path))
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
-    weight_lists = [entry for entry in sprite["lists"].values() if entry[0].startswith("W_")]
+    weight_lists = [entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")]
     assert weight_lists and all(not entry[1] for entry in weight_lists)
     weight_banks = [
         entry for entry in sprite["variables"].values()
@@ -211,7 +233,7 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
     assert [costume["name"] for costume in sprite["costumes"]] == list(BASE92_ALPHABET)
     assert len({costume["md5ext"] for costume in sprite["costumes"]}) == 1
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -221,8 +243,7 @@ def test_default_export_unpacks_weights_once_and_prepare_save_rearms_it(tmp_path
         rtol=0,
     )
 
-    prepare_root = emulator._procedures["cattorch prepare for save"]
-    emulator._exec_chain(prepare_root)
+    emulator.run_procedure("cattorch prepare for save")
     assert emulator.variables["cattorch initialized"] == 0
     assert all(not emulator.lists[entry[0]] for entry in weight_lists)
 
@@ -309,13 +330,13 @@ def test_split_scale_banks_decode_every_tensor_value(tmp_path):
         ),
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    emulator = ScratchEmulator(_load(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
     emulator.run_procedure("cattorch init")
 
     decoded = [
         emulator._lists[identifiers[0]]
         for name, identifiers in sorted(emulator._list_name_to_ids.items())
-        if name.startswith("W_")
+        if name.startswith("_W_")
     ]
     assert [len(values) for values in decoded] == [30_000, 30_000]
     assert all(all(value != 0 for value in values) for values in decoded)
@@ -361,16 +382,18 @@ def test_default_float32_export_shards_for_temporary_decode_limit(tmp_path):
         tmp_path / "large-f32",
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    sprite = _load(result.path)
-    emulator = ScratchEmulator(sprite)
+    sprite = load_sprite(result.path)
+    emulator = SpriteEmulator(sprite)
     emulator.run_procedure("cattorch init")
 
     weight_lengths = [
         len(emulator.lists[name])
         for name in emulator._list_name_to_ids
-        if name.startswith("W_")
+        if name.startswith("_W_")
     ]
-    assert weight_lengths == [50_000, 15_536]
+    # Float32 storage caps a list at 50,000 values: the Linear kernel cuts
+    # the weight at whole four-row groups below that, not mid-row.
+    assert weight_lengths == [49_152, 16_384]
     assert sum(weight_lengths) == model.weight.numel()
 
 
@@ -395,7 +418,7 @@ def test_emulator_enforces_vanilla_scratch_list_item_limit(monkeypatch):
         lists=("values",),
         body=(append("values", 1), append("values", 2), append("values", 3)),
     )
-    emulator = ScratchEmulator(program.compile())
+    emulator = SpriteEmulator(program.compile())
     emulator.run()
 
     assert emulator.lists["values"] == [1, 2]
@@ -413,8 +436,8 @@ def test_float16_storage_is_explicitly_lossy_in_exact_mode(tmp_path):
         optimization="exact",
         storage=StorageConfig(precision="float16"),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
-    emulator = ScratchEmulator(sprite)
+    sprite = load_sprite(path.with_suffix(".sprite3"))
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -447,15 +470,15 @@ def test_integer_storage_dequantizes_before_forward_and_reinitializes(
             bits=int(precision[3:]), group_size=4, min_quantized_values=1,
         ),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
-    emulator = ScratchEmulator(sprite)
+    sprite = load_sprite(path.with_suffix(".sprite3"))
+    emulator = SpriteEmulator(sprite)
 
     outputs = []
     for _ in range(2):
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run()
         outputs.append(list(emulator.lists["output"]))
-        emulator._exec_chain(emulator._procedures["cattorch prepare for save"])
+        emulator.run_procedure("cattorch prepare for save")
     # The second run decodes the re-encoded weights to the same values.
     assert outputs[0] == outputs[1]
     torch.testing.assert_close(
@@ -507,13 +530,13 @@ def test_uncompressed_prepare_save_keeps_static_weights(tmp_path):
         model, value, str(path),
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     before = {
         name: list(emulator.lists[name])
         for name in emulator._list_name_to_ids
-        if name.startswith("W_")
+        if name.startswith("_W_")
     }
-    emulator._exec_chain(emulator._procedures["cattorch prepare for save"])
+    emulator.run_procedure("cattorch prepare for save")
     assert before
     assert all(emulator.lists[name] == values for name, values in before.items())
 
@@ -537,7 +560,7 @@ def test_nonfloating_static_tensor_cannot_silently_round_through_float32(tmp_pat
         model, value, path,
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = [0]
     emulator.run_procedure("cattorch forward")
     assert emulator.lists["output"] == [16_777_217]
@@ -590,7 +613,7 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
         sprite,
         {"input": SCRATCH_LIST_LIMIT + 3},
     )
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
 
     second = layouts["input"].shards[1]
@@ -599,6 +622,24 @@ def test_oversized_list_routes_reads_writes_and_appends_to_public_shards():
     assert second.name == "input shard 2"
     assert sprite["variables"]["cattorch_input_shard_count"][1] == 2
     assert sprite["variables"]["cattorch_input_logical_length"][1] == SCRATCH_LIST_LIMIT + 3
+
+
+def test_table_sharded_hundreds_of_ways_is_read_into_a_sharded_output(
+    tmp_path,
+    small_list_limit,
+):
+    # Float32 storage caps each table list at a quarter of the limit, so the
+    # table is 601 lists and each lookup a sum of 601 reads. Copying that sum
+    # into each shard of the output must not recurse once per read: at the
+    # real limit, a 31M-value embedding and a 300-token input did.
+    limit = small_list_limit(300)
+    torch.manual_seed(0)
+    model = torch.nn.Embedding(704, 64).eval()
+    tokens = torch.tensor([[3, 703, 0, 350, 9]])
+    assert model.weight.numel() > 600 * (limit // 4)
+    assert tokens.numel() * 64 > limit
+    result = transpile(model, tokens, tmp_path / "embedding")
+    assert verify(model, tokens, result, atol=0, rtol=0).passed
 
 
 def test_storage_config_validation():
@@ -635,13 +676,13 @@ def test_small_matrices_use_float16_instead_of_integer_decoder(tmp_path, precisi
     transpile(
         model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
     assert not any(
         "scale bank payload" in entry[0]
         for entry in sprite["variables"].values()
     )
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     expected = torch.nn.functional.linear(
@@ -667,7 +708,7 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
     value = torch.randn(1, 128)
     path = tmp_path / f"large-{precision}"
     transpile(model, value, path, quantization=QuantizationConfig(bits=int(precision[3:])))
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
 
     assert any(
         "scale bank payload" in entry[0]
@@ -687,14 +728,14 @@ def test_large_matrices_use_requested_integer_storage(tmp_path, precision):
         assert next(
             entry[1] for entry in sprite["variables"].values()
             if entry[0] == "cattorch storage compression"
-        ) == "costume-base92-huffman-int4"
+        ) == "base92-huffman-int4"
 
 
 def test_storage_benchmark_bundles_all_variants(tmp_path):
     project_path = build_storage_benchmark_suite(
         [("tiny", TinyLinear().eval(), torch.randn(1, 3))],
         tmp_path / "storage_suite",
-        iterations=2,
+        repeats=2,
     )
     with zipfile.ZipFile(project_path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -752,3 +793,37 @@ def test_int4_huffman_banks_split_when_compressed_stream_exceeds_list_limit():
     for payload in banks:
         decoded = 13 * ((len(payload) - 1) // 16) - BASE92_ALPHABET.index(payload[0])
         assert decoded <= SCRATCH_LIST_LIMIT
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"storage": StorageConfig(precision="float16")},
+        {"quantization": QuantizationConfig(bits=8, min_quantized_values=1024)},
+        {"quantization": QuantizationConfig(bits=4, min_quantized_values=1024)},
+        {"storage": StorageConfig(compression=False)},
+    ],
+    ids=["float32", "float16", "int8", "int4", "uncompressed"],
+)
+def test_prepare_for_save_leaves_the_data_of_a_fresh_export(tmp_path, options):
+    # Init left the last weight bank's payload in a variable, so a project
+    # saved after a forward and prepare for save stored the weights twice.
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(200, 128), torch.nn.ReLU(), torch.nn.Linear(128, 10),
+    ).eval()
+    example = torch.randn(1, 200)
+    sprite = load_sprite(transpile(model, example, tmp_path / "m", **options).path)
+    emulator = SpriteEmulator(sprite)
+    emulator.lists["input"] = example.flatten().tolist()
+    emulator.run_procedure("cattorch forward")
+    emulator.run_procedure("cattorch prepare for save")
+
+    for identifier, (name, values) in sprite["lists"].items():
+        # Public lists keep their values.
+        if name not in ("input", "output"):
+            assert len(emulator._lists[identifier]) == len(values), name
+    for identifier, (name, value) in sprite["variables"].items():
+        # Counters and other numbers change; nothing grows past one.
+        assert len(str(emulator._vars[identifier])) <= max(len(str(value)), 24), name

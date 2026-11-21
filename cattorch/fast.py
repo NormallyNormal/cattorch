@@ -21,22 +21,22 @@ class FastLayerConfig:
     """Approximation policy for an eligible static-weight layer.
 
     ``rank`` is an explicit truncated-SVD rank. ``rank_ratio`` selects a
-    fraction of the matrix's full rank. ``pruning`` removes that fraction of
-    Scratch-friendly weight blocks by magnitude. Module overrides replace the
-    global policy rather than merging with it.
+    fraction of the matrix's full rank. ``block_pruning`` removes that
+    fraction of Scratch-friendly weight blocks by magnitude. Module overrides
+    replace the global policy rather than merging with it.
     """
 
-    pruning: float = 0.0
+    block_pruning: float = 0.0
     rank: int | None = None
     rank_ratio: float | None = None
 
     def __post_init__(self):
         if (
-            isinstance(self.pruning, bool)
-            or not isinstance(self.pruning, (int, float))
-            or not 0 <= self.pruning < 1
+            isinstance(self.block_pruning, bool)
+            or not isinstance(self.block_pruning, (int, float))
+            or not 0 <= self.block_pruning < 1
         ):
-            raise ValueError("pruning must be in [0, 1)")
+            raise ValueError("block_pruning must be in [0, 1)")
         if self.rank is not None and (
             isinstance(self.rank, bool)
             or not isinstance(self.rank, int)
@@ -54,18 +54,26 @@ class FastLayerConfig:
 
     @property
     def enabled(self) -> bool:
-        return self.pruning > 0 or self.rank is not None or self.rank_ratio is not None
+        return self.block_pruning > 0 or self.rank is not None or self.rank_ratio is not None
 
 
 @dataclass(frozen=True)
 class FastConfig:
-    """Controls approximate kernels and optional static-weight transforms."""
+    """Controls approximate kernels and optional static-weight transforms.
+
+    ``activations``, ``layer_norm`` and ``softmax`` select approximate
+    kernels for those operations. ``neuron_pruning`` removes that fraction
+    of the hidden neurons of each Linear, activation, Linear chain.
+    ``layers`` is the weight-transform policy for every eligible Linear and
+    convolution layer, and ``overrides`` replaces it for the layers it names
+    by module path.
+    """
 
     activations: bool = True
     layer_norm: bool = True
     softmax: bool = True
     neuron_pruning: float = 0.0
-    weights: FastLayerConfig = field(default_factory=FastLayerConfig)
+    layers: FastLayerConfig = field(default_factory=FastLayerConfig)
     overrides: Mapping[str, FastLayerConfig] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -78,8 +86,8 @@ class FastConfig:
             or not 0 <= self.neuron_pruning < 1
         ):
             raise ValueError("neuron_pruning must be in [0, 1)")
-        if not isinstance(self.weights, FastLayerConfig):
-            raise TypeError("weights must be a FastLayerConfig")
+        if not isinstance(self.layers, FastLayerConfig):
+            raise TypeError("layers must be a FastLayerConfig")
         normalized = dict(self.overrides)
         if any(not isinstance(name, str) or not name for name in normalized):
             raise ValueError("fast override names must be non-empty module names")
@@ -91,15 +99,17 @@ class FastConfig:
     def has_weight_transforms(self) -> bool:
         return (
             self.neuron_pruning > 0
-            or self.weights.enabled
+            or self.layers.enabled
             or any(policy.enabled for policy in self.overrides.values())
         )
 
     def policy_for(self, module_name: str) -> FastLayerConfig:
-        return self.overrides.get(module_name, self.weights)
+        return self.overrides.get(module_name, self.layers)
 
 
-def _selected_rank(weight: torch.Tensor, policy: FastLayerConfig) -> int | None:
+def _selected_rank(
+    weight: torch.Tensor, policy: FastLayerConfig, where: str = "the model",
+) -> int | None:
     matrix = weight.flatten(1)
     full_rank = min(matrix.shape)
     if policy.rank is not None:
@@ -109,6 +119,12 @@ def _selected_rank(weight: torch.Tensor, policy: FastLayerConfig) -> int | None:
     else:
         return None
     if rank >= full_rank:
+        from cattorch.errors import warn
+
+        warn(
+            f"{where} was exported without its low-rank factorization: rank {rank} is not "
+            f"below the weight's full rank {full_rank}, so it would change nothing"
+        )
         return None
     return rank
 
@@ -169,6 +185,57 @@ def _factor_conv(module: nn.Conv1d | nn.Conv2d, rank: int) -> nn.Sequential | No
     return nn.Sequential(first, second).train(module.training)
 
 
+_CONTAINERS = (
+    nn.Sequential, nn.ModuleList, nn.ModuleDict, nn.ParameterList, nn.ParameterDict,
+)
+
+
+def _replacement_drops(model: nn.Module, path: str) -> str | None:
+    """Why putting plain layers in place of the module at ``path`` would drop code.
+
+    A low-rank factorization or a neuron pruning puts new ``nn.Linear`` or
+    convolution modules in the module's place, which keep only the weight
+    read. That is only correct when the module does nothing else: its class
+    uses the stock ``forward``, it has no forward hooks, and nothing inside
+    a ``torch.nn`` module (whose forward ``torch.fx`` can't see into, such as
+    ``nn.MultiheadAttention`` reading ``out_proj.weight``) uses it. Returns
+    ``None`` when the replacement is safe.
+    """
+    module = model.get_submodule(path) if path else model
+    for base in (nn.Linear, nn.Conv1d, nn.Conv2d):
+        if isinstance(module, base):
+            overridden = [
+                method for method in ("forward", "_conv_forward")
+                if hasattr(base, method)
+                and getattr(type(module), method) is not getattr(base, method)
+            ]
+            if overridden:
+                return (
+                    f"its class {type(module).__name__} has its own "
+                    f"{overridden[0]}, which replacing the module would drop"
+                )
+    if module._forward_hooks or module._forward_pre_hooks:
+        return "it has forward hooks, which replacing the module would drop"
+    parts = path.split(".") if path else []
+    for depth in range(len(parts)):
+        ancestor_path = ".".join(parts[:depth])
+        ancestor = model.get_submodule(ancestor_path) if ancestor_path else model
+        if isinstance(ancestor, _CONTAINERS):
+            continue
+        if type(ancestor).__module__.startswith(("torch.nn", "torch.ao.nn")):
+            where = f"{ancestor_path!r}" if ancestor_path else "the model"
+            return (
+                f"it belongs to {where}, an nn.{type(ancestor).__name__}, whose "
+                "own code may read the module's parameters directly"
+            )
+    return None
+
+
+def _kept_warning(transform: str, path: str, reason: str) -> str:
+    name = repr(path) if path else "the model"
+    return f"fast mode left {name} without {transform}: {reason}"
+
+
 def _prune_linear_blocks(weight: torch.Tensor, fraction: float) -> torch.Tensor:
     """Prune contiguous groups of four inputs so Scratch can skip whole blocks."""
     result = weight.detach().clone()
@@ -219,8 +286,16 @@ def prepare_fast_matmul_weights(
     if weight.ndim != 2:
         return (weight,)
     inner, columns = weight.shape
-    rank = _selected_rank(weight, policy)
+    where = f"an x @ W weight of shape {tuple(weight.shape)}"
+    rank = _selected_rank(weight, policy, where)
     factors: tuple[torch.Tensor, ...]
+    if rank is not None and rank * (inner + columns) >= inner * columns:
+        from cattorch.errors import warn
+
+        warn(
+            f"{where} was exported without its low-rank factorization at rank {rank}, "
+            "which would not make it smaller or faster"
+        )
     if rank is not None and rank * (inner + columns) < inner * columns:
         matrix = weight.detach()
         svd_input = (
@@ -237,8 +312,10 @@ def prepare_fast_matmul_weights(
         factors = (first, second)
     else:
         factors = (weight.detach().clone(),)
-    if policy.pruning:
-        factors = tuple(_prune_matmul_blocks(factor, policy.pruning) for factor in factors)
+    if policy.block_pruning:
+        factors = tuple(
+            _prune_matmul_blocks(factor, policy.block_pruning) for factor in factors
+        )
     return factors
 
 
@@ -255,15 +332,17 @@ def _apply_pruning(module: nn.Module, fraction: float) -> None:
         child.weight = nn.Parameter(pruned, requires_grad=child.weight.requires_grad)
 
 
-def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
-    """Remove neurons from dataflow-connected Linear/activation/Linear MLPs."""
-    if not fraction:
-        return
-    activations = (
-        nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh, nn.Sigmoid,
-        nn.ELU, nn.LeakyReLU, nn.Identity,
-    )
-    try:
+class _ModelUses:
+    """How the exported methods use a model's modules, from ``torch.fx`` traces.
+
+    ``calls`` lists each module's calls; ``foreign`` holds the modules whose
+    parameters or buffers some code other than the module's own forward
+    reads directly (``x @ self.up.weight.T``), in any exported method. A
+    transform that rewrites a module's parameters would change those reads
+    too, so it leaves such a module alone.
+    """
+
+    def __init__(self, model: nn.Module, methods: tuple[str, ...]):
         from cattorch.experts import _BankedSparseMoE
 
         class _FastTransformTracer(Tracer):
@@ -272,17 +351,60 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
                     return True
                 return super().is_leaf_module(module, qualified_name)
 
-        tracer = _FastTransformTracer()
-        traced = GraphModule(model, tracer.trace(model))
-    except Exception:
-        log.warning("Skipping whole-neuron pruning because FX tracing was not available")
-        return
+        self.calls: dict[str, list] = {}
+        self.foreign: set[str] = set()
+        owners = {name for name, _ in model.named_modules()}
+        for method in dict.fromkeys(methods):
+            tracer = _FastTransformTracer()
+            tracer.traced_func_name = method
+            graph = GraphModule(model, tracer.trace(model)).graph
+            for node in graph.nodes:
+                if node.op == "call_module":
+                    self.calls.setdefault(str(node.target), []).append(node)
+                elif node.op == "get_attr":
+                    owner = str(node.target).rpartition(".")[0]
+                    if owner not in owners:
+                        continue
+                    stack = tuple(node.meta.get("nn_module_stack", {}).values())
+                    reader = stack[-1][0] if stack and stack[-1] else ""
+                    if reader != owner:
+                        self.foreign.add(owner)
 
+    def read_elsewhere(self, *paths: str) -> bool:
+        return any(path in self.foreign for path in paths)
+
+
+def _model_uses(model: nn.Module, methods: tuple[str, ...]) -> tuple[_ModelUses | None, str]:
+    """``_ModelUses``, or ``None`` and why ``torch.fx`` couldn't trace the model."""
+    try:
+        return _ModelUses(model, methods), ""
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else ""
+        return None, f"{type(error).__name__}: {reason}"
+
+
+def _skipped_warning(transform: str, paths: tuple[str, ...]) -> str:
+    names = " and ".join(f"{path!r}" for path in paths)
+    return (
+        f"fast mode left {names} without {transform}: the model also reads "
+        f"{'their' if len(paths) > 1 else 'its'} parameters directly, outside "
+        f"{'those modules' if len(paths) > 1 else 'the module'}, and those reads "
+        "must keep the original values"
+    )
+
+
+def _prune_sequential_neurons(model: nn.Module, fraction: float, uses: _ModelUses) -> None:
+    """Remove neurons from dataflow-connected Linear/activation/Linear MLPs."""
+    if not fraction:
+        return
+    from cattorch.errors import warn
+
+    activations = (
+        nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh, nn.Sigmoid,
+        nn.ELU, nn.LeakyReLU, nn.Identity,
+    )
     modules = dict(model.named_modules())
-    calls_by_target: dict[str, list] = {}
-    for node in traced.graph.nodes:
-        if node.op == "call_module":
-            calls_by_target.setdefault(str(node.target), []).append(node)
+    calls_by_target = uses.calls
 
     triples = []
     claimed: set[str] = set()
@@ -315,6 +437,18 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
             or up.out_features != down.in_features
             or up.out_features < 2
         ):
+            continue
+        if uses.read_elsewhere(up_path, down_path):
+            warn(_skipped_warning("neuron pruning", (up_path, down_path)))
+            claimed.update(paths)
+            continue
+        drops = [
+            (path, reason) for path in (up_path, down_path)
+            if (reason := _replacement_drops(model, path)) is not None
+        ]
+        if drops:
+            warn(_kept_warning("neuron pruning", drops[0][0], drops[0][1]))
+            claimed.update(paths)
             continue
         triples.append((up_path, down_path))
         claimed.update(paths)
@@ -359,7 +493,9 @@ def _prune_sequential_neurons(model: nn.Module, fraction: float) -> None:
         )
 
 
-def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
+def _prune_stacked_swiglu_neurons(
+    model: nn.Module, fraction: float, uses: _ModelUses | None,
+) -> None:
     """Remove shared hidden channels from banked SwiGLU experts.
 
     Every expert retains the same channel IDs, so the stacked bank geometry and
@@ -371,6 +507,11 @@ def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
 
     for name, module in model.named_modules():
         if not isinstance(module, StackedSwiGLUMoE):
+            continue
+        if uses is not None and uses.read_elsewhere(name):
+            from cattorch.errors import warn
+
+            warn(_skipped_warning("neuron pruning", (name,)))
             continue
         hidden = module.gate_weight.shape[1]
         keep_count = max(1, hidden - math.floor(hidden * fraction))
@@ -402,10 +543,18 @@ def _prune_stacked_swiglu_neurons(model: nn.Module, fraction: float) -> None:
         )
 
 
-def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
-    """Return an independently transformed model for fast export."""
+def prepare_fast_model(
+    model: nn.Module, config: FastConfig, *, methods: tuple[str, ...] = ("forward",),
+) -> nn.Module:
+    """Return an independently transformed model for fast export.
+
+    ``methods`` are the methods the export runs, such as a program's entry
+    points: a module whose parameters any of them reads directly is left
+    untransformed, with a warning.
+    """
     if not config.has_weight_transforms:
         return model
+    from cattorch.errors import UnsupportedModelError, warn
 
     # Generic expert templates are compiled once against fixed bank geometry.
     # Kernel-level approximations remain valid, but changing hidden widths or
@@ -421,13 +570,23 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
         for name in config.overrides for prefix in expert_prefixes
     ):
         raise ValueError(
-            "fast weight overrides cannot change topology inside a generic "
+            "fast weight overrides can't change topology inside a generic "
             "ExpertFamily; approximate kernels remain available"
         )
 
     transformed = copy.deepcopy(model)
-    _prune_sequential_neurons(transformed, config.neuron_pruning)
-    _prune_stacked_swiglu_neurons(transformed, config.neuron_pruning)
+    uses, untraceable = _model_uses(transformed, methods)
+    if config.neuron_pruning:
+        if uses is None:
+            raise UnsupportedModelError(
+                "FastConfig(neuron_pruning=...) finds Linear, activation, Linear chains "
+                "with torch.fx symbolic tracing, which can't trace this model "
+                f"({untraceable}); export it with neuron_pruning=0"
+            )
+        _prune_sequential_neurons(transformed, config.neuron_pruning, uses)
+        _prune_stacked_swiglu_neurons(transformed, config.neuron_pruning, uses)
+        # The hidden widths changed: trace the pruned model again.
+        uses, untraceable = _model_uses(transformed, methods)
     if isinstance(transformed, (nn.Linear, nn.Conv1d, nn.Conv2d)):
         unknown = sorted(set(config.overrides) - {"<root>"})
         if unknown:
@@ -437,14 +596,25 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
         policy = config.policy_for("<root>")
         rank = _selected_rank(transformed.weight, policy)
         replacement = None
+        drops = _replacement_drops(transformed, "") if rank is not None else None
+        if drops is not None:
+            warn(_kept_warning("its low-rank factorization", "", drops))
+            rank = None
         if rank is not None:
             replacement = (
                 _factor_linear(transformed, rank)
                 if isinstance(transformed, nn.Linear)
                 else _factor_conv(transformed, rank)
             )
+            if replacement is None:
+                from cattorch.errors import warn
+
+                warn(
+                    f"the model was exported without its low-rank factorization at rank "
+                    f"{rank}, which would not make it smaller or faster"
+                )
         target = replacement if replacement is not None else transformed
-        _apply_pruning(target, policy.pruning)
+        _apply_pruning(target, policy.block_pruning)
         return target
 
     eligible = [
@@ -457,26 +627,60 @@ def prepare_fast_model(model: nn.Module, config: FastConfig) -> nn.Module:
     if unknown:
         raise ValueError(f"unknown or ineligible fast module override(s): {', '.join(unknown)}")
 
+    # Modules replaced by their low-rank factors, which keep their paths;
+    # quantization overrides name the model's own parameters through them.
+    factorized: list[str] = []
+    unchecked = []
     for name, module in eligible:
         policy = config.policy_for(name)
         if not policy.enabled:
             continue
-        rank = _selected_rank(module.weight, policy)
+        if uses is None:
+            if policy.block_pruning:
+                unchecked.append(name)
+        elif uses.read_elsewhere(name):
+            warn(_skipped_warning("its low-rank factorization and block pruning", (name,)))
+            continue
+        rank = _selected_rank(module.weight, policy, repr(name))
         replacement = None
+        drops = _replacement_drops(transformed, name) if rank is not None else None
+        if drops is not None:
+            warn(_kept_warning("its low-rank factorization", name, drops))
+            rank = None
         if rank is not None:
             if isinstance(module, nn.Linear):
                 replacement = _factor_linear(module, rank)
             else:
                 replacement = _factor_conv(module, rank)
             if replacement is None:
-                log.warning("Skipping non-beneficial low-rank transform for %s", name)
+                from cattorch.errors import warn
+
+                warn(
+                    f"{name!r} was exported without its low-rank factorization at rank "
+                    f"{rank}, which would not make it smaller or faster"
+                )
             else:
                 parent_name, _, child_name = name.rpartition(".")
                 parent = transformed.get_submodule(parent_name) if parent_name else transformed
                 setattr(parent, child_name, replacement)
+                factorized.append(name)
                 log.info("Fast factorized %s at rank %d", name, rank)
         target = replacement if replacement is not None else module
-        _apply_pruning(target, policy.pruning)
-        if policy.pruning:
-            log.info("Fast pruned %.1f%% of Scratch blocks in %s", policy.pruning * 100, name)
+        _apply_pruning(target, policy.block_pruning)
+        if policy.block_pruning:
+            log.info(
+                "Fast pruned %.1f%% of Scratch blocks in %s", policy.block_pruning * 100, name,
+            )
+    if factorized:
+        transformed._cattorch_replaced_modules = {
+            **getattr(transformed, "_cattorch_replaced_modules", {}),
+            **{name: ("factorized", None) for name in factorized},
+        }
+    if unchecked:
+        warn(
+            "fast mode couldn't check whether the model reads the weights of "
+            f"{', '.join(repr(name) for name in unchecked)} directly, outside those "
+            f"modules, because torch.fx can't trace it ({untraceable}); any such "
+            "read uses the block-pruned weights too"
+        )
     return transformed

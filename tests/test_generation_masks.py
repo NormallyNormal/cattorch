@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import math
-import sys
-import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -14,10 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cattorch import CodegenConfig, GenerationProgram, transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_generation_automatic import load_sprite, nano, prefill_and_decode  # noqa: E402
+from shared_models import nano
+from cattorch.interface import TOKEN_IDS
+from sprite_helpers import SpriteEmulator, load_emulator, load_sprite, prefill_and_decode
 
 CONTEXT, VOCAB, WIDTH, HEADS = 16, 24, 16, 2
 
@@ -74,7 +70,7 @@ def test_masks_biases_and_sinks_generate_with_a_cache(tmp_path, kind):
     model = MaskedLM(kind).eval()
     result = transpile(model, GenerationProgram(max_context=12), tmp_path / kind)
     # Decoding past the window shows that old keys drop out.
-    prefill_and_decode(ScratchEmulator(load_sprite(result.path)), model, [3, 1, 4, 1], [5, 9, 2])
+    prefill_and_decode(SpriteEmulator(load_sprite(result.path)), model, [3, 1, 4, 1], [5, 9, 2])
 
 
 @torch.no_grad()
@@ -84,7 +80,7 @@ def test_alibi_with_the_fast_kernel(tmp_path):
     result = transpile(
         model, GenerationProgram(max_context=12), tmp_path / "fast", optimization="fast",
     )
-    prefill_and_decode(ScratchEmulator(load_sprite(result.path)), model, [3, 1, 4], [1, 5])
+    prefill_and_decode(SpriteEmulator(load_sprite(result.path)), model, [3, 1, 4], [1, 5])
 
 
 @torch.no_grad()
@@ -98,8 +94,7 @@ def test_huggingface_sliding_window_model_generates(tmp_path):
     )
     model = transformers.AutoModelForCausalLM.from_config(config).eval()
     result = transpile(model, GenerationProgram(max_context=10), tmp_path / "mistral")
-    with zipfile.ZipFile(result.path) as archive:
-        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator = load_emulator(result.path)
     prefill_and_decode(emulator, model, [3, 17, 5], [40, 9, 2])
 
 
@@ -122,7 +117,7 @@ def test_hidden_prefill_skips_the_final_query_projection(tmp_path, monkeypatch):
     import cattorch.transpiler as transpiler
 
     model = nano()
-    options = dict(codegen=CodegenConfig(layer_sharing="off"))
+    options = dict(codegen=CodegenConfig(layer_sharing=False))
     guarded = load_sprite(transpile(
         model, GenerationProgram(max_context=12), tmp_path / "hidden", **options,
     ).path)
@@ -133,12 +128,12 @@ def test_hidden_prefill_skips_the_final_query_projection(tmp_path, monkeypatch):
     assert _project_output_guards(guarded) > _project_output_guards(unguarded)
 
     def prefill_cost(sprite):
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
-        emulator.lists["cattorch tokens"] = [3, 1, 4, 1, 5]
+        emulator.lists[TOKEN_IDS] = [3, 1, 4, 1, 5]
         emulator.run_procedure("cattorch prefill")
         return sum(emulator.opcode_counts.values()) - before
 
     assert prefill_cost(guarded) < prefill_cost(unguarded)
-    prefill_and_decode(ScratchEmulator(guarded), model, [3, 1, 4, 1, 5], [9])
+    prefill_and_decode(SpriteEmulator(guarded), model, [3, 1, 4, 1, 5], [9])

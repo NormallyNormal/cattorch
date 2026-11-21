@@ -15,21 +15,24 @@ attention, ``use_cache=False``) and the registered adapters.
 from __future__ import annotations
 
 import operator
-import copy
 from dataclasses import dataclass
 from math import prod
 from types import MappingProxyType
+from collections.abc import Callable, Iterable
 from typing import Any, Mapping
 
 import torch
 import torch.fx
 import torch.nn as nn
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from cattorch.errors import UnsupportedModelError
+from cattorch.quantization import _parameter_elements
 from cattorch.frontend import (
     FALLBACK_META, CapturedGraph, capture_model, tensor_output_leaves,
 )
-from cattorch.graph import _unsupported_operation, fold_static_values
+from cattorch.graph import fold_static_values
 from cattorch.program_runtime import MethodModule
 
 __all__ = [
@@ -121,6 +124,11 @@ class SequenceTable:
     consumers: tuple[str, ...]
     kind: str
     module_path: str | None
+    # The parameter whose elements the table holds, with the element at
+    # each of the table's positions, when it holds one parameter's
+    # elements as they are, as a learned position table read with
+    # ``torch.arange`` does. The quantization report names it.
+    sources: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -319,30 +327,29 @@ def _module_path(node) -> str | None:
 
 
 def _where(node) -> str:
+    """The operation a node runs and the module it came from, for messages."""
     path = _module_path(node)
-    return f"{node.target}" + (f" at {path}" if path else "")
+    return f"`{_op_name(node)}`" + (f" in module {path!r}" if path else "")
 
 
 def _require_same_structure(long_nodes, short_nodes) -> None:
     for position, (a, b) in enumerate(zip(long_nodes, short_nodes)):
         if (a.op, str(a.target)) != (b.op, str(b.target)):
             raise UnsupportedModelError(
-                "the model's graph changes with the sequence length: node "
-                f"{position} is {a.op} {a.target} at the longest length and "
-                f"{b.op} {b.target} at one token fewer ({_where(a)}); "
-                "length-dependent Python branches (such as an `if` on "
-                "tokens.shape[1]) cannot be cached"
+                "the model computes something else when the sequence is one token "
+                f"shorter: operation {position + 1} is {_where(a)} at the longest "
+                f"length and {_where(b)} at one token fewer; length-dependent Python "
+                "branches (such as an `if` on tokens.shape[1]) can't be cached"
             )
     if len(long_nodes) != len(short_nodes):
         extra = (long_nodes if len(long_nodes) > len(short_nodes) else short_nodes)[
             min(len(long_nodes), len(short_nodes))
         ]
         raise UnsupportedModelError(
-            "the model's graph changes with the sequence length: "
-            f"{len(long_nodes)} nodes at the longest length against "
-            f"{len(short_nodes)} at one token fewer, first extra node "
-            f"{extra.target} ({_where(extra)}); length-dependent Python "
-            "branches cannot be cached"
+            "the model computes something else when the sequence is one token "
+            f"shorter: {len(long_nodes)} operations at the longest length against "
+            f"{len(short_nodes)} at one token fewer, the first extra one "
+            f"{_where(extra)}; length-dependent Python branches can't be cached"
         )
 
 
@@ -494,7 +501,7 @@ def _pair_arguments(node, short_node, pair, static, short_static, out) -> None:
                 raise UnsupportedModelError(
                     f"{_where(node)}: argument {location} has a different "
                     "length at one token fewer; length-dependent Python "
-                    "branches cannot be cached"
+                    "branches can't be cached"
                 )
             for i, (x, y) in enumerate(zip(a, b)):
                 walk(x, y, (*location, i))
@@ -552,7 +559,7 @@ _POINTWISE = frozenset({
     "hardswish", "hardsigmoid", "mish", "nan_to_num", "dropout", "contiguous",
     "clone", "alias", "detach", "detach_", "lift_fresh_copy", "type_as", "copy",
     "isnan", "isinf", "full_like", "ones_like", "zeros_like", "rotary_embedding", "rotary_half",
-    "_assert_tensor_metadata",
+    "_assert_tensor_metadata", "check_index",
 })
 # Operations that only relabel axes: each input axis survives in the output.
 _RELABEL = frozenset({
@@ -612,10 +619,36 @@ def _dims(node, ndim: int, spec) -> set[int]:
     return {_normalize(int(dim), ndim) for dim in value}
 
 
-def _mixing(node, detail: str):
-    return _unsupported_operation(
-        node, f"{detail}; automatic generation allows mixing tokens only in causal attention"
+_RECURRENT_OPERATIONS = frozenset({
+    "recurrent_scan", "recurrent_final", "gru", "lstm", "rnn_tanh", "rnn_relu",
+})
+
+
+def _requirement(node, detail: str) -> UnsupportedModelError:
+    """A ``GenerationProgram`` requirement ``node`` doesn't meet.
+
+    The operation itself is supported; what it does to the sequence isn't
+    something a one-token step can reproduce.
+    """
+    path = _module_path(node)
+    where = f" in module {path!r}" if path else ""
+    return UnsupportedModelError(
+        f"GenerationProgram can't generate this model one token at a time: "
+        f"`{_op_name(node)}`{where}: {detail}"
     )
+
+
+def _mixing(node, detail: str) -> UnsupportedModelError:
+    detail = f"{detail}; automatic generation allows mixing tokens only in causal attention"
+    if _op_name(node) in _RECURRENT_OPERATIONS:
+        # A GRU, LSTM or RNN carries a state from one token to the next.
+        detail += (
+            ". This is a recurrent layer: export the model with a "
+            "RecurrentGenerationProgram and a step method that takes and returns "
+            "its state (see https://github.com/NormallyNormal/cattorch/blob/main/"
+            "docs/recurrent-generation.md)"
+        )
+    return _requirement(node, detail)
 
 
 def _check_row_wise(nodes, live, static, infos, internal) -> None:
@@ -712,11 +745,10 @@ def _check_node(node, info, inputs, infos) -> None:
         if ndim - 1 in axes:
             raise _mixing(node, "experts mix the sequence as features")
         return
-    raise _unsupported_operation(
+    raise _mixing(
         node,
         "not known to act on each token independently, but its input has a "
-        "sequence axis; automatic generation allows mixing tokens only in "
-        "causal attention",
+        "sequence axis",
     )
 
 
@@ -813,11 +845,12 @@ def _scalar(value):
 
 def _match_attention(index, softmax, infos, values, short_values, pair) -> AttentionBlock:
     path = _module_path(softmax)
+    where = repr(path) if path else "the model's top level"
 
     def reject(detail):
-        return _unsupported_operation(
+        return _requirement(
             softmax,
-            f"softmax over the sequence is not a recognised attention pattern "
+            f"softmax over the sequence isn't a recognised attention pattern "
             f"({detail}); expected matmul(q, k^T) -> [scale] -> causal mask -> "
             "softmax -> matmul(p, v)",
         )
@@ -946,14 +979,14 @@ def _match_attention(index, softmax, infos, values, short_values, pair) -> Atten
 
     if not masks:
         raise UnsupportedModelError(
-            f"attention over the sequence isn't causal at {path}: the softmax node "
-            f"{softmax.name} has no mask, so every token attends to later "
-            "tokens (a bidirectional model such as BERT)"
+            f"attention over the sequence isn't causal at {where}: its softmax has "
+            "no mask, so every token attends to later tokens (a bidirectional "
+            "model such as BERT)"
         )
     if sink_node is not None and not sink_dropped:
         raise reject("the sink column is not dropped before matmul(p, v)")
     window, slopes = _check_causal(
-        masks, values, short_values, pair, path, int(n_heads),
+        masks, values, short_values, pair, where, int(n_heads),
     )
     sinks = None
     if sink_node is not None:
@@ -1137,7 +1170,7 @@ def _check_causal(masks, values, short_values, pair, path, heads) -> tuple[int, 
         wrong = (allowed != expected).nonzero()
         if len(wrong):
             r, c = (int(v) for v in wrong[0])
-            what = "attends to" if bool(allowed[r, c]) else "cannot attend to"
+            what = "attends to" if bool(allowed[r, c]) else "can't attend to"
             raise UnsupportedModelError(
                 f"attention over the sequence isn't causal at {path}: {label}"
                 f"token {r} {what} token {c} (each token may attend to itself and "
@@ -1206,7 +1239,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
         if not info.sequence_axes or not consumers:
             continue
         if len(info.sequence_axes) != 1 or info.sequence_axes[0].stride != 1:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
                 f"a static tensor of shape {info.shape} is used outside attention "
                 "and has more than one growing axis or merges the sequence "
@@ -1215,9 +1248,9 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
         value = values.get(node.name)
         short_value = short_values.get(pair[node.name].name)
         if value is None or short_value is None:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
-                "a sequence-length-dependent constant could not be evaluated at "
+                "a constant that depends on the sequence length couldn't be evaluated at "
                 "export time",
             )
         axis = info.sequence_axes[0].axis
@@ -1227,7 +1260,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
             if prefix.dtype.is_floating_point else torch.equal(prefix, short_value)
         )
         if prefix.shape != short_value.shape or not close:
-            raise _unsupported_operation(
+            raise _requirement(
                 node,
                 f"the table's first {length - 1} rows at {length} tokens differ "
                 f"from the table at {length - 1} tokens (axis {axis}); rows must "
@@ -1247,6 +1280,7 @@ def _find_tables(nodes, live, static, infos, values, short_values, pair, interna
             consumers=tuple(user.name for user in consumers),
             kind=kind,
             module_path=info.module_path,
+            sources=_parameter_elements(nodes, values, node.name),
         ))
     return tables
 
@@ -1267,6 +1301,25 @@ class SequenceStepModule(torch.fx.GraphModule):
 
     def __init__(self, root, graph):
         super().__init__(root, graph, "SequenceStepModule")
+
+    def __deepcopy__(self, memo):
+        # ``GraphModule`` copies only what its graph reads; the copy keeps
+        # which parameter elements its position tables hold (see
+        # ``quantization._storage_sources``). A parameter the step holds is
+        # named as the copy holds it; any other is the model's own, which
+        # the quantization report knows it by.
+        result = super().__deepcopy__(memo)
+        sources = self.__dict__.get("_cattorch_storage_sources")
+        if sources is not None:
+            held = {id(value) for value in (*self.parameters(), *self.buffers())}
+            result._cattorch_storage_sources = {
+                name: (
+                    memo.get(id(parameter), parameter) if id(parameter) in held else parameter,
+                    positions,
+                )
+                for name, (parameter, positions) in sources.items()
+            }
+        return result
 
     def cache_buffers(self) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
         """``(block index, k_cache, v_cache)`` per attention block, in order."""
@@ -1330,7 +1383,7 @@ def build_step_module(
             owner = removed.get(node.name)
             raise UnsupportedModelError(
                 f"{_where(node)}: the value is used outside the attention block "
-                f"{owner} it belongs to, so the block cannot be replaced by a cached step"
+                f"{owner} it belongs to, so the block can't be replaced by a cached step"
             ) if owner else UnsupportedModelError(
                 f"{_where(node)}: the node was not carried into the step graph"
             )
@@ -1354,6 +1407,8 @@ def build_step_module(
             internal.setdefault(name, block.module_path or f"#{block.index}")
     tables = {table.node: table for table in plan.tables}
     table_buffers: list[tuple[torch.Tensor, str]] = []
+    # See ``quantization._storage_sources``.
+    storage_sources: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def table_buffer(table: SequenceTable) -> str:
         for value, name in table_buffers:
@@ -1366,6 +1421,8 @@ def build_step_module(
         name = f"table_{len(table_buffers)}"
         table_buffers.append((table.value, name))
         root.register_buffer(name, table.value.detach().clone())
+        if table.sources is not None and table.sources[1].shape == table.value.shape:
+            storage_sources[name] = table.sources
         return name
 
     diffs: dict[str, list[LiteralDiff]] = {}
@@ -1469,6 +1526,7 @@ def build_step_module(
     # output node; node order is already that.
     graph.lint()
     step = SequenceStepModule(root, graph)
+    step._cattorch_storage_sources = storage_sources
     step.eval()
     return step
 
@@ -1496,9 +1554,132 @@ def _vocabulary_size(plan: SequencePlan) -> int:
         ):
             frontier.add(node.name)
     raise UnsupportedModelError(
-        "cannot find the vocabulary size: the token input is not looked up in an "
+        "can't find the vocabulary size: the token input is not looked up in an "
         "embedding table; automatic generation needs token ids"
     )
+
+
+def row_mismatch(
+    actual: torch.Tensor, expected: torch.Tensor, rtol: float,
+) -> tuple[float, float] | None:
+    """``(largest error, row scale)`` if a step's row differs from the model's.
+
+    The rows differ when an error exceeds ``rtol`` times the largest finite
+    value of ``expected``, or they disagree on which values are finite. Equal
+    values, such as -inf for a banned token, match exactly.
+    """
+    same = actual.double() == expected.double()
+    error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
+    largest = float(error.max()) if error.numel() else 0.0
+    finite = expected.double()[torch.isfinite(expected)].abs()
+    scale = float(finite.max()) if finite.numel() else 0.0
+    if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
+            or largest > rtol * max(scale, 1e-3) or largest != largest:
+        return largest, scale
+    return None
+
+
+class EmbeddingLookup(TorchDispatchMode):
+    """Record the embedding tables a call looks its token up in.
+
+    A tensor stands for the token when it has one element holding the
+    token's value and was computed from the token alone, by whatever
+    operation: a view, selection, copy, reshape or dtype change of it.
+    """
+
+    def __init__(self, token: torch.Tensor):
+        super().__init__()
+        self.value = int(token)
+        self.token_values = [token]
+        # Rows of the first table looked up with the token.
+        self.rows: int | None = None
+        # Rows of every table looked up with a one-element index.
+        self.tables: set[int] = set()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        if func is torch.ops.aten.embedding.default:
+            rows = int(args[0].shape[0])
+            if args[1].numel() == 1:
+                self.tables.add(rows)
+            if self.rows is None and self._token(args[1]):
+                self.rows = rows
+            return result
+        inputs = [
+            value for value in pytree.tree_leaves((args, kwargs)) if isinstance(value, torch.Tensor)
+        ]
+        if inputs and all(self._token(value) for value in inputs):
+            self.token_values.extend(
+                value for value in pytree.tree_leaves(result)
+                if isinstance(value, torch.Tensor) and value.numel() == 1
+                and value.dtype != torch.bool and not value.is_complex()
+                and value.item() == self.value
+            )
+        return result
+
+    def _token(self, value) -> bool:
+        return any(value is token for token in self.token_values)
+
+
+def lookup_vocabulary(
+    run: Callable[[torch.Tensor], object], first: EmbeddingLookup,
+) -> int | None:
+    """The rows of the table ``run`` looks a ``[1, 1]`` token up in, if any.
+
+    ``first`` watched ``run`` on token 0, which can't tell the token from a
+    constant 0 index. So each table size it saw is tried as the vocabulary:
+    with its last token, from the largest. A table larger than the token's
+    makes the call fail or not look the token up.
+    """
+    for rows in sorted(first.tables, reverse=True):
+        if rows < 2:
+            break
+        lookup = EmbeddingLookup(torch.full((1, 1), rows - 1, dtype=torch.long))
+        try:
+            with torch.no_grad(), lookup:
+                run(lookup.token_values[0])
+        except (IndexError, RuntimeError):
+            continue
+        if lookup.rows is not None:
+            return lookup.rows
+    return 1 if first.rows == 1 else None
+
+
+def check_calibration_tokens(
+    sequences: Iterable, vocabulary: int | None, max_context: int | None = None,
+) -> list:
+    """Generation ``calibration=`` as a list, each item a ``[1, length]``
+    token tensor (a batch of rows is accepted too) of at most
+    ``max_context`` tokens, and each token checked against ``vocabulary``."""
+    checked = list(sequences)
+    allowed = (
+        f"from 0 to {vocabulary - 1}" if vocabulary is not None else "of 0 or more"
+    )
+    for index, sequence in enumerate(checked):
+        tokens = sequence[0] if isinstance(sequence, tuple) and sequence else sequence
+        if not isinstance(tokens, torch.Tensor) or tokens.is_complex():
+            continue
+        longest = f" of 1 to {max_context} tokens" if max_context is not None else ""
+        if tokens.ndim != 2 or tokens.shape[1] < 1 or (
+            max_context is not None and tokens.shape[1] > max_context
+        ):
+            raise ValueError(
+                f"calibration[{index}] has shape {tuple(tokens.shape)}; a generation "
+                f"export's calibration= takes [1, length] token tensors{longest}"
+            )
+        flat = tokens.detach().flatten().double()
+        wrong = (flat != flat.round()) | (flat < 0)
+        if vocabulary is not None:
+            wrong |= flat >= vocabulary
+        if bool(wrong.any()):
+            position = int(wrong.nonzero()[0])
+            value = tokens.flatten()[position].item()
+            raise ValueError(
+                f"calibration[{index}] has token {value} at position {position}; "
+                f"token IDs must be whole numbers {allowed}"
+            )
+    return checked
 
 
 def check_step_equivalence(
@@ -1511,14 +1692,18 @@ def check_step_equivalence(
 ) -> None:
     """Run the step module token by token against the stateless model.
 
-    Every output row must match ``adapted(tokens)`` within ``rtol`` (relative to
-    the largest value in the row). Raises :class:`UnsupportedModelError`
-    otherwise. The step module is reset before and after.
+    Every output row of the first ``min(max_context, 32)`` tokens must match
+    ``adapted(tokens)`` within ``rtol`` (relative to the largest value in the
+    row). The model's answer for a token must also not change with the
+    prompt's length: it is compared at a spread of lengths up to
+    ``max_context`` with its answer for the full ``max_context`` tokens. Raises
+    :class:`UnsupportedModelError` otherwise. The step module is reset before
+    and after.
     """
     length = min(plan.max_context, 32)
     generator = torch.Generator().manual_seed(seed)
     vocabulary = _vocabulary_size(plan)
-    tokens = torch.randint(0, vocabulary, (1, length), generator=generator)
+    tokens = torch.randint(0, vocabulary, (1, plan.max_context), generator=generator)
     names = plan.long.user_output_names
     with torch.no_grad():
         reference = tensor_output_leaves(adapted(tokens), warn=False)
@@ -1526,7 +1711,7 @@ def check_step_equivalence(
         # length, such as dynamic NTK RoPE, matches only at the full length.
         prefixes = {
             count: tensor_output_leaves(adapted(tokens[:, :count]), warn=False)
-            for count in sorted({1, length // 2, length - 1}) if 0 < count < length
+            for count in _prefix_lengths(length, plan.max_context)
         }
         step.reset()
         try:
@@ -1544,14 +1729,9 @@ def check_step_equivalence(
                     f"{tuple(actual.shape)} but the model gives {tuple(expected.shape)} "
                     f"for token {row}"
                 )
-            # Equal values, such as -inf for a banned token, match exactly.
-            same = actual.double() == expected.double()
-            error = torch.where(same, 0.0, (actual.double() - expected.double()).abs())
-            largest = float(error.max()) if error.numel() else 0.0
-            finite = expected.double()[torch.isfinite(expected)].abs()
-            scale = float(finite.max()) if finite.numel() else 0.0
-            if not bool(torch.isfinite(actual).all() == torch.isfinite(expected).all()) \
-                    or largest > rtol * max(scale, 1e-3) or largest != largest:
+            mismatch = row_mismatch(actual, expected, rtol)
+            if mismatch is not None:
+                largest, scale = mismatch
                 overall = max(
                     float((rows[r][leaf].double() - reference[leaf].narrow(axis.axis, r, 1).double()).abs().max())
                     for r in range(length)
@@ -1564,13 +1744,13 @@ def check_step_equivalence(
                     "token from its own row and earlier tokens only"
                 )
 
-    # The cached step matches the full prompt; check it is the model's answer
-    # for shorter prompts too.
+    # The cached step matches the full prompt; check the full prompt's
+    # answer for each token is the model's answer for shorter prompts too.
     for count, shorter in prefixes.items():
         for name, axis in plan.outputs:
             leaf = names.index(name)
             expected = shorter[leaf].narrow(axis.axis, count - 1, 1)
-            actual = rows[count - 1][leaf]
+            actual = reference[leaf].narrow(axis.axis, count - 1, 1)
             scale = float(expected.double().abs().max()) if expected.numel() else 0.0
             if actual.shape != expected.shape or not torch.allclose(
                 actual.double(), expected.double(), rtol=0, atol=rtol * max(scale, 1e-3),
@@ -1578,9 +1758,26 @@ def check_step_equivalence(
             ):
                 raise UnsupportedModelError(
                     f"the model's output for token {count} changes when more tokens "
-                    "follow it, so it can't be generated one token at a time; for "
-                    "example, its positions are scaled by the prompt length"
+                    "follow it, so it can't be generated one token at a time: "
+                    "something in it depends on the prompt's length, such as a "
+                    "Python branch on tokens.shape[1] or positions scaled by the "
+                    "length (dynamic NTK RoPE). Compute each token from itself and "
+                    "earlier tokens only"
                 )
+
+
+def _prefix_lengths(stepped: int, max_context: int) -> list[int]:
+    """Prompt lengths to compare with the full ``max_context`` tokens.
+
+    The tokens the step was run over, and a spread up to ``max_context``,
+    so that a model depending on the prompt's length shows at one of them.
+    About a dozen, whatever ``max_context`` is, to keep the cost bounded.
+    """
+    spread = {round(max_context * eighth / 8) for eighth in range(1, 8)}
+    return sorted(
+        count for count in {1, 2, stepped // 2, stepped - 1, stepped, max_context - 1} | spread
+        if 0 < count < max_context
+    )
 
 
 def build_generation_step(

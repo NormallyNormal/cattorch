@@ -52,7 +52,9 @@ def _remap_input(value, mapping: dict[str, str]):
     return result
 
 
-def _remap_blocks(blocks: dict, mapping: dict[str, str]) -> dict:
+def _remap_blocks(
+    blocks: dict, mapping: dict[str, str], share_unchanged: bool = False,
+) -> dict:
     remapped = {}
     for identifier, original in blocks.items():
         block = _copy(original)
@@ -86,11 +88,17 @@ def _remap_blocks(blocks: dict, mapping: dict[str, str]) -> dict:
                     [mapping.get(item, item) for item in argument_ids],
                     separators=(",", ":"),
                 )
+        if share_unchanged and block == original:
+            # Nothing in it was remapped: keep the caller's block and let
+            # the copy go, so unchanged blocks are never held twice.
+            block = original
         remapped[mapping.get(identifier, identifier)] = block
     return remapped
 
 
-def remap_ids(data: dict, mapping: dict[str, str]) -> dict:
+def remap_ids(
+    data: dict, mapping: dict[str, str], *, share_unchanged: bool = False,
+) -> dict:
     """Return ``data`` with Scratch IDs remapped without changing literals.
 
     ``data`` may be a complete sprite dictionary or a block dictionary. Only
@@ -98,17 +106,21 @@ def remap_ids(data: dict, mapping: dict[str, str]) -> dict:
     variable values and list contents are deliberately preserved; treating all
     equal JSON strings as references corrupts token vocabularies when a block
     happens to have an ID such as ``"a"``.
+
+    ``share_unchanged`` returns the input's own objects for blocks that hold
+    no remapped ID instead of copies, for a caller that replaces its block
+    dictionary with the result and keeps no other use of the input.
     """
     mapping = {key: value for key, value in mapping.items() if key != value}
     if not mapping:
         return data
 
     if "blocks" not in data:
-        return _remap_blocks(data, mapping)
+        return _remap_blocks(data, mapping, share_unchanged)
 
     # Blocks are rebuilt by _remap_blocks; everything else is copied once.
     result = {key: _copy(value) for key, value in data.items() if key != "blocks"}
-    result["blocks"] = _remap_blocks(data.get("blocks", {}), mapping)
+    result["blocks"] = _remap_blocks(data.get("blocks", {}), mapping, share_unchanged)
     for section in ("variables", "lists", "broadcasts"):
         result[section] = {
             mapping.get(identifier, identifier): value

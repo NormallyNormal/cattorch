@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 from torch import nn
 from torch.utils._pytree import tree_flatten
@@ -23,6 +25,74 @@ class MethodModule(nn.Module):
         return getattr(self.model, self.method)(*args)
 
 
+_CONTAINERS = (list, tuple, dict, OrderedDict, set)
+
+
+def _copied_containers(value, memo: dict):
+    """``value`` with its lists, tuples, dicts and sets copied, at any depth.
+
+    Everything else, tensors and modules included, is kept as it is.
+    ``memo`` keeps containers shared between attributes shared in the copy.
+    """
+    kind = type(value)
+    if kind not in _CONTAINERS:
+        return value
+    if id(value) in memo:
+        return memo[id(value)]
+    if kind is tuple:
+        copied = tuple(_copied_containers(item, memo) for item in value)
+        memo[id(value)] = copied
+        return copied
+    result = kind()
+    memo[id(value)] = result
+    if kind is list:
+        result.extend(_copied_containers(item, memo) for item in value)
+    elif kind is set:
+        result.update(value)
+    else:
+        for key, item in value.items():
+            result[key] = _copied_containers(item, memo)
+    return result
+
+
+class ModuleState:
+    """The Python attributes of a model's modules, to put back later.
+
+    A method can change its module as it runs: set ``self.scale = 2.0``,
+    fill a dict, reassign a buffer. Tracing or calling entry points one
+    after another on one model would let one's changes reach the next.
+    :meth:`restore` puts every module's attributes back as they were when
+    this was made, with fresh copies of their containers each time.
+    Tensors themselves aren't copied; an in-place update of a tensor that
+    isn't a state fails the export anyway. ``user_only`` leaves the
+    attributes every module has (parameters, buffers, submodules, hooks)
+    alone, keeping only those the module's own code sets.
+    """
+
+    def __init__(self, model: nn.Module, *, user_only: bool = False):
+        internals = frozenset(nn.Module().__dict__) if user_only else frozenset()
+        memo: dict = {}
+        # Each attribute is copied on its own: ``memo`` is keyed by ``id``,
+        # which a temporary dict of them would hand on to the next one.
+        self.saved = [
+            (module, {
+                key: _copied_containers(value, memo)
+                for key, value in vars(module).items() if key not in internals
+            }, internals)
+            for module in model.modules()
+        ]
+
+    def restore(self) -> None:
+        memo: dict = {}
+        for module, saved, internals in self.saved:
+            kept = {key: value for key, value in vars(module).items() if key in internals}
+            module.__dict__.clear()
+            module.__dict__.update(
+                (key, _copied_containers(value, memo)) for key, value in saved.items()
+            )
+            module.__dict__.update(kept)
+
+
 def entry_examples(program, entrypoint):
     """Capture one append row while retaining its declared runtime bounds."""
     states = {state.name: state for state in program.states}
@@ -32,8 +102,9 @@ def entry_examples(program, entrypoint):
         if isinstance(binding, Input):
             if binding.dynamic is not None:
                 # Traced with one row, like append state.
-                dynamic_inputs[len(args)] = (binding.name, *binding.dynamic)
-                args.append(binding.example[:1])
+                ((axis, (minimum, maximum)),) = binding.dynamic.items()
+                dynamic_inputs[len(args)] = (binding.name, minimum, maximum, axis)
+                args.append(binding.example.narrow(axis, 0, 1))
             else:
                 args.append(binding.example)
         else:
@@ -43,6 +114,7 @@ def entry_examples(program, entrypoint):
                     state.name,
                     int(state.initial.shape[0]),
                     int(state.capacity),
+                    0,
                 )
                 args.append(state.initial.new_zeros((1, *state.initial.shape[1:])))
             else:
@@ -65,7 +137,7 @@ def validate_entry_outputs(program, entrypoint, specs):
     """Validate the same return bindings in analysis and sprite assembly."""
     if len(specs) != len(entrypoint.returns):
         raise UnsupportedModelError(
-            f"entrypoint {entrypoint.name!r} returns {len(specs)} tensor leaves "
+            f"entry point {entrypoint.name!r} returns {len(specs)} tensor leaves "
             f"but declares {len(entrypoint.returns)} bindings"
         )
     states = {state.name: state for state in program.states}
@@ -79,7 +151,7 @@ def validate_entry_outputs(program, entrypoint, specs):
             # An input and output with one name share a Scratch list, which
             # only works as an in-place update of the same shape.
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} output {binding.name!r} has shape "
+                f"entry point {entrypoint.name!r} output {binding.name!r} has shape "
                 f"{tuple(spec.shape)} but shares its list with an input of shape "
                 f"{tuple(shared_input.example.shape)}; give the output another name"
             )
@@ -88,14 +160,14 @@ def validate_entry_outputs(program, entrypoint, specs):
         state = states[binding.name]
         if state.mode == "replace" and tuple(spec.shape) != tuple(state.initial.shape):
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} returns shape {spec.shape} for "
+                f"entry point {entrypoint.name!r} returns shape {spec.shape} for "
                 f"replace state {state.name!r}, expected {tuple(state.initial.shape)}"
             )
         if state.mode == "append" and (
             not spec.shape or tuple(spec.shape[1:]) != tuple(state.initial.shape[1:])
         ):
             raise UnsupportedModelError(
-                f"entrypoint {entrypoint.name!r} append update for {state.name!r} "
+                f"entry point {entrypoint.name!r} append update for {state.name!r} "
                 "must preserve the state's leading axis and trailing dimensions"
             )
 
@@ -108,40 +180,59 @@ class ProgramReplay:
         self.program = program
         self.entries = {entry.name: entry for entry in program.entrypoints}
         self.declarations = {state.name: state for state in program.states}
-        self.states = {state.name: state.initial.detach().clone() for state in program.states}
+        self.reset()
+
+    def reset(self) -> None:
+        """Restore every state to its initial value, as ``cattorch reset`` does."""
+        self.states = {
+            state.name: state.initial.detach().clone() for state in self.program.states
+        }
 
     def entry(self, invocation):
         entry = self.entries.get(invocation.entrypoint)
         if entry is None:
-            raise ValueError(f"unknown entrypoint {invocation.entrypoint!r}")
+            raise ValueError(f"unknown entry point {invocation.entrypoint!r}")
         expected = sum(isinstance(value, Input) for value in entry.arguments)
         if len(invocation.inputs) != expected:
             raise ValueError(
-                f"entrypoint {entry.name!r} expects {expected} public inputs, "
+                f"entry point {entry.name!r} expects {expected} public inputs, "
                 f"got {len(invocation.inputs)}"
             )
         return entry
 
+    def checked_inputs(self, entry, inputs) -> list[torch.Tensor]:
+        """Copies of a call's public inputs, each checked against its contract."""
+        checked = []
+        for binding, value in zip(
+            (binding for binding in entry.arguments if isinstance(binding, Input)), inputs,
+        ):
+            expected = binding.example.shape
+            if binding.dynamic is not None:
+                ((axis, (minimum, maximum)),) = binding.dynamic.items()
+                matches = (
+                    value.ndim == len(expected)
+                    and all(
+                        size == wanted for dimension, (size, wanted)
+                        in enumerate(zip(value.shape, expected)) if dimension != axis
+                    )
+                    and minimum <= value.shape[axis] <= maximum
+                )
+            else:
+                matches = value.shape == expected
+            if not matches or value.dtype != binding.example.dtype:
+                raise ValueError(
+                    f"input {binding.name!r} does not match its shape/dtype contract"
+                )
+            checked.append(value.detach().clone())
+        return checked
+
     def run(self, invocation):
         entry = self.entry(invocation)
-        public = iter(invocation.inputs)
+        public = iter(self.checked_inputs(entry, invocation.inputs))
         args = []
         for binding in entry.arguments:
             if isinstance(binding, Input):
                 value = next(public)
-                expected = binding.example.shape
-                if binding.dynamic is not None:
-                    minimum, maximum = binding.dynamic
-                    matches = (
-                        value.ndim == len(expected) and value.shape[1:] == expected[1:]
-                        and minimum <= value.shape[0] <= maximum
-                    )
-                else:
-                    matches = value.shape == expected
-                if not matches or value.dtype != binding.example.dtype:
-                    raise ValueError(
-                        f"input {binding.name!r} does not match its shape/dtype contract"
-                    )
             else:
                 value = self.states[binding.name]
             args.append(value.detach().clone())
@@ -149,7 +240,7 @@ class ProgramReplay:
             returned = getattr(self.model, entry.method)(*args)
         leaves, _ = tree_flatten(returned)
         if any(not isinstance(value, torch.Tensor) for value in leaves):
-            raise UnsupportedModelError(f"entrypoint {entry.name!r} must return only tensor leaves")
+            raise UnsupportedModelError(f"entry point {entry.name!r} must return only tensor leaves")
         validate_entry_outputs(self.program, entry, leaves)
         pending = {}
         for binding, value in zip(entry.returns, leaves):
@@ -164,3 +255,70 @@ class ProgramReplay:
             pending[binding.name] = updated
         self.states.update(pending)
         return leaves
+
+
+MARKED_PREFIX = "_cattorch_entry_"
+
+
+def is_marked(model: nn.Module, program: ExportProgram) -> bool:
+    """Whether every entry point calls a method ``marked_program`` generated."""
+    return all(
+        entry.method.startswith(MARKED_PREFIX)
+        and callable(getattr(model, entry.method.removeprefix(MARKED_PREFIX), None))
+        for entry in program.entrypoints
+    )
+
+
+class MarkedReplay(ProgramReplay):
+    """Replay calls of a marked program through the user's own methods.
+
+    ``marked_program`` turns each ``@entrypoint`` method into a generated one
+    that takes the states as arguments. This replay doesn't use those: it
+    calls the user's method on the model, with the states living in its
+    buffers, as in PyTorch, so a defect in the generated methods shows as a
+    difference from the sprite.
+    """
+
+    def __init__(self, model: nn.Module, program: ExportProgram):
+        canonical: dict[int, str] = {}
+        self.aliases: dict[str, list[str]] = {}
+        for name, buffer in model.named_buffers(remove_duplicate=False):
+            self.aliases.setdefault(canonical.setdefault(id(buffer), name), []).append(name)
+        super().__init__(model, program)
+
+    @property  # type: ignore[override]
+    def states(self) -> dict[str, torch.Tensor]:
+        from cattorch.markers import _get_buffer
+
+        return {
+            state.name: _get_buffer(self.model, state.name) for state in self.program.states
+        }
+
+    @states.setter
+    def states(self, values: dict[str, torch.Tensor]) -> None:
+        from cattorch.markers import _set_buffer
+
+        for name, value in values.items():
+            value = value.detach().clone()
+            for alias in self.aliases.get(name, [name]):
+                _set_buffer(self.model, alias, value)
+
+    def run(self, invocation):
+        from cattorch.markers import _tensor_leaves
+
+        entry = self.entry(invocation)
+        inputs = self.checked_inputs(entry, invocation.inputs)
+        before = {name: value.detach().clone() for name, value in self.states.items()}
+        with torch.no_grad():
+            returned = getattr(self.model, entry.method.removeprefix(MARKED_PREFIX))(*inputs)
+        for name, value in self.states.items():
+            state = self.declarations[name]
+            if state.mode == "append" and value.shape[0] > (state.capacity or 0):
+                self.states = before
+                raise ValueError(f"state capacity exceeded: {state.name}")
+        return _tensor_leaves(returned)
+
+
+def program_replay(model: nn.Module, program: ExportProgram) -> ProgramReplay:
+    """The replay of ``program``'s calls on ``model``, which a sprite should match."""
+    return MarkedReplay(model, program) if is_marked(model, program) else ProgramReplay(model, program)

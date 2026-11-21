@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,7 +15,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class BoundedDimension:
-    """One runtime tensor extent with a finite exported capacity."""
+    """One tensor dimension whose length varies at run time, within bounds.
+
+    ``name`` names the dimension (``tokens``, or the input it comes from),
+    and ``minimum`` and ``maximum`` bound its length.
+    """
 
     name: str
     minimum: int
@@ -35,8 +40,10 @@ class BoundedDimension:
 class TensorSpec:
     """One flattened Scratch list at a model interface boundary.
 
-    ``list_name`` is the generated display name; ``shape`` and ``dtype``
-    describe the original tensor; ``numel`` is its flattened item count.
+    ``list_name`` is the list's Scratch name; ``shape`` and ``dtype``
+    describe the tensor it holds, flattened, with a ``BoundedDimension`` for
+    a dimension whose length varies. ``numel`` is the number of items, or
+    ``None`` when it varies, and ``max_numel`` the most items the list holds.
     """
 
     list_name: str
@@ -71,12 +78,18 @@ class TensorSpec:
 
 @dataclass(frozen=True)
 class ArtifactResult:
-    """Common metadata for a generated Scratch artifact.
+    """What every export writes: the file and its size.
 
-    Size fields are bytes: ``archive_bytes`` measures the compressed artifact
-    and ``expanded_json_bytes`` its uncompressed Scratch JSON. ``warnings`` are
-    non-fatal compatibility, size, or fallback messages that callers should
-    inspect before distribution.
+    ``path`` is the file written and ``sprite_name`` the sprite's name in
+    Scratch. Size fields are bytes: ``archive_bytes`` measures the
+    compressed file and ``expanded_json_bytes`` its uncompressed Scratch
+    JSON. ``block_count`` and ``list_count`` count the sprite's blocks and
+    its own lists, and ``sharded_lists`` names the global lists (inputs,
+    outputs, states, ``NAME logits``, ...) split into shards because they
+    hold more than a Scratch list can; internal lists, such as weights, are
+    split too but not listed. ``warnings`` are the export's warnings (size,
+    fallbacks, anything that changed what was exported), each also emitted
+    as a ``CattorchWarning``.
     """
 
     path: Path
@@ -91,28 +104,127 @@ class ArtifactResult:
 
 @dataclass(frozen=True)
 class TranspileResult(ArtifactResult):
-    """Model artifact metadata, tensor interface, and public procedures.
+    """A model sprite from tensor inputs: its interface.
 
-    ``quantization`` is set when ``QuantizationConfig`` was used, and records
-    whether each parameter used GPTQ, symmetric quantization, or float16.
-    ``fallback_operations`` lists operations without a kernel of their own,
-    which run as PyTorch's decomposition into simpler operations, with how
-    many calls of each the sprite runs. ``approximate_operations`` lists the
-    operations that use an approximate (fast-mode) kernel, the same way.
+    ``inputs`` and ``outputs`` describe the global ``NAME input``,
+    ``NAME input_1``, ... and ``NAME output``, ``NAME output_1``, ... lists,
+    NAME being ``sprite_name``, in the model's argument and output order;
+    ``output`` is the first output. ``broadcasts`` are the messages that run
+    the sprite: ``NAME init``, ``NAME forward`` and
+    ``NAME prepare for save``; each call ends by broadcasting the message
+    followed by `` complete``. ``quantization`` is set when ``QuantizationConfig`` was used, and
+    records whether each parameter used GPTQ, symmetric quantization, or
+    float16. ``fallback_operations`` lists operations without a kernel of
+    their own, which run as PyTorch's decomposition into simpler operations,
+    with how many calls of each the sprite runs. ``approximate_operations``
+    lists the operations that use an approximate (fast-mode) kernel, the
+    same way.
     """
 
     inputs: tuple[TensorSpec, ...]
-    output: TensorSpec
-    procedures: tuple[str, ...]
+    outputs: tuple[TensorSpec, ...]
+    broadcasts: tuple[str, ...]
     quantization: QuantizationReport | None = None
-    additional_outputs: tuple[TensorSpec, ...] = ()
     fallback_operations: tuple[tuple[str, int], ...] = ()
     approximate_operations: tuple[tuple[str, int], ...] = ()
 
     @property
-    def outputs(self) -> tuple[TensorSpec, ...]:
-        """All tensor output leaves in their original pytree order."""
-        return (self.output, *self.additional_outputs)
+    def output(self) -> TensorSpec:
+        """The first output, ``outputs[0]``: the ``NAME output`` list."""
+        return self.outputs[0]
+
+
+@dataclass(frozen=True)
+class GenerationResult(ArtifactResult):
+    """A text generator sprite, from a ``GenerationProgram`` or ``RecurrentGenerationProgram``.
+
+    Both kinds have the same interface. NAME is ``sprite_name``. ``inputs``
+    describes the global ``NAME token ids`` list: a prompt for
+    ``NAME prefill`` of 1 to ``max_context`` tokens (to the most a Scratch
+    list holds when there is no limit), or the one token ``NAME decode``
+    reads. ``outputs`` describes ``NAME logits``, one value per token ID,
+    then, with ``top_k``, ``NAME top k values`` and ``NAME top k ids``.
+    ``max_context`` is the most tokens the sprite reads between resets
+    (``None``: no limit, for a recurrent model), ``vocabulary_size`` the
+    number of token IDs it accepts, and ``top_k`` the number of largest
+    logits it lists (``None``: none). ``broadcasts`` are ``NAME init``,
+    ``NAME reset``, ``NAME prefill``, ``NAME decode`` and
+    ``NAME prepare for save``. ``quantization``,
+    ``fallback_operations`` and ``approximate_operations`` are as for
+    ``TranspileResult``.
+    """
+
+    inputs: tuple[TensorSpec, ...]
+    outputs: tuple[TensorSpec, ...]
+    max_context: int | None
+    vocabulary_size: int
+    top_k: int | None
+    broadcasts: tuple[str, ...]
+    quantization: QuantizationReport | None = None
+    fallback_operations: tuple[tuple[str, int], ...] = ()
+    approximate_operations: tuple[tuple[str, int], ...] = ()
+
+
+def generation_result(
+    result: TranspileResult | ProgramResult,
+    *,
+    max_context: int | None,
+    top_k: int | None,
+    vocabulary_size: int,
+    logits: int | None = None,
+) -> GenerationResult:
+    """The ``GenerationResult`` of a generation export assembled as ``result``.
+
+    ``logits`` is the number of logits, when ``result`` doesn't describe
+    them as a ``TranspileResult`` does.
+    """
+    from cattorch import interface
+    from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
+
+    if logits is None:
+        assert isinstance(result, TranspileResult)
+        logits = math.prod(
+            extent for extent in result.outputs[0].shape if isinstance(extent, int)
+        )
+    capacity = min(max_context or SCRATCH_LIST_LIMIT, SCRATCH_LIST_LIMIT)
+    name = result.sprite_name
+
+    def public(built: str) -> str:
+        return interface.global_name(name, built)
+
+    outputs = [TensorSpec(public(interface.LOGITS), (logits,), "float32", logits)]
+    if top_k is not None:
+        outputs += [
+            TensorSpec(public(interface.TOP_K_VALUES), (top_k,), "float32", top_k),
+            TensorSpec(public(interface.TOP_K_IDS), (top_k,), "int64", top_k),
+        ]
+    return GenerationResult(
+        path=result.path,
+        sprite_name=result.sprite_name,
+        archive_bytes=result.archive_bytes,
+        expanded_json_bytes=result.expanded_json_bytes,
+        block_count=result.block_count,
+        list_count=result.list_count,
+        sharded_lists=result.sharded_lists,
+        warnings=result.warnings,
+        inputs=(TensorSpec(
+            public(interface.TOKEN_IDS), (1, BoundedDimension("tokens", 1, capacity)), "int64",
+            None,
+        ),),
+        outputs=tuple(outputs),
+        max_context=max_context,
+        vocabulary_size=vocabulary_size,
+        top_k=top_k,
+        broadcasts=tuple(
+            interface.message(name, block) for block in (
+                interface.INIT, interface.RESET, interface.PREFILL, interface.DECODE,
+                interface.PREPARE_FOR_SAVE,
+            )
+        ),
+        quantization=result.quantization,
+        fallback_operations=result.fallback_operations,
+        approximate_operations=result.approximate_operations,
+    )
 
 
 def fallback_warning(fallbacks: tuple[tuple[str, int], ...]) -> str | None:
@@ -131,10 +243,19 @@ def fallback_warning(fallbacks: tuple[tuple[str, int], ...]) -> str | None:
 
 @dataclass(frozen=True)
 class EntryPointResult:
-    """Generated interface metadata for one program entrypoint."""
+    """The Scratch interface of one program entry point.
+
+    ``name`` is the entry point's name, ``broadcast`` the message that calls
+    it (``NAME ENTRY``, NAME being the sprite's name) and
+    ``completion_broadcast`` the one the call sends when it ends
+    (``NAME ENTRY complete``). ``inputs`` and ``outputs`` describe its global
+    ``NAME ENTRY INPUT`` and ``NAME ENTRY OUTPUT`` lists, in declaration
+    order. ``state_inputs``
+    names the states it reads and ``state_updates`` the states it writes.
+    """
 
     name: str
-    procedure: str
+    broadcast: str
     completion_broadcast: str
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
@@ -144,7 +265,13 @@ class EntryPointResult:
 
 @dataclass(frozen=True)
 class StateResult:
-    """Generated persistent Scratch list and logical tensor contract."""
+    """One piece of a program's persistent state and its Scratch list.
+
+    ``name`` is the state's name and ``list_name`` its global list
+    (``NAME state STATE``). ``mode`` is ``"replace"`` or ``"append"``,
+    and ``shape`` and ``dtype`` describe its initial tensor. ``capacity`` is
+    the most rows an append state holds, ``None`` for a replace state.
+    """
 
     name: str
     list_name: str
@@ -156,34 +283,61 @@ class StateResult:
 
 @dataclass(frozen=True)
 class ProgramResult(ArtifactResult):
-    """Artifact metadata for an experimental multi-entrypoint program."""
+    """A program sprite, from an ``ExportProgram`` or ``@entrypoint`` markers.
+
+    ``entrypoints`` and ``states`` describe its entry points and states, and
+    ``broadcasts`` are the messages that run it: one per entry point
+    (``NAME ENTRY``), then ``NAME init``, ``NAME reset`` and
+    ``NAME prepare for save``.
+    ``quantization``, ``fallback_operations`` and ``approximate_operations``
+    are as for ``TranspileResult``, summed over the entry points.
+    """
 
     entrypoints: tuple[EntryPointResult, ...]
     states: tuple[StateResult, ...]
-    procedures: tuple[str, ...]
+    broadcasts: tuple[str, ...]
     quantization: QuantizationReport | None = None
+    fallback_operations: tuple[tuple[str, int], ...] = ()
+    approximate_operations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
 class TokenizerResult(ArtifactResult):
-    """Tokenizer artifact metadata, selected backend type, and vocabulary size."""
+    """A tokenizer sprite.
+
+    ``tokenizer_type`` is ``"char"``, ``"bpe"`` or ``"sentencepiece-bpe"``,
+    the kind of tokenizer exported, and ``token_count`` its vocabulary size.
+    ``broadcasts`` are the messages that run it, ``NAME tokenize`` and
+    ``NAME detokenize``; it reads and writes the global ``NAME text`` and
+    ``NAME token ids``.
+    """
 
     tokenizer_type: str
     token_count: int
+    broadcasts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ProjectResult:
-    """A project written by :func:`build_project`.
+    """A project written by :func:`build_project` or :func:`add_to_project`.
 
-    ``messages`` are the broadcasts that run each bridged operation, and
-    ``lists`` and ``variables`` the global data they read and write, all by
-    Scratch name.
+    ``path`` is the ``.sb3`` written and ``sprites`` its sprites' names, in
+    order: from ``build_project`` the Demo sprite first, from
+    ``add_to_project`` every sprite of the project, its own first.
+    ``broadcasts`` are the public broadcasts: each exported sprite's
+    messages, each followed by its completion broadcast (``NAME forward``,
+    ``NAME forward complete``, ...), the shared ``cattorch prepare for
+    save``, and ``build_project``'s own (``NAME predict``, ``NAME sample``).
+    ``lists`` and ``variables`` are the global data the exported sprites
+    (and ``build_project``'s Demo) use, by Scratch name; from
+    ``add_to_project`` that includes globals the project already had and
+    the added sprites now use, but not the project's other broadcasts and
+    globals. ``warnings`` are as for ``ArtifactResult``.
     """
 
     path: Path
     sprites: tuple[str, ...]
-    messages: tuple[str, ...]
+    broadcasts: tuple[str, ...]
     lists: tuple[str, ...]
     variables: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -191,13 +345,16 @@ class ProjectResult:
 
 @dataclass(frozen=True)
 class VerifyResult:
-    """Numerical comparison between PyTorch and a generated Scratch sprite.
+    """Numerical comparison between PyTorch and one list of a generated sprite.
 
-    Error fields compare flattened values. ``worst_index`` is zero-based and
-    is ``None`` for an empty result. Output-length mismatches return a failed
-    result with infinite aggregate errors. ``approximate_operations`` repeats
-    the export's approximate kernels when ``verify`` was given its
-    ``TranspileResult``, since they explain small differences.
+    ``passed`` is whether every value is within the tolerance.
+    ``values_compared`` counts the values compared, ``expected_shape`` is
+    PyTorch's tensor shape and ``actual_values`` the number of values the
+    sprite wrote. Error fields compare flattened values. ``worst_index`` is
+    zero-based and is ``None`` for an empty result. Output-length mismatches
+    return a failed result with infinite aggregate errors.
+    ``approximate_operations`` repeats the export's approximate kernels when
+    ``verify`` was given its result, since they explain small differences.
     """
 
     passed: bool
@@ -213,9 +370,10 @@ class VerifyResult:
 
 @dataclass(frozen=True)
 class MultiOutputVerifyResult:
-    """Per-tensor comparisons in the exported pytree leaf order.
+    """Per-output comparisons of a model with several outputs.
 
-    ``passed`` is true only when every output comparison passes.
+    ``outputs`` holds one ``VerifyResult`` per output list, in the exported
+    order. ``passed`` is true only when every comparison passes.
     ``approximate_operations`` is as for ``VerifyResult``.
     """
 
@@ -226,18 +384,34 @@ class MultiOutputVerifyResult:
 
 @dataclass(frozen=True)
 class ProgramCallVerifyResult:
-    """Numerical result for one stateful program invocation."""
+    """The result of one block call in a stateful verification.
+
+    ``entrypoint`` names the block called: a program's entry point, or
+    ``prefill``, ``decode`` or ``reset`` of a generation sprite. ``status``
+    is the ``cattorch status`` it ended with and ``expected_status`` the one
+    it should end with: ``ok``, or the failure the call's input should give.
+    ``outputs`` compares its output lists with PyTorch when both are
+    ``ok`` (for generation: ``cattorch logits``, then the top-k values, then
+    the logits at the top-k IDs against the top-k values), and ``states``
+    compares each state list, by state name. ``passed`` is whether the
+    status is the expected one and every comparison passed.
+    """
 
     entrypoint: str
     passed: bool
     outputs: tuple[VerifyResult, ...]
-    states: tuple[tuple[str, VerifyResult], ...]
+    states: Mapping[str, VerifyResult]
     status: str = "ok"
+    expected_status: str = "ok"
 
 
 @dataclass(frozen=True)
 class ProgramVerifyResult:
-    """Ordered stateful verification results for an exported program."""
+    """The results of a sequence of block calls, in order.
+
+    ``calls`` holds one ``ProgramCallVerifyResult`` per call, and ``passed``
+    is whether every call passed.
+    """
 
     passed: bool
     calls: tuple[ProgramCallVerifyResult, ...]

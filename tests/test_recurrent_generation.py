@@ -1,0 +1,788 @@
+"""Recurrent token-by-token generation end to end in the Scratch emulator."""
+
+from __future__ import annotations
+
+from cattorch import interface
+
+import pytest
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from cattorch import (
+    CattorchWarning, CharTokenizer, CodegenConfig, ProgramCall, QuantizationConfig, RecurrentGenerationProgram,
+    State,
+    UnsupportedModelError, build_project, transpile, verify,
+)
+from cattorch.util.scratch.emulator import ProjectEmulator
+from cattorch.util.scratch.interface import read_logical_list
+from cattorch.interface import TOKEN_IDS
+from shared_models import GRULM, LSTMLM, RECURRENT_MODELS, recurrent_model, reference_rows
+from sprite_helpers import SpriteEmulator, load_sprite, logits
+
+
+TOLERANCE = 1e-4
+
+
+PROGRAM_FIELDS = {"step", "max_context", "hidden_prefill", "top_k", "reference"}
+
+
+def export(model, path, **options):
+    """Export with the model's states; program fields and transpile options mixed."""
+    fields = {key: options.pop(key) for key in PROGRAM_FIELDS & set(options)}
+    result = transpile(model, RecurrentGenerationProgram(model.states(), **fields), path, **options)
+    return SpriteEmulator(load_sprite(result.path)), result
+
+
+def run(emulator, procedure, tokens=None):
+    if tokens is not None:
+        # The internal step reads its own one-token list.
+        name = "_cattorch step token" if procedure.startswith("_") else TOKEN_IDS
+        emulator.lists[name] = list(tokens)
+    emulator.run_procedure(procedure)
+    return emulator.variables["cattorch status"]
+
+
+def states(emulator, model):
+    return {state.name: list(emulator.lists[f"_cattorch state {state.name}"]) for state in model.states()}
+
+
+@pytest.fixture(scope="module", params=sorted(RECURRENT_MODELS))
+def exported(request, tmp_path_factory):
+    model = recurrent_model(request.param)
+    emulator, result = export(
+        model, tmp_path_factory.mktemp(request.param) / "lm", top_k=3, reference="forward",
+    )
+    return model, emulator, result
+
+
+def test_prefill_then_decode_matches_the_stateless_forward(exported):
+    model, emulator, result = exported
+    tokens = [1, 3, 5, 2, 7, 4, 6, 9, 11, 2]
+    expected = reference_rows(model, tokens).double()
+    assert run(emulator, "cattorch init") == "ok"
+    assert run(emulator, "cattorch prefill", tokens[:5]) == "ok"
+    rows = [logits(emulator)]
+    for token in tokens[5:]:
+        assert run(emulator, "cattorch decode", [token]) == "ok"
+        rows.append(logits(emulator))
+    torch.testing.assert_close(torch.stack(rows), expected[4:], atol=TOLERANCE, rtol=0)
+    assert emulator.variables["cattorch cache length"] == 10
+    assert emulator.variables["cattorch max context"] == "Infinity"
+    assert emulator.lists["cattorch top k ids"] == expected[-1].topk(3).indices.tolist()
+    torch.testing.assert_close(
+        torch.tensor(emulator.lists["cattorch top k values"], dtype=torch.float64),
+        expected[-1].topk(3).values, atol=TOLERANCE, rtol=0,
+    )
+    assert result.broadcasts == (
+        "lm init", "lm reset", "lm prefill", "lm decode", "lm prepare for save",
+    )
+    assert result.inputs[0].list_name == "lm token ids"
+    assert result.outputs[0].list_name == "lm logits"
+    assert result.outputs[0].numel == expected.shape[1]
+
+
+def test_prefill_equals_the_same_tokens_decoded_one_by_one(exported):
+    model, emulator, _ = exported
+    run(emulator, "cattorch prefill", [4, 1, 8, 2])
+    prefilled = (logits(emulator), states(emulator, model))
+    run(emulator, "cattorch reset")
+    for token in (4, 1, 8, 2):
+        assert run(emulator, "cattorch decode", [token]) == "ok"
+    assert torch.equal(logits(emulator), prefilled[0])
+    assert states(emulator, model) == prefilled[1]
+    assert emulator.variables["cattorch cache length"] == 4
+
+
+def test_reset_restores_the_initial_states(exported):
+    model, emulator, _ = exported
+    initial = {state.name: state.initial.flatten().tolist() for state in model.states()}
+    run(emulator, "cattorch prefill", [2, 3, 4])
+    assert states(emulator, model) != initial
+    assert run(emulator, "cattorch reset") == "ok"
+    restored = states(emulator, model)
+    assert restored.keys() == initial.keys()
+    for name, values in initial.items():
+        assert restored[name] == pytest.approx(values), name
+    assert emulator.variables["cattorch cache length"] == 0
+    assert emulator.lists["cattorch logits"] == []
+    assert emulator.lists["cattorch top k ids"] == []
+    assert run(emulator, "cattorch decode", [5]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [5])[0].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_invalid_tokens_leave_every_state_untouched(exported):
+    model, emulator, result = exported
+    vocabulary = result.vocabulary_size
+    run(emulator, "cattorch prefill", [1, 2])
+    before = states(emulator, model)
+    for tokens, status in (
+        ([], interface.wrong_number_of_items(emulator.public(interface.TOKEN_IDS))),
+        ([1, 2], interface.wrong_number_of_items(emulator.public(interface.TOKEN_IDS))),
+        ([vocabulary], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        ([-1], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        ([2.5], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+        (["abc"], interface.invalid_item(emulator.public(interface.TOKEN_IDS))),
+    ):
+        outputs = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
+        assert run(emulator, "cattorch decode", tokens) == status, tokens
+        assert states(emulator, model) == before
+        assert emulator.variables["cattorch cache length"] == 2
+        # A call that fails writes nothing.
+        assert (emulator.lists["cattorch logits"], emulator.lists["cattorch top k ids"]) == outputs
+    # As for a K/V cache, prefill checks its tokens before it resets.
+    for tokens in ([], [1, vocabulary], [3, -2]):
+        assert run(emulator, "cattorch prefill", tokens) != "ok"
+        assert states(emulator, model) == before
+        assert emulator.variables["cattorch cache length"] == 2
+    assert run(emulator, "cattorch decode", [vocabulary - 1]) == "ok"
+
+
+@pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
+    ("cattorch prefill", "_cattorch token step for epoch %s", 3, [1, 2, 3, 4, 5]),
+    ("cattorch decode", "_cattorch token step for epoch %s", 1, [5]),
+    ("cattorch reset", "_cattorch reset state", 1, None),
+])
+def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
+    tmp_path, public, procedure, call, tokens,
+):
+    from scratch_status import INTERRUPTED
+    from test_generation_automatic import stop_during
+
+    model = recurrent_model("lstm")
+    emulator, _ = export(model, tmp_path / "lstm", top_k=2)
+    assert run(emulator, "cattorch prefill", [2, 7]) == "ok"
+    stop_during(emulator, public, procedure, call, tokens)
+    before = (
+        states(emulator, model), emulator.variables["cattorch cache length"],
+        list(emulator.lists["cattorch logits"]),
+    )
+    assert run(emulator, "cattorch decode", [3]) == INTERRUPTED
+    assert (
+        states(emulator, model), emulator.variables["cattorch cache length"],
+        emulator.lists["cattorch logits"],
+    ) == before
+    assert run(emulator, "cattorch reset") == "ok"
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [3])[0].double(), atol=TOLERANCE, rtol=0,
+    )
+    stop_during(emulator, public, procedure, call, tokens)
+    assert run(emulator, "cattorch prefill", [4, 1]) == "ok"
+    assert run(emulator, "cattorch decode", [6]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [4, 1, 6])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_decode_in_a_freshly_loaded_sprite_fills_constant_states(tmp_path):
+    model = recurrent_model("lstm")
+    emulator, result = export(model, tmp_path / "lstm")
+    sprite = load_sprite(result.path)
+    stored = {entry[0]: entry[1] for entry in sprite["lists"].values()}
+    assert stored["_cattorch state cell"] == []
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [3])[0].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_max_context_limits_decode_and_prefill(tmp_path):
+    model = recurrent_model("gru")
+    emulator, _ = export(model, tmp_path / "bounded", max_context=3, top_k=2)
+    assert emulator.variables["cattorch max context"] == 3
+    assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    before = states(emulator, model)
+    kept = list(emulator.lists["cattorch logits"])
+    assert run(emulator, "cattorch decode", [4]) == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
+    assert emulator.variables["cattorch cache length"] == 3
+    assert states(emulator, model) == before
+    assert run(emulator, "cattorch prefill", [1, 2, 3, 4]) == interface.too_many_items(emulator.public(interface.TOKEN_IDS))
+    assert emulator.lists["cattorch logits"] == kept
+    assert emulator.variables["cattorch cache length"] == 3
+    assert run(emulator, "cattorch prefill", [5, 6, 7]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [5, 6, 7])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_a_max_context_beyond_a_list_keeps_one_prefill_buffer(tmp_path, small_list_limit):
+    # A prompt arrives in the one `cattorch token ids` list, so the buffer that
+    # copies it never needs more than a list holds.
+    limit = small_list_limit(400)
+    model = recurrent_model("gru")
+    emulator, result = export(model, tmp_path / "long", max_context=50 * limit)
+    assert not [name for name in result.sharded_lists if "prefill" in name]
+    assert run(emulator, "cattorch prefill", [1, 2, 3]) == "ok"
+
+
+def test_unbounded_generation_runs_past_any_small_limit(tmp_path):
+    model = recurrent_model("gru")
+    emulator, _ = export(model, tmp_path / "unbounded", hidden_prefill=False)
+    tokens = [(7 * index + 3) % 16 for index in range(40)]
+    assert run(emulator, "cattorch prefill", tokens[:1]) == "ok"
+    for token in tokens[1:]:
+        assert run(emulator, "cattorch decode", [token]) == "ok"
+    assert emulator.variables["cattorch cache length"] == 40
+    assert emulator.variables["cattorch max context"] == "Infinity"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, tokens)[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+@pytest.mark.parametrize("name", ["gru", "ssm"])
+def test_hidden_prefill_skips_the_logits_of_prompt_tokens(tmp_path, name):
+    model = recurrent_model(name)
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+    counts, results = {}, {}
+    for hidden in (False, True):
+        emulator, _ = export(model, tmp_path / f"{name}_{hidden}", hidden_prefill=hidden)
+        run(emulator, "cattorch init")
+        before = sum(emulator.opcode_counts.values())
+        assert run(emulator, "cattorch prefill", prompt) == "ok"
+        counts[hidden] = sum(emulator.opcode_counts.values()) - before
+        prefilled = (logits(emulator), states(emulator, model))
+        assert run(emulator, "cattorch decode", [9]) == "ok"
+        results[hidden] = (*prefilled, logits(emulator))
+        if hidden:
+            # A step computes the logits a hidden prompt token skips.
+            cost = {}
+            for output in (1, 0):
+                emulator.variables["_cattorch project output"] = output
+                before = sum(emulator.opcode_counts.values())
+                run(emulator, "_cattorch token step for epoch %s", [9])
+                cost[output] = sum(emulator.opcode_counts.values()) - before
+            skipped = cost[1] - cost[0]
+    assert torch.equal(results[True][0], results[False][0])
+    assert results[True][1] == results[False][1]
+    assert torch.equal(results[True][2], results[False][2])
+    assert skipped > 0
+    # Every prompt token but the last skips that work; the loops differ slightly.
+    assert counts[False] - counts[True] == pytest.approx((len(prompt) - 1) * skipped, rel=0.02)
+
+
+def test_a_hidden_step_still_commits_its_states(tmp_path):
+    model = recurrent_model("ssm")
+    emulator, _ = export(model, tmp_path / "ssm")
+    run(emulator, "cattorch prefill", [1])
+    emulator.variables["_cattorch project output"] = 0
+    kept = list(emulator.lists["_cattorch step logits"])
+    assert run(emulator, "_cattorch token step for epoch %s", [2]) == "ok"
+    assert emulator.lists["_cattorch step logits"] == kept
+    # Decode computes its logits whatever a stopped prefill left behind.
+    emulator.variables["_cattorch project output"] = 0
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [1, 2, 3])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_layer_sharing_option_behaves_as_for_programs(tmp_path):
+    model = recurrent_model("ssm")
+    # Its layers can't share one procedure, and the export says why: each
+    # layer passes on its own states as well as its output.
+    with pytest.warns(CattorchWarning, match="more than one tensor of layer `blocks.0`"):
+        emulator, result = export(
+            model, tmp_path / "shared", codegen=CodegenConfig(layer_sharing=True),
+        )
+    assert any("exported without layer sharing" in item for item in result.warnings)
+    run(emulator, "cattorch prefill", [3, 1, 4])
+    run(emulator, "cattorch decode", [1])
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [3, 1, 4, 1])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_lifecycle_broadcasts(tmp_path):
+    model = recurrent_model("gru")
+    emulator, result = export(model, tmp_path / "gru")
+    sprite = load_sprite(result.path)
+    # The sprite declares no message: Scratch keeps them on the stage.
+    assert sprite["broadcasts"] == {}
+    received = {
+        block["fields"]["BROADCAST_OPTION"][0] for block in sprite["blocks"].values()
+        if block["opcode"] == "event_whenbroadcastreceived"
+    }
+    assert received == {
+        "gru init", "gru reset", "gru prefill", "gru decode", "gru prepare for save",
+        "cattorch prepare for save",
+    }
+    # Decode decodes the weights itself, as gru init does, and sends one
+    # completion broadcast, its own.
+    emulator.lists[TOKEN_IDS] = [4]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.broadcasts == ["gru decode complete"]
+    for procedure, tokens in (
+        ("init", None), ("reset", None), ("prefill", [1, 2, 3]), ("decode", [4]),
+        ("prepare for save", None),
+    ):
+        emulator.broadcasts.clear()
+        run(emulator, f"cattorch {procedure}", tokens)
+        assert emulator.broadcasts == [f"gru {procedure} complete"]
+    # The shared message prepares it too.
+    emulator.broadcasts.clear()
+    emulator.broadcast("cattorch prepare for save")
+    assert emulator.broadcasts == ["gru prepare for save complete"]
+    assert emulator.variables["cattorch initialized"] == 0
+
+
+def test_no_loose_canvas_block_runs_a_private_procedure(tmp_path):
+    _, result = export(recurrent_model("gru"), tmp_path / "gru")
+    sprite = load_sprite(result.path)
+    assert not [
+        block for block in sprite["blocks"].values()
+        if block["opcode"] == "procedures_call" and block.get("topLevel")
+    ]
+    # A loose block runs a call as a project does: it broadcasts its message.
+    loose = {
+        block["inputs"]["BROADCAST_INPUT"][1][1] for block in sprite["blocks"].values()
+        if block["opcode"] == "event_broadcastandwait" and block.get("topLevel")
+    }
+    assert loose <= set(result.broadcasts)
+
+
+def test_the_reference_check_catches_a_wrong_step(tmp_path):
+    class Wrong(GRULM):
+        def step(self, token, hidden):
+            output, hidden = self.gru(self.embed(token), hidden)
+            return self.head(output) + 0.01 * hidden[0], hidden
+
+    torch.manual_seed(0)
+    model = Wrong(width=16).eval()
+    with pytest.raises(
+        UnsupportedModelError,
+        match=r"the recurrent step disagrees with forward at logits row 0: max error .* "
+              r"tolerance 0.0001 relative; max error over all rows",
+    ):
+        export(model, tmp_path / "wrong", reference="forward")
+    # Without a reference nothing is checked.
+    export(model, tmp_path / "unchecked")
+
+
+class SharedZerosLSTM(LSTMLM):
+    """The usual LSTM pattern: both states start from one zeros tensor."""
+
+    def states(self):
+        zeros = torch.zeros(1, 1, self.width)
+        return (State("hidden", zeros), State("cell", zeros))
+
+    def forward(self, tokens):
+        output, _ = self.lstm(self.embed(tokens))
+        return self.head(output)
+
+
+def test_states_sharing_one_initial_tensor_each_keep_their_own_list(tmp_path):
+    model = recurrent_model("lstm")
+    shared = SharedZerosLSTM()
+    shared.load_state_dict(model.state_dict())
+    shared.eval()
+    emulator, _ = export(shared, tmp_path / "shared", reference="forward")
+    tokens = [1, 3, 5, 2, 7]
+    expected = reference_rows(shared, tokens).double()
+    rows = []
+    for token in tokens:
+        assert run(emulator, "cattorch decode", [token]) == "ok"
+        rows.append(logits(emulator))
+    torch.testing.assert_close(torch.stack(rows), expected, atol=TOLERANCE, rtol=0)
+
+
+def test_the_reference_check_runs_the_traced_step(monkeypatch, tmp_path):
+    # A trace that binds both states to one input must fail the check, not
+    # export a wrong sprite: the check runs the traced graph, not the method.
+    import cattorch.frontend
+
+    monkeypatch.setattr(cattorch.frontend, "distinct_example_inputs", lambda *args: args)
+    torch.manual_seed(0)
+    with pytest.raises(UnsupportedModelError, match="the recurrent step disagrees with forward"):
+        export(SharedZerosLSTM().eval(), tmp_path / "merged", reference="forward")
+
+
+@pytest.mark.parametrize("name", ["gru", "lstm"])
+def test_a_recurrent_model_given_a_generation_program_is_pointed_here(tmp_path, name):
+    from cattorch import CattorchError, GenerationProgram
+
+    with pytest.raises(CattorchError, match="RecurrentGenerationProgram"):
+        transpile(recurrent_model(name), GenerationProgram(max_context=8), tmp_path / name)
+
+
+def test_reference_must_return_one_row_per_token(tmp_path):
+    class LastOnly(GRULM):
+        def last(self, tokens):
+            return self(tokens)[:, -1]
+
+    with pytest.raises(UnsupportedModelError, match="last returned logits of shape"):
+        export(LastOnly().eval(), tmp_path / "last", reference="last")
+
+
+def test_program_validation():
+    state = State("h", torch.zeros(2))
+    program = RecurrentGenerationProgram((state,))
+    assert (program.step, program.max_context, program.hidden_prefill, program.top_k,
+            program.reference) == ("step", None, True, None, None)
+    assert RecurrentGenerationProgram([state]).states == (state,)
+    with pytest.raises(TypeError, match="must be a tuple of State values"):
+        RecurrentGenerationProgram(state)
+    cases = [
+        ((), {}, ValueError, "needs at least one state"),
+        (("h",), {}, TypeError, "must contain State values"),
+        ((state, State("h", torch.ones(1))), {}, ValueError, "state names must be unique"),
+        ((State("log", torch.zeros(0, 2), mode="append", capacity=4),), {}, ValueError,
+         "recurrent state 'log' must be a replace state"),
+        ((state,), {"step": " "}, ValueError, "recurrent step must be a non-empty string"),
+        ((state,), {"reference": ""}, ValueError, "reference method must be a non-empty string"),
+        ((state,), {"max_context": 0}, ValueError, "max_context must be positive"),
+        ((state,), {"max_context": 2.0}, TypeError, "max_context must be an integer or None"),
+        ((state,), {"max_context": True}, TypeError, "max_context must be an integer or None"),
+        ((state,), {"hidden_prefill": 1}, TypeError, "hidden_prefill must be a boolean"),
+        ((state,), {"top_k": 0}, ValueError, "top_k must be between 1 and 64"),
+        ((state,), {"top_k": 65}, ValueError, "top_k must be between 1 and 64"),
+        ((state,), {"top_k": "3"}, TypeError, "top_k must be an integer or None"),
+    ]
+    for arguments, options, error, message in cases:
+        with pytest.raises(error, match=message):
+            RecurrentGenerationProgram(arguments, **options)
+    with pytest.raises(TypeError):
+        RecurrentGenerationProgram((state,), "step")
+    assert RecurrentGenerationProgram().states is None
+    for options in ({"step": "next"}, {"reference": "forward"}):
+        with pytest.raises(ValueError, match="step= and reference= need states="):
+            RecurrentGenerationProgram(**options)
+
+
+TOKEN_FORMS = {
+    "token[:, 0]": lambda token: token[:, 0],
+    "token[0]": lambda token: token[0],
+    "token[..., -1]": lambda token: token[..., -1],
+    "token.T": lambda token: token.T,
+    "token.permute(1, 0)": lambda token: token.permute(1, 0),
+    "token.transpose(0, 1)": lambda token: token.transpose(0, 1),
+    "token.expand(1, 1)": lambda token: token.expand(1, 1),
+    "token.squeeze(0)": lambda token: token.squeeze(0),
+    "token.float().long()": lambda token: token.float().long(),
+    "token.flatten()[-1:]": lambda token: token.flatten()[-1:],
+}
+
+
+class TokenForm(nn.Module):
+    """Looks up a rearranged token, after a larger table indexed by a constant 0."""
+
+    def __init__(self, form, vocab=9, width=4):
+        super().__init__()
+        self.form = form
+        self.start = nn.Embedding(20, width)
+        self.embed = nn.Embedding(vocab, width)
+        self.head = nn.Linear(width, vocab)
+
+    def step(self, token, hidden):
+        start = self.start(torch.zeros_like(token)).reshape(1, -1)
+        embedded = self.embed(TOKEN_FORMS[self.form](token)).reshape(1, -1)
+        hidden = torch.tanh(embedded + hidden + start)
+        return self.head(hidden), hidden
+
+
+@pytest.mark.parametrize("form", sorted(TOKEN_FORMS))
+def test_the_token_may_be_rearranged_before_its_lookup(tmp_path, form):
+    torch.manual_seed(0)
+    model = TokenForm(form).eval()
+    states = (State("hidden", torch.zeros(1, 4)),)
+    result = transpile(model, RecurrentGenerationProgram(states), tmp_path / "form")
+    emulator = SpriteEmulator(load_sprite(result.path))
+    hidden, rows = torch.zeros(1, 4), []
+    with torch.no_grad():
+        for token in (8, 3):
+            row, hidden = model.step(torch.tensor([[token]]), hidden)
+            rows.append(row.reshape(-1).double())
+    assert run(emulator, "cattorch prefill", [8]) == "ok"
+    torch.testing.assert_close(logits(emulator), rows[0], atol=TOLERANCE, rtol=0)
+    assert run(emulator, "cattorch decode", [9]) == interface.invalid_item(emulator.public(interface.TOKEN_IDS))
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(logits(emulator), rows[1], atol=TOLERANCE, rtol=0)
+
+
+class Broken(GRULM):
+    def only_logits(self, token, hidden):
+        return self.step(token, hidden)[0]
+
+    def reshaped(self, token, hidden):
+        logits, hidden = self.step(token, hidden)
+        return logits, hidden.reshape(1, -1)
+
+    def two_rows(self, token, hidden):
+        logits, hidden = self.step(token, hidden)
+        return logits.expand(2, 1, -1), hidden
+
+    def one_hot(self, token, hidden):
+        embedded = F.one_hot(token, 16).float() @ self.embed.weight
+        output, hidden = self.gru(embedded, hidden)
+        return self.head(output), hidden
+
+
+@pytest.mark.parametrize(("options", "error", "message"), [
+    ({"step": "missing"}, ValueError, "model has no callable method 'missing', which "
+     r"RecurrentGenerationProgram\(step=...\) names"),
+    ({"reference": "missing"}, ValueError, "model has no callable method 'missing', which "
+     r"RecurrentGenerationProgram\(reference=...\) names"),
+    ({"step": "only_logits"}, UnsupportedModelError,
+     r"step returned 1 tensors, expected 1 \+ number of states \(2\)"),
+    ({"step": "reshaped"}, UnsupportedModelError,
+     r"step changes the shape of state 'hidden' from \(1, 1, 8\) to \(1, 8\)"),
+    ({"step": "two_rows"}, UnsupportedModelError,
+     r"logits must flatten to one vocabulary row, not shape \(2, 1, 16\)"),
+    ({"step": "one_hot"}, UnsupportedModelError, "token must index an embedding table"),
+    ({"top_k": 17}, ValueError, r"top_k \(17\) exceeds output size \(16\)"),
+    ({"dynamic": {0: (1, 4)}}, ValueError, "dynamic= can't be used with a RecurrentGenerationProgram"),
+    ({"example_kwargs": {}}, ValueError, "example_kwargs can't be used with a RecurrentGenerationProgram"),
+    ({"calibration": [torch.zeros(1, 2, dtype=torch.long)]}, ValueError,
+     "calibration= is only used by GPTQ"),
+    ({"calibration": [torch.zeros(3, dtype=torch.long)],
+      "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"calibration= takes \[1, length\] token tensors"),
+    ({"quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"GPTQ needs calibration=, an iterable of \[1, length\] token tensors for a "
+     "RecurrentGenerationProgram"),
+    ({"calibration": [], "quantization": QuantizationConfig(bits=8, method="gptq")},
+     ValueError, "GPTQ requires nonempty calibration"),
+    ({"calibration": [torch.tensor([[3, 16]])],
+      "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"calibration\[0\] has token 16 at position 1; token IDs must be whole "
+     "numbers from 0 to 15"),
+    ({"calibration": [torch.tensor([[1, 2]]), torch.tensor([[3.0, 4.5]])],
+      "quantization": QuantizationConfig(bits=8, method="gptq")}, ValueError,
+     r"calibration\[1\] has token 4.5 at position 1"),
+])
+def test_export_validation(tmp_path, options, error, message):
+    torch.manual_seed(0)
+    model = Broken().eval()
+    with pytest.raises(error, match=message):
+        export(model, tmp_path / "broken", **options)
+
+
+def max_error(emulator, model, tokens):
+    run(emulator, "cattorch prefill", tokens[:3])
+    rows = [logits(emulator)]
+    for token in tokens[3:]:
+        run(emulator, "cattorch decode", [token])
+        rows.append(logits(emulator))
+    expected = reference_rows(model, tokens)[2:].double()
+    return float((torch.stack(rows) - expected).abs().max()), float(expected.abs().max())
+
+
+def test_int8_quantized_export_stays_close(tmp_path):
+    model = recurrent_model("ssm")
+    emulator, result = export(
+        model, tmp_path / "q8", quantization=QuantizationConfig(bits=8, min_quantized_values=16),
+    )
+    assert result.quantization is not None and result.quantization.tensors
+    error, scale = max_error(emulator, model, [1, 5, 9, 13, 17, 21])
+    assert error < 0.04 * scale
+
+
+def test_gptq_calibrates_over_token_sequences(tmp_path):
+    model = recurrent_model("ssm")
+    generator = torch.Generator().manual_seed(0)
+    sequences = [torch.randint(0, 24, (1, 48), generator=generator) for _ in range(3)]
+    emulator, result = export(
+        model, tmp_path / "gptq",
+        quantization=QuantizationConfig(bits=8, method="gptq", min_quantized_values=16),
+        calibration=sequences,
+    )
+    methods = {item.method for item in result.quantization.tensors}
+    assert "gptq" in methods
+    error, scale = max_error(emulator, model, [2, 4, 6, 8, 10, 12])
+    assert error < 0.04 * scale
+
+
+def test_gptq_resets_the_states_between_sequences(monkeypatch, tmp_path):
+    from cattorch import program_runtime
+
+    resets = []
+    original = program_runtime.ProgramReplay.reset
+
+    def counting(self):
+        resets.append(True)
+        original(self)
+
+    monkeypatch.setattr(program_runtime.ProgramReplay, "reset", counting)
+    model = recurrent_model("gru")
+    sequences = [torch.tensor([[1, 2, 3]]), (torch.tensor([[4, 5]]),)]
+    export(
+        model, tmp_path / "gptq",
+        quantization=QuantizationConfig(bits=8, method="gptq", min_quantized_values=16),
+        calibration=sequences,
+    )
+    # When the replay is created, and before each sequence.
+    assert len(resets) == 1 + len(sequences)
+
+
+class NormedGRULM(GRULM):
+    """A GRU language model with a LayerNorm and GELU feed-forward before its head,
+    operations fast mode approximates, and mish, which runs as a decomposition."""
+
+    def __init__(self, vocab=16, width=8):
+        super().__init__(vocab, width)
+        self.norm = nn.LayerNorm(width)
+        self.up = nn.Linear(width, 2 * width)
+        self.down = nn.Linear(2 * width, width)
+
+    def project(self, output):
+        output = self.norm(output)
+        return self.head(output + self.down(F.mish(F.gelu(self.up(output)))))
+
+    def forward(self, tokens):
+        output, _ = self.gru(self.embed(tokens), self.h0)
+        return self.project(output)
+
+    def step(self, token, hidden):
+        output, hidden = self.gru(self.embed(token), hidden)
+        return self.project(output), hidden
+
+
+def test_fast_mode_reports_its_approximations(tmp_path):
+    torch.manual_seed(6)
+    model = NormedGRULM().eval()
+    tokens = [1, 2, 3, 4, 5, 6]
+    errors = {}
+    approximated = {
+        "exact": (), "fast": (("aten.gelu.default", 1), ("aten.layer_norm.default", 1)),
+    }
+    for optimization in ("exact", "fast"):
+        emulator, result = export(model, tmp_path / optimization, optimization=optimization)
+        errors[optimization], scale = max_error(emulator, model, tokens)
+        assert result.approximate_operations == approximated[optimization]
+        assert result.fallback_operations == (("aten.mish.default", 1),)
+        assert any("aten.mish.default (1 call)" in warning for warning in result.warnings)
+    # QuickGELU moves the logits measurably, but stays close.
+    assert errors["exact"] < TOLERANCE < errors["fast"] < 0.02 * scale
+
+
+class Memory(nn.Module):
+    """A large state, so the state list is sharded."""
+
+    def __init__(self, size=600, vocab=8):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, size)
+        self.head = nn.Linear(size, vocab)
+        self.register_buffer("start", torch.randn(1, size))
+
+    def states(self):
+        return (State("memory", self.start.clone()),)
+
+    def forward(self, tokens):
+        memory, rows = self.start, []
+        for position in range(tokens.shape[1]):
+            memory = 0.5 * memory + self.embed(tokens[:, position])
+            rows.append(self.head(memory))
+        return torch.stack(rows, 1)
+
+    def step(self, token, memory):
+        memory = 0.5 * memory + self.embed(token)[:, 0]
+        return self.head(memory), memory
+
+
+def test_a_state_longer_than_a_list_is_sharded(tmp_path, small_list_limit):
+    small_list_limit(300)
+    torch.manual_seed(4)
+    model = Memory().eval()
+    emulator, result = export(model, tmp_path / "memory", reference="forward")
+    # The state is private: split, but not listed in sharded_lists.
+    assert "_cattorch state memory shard 2" in emulator.lists
+    assert not any("state" in name for name in result.sharded_lists)
+    run(emulator, "cattorch prefill", [1, 2, 3])
+    run(emulator, "cattorch decode", [4])
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [1, 2, 3, 4])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+    run(emulator, "cattorch reset")
+    restored = read_logical_list(emulator.lists, "_cattorch state memory")
+    assert restored == pytest.approx(model.start.flatten().tolist())
+
+
+class Readout(Memory):
+    """Logits reduced from a product as long as the state, plus a bias."""
+
+    def __init__(self, size=650, vocab=5):
+        super().__init__(size, vocab)
+        self.weight = nn.Parameter(torch.randn(vocab, size // vocab))
+        self.bias = nn.Parameter(torch.randn(vocab))
+
+    def forward(self, tokens):
+        memory, rows = self.start, []
+        for position in range(tokens.shape[1]):
+            memory, row = self._next(memory, self.embed(tokens[:, position]))
+            rows.append(row)
+        return torch.stack(rows, 1)
+
+    def _next(self, memory, row):
+        memory = 0.5 * memory + row
+        vocab = self.bias.numel()
+        return memory, (memory.reshape(vocab, -1) * self.weight).sum(-1).reshape(1, vocab) + self.bias
+
+    def step(self, token, memory):
+        memory, row = self._next(memory, self.embed(token)[:, 0])
+        return row, memory
+
+
+def test_a_logits_list_used_for_a_product_longer_than_a_list_is_sharded(
+    tmp_path, small_list_limit,
+):
+    small_list_limit(300)
+    torch.manual_seed(4)
+    model = Readout().eval()
+    emulator, _ = export(model, tmp_path / "readout", reference="forward")
+    assert run(emulator, "cattorch prefill", [1, 2]) == "ok"
+    assert run(emulator, "cattorch decode", [3]) == "ok"
+    torch.testing.assert_close(
+        logits(emulator), reference_rows(model, [1, 2, 3])[-1].double(), atol=TOLERANCE, rtol=0,
+    )
+
+
+def test_a_fixed_table_longer_than_a_list_is_rejected_as_for_plain_exports(
+    tmp_path, small_list_limit,
+):
+    # The storage decoder's table of powers of two can't be sharded.
+    small_list_limit(200)
+    model = recurrent_model("gru")
+    with pytest.raises(ValueError, match="_cattorch f32 powers.* exceeds Scratch's limit of 200"):
+        export(model, tmp_path / "tiny")
+
+
+def test_build_project_runs_the_generation_demo(tmp_path):
+    from shared_models import CHARACTERS, char_tokenizer
+
+    torch.manual_seed(5)
+    model = GRULM(vocab=len(CHARACTERS)).eval()
+    _, result = export(model, tmp_path / "lm")
+    tokenizer = CharTokenizer(char_tokenizer()).save(tmp_path / "chars", name="chars")
+    project = build_project(
+        result, tmp_path / "demo", tokenizer=tokenizer, max_new_tokens=4, temperature=0,
+    )
+    emulator = ProjectEmulator(project.path, answers=["hi", ""])
+    emulator.green_flag()
+    ids = [CHARACTERS.index(character) for character in "hi"]
+    with torch.no_grad():
+        for _ in range(4):
+            ids.append(int(model(torch.tensor([ids]))[0, -1].argmax()))
+    text = "".join(CHARACTERS[index] for index in ids)
+    assert text in emulator.sprites["Demo"].said
+
+
+def test_verify_runs_prefill_and_decode_against_the_step(tmp_path):
+    model = recurrent_model("gru")
+    program = RecurrentGenerationProgram(model.states(), max_context=5, top_k=2)
+    result = transpile(model, program, tmp_path / "gru")
+    report = verify(model, program, result, calls=[
+        ProgramCall("prefill", (torch.tensor([[1, 2, 3]]),)),
+        ProgramCall("decode", (torch.tensor([[4]]),)),
+        ProgramCall("decode", (torch.tensor([[5]]),)),
+        ProgramCall("decode", (torch.tensor([[6]]),)),
+        ProgramCall("reset", ()),
+        ProgramCall("decode", (torch.tensor([[16]]),)),
+    ])
+    assert [call.status for call in report.calls] == [
+        "ok", "ok", "ok", "context full", "ok", "invalid item: gru token ids",
+    ]
+    assert report.passed, report

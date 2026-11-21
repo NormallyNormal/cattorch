@@ -1,12 +1,10 @@
 import json
 import math
-import zipfile
 
 import pytest
 import torch
 
 from cattorch import CodegenConfig, QuantizationConfig, StorageConfig, transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
 from cattorch.util.scratch.finalize_scratch import finalize_sprite
 from cattorch.util.scratch.ids import (
     ID_ALPHABET,
@@ -14,12 +12,9 @@ from cattorch.util.scratch.ids import (
     compact_sprite_ids,
 )
 from cattorch.util.scratch.remap import remap_ids
-from cattorch.sprite import _build_compact_top_k_program, _build_top_k_program
-
-
-def _load(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
+from cattorch.generation_blocks import _build_compact_top_k_program, _build_top_k_program
+from cattorch.util.scratch.globals import global_references
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 def test_codegen_config_validation():
@@ -131,13 +126,31 @@ def test_id_remap_preserves_literal_strings_and_list_payloads():
     assert remapped["lists"]["ctL"] == ["characters", ["a", "b", "v", "l"]]
 
 
+def test_remap_can_share_the_blocks_it_leaves_unchanged():
+    blocks = {
+        "a": {"opcode": "data_addtolist", "next": "b", "parent": None,
+              "inputs": {"ITEM": [1, [10, "x"]]}, "fields": {"LIST": ["items", "old"]}},
+        "b": {"opcode": "data_addtolist", "next": None, "parent": "a",
+              "inputs": {"ITEM": [1, [10, "y"]]}, "fields": {"LIST": ["items", "kept"]}},
+    }
+    snapshot = json.loads(json.dumps(blocks))
+    copied = remap_ids(blocks, {"old": "kept"})
+    shared = remap_ids(blocks, {"old": "kept"}, share_unchanged=True)
+    assert shared == copied
+    assert list(shared) == list(copied)
+    assert blocks == snapshot
+    assert shared["b"] is blocks["b"]
+    assert shared["a"] is not blocks["a"]
+    assert copied["b"] is not blocks["b"]
+
+
 def test_codegen_config_validates_new_compaction_controls():
     with pytest.raises(TypeError, match="compact_internal_names"):
         CodegenConfig(compact_internal_names=1)
     with pytest.raises(TypeError, match="compact_schema"):
         CodegenConfig(compact_schema=1)
-    with pytest.raises(ValueError, match="layer_sharing"):
-        CodegenConfig(layer_sharing="force")
+    with pytest.raises(TypeError, match="layer_sharing"):
+        CodegenConfig(layer_sharing="auto")
 
 
 def test_finalizer_repairs_costume_menu_shadow_for_editor(tmp_path):
@@ -178,7 +191,7 @@ def test_finalizer_repairs_costume_menu_shadow_for_editor(tmp_path):
         path,
         codegen=CodegenConfig(id_namespace="", compact_schema=True),
     )
-    finalized = _load(path)
+    finalized = load_sprite(path)
     switch = next(
         block for block in finalized["blocks"].values()
         if block["opcode"] == "looks_switchcostumeto"
@@ -199,7 +212,7 @@ def test_compact_top_k_matches_unrolled_with_fewer_blocks():
     block_counts = {}
     for name, program in programs.items():
         sprite = program.compile()
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["output"] = logits
         emulator.run()
         outputs[name] = (
@@ -214,7 +227,7 @@ def test_compact_top_k_matches_unrolled_with_fewer_blocks():
 def test_top_k_accepts_logits_below_old_finite_sentinel():
     for builder in (_build_top_k_program, _build_compact_top_k_program):
         sprite = builder(2).compile()
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["output"] = [-1e31, -2e31, -3e31]
         emulator.run()
         assert [int(value) for value in emulator.lists["cattorch top k ids"]] == [0, 1]
@@ -235,20 +248,24 @@ def test_internal_name_compaction_preserves_public_interface(tmp_path):
             compact_schema=True,
         ),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     data_names = {
         entry[0]
         for section in ("variables", "lists")
         for entry in sprite[section].values()
     }
-    assert {"input", "output"} <= data_names
-    assert any(name.startswith("l") for name in data_names)
+    # The globals keep their names, and aren't in the sprite.
+    assert {"compact_names input", "compact_names output"} <= set(
+        global_references(sprite)["lists"].values(),
+    )
+    assert not {"input", "output"} & data_names
+    assert any(name.startswith("_l") for name in data_names)
     assert all(
         block.get("shadow") is True or "shadow" not in block
         for block in sprite["blocks"].values()
         if block["opcode"] != "procedures_prototype"
     )
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = [1, 2, 3, 4]
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -304,13 +321,13 @@ def test_repeated_layers_share_weight_banks_and_procedure(tmp_path):
             value,
             tmp_path / mode,
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        sprites[mode] = _load(results[mode].path)
+        sprites[mode] = load_sprite(results[mode].path)
     assert results["auto"].block_count < results["off"].block_count
-    auto = ScratchEmulator(sprites["auto"])
-    off = ScratchEmulator(sprites["off"])
+    auto = SpriteEmulator(sprites["auto"])
+    off = SpriteEmulator(sprites["off"])
     for emulator in (auto, off):
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run_procedure("cattorch forward")
@@ -327,11 +344,11 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
     tmp_path, small_list_limit, monkeypatch,
 ):
     """A layer base may land in either shard of one logical weight bank."""
-    from cattorch.util.instruction.optimized import LinearInstruction
+    from cattorch.util.instruction import optimized_linear
 
     small_list_limit(2_000)
     # Keep the grouped linear layout a full-size model would use.
-    monkeypatch.setattr(LinearInstruction, "grouped_min_macs", 1)
+    monkeypatch.setattr(optimized_linear, "GROUPED_MIN_MACS", 1)
     width = 32  # two matrices contain 2,048 values, just over the lowered cap
 
     class Block(torch.nn.Module):
@@ -367,15 +384,15 @@ def test_shared_quantized_bank_can_cross_physical_list_boundary(
                 bits=4, method="symmetric", min_quantized_values=1,
             ),
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        sprites[mode] = ScratchEmulator(_load(result.path))
+        sprites[mode] = SpriteEmulator(load_sprite(result.path))
         sprites[mode].lists["input"] = value.flatten().tolist()
         sprites[mode].run_procedure("cattorch forward")
 
     assert "_cattorch shared transformer layer" in sprites["auto"]._procedures
-    assert "W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
+    assert "_W_linear_linear_weight_1 shard 2" in sprites["auto"]._list_name_to_ids
     torch.testing.assert_close(
         torch.tensor(sprites["auto"].lists["output"]),
         torch.tensor(sprites["off"].lists["output"]),
@@ -396,14 +413,14 @@ def test_tied_grouped_embedding_head_uses_one_physical_weight(tmp_path):
         storage=StorageConfig(compression=False),
         codegen=CodegenConfig(id_namespace=""),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weight_lists = [
-        entry for entry in sprite["lists"].values() if entry[0].startswith("W_")
+        entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
     assert len(weight_lists) == 1
     assert len(weight_lists[0][1]) == model.embedding.weight.numel()
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run_procedure("cattorch forward")
     torch.testing.assert_close(
@@ -434,16 +451,15 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
         storage=StorageConfig(compression=False),
         codegen=CodegenConfig(unrolling="compact", id_namespace=""),
     )
-    sprite = _load(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weight_lists = [
-        entry for entry in sprite["lists"].values() if entry[0].startswith("W_")
+        entry for entry in sprite["lists"].values() if entry[0].startswith("_W_")
     ]
     assert [len(entry[1]) for entry in weight_lists] == [199_680, 62_464]
     assert sum(len(entry[1]) for entry in weight_lists) == model.embedding.weight.numel()
 
-    # Float32 compression requires smaller temporary-byte-safe shards. When
-    # those no longer align with the grouped head representation, export must
-    # retain both copies rather than fail or alias mismatched physical lists.
+    # Float32 compression requires smaller temporary-byte-safe shards; the
+    # head's shards are cut to them, so the table is still stored once.
     compressed = transpile(
         model,
         torch.tensor([[3]]),
@@ -452,7 +468,7 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
             unrolling="compact", id_namespace="", target_json_bytes=None,
         ),
     )
-    compressed_sprite = _load(compressed.path)
+    compressed_sprite = load_sprite(compressed.path)
     payloads = [
         entry[1]
         for entry in compressed_sprite["variables"].values()
@@ -460,6 +476,9 @@ def test_oversized_tied_embedding_head_shares_aligned_shards(tmp_path):
     ]
     assert payloads
     assert all(len(payload) <= 250_000 for payload in payloads)
+    assert not compressed.warnings
+    # Base92 holds 13 bytes in 16 characters.
+    assert sum(map(len, payloads)) < model.embedding.weight.numel() * 4 * 16 / 13 * 1.01
 
 
 def test_compact_unrolling_emits_fewer_blocks(tmp_path):
@@ -481,3 +500,183 @@ def test_compact_unrolling_emits_fewer_blocks(tmp_path):
     )
     assert compact.block_count < speed.block_count
     assert compact.expanded_json_bytes < speed.expanded_json_bytes
+
+
+def test_batched_renames_apply_in_order_and_walk_the_blocks_once(monkeypatch):
+    import cattorch.util.scratch.interface as interface
+
+    walks = []
+    original = interface.refresh_data_display_names
+    monkeypatch.setattr(
+        interface, "refresh_data_display_names",
+        lambda blocks, names: (walks.append(dict(names)), original(blocks, names)),
+    )
+    sprite = {
+        "lists": {"a": ["x", []], "b": ["x shard 2", []], "c": ["y", []]},
+        "variables": {"n": ["cattorch x shard count", 2], "v": ["value", 0]},
+        "blocks": {
+            "read": {"fields": {"LIST": ["x shard 2", "b"]}},
+            "show": {"inputs": {"VALUE": [3, [12, "value", "v"], [10, ""]]}},
+        },
+    }
+    # Later renames see earlier ones, as separate calls would.
+    interface.rename_lists(sprite, {"x": "y2", "y": "z", "y2": "w"})
+    interface.rename_variables(sprite, {"value": "total"})
+    assert len(walks) == 2
+    assert [entry[0] for entry in sprite["lists"].values()] == ["w", "w shard 2", "z"]
+    assert sprite["variables"]["n"][0] == "cattorch w shard count"
+    assert sprite["blocks"]["read"]["fields"]["LIST"] == ["w shard 2", "b"]
+    assert sprite["blocks"]["show"]["inputs"]["VALUE"][1] == [12, "total", "v"]
+
+
+def test_program_export_walks_the_blocks_independently_of_the_weight_count(tmp_path, monkeypatch):
+    import cattorch.program_export as program_export
+    import cattorch.util.scratch.interface as interface
+    from cattorch import EntryPoint, ExportProgram, Input, Output
+
+    class Stack(torch.nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = torch.nn.Sequential(*(torch.nn.Linear(4, 4) for _ in range(layers)))
+
+        def run(self, value):
+            return self.layers(value)
+
+    walks = []
+    original = interface.refresh_data_display_names
+    for module in (interface, program_export):
+        monkeypatch.setattr(
+            module, "refresh_data_display_names",
+            lambda blocks, names: (walks.append(names), original(blocks, names)),
+        )
+
+    def count(layers):
+        walks.clear()
+        program = ExportProgram(entrypoints=(EntryPoint(
+            "run", method="run", arguments=(Input("value", torch.ones(4)),),
+            returns=(Output("out"),),
+        ),))
+        transpile(Stack(layers).eval(), program, tmp_path / f"stack{layers}")
+        return len(walks)
+
+    assert count(2) == count(8)
+
+
+def test_tensor_adder_copies_only_the_lists():
+    from cattorch.util.scratch.tensor_adder import TensorAdder
+
+    sprite = {"blocks": {"b": {"opcode": "x"}}, "lists": {"l": ["W_a", [1.0]]}, "variables": {}}
+    result = TensorAdder().apply(sprite, ["W_a", "W_b"], weights={"W_a": torch.tensor([2.0])})
+    assert sprite["lists"] == {"l": ["W_a", [1.0]]}
+    assert result["lists"]["l"] == ["W_a", [2.0]]
+    assert result["lists"]["cattorch_tensor_W_b"] == ["W_b", []]
+    assert result["blocks"] is sprite["blocks"]
+
+
+def test_static_values_stand_in_for_the_list_tolist_makes():
+    import numpy as np
+    from cattorch.static_storage import _deinterleave_static_values
+    from cattorch.util.scratch.tensor_adder import StaticValues, TensorAdder
+
+    tensor = torch.tensor([1.5, -0.0, float("nan"), 3.25, 1e-30, 7.0, 2.0, -4.0])
+    values = TensorAdder().apply({"lists": {}}, ["W_a"], weights={"W_a": tensor})["lists"][
+        "cattorch_tensor_W_a"
+    ][1]
+    assert isinstance(values, StaticValues)
+    expected = tensor.tolist()
+    assert len(values) == 8 and values[3] == 3.25
+    assert values.tolist()[:2] == expected[:2] and list(values)[3:] == expected[3:]
+    assert values[4:] == expected[4:] and values[4:].array.base is not None
+    # As lists of floats compare, NaN never equals NaN.
+    assert values != StaticValues(tensor.numpy().copy())
+    assert values[3:] == StaticValues(tensor.numpy()[3:].copy())
+    assert np.asarray(values, dtype=np.float64).tolist()[3:] == expected[3:]
+    with pytest.raises(TypeError):
+        values + values  # noqa: B018
+    # Integer tensors keep their exact list; bfloat16 widens exactly.
+    integral = TensorAdder().apply({"lists": {}}, ["W_i"], weights={"W_i": torch.arange(3)})
+    assert integral["lists"]["cattorch_tensor_W_i"][1] == [0, 1, 2]
+    half = StaticValues.from_tensor(torch.tensor([0.1, 3.0], dtype=torch.bfloat16))
+    assert half.tolist() == torch.tensor([0.1, 3.0], dtype=torch.bfloat16).tolist()
+
+    # The array path reorders four-row groups exactly as the list path does.
+    grouped = torch.arange(2 * 4 * 3 + 5, dtype=torch.float32)
+    segments = ((1, 8, 3),)
+    assert (
+        _deinterleave_static_values(StaticValues.from_tensor(grouped), segments).tolist()
+        == _deinterleave_static_values(grouped.tolist(), segments)
+    )
+
+
+def test_slot_merges_leave_the_other_blocks_as_a_full_remap_would(tmp_path, monkeypatch):
+    # A merge that only remaps the blocks just added is equivalent to
+    # remapping every block only if the others are already what remap_ids
+    # makes of them: copied (no sub-object shared between blocks) and in
+    # normal form.
+    import cattorch.procedures as procedures
+    from cattorch import (
+        EntryPoint, ExportProgram, GenerationProgram, Input, Output, RecurrentGenerationProgram,
+        State, StateInput, StateUpdate,
+    )
+    from cattorch.util.scratch.remap import _remap_blocks
+
+    checked = 0
+    original = procedures._merge_slots_by_name
+
+    def checked_merge(sprite, section, names, added):
+        nonlocal checked
+        if added is not None:
+            others = {key: block for key, block in sprite["blocks"].items() if key not in added[1]}
+            assert _remap_blocks(others, {"unused": "unused"}) == others
+            seen = set()
+            stack = list(others.values())
+            while stack:
+                value = stack.pop()
+                if isinstance(value, (list, dict)):
+                    assert id(value) not in seen, value
+                    seen.add(id(value))
+                    stack.extend(value.values() if isinstance(value, dict) else value)
+            checked += 1
+        original(sprite, section, names, added)
+
+    monkeypatch.setattr(procedures, "_merge_slots_by_name", checked_merge)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.gru = torch.nn.GRU(4, 4, batch_first=True)
+            self.head = torch.nn.Linear(4, 8)
+
+        def forward(self, tokens):
+            return self.head(self.gru(self.embed(tokens))[0])
+
+        def step(self, token, hidden):
+            output, hidden = self.gru(self.embed(token), hidden)
+            return self.head(output), hidden
+
+        def accumulate(self, value, total):
+            updated = total + self.head(value)
+            return updated.sum().reshape(1), updated
+
+    torch.manual_seed(0)
+    model = Model().eval()
+    program = ExportProgram(
+        states=(State("total", torch.zeros(8)),),
+        entrypoints=(EntryPoint(
+            "add", method="accumulate", arguments=(Input("value", torch.ones(4)), StateInput("total")),
+            returns=(Output("sum"), StateUpdate("total")),
+        ),),
+    )
+    transpile(model, program, tmp_path / "program")
+    transpile(
+        model, RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 4)),)),
+        tmp_path / "recurrent",
+    )
+    from shared_models import NanoGPT
+
+    transpile(
+        NanoGPT(layers=1, width=8, heads=2, context=4).eval(), GenerationProgram(max_context=4),
+        tmp_path / "generation",
+    )
+    assert checked

@@ -54,6 +54,8 @@ POINTWISE = {
     "reciprocal": (torch.reciprocal, POSITIVE),
     "erf": (torch.erf, VECTOR),
     "exact gelu": (F.gelu, VECTOR),
+    "log gamma": (torch.lgamma, POSITIVE),
+    "log gamma of negative values": (torch.lgamma, VECTOR + 0.1),
     "clamp": (lambda x: x.clamp(-1.0, 0.5), VECTOR),
     "clamp min": (lambda x: x.clamp(min=-1.0), VECTOR),
     "clamp max": (lambda x: x.clamp(max=0.5), VECTOR),
@@ -81,6 +83,19 @@ POINTWISE = {
 def test_pointwise_operation(tmp_path, name):
     function, value = POINTWISE[name]
     _export_and_verify(tmp_path, Lambda(function), (value,), atol=1e-6)
+
+
+def test_log_gamma_across_its_domain(tmp_path):
+    """Large and tiny arguments, the zeros at 1 and 2, reflection below 1/2,
+    poles and infinities, against float64 PyTorch."""
+    near_one = [1 - 2.0 ** -24, 1 + 2.0 ** -23, 1 + 1e-12, 2 - 2.0 ** -23, 2 + 2.0 ** -22]
+    value = torch.tensor([
+        1e30, 3.5e36, 171.5, 1e6 + 0.25, 25.0, 10.5, 3.7, 2.75, 1.5, 0.75, 0.3,
+        1e-3, 1e-8, 1e-30, 1.0, 2.0, *near_one, -1e-7, -0.5, -1.5, -3.9, -6.999999999,
+        -10.3, -123456.5, 0.0, -0.0, -1.0, -5.0, -1e30, math.inf, -math.inf,
+    ], dtype=torch.float64)
+    # No absolute tolerance: lgamma(1) and lgamma(2) must be exactly zero.
+    _export_and_verify(tmp_path, Lambda(torch.lgamma), (value,), atol=0, rtol=1e-13)
 
 
 def test_integer_input_can_be_cast_to_float(tmp_path):
@@ -155,6 +170,57 @@ def test_torch_multihead_attention_with_weights(tmp_path):
     value = torch.randn(1, 4, 8)
     model = nn.MultiheadAttention(8, 2, batch_first=True)
     _export_and_verify(tmp_path, model, (value, value, value))
+
+
+def test_signed_zeros_in_atan2_signbit_and_copysign(tmp_path):
+    # 1 / -0 is -infinity, which tells -0 from 0: atan2(-0, -1) is -pi.
+    values = torch.tensor([0.0, -0.0, 1.0, -1.0, math.inf, -math.inf, -0.3])
+    y, x = values.repeat_interleave(len(values)), values.repeat(len(values))
+    finite = ~(y.isinf() & x.isinf())  # two infinities are a documented difference
+    model = Lambda(lambda y, x: (
+        torch.atan2(y, x), torch.signbit(y), torch.copysign(x, y),
+    ))
+    _export_and_verify(tmp_path, model, (y[finite], x[finite]))
+
+
+def test_one_hot_and_a_norm_over_variable_items(tmp_path):
+    one_hot = Lambda(lambda ids: F.one_hot(ids, 5))
+    _export_and_verify(tmp_path, one_hot, (torch.tensor([0, 4, 2]),))
+    # Traced with one item, PyTorch's norm over it is just abs; it must
+    # still sum over the items at other lengths.
+    norm = Lambda(lambda x: x.norm(dim=0)).eval()
+    result = transpile(norm, torch.randn(3, 4), tmp_path / "norm", dynamic={0: (1, 6)})
+    assert verify(norm, torch.randn(5, 4), result).passed
+
+
+class BooleanMasks(nn.Module):
+    """Boolean masks registered as buffers, as attention code usually keeps them."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.attention = nn.MultiheadAttention(8, 2, batch_first=True)
+        self.decoder = nn.TransformerDecoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+        self.register_buffer("future", torch.triu(torch.ones(4, 4, dtype=torch.bool), 1))
+        self.register_buffer("padding", torch.tensor([[False, False, False, True]]))
+
+    def forward(self, x):
+        if self.kind == "multihead":
+            return self.attention(
+                x, x, x, attn_mask=self.future, key_padding_mask=self.padding,
+            )[0]
+        if self.kind == "decoder":
+            return self.decoder(
+                x, x, tgt_mask=self.future, tgt_key_padding_mask=self.padding,
+                memory_key_padding_mask=self.padding,
+            )
+        return F.scaled_dot_product_attention(x, x, x, attn_mask=~self.future)
+
+
+@pytest.mark.parametrize("kind", ["multihead", "decoder", "sdpa"])
+def test_boolean_attention_mask_buffers(tmp_path, kind):
+    torch.manual_seed(8)
+    _export_and_verify(tmp_path, BooleanMasks(kind), (torch.randn(1, 4, 8),))
 
 
 def test_torch_transformer_encoder_classifier(tmp_path):
@@ -396,19 +462,8 @@ def test_tensor_keyword_becomes_next_input(tmp_path):
     kwargs = {"mask": mask, "scale": 2.0, "label": "ignored"}
     model = KeywordMask().eval()
     result = transpile(model, (x,), tmp_path / "model", example_kwargs=kwargs)
-    assert [spec.list_name for spec in result.inputs] == ["input", "input_1"]
+    assert [spec.list_name for spec in result.inputs] == ["model input", "model input_1"]
     assert tuple(result.inputs[1].shape) == (1, 4)
-    assert verify(model, (x,), result, example_kwargs=kwargs).passed
-
-
-def test_tensor_keyword_with_export_frontend(tmp_path):
-    x, mask = torch.randn(2, 4), torch.ones(1, 4)
-    kwargs = {"mask": mask}
-    model = KeywordMask().eval()
-    with pytest.warns(DeprecationWarning):
-        result = transpile(
-            model, (x,), tmp_path / "model", example_kwargs=kwargs, frontend="export",
-        )
     assert verify(model, (x,), result, example_kwargs=kwargs).passed
 
 
@@ -475,10 +530,10 @@ def test_example_kwargs_rejections(tmp_path):
     program = ExportProgram(entrypoints=(
         EntryPoint("run", arguments=(Input("x", x),), returns=(Output("y"),)),
     ))
-    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+    with pytest.raises(ValueError, match="example_kwargs can't be used with an ExportProgram"):
         transpile(model, program, tmp_path / "a", example_kwargs={"mask": mask})
     generation = GenerationProgram(max_context=4)
-    with pytest.raises(ValueError, match="ExportProgram or GenerationProgram"):
+    with pytest.raises(ValueError, match="example_kwargs can't be used with a GenerationProgram"):
         transpile(model, generation, tmp_path / "b", example_kwargs={"mask": mask})
     with pytest.raises(TypeError, match="dict with string keys"):
         transpile(model, (x,), tmp_path / "c", example_kwargs=[("mask", mask)])
@@ -488,7 +543,7 @@ def test_example_kwargs_rejections(tmp_path):
         transpile(
             WithDropout().eval(), (VECTOR,), tmp_path / "d",
             quantization=QuantizationConfig(bits=4, method="gptq"),
-            calibration_inputs=[VECTOR],
+            calibration=[VECTOR],
             example_kwargs={"mask": mask},
         )
     result = transpile(model, (x,), tmp_path / "e", example_kwargs={"mask": mask})
@@ -576,13 +631,14 @@ def test_decomposed_operation(tmp_path, name):
     _export_and_verify(tmp_path, model, inputs, atol=1e-5)
 
 
-KNOWN_UNSUPPORTED = {
-    "log gamma": (Lambda(torch.lgamma), (POSITIVE,)),
-}
+# Cases that still fail, as ``name: (model, inputs)``. Every typical case is
+# supported now; the test is only defined while there is something to xfail.
+KNOWN_UNSUPPORTED: dict[str, tuple[nn.Module, tuple[torch.Tensor, ...]]] = {}
 
 
-@pytest.mark.parametrize("name", sorted(KNOWN_UNSUPPORTED))
-@pytest.mark.xfail(raises=CattorchError, strict=True)
-def test_known_unsupported(name):
-    model, inputs = KNOWN_UNSUPPORTED[name]
-    _prepare_graph(model.eval(), inputs)
+if KNOWN_UNSUPPORTED:
+    @pytest.mark.parametrize("name", sorted(KNOWN_UNSUPPORTED))
+    @pytest.mark.xfail(raises=CattorchError, strict=True)
+    def test_known_unsupported(name):
+        model, inputs = KNOWN_UNSUPPORTED[name]
+        _prepare_graph(model.eval(), inputs)

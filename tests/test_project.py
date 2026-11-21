@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cattorch import interface
 import collections
 import math
 
@@ -14,7 +15,35 @@ from cattorch import (
 )
 from cattorch.project import _sample
 from cattorch.util.scratch.dsl import Program
-from cattorch.util.scratch.emulator import ProjectEmulator, ScratchEmulator
+from cattorch.util.scratch.emulator import ProjectEmulator
+from shared_models import CHARACTERS, Language, char_tokenizer, greedy
+from sprite_helpers import SpriteEmulator
+
+
+def test_non_finite_example_values_are_written_as_strict_json(tmp_path):
+    # Bare Infinity and NaN aren't JSON, and the Scratch VM refuses them.
+    import json
+    import zipfile
+
+    value = torch.tensor([1.5, math.inf, -math.inf, math.nan])
+    result = transpile(nn.Identity().eval(), value, tmp_path / "same")
+    project = build_project(result, tmp_path / "same", example_inputs=value)
+    with zipfile.ZipFile(project.path) as archive:
+        stored = json.loads(archive.read("project.json"), parse_constant=pytest.fail)
+    stage = stored["targets"][0]
+    assert stage["lists"] and all(
+        entry[1] == [1.5, "Infinity", "-Infinity", "NaN"] for entry in stage["lists"].values()
+        if entry[0] == "same input"
+    )
+    emulator = ProjectEmulator(project.path)
+    emulator.green_flag()
+    # NaN isn't a number the sprite takes; it writes no output.
+    assert emulator.stage.variables["same status"] == interface.invalid_item("same input")
+    assert emulator.stage.lists["same output"] == []
+    emulator.stage.lists["same input"] = [1.5, math.inf, -math.inf, 0]
+    emulator.green_flag()
+    output = [float(value) for value in emulator.stage.lists["same output"]]
+    assert output == [1.5, math.inf, -math.inf, 0]
 
 
 def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
@@ -23,10 +52,17 @@ def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
     example = torch.randn(1, 3)
     result = transpile(model, example, tmp_path / "net")
     project = build_project(
-        tmp_path / "net", result, example_inputs=example, labels=["a", "b", "c"],
+        result, tmp_path / "net", example_inputs=example, labels=["a", "b", "c"],
     )
     assert project.path.suffix == ".sb3"
-    assert project.messages == ("net run", "net predict")
+    assert project.sprites == ("Demo", "net")
+    assert project.broadcasts == (
+        "net forward", "net forward complete", "net init", "net init complete",
+        "net prepare for save", "net prepare for save complete", "cattorch prepare for save",
+        "net predict", "net predict complete",
+    )
+    assert set(project.lists) == {"net input", "net output", "net labels"}
+    assert set(project.variables) == {"net status", "net prediction"}
     emulator = ProjectEmulator(project.path)
     emulator.green_flag()
     expected = model(example)[0]
@@ -42,14 +78,14 @@ def test_a_classifier_runs_on_the_green_flag_and_space(tmp_path):
 def test_inputs_start_as_zeros_and_labels_must_match(tmp_path):
     model = nn.Linear(2, 2).eval()
     result = transpile(model, torch.ones(1, 2), tmp_path / "linear")
-    project = build_project(tmp_path / "linear", result)
+    project = build_project(result, tmp_path / "linear")
     emulator = ProjectEmulator(project.path)
     assert emulator.stage.lists["linear input"] == [0, 0]
     with pytest.raises(ValueError, match="labels has 3 entries"):
-        build_project(tmp_path / "bad", result, labels=["a", "b", "c"])
+        build_project(result, tmp_path / "bad", labels=["a", "b", "c"])
     batch = transpile(model, torch.ones(3, 2), tmp_path / "batch", dynamic={0: (1, 4)})
     with pytest.raises(ValueError, match="variable-length dimension"):
-        build_project(tmp_path / "batch", batch, labels=["a", "b"])
+        build_project(batch, tmp_path / "batch", labels=["a", "b"])
 
 
 class Counter(nn.Module):
@@ -58,59 +94,37 @@ class Counter(nn.Module):
         self.linear = nn.Linear(2, 2)
         self.register_buffer("total", torch.zeros(1, 2))
 
-    @entrypoint(example=lambda: (torch.ones(1, 2),))
+    @entrypoint(example_inputs=lambda: (torch.ones(1, 2),))
     def add(self, value):
         self.total += self.linear(value)
         return self.total.clone()
 
 
-def test_entry_points_are_bridged(tmp_path):
+def test_entry_points_run_by_their_messages(tmp_path):
     torch.manual_seed(1)
     model = Counter().eval()
     result = transpile(model, None, tmp_path / "counter")
-    project = build_project(tmp_path / "counter", result)
-    assert project.messages == ("counter add",)
+    project = build_project(result, tmp_path / "counter")
+    assert set(project.broadcasts) == {
+        "counter add", "counter add complete", "counter init", "counter init complete",
+        "counter reset", "counter reset complete", "counter prepare for save",
+        "counter prepare for save complete", "cattorch prepare for save",
+    }
     emulator = ProjectEmulator(project.path)
     value = torch.tensor([[0.5, -1.0]])
     name = result.entrypoints[0].inputs[0].list_name
-    emulator.stage.lists[f"counter {name}"] = value.flatten().tolist()
+    assert name == "counter add value"
+    emulator.stage.lists[name] = value.flatten().tolist()
     output = result.entrypoints[0].outputs[0].list_name
     for _ in range(2):
         emulator.broadcast("counter add")
     with torch.no_grad():
         expected = 2 * model.linear(value)
-    assert emulator.stage.lists[f"counter {output}"] == pytest.approx(
+    assert emulator.stage.variables["counter status"] == interface.OK
+    assert emulator.sprites["counter"].broadcasts[-1] == "counter add complete"
+    assert emulator.stage.lists[output] == pytest.approx(
         expected.flatten().tolist(), abs=1e-5,
     )
-
-
-CHARACTERS = "?abcdefghijklmnopqrstuvwxyz ."
-
-
-def char_tokenizer():
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
-    backend = Tokenizer(models.WordLevel(
-        vocab={character: index for index, character in enumerate(CHARACTERS)}, unk_token="?",
-    ))
-    backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
-    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="?")
-
-
-class Language(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tokens = nn.Embedding(len(CHARACTERS), 8)
-        self.positions = nn.Embedding(16, 8)
-        self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
-        self.head = nn.Linear(8, len(CHARACTERS))
-
-    def forward(self, tokens):
-        length = tokens.shape[1]
-        x = self.tokens(tokens) + self.positions(torch.arange(length))
-        mask = nn.Transformer.generate_square_subsequent_mask(length)
-        return self.head(self.layer(x, src_mask=mask, is_causal=True))
 
 
 @pytest.fixture(scope="module")
@@ -123,18 +137,10 @@ def generator(tmp_path_factory):
     return model, result, tokenizer, directory
 
 
-def greedy(model, prompt, count):
-    ids = [CHARACTERS.index(character) for character in prompt]
-    with torch.no_grad():
-        for _ in range(count):
-            ids.append(int(model(torch.tensor([ids]))[0, -1].argmax()))
-    return ids[len(prompt):]
-
-
 def test_a_text_generator_continues_each_prompt(generator):
     model, result, tokenizer, directory = generator
     project = build_project(
-        directory / "demo", result, tokenizer=tokenizer, max_new_tokens=5, temperature=0,
+        result, directory / "demo", tokenizer=tokenizer, max_new_tokens=5, temperature=0,
     )
     emulator = ProjectEmulator(project.path, answers=["hi", "the cat", ""])
     emulator.green_flag()
@@ -143,41 +149,46 @@ def test_a_text_generator_continues_each_prompt(generator):
         text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
         assert prompt + text in said
     assert len(emulator.questions) == 3
-    # The weights are decoded once, not before every token.
-    model_sprite = next(name for name in emulator.sprites if name not in {"Demo", tokenizer.sprite_name})
-    assert emulator.sprites[model_sprite].broadcasts.count("cattorch init complete") == 1
+    # Asking replaces the speech bubble, so each next question shows the
+    # finished continuation, after the question, which a long continuation
+    # can't push past Scratch's 330-character bubble.
+    for prompt, question in zip(("hi", "the cat"), emulator.questions[1:]):
+        text = "".join(CHARACTERS[index] for index in greedy(model, prompt, 5))
+        assert question == emulator.questions[0] + "\n\n" + prompt + text
+    # The prefill decoded the weights; nothing else ran init.
+    model_sprite = emulator.sprites[result.sprite_name]
+    assert "lm init complete" not in model_sprite.broadcasts
+    assert model_sprite.variables["cattorch initialized"] == 1
 
 
 def test_generation_stops_at_the_end_token_and_the_context(generator):
     model, result, tokenizer, directory = generator
     first = greedy(model, "ab", 1)[0]
     project = build_project(
-        directory / "eos", result, tokenizer=tokenizer, temperature=0, eos_token_id=first,
+        result, directory / "eos", tokenizer=tokenizer, temperature=0, eos_token_id=first,
     )
     emulator = ProjectEmulator(project.path, answers=["ab", ""])
     emulator.green_flag()
     assert emulator.sprites["Demo"].said[-1] == "ab..."
 
     # 40 new tokens don't fit in a context of 16: generation stops when full.
-    project = build_project(directory / "full", result, tokenizer=tokenizer, temperature=0)
+    project = build_project(result, directory / "full", tokenizer=tokenizer, temperature=0)
     emulator = ProjectEmulator(project.path, answers=["abc", ""])
     emulator.green_flag()
-    assert emulator.stage.variables["lm status"] == "maximum context exceeded"
+    assert emulator.stage.variables["lm status"] == interface.CONTEXT_FULL
     # 16 cached tokens, plus the one their logits predict.
     assert len(emulator.sprites["Demo"].said[-1]) == 17
 
 
 def test_sampling_follows_the_softmax(tmp_path):
-    from cattorch.project import _BEST
+    from cattorch.project import _BEST, _INDEX, _PICK, _TOTAL
 
     program = Program(
-        "sample", lists=("logits",), variables=("_cattorch bridge index", _BEST,
-                                                "_cattorch bridge total",
-                                                "_cattorch bridge pick", "heat"),
+        "sample", lists=("logits",), variables=(_INDEX, _BEST, _TOTAL, _PICK, "heat"),
         variable_values={"heat": 0.5}, list_values={"logits": [0.0, 0.5, 1.0]},
         body=_sample("logits", "heat"),
     )
-    emulator = ScratchEmulator(program.compile())
+    emulator = SpriteEmulator(program.compile())
     torch.manual_seed(3)
     counts = collections.Counter()
     for _ in range(3000):
@@ -191,15 +202,115 @@ def test_sampling_follows_the_softmax(tmp_path):
 def test_generators_need_their_tokenizer(generator):
     _, result, tokenizer, directory = generator
     with pytest.raises(ValueError, match="needs its tokenizer"):
-        build_project(directory / "none", result)
+        build_project(result, directory / "none")
     with pytest.raises(TypeError, match="result of cattorch.transpile"):
-        build_project(directory / "wrong", tokenizer)
+        build_project(tokenizer, directory / "wrong")
 
 
-@pytest.mark.parametrize("name", ["cattorch", "Demo", "Stage"])
-def test_reserved_sprite_names_are_renamed(tmp_path, name):
-    result = transpile(nn.Linear(2, 2).eval(), torch.randn(1, 2), tmp_path / "m", name=name)
-    project = build_project(tmp_path / "project", result)
-    assert name not in project.sprites
-    assert len(set(project.sprites)) == len(project.sprites)
-    assert not any(entry.startswith("cattorch ") for entry in project.lists)
+def test_names_a_project_cant_use(tmp_path):
+    model, example = nn.Linear(2, 2).eval(), torch.randn(1, 2)
+    # Its prepare for save would be the message every sprite answers.
+    with pytest.raises(ValueError, match="every exported sprite answers"):
+        transpile(model, example, tmp_path / "m", name="Cattorch")
+    # The project's own sprite gives way: the model's name is its interface.
+    result = transpile(model, example, tmp_path / "m", name="Demo")
+    project = build_project(result, tmp_path / "project")
+    assert project.sprites == ("Demo2", "Demo")
+    assert set(project.lists) == {"Demo input", "Demo output"}
+    result = transpile(model, example, tmp_path / "m", name="Stage")
+    with pytest.raises(ValueError, match="named 'Stage'"):
+        build_project(result, tmp_path / "project")
+
+
+def test_two_sprites_of_one_name_or_global_are_refused(generator, tmp_path):
+    from shared_models import char_tokenizer
+
+    _, result, _, _ = generator
+    words = CharTokenizer(char_tokenizer()).save(tmp_path / "words", name="lm")
+    with pytest.raises(ValueError, match="named 'lm'"):
+        build_project(result, tmp_path / "same", tokenizer=words)
+
+
+@pytest.mark.parametrize(("options", "error", "expected"), [
+    ({"max_new_tokens": 2.5}, TypeError, "max_new_tokens must be an integer"),
+    ({"max_new_tokens": True}, TypeError, "max_new_tokens must be an integer"),
+    ({"max_new_tokens": 0}, ValueError, "max_new_tokens must be positive"),
+    ({"temperature": -1}, ValueError, "temperature must be a finite number of 0 or more"),
+    ({"temperature": math.nan}, ValueError, "temperature must be a finite"),
+    ({"temperature": math.inf}, ValueError, "temperature must be a finite"),
+    ({"temperature": "0.5"}, TypeError, "temperature must be a number"),
+    ({"eos_token_id": len(CHARACTERS)}, ValueError, "not a token ID of the model"),
+    ({"eos_token_id": -1}, ValueError, "not a token ID of the model"),
+    ({"eos_token_id": 1.0}, TypeError, "eos_token_id must be an integer"),
+    ({"prompt": ""}, ValueError, "prompt must be a non-empty string"),
+    ({"labels": ["a"]}, ValueError, "labels= applies only to a TranspileResult"),
+    ({"example_inputs": torch.zeros(1, 2)}, ValueError, "example_inputs= applies only"),
+])
+def test_generation_project_options_are_checked(generator, options, error, expected):
+    _, result, tokenizer, directory = generator
+    with pytest.raises(error, match=expected):
+        build_project(result, directory / "bad", tokenizer=tokenizer, **options)
+    assert not (directory / "bad.sb3").exists()
+
+
+def test_generation_project_without_its_tokenizer_mismatch_does_not_warn(generator):
+    import warnings
+
+    _, result, tokenizer, directory = generator
+    assert result.vocabulary_size == tokenizer.token_count
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        project = build_project(result, directory / "matched", tokenizer=tokenizer)
+    assert project.warnings == ()
+
+
+def test_options_of_another_kind_of_project_are_rejected(tmp_path):
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2).eval()
+    example = torch.randn(1, 4)
+    result = transpile(model, example, tmp_path / "net")
+    for options, expected in (
+        ({"temperature": 0.5}, "temperature= applies only to a text generator"),
+        ({"max_new_tokens": 3}, "max_new_tokens= applies only"),
+        ({"eos_token_id": 1}, "eos_token_id= applies only"),
+        ({"prompt": "Say"}, "prompt= applies only"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            build_project(result, tmp_path / "bad", **options)
+
+    class Counter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(2))
+
+        @entrypoint(example_inputs=(torch.ones(2),))
+        def add(self, value):
+            self.total = self.total + value
+            return self.total
+
+    program = transpile(Counter().eval(), None, tmp_path / "counter")
+    for options, expected in (
+        ({"labels": ["a", "b"]}, "labels= applies only to a TranspileResult"),
+        ({"example_inputs": (torch.ones(2),)}, "example_inputs= applies only"),
+        ({"temperature": 0}, "temperature= applies only"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            build_project(program, tmp_path / "bad", **options)
+    assert not list(tmp_path.glob("bad*"))
+
+
+def test_example_inputs_must_fit_the_exported_inputs(tmp_path):
+    model = nn.Linear(4, 2).eval()
+    result = transpile(model, torch.randn(1, 4), tmp_path / "net")
+    for example, error, expected in (
+        (torch.randn(2, 4), ValueError, r"shape \(2, 4\), but 'net input' takes float32 of shape \(1, 4\)"),
+        (torch.zeros(1, 4, dtype=torch.int64), ValueError, "int64 tensor"),
+        ((torch.randn(1, 4), torch.randn(1, 4)), ValueError, "has 2 tensors, but the export has 1"),
+        (([1.0, 2.0, 3.0, 4.0],), TypeError, "example input 0 is a list"),
+        ({"x": torch.randn(1, 4)}, TypeError, "example_inputs must be a tensor or a tuple"),
+    ):
+        with pytest.raises(error, match=expected):
+            build_project(result, tmp_path / "bad", example_inputs=example)
+    with pytest.raises(TypeError, match="labels must be a sequence"):
+        build_project(result, tmp_path / "bad", labels="ab")
+    assert build_project(result, tmp_path / "ok", example_inputs=torch.randn(1, 4)).path.exists()

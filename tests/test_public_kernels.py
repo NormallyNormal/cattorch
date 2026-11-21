@@ -12,6 +12,7 @@ import torch.nn as nn
 from cattorch import GenerationProgram, UnsupportedOperationError, transpile, verify
 from cattorch import EntryPoint, ExportProgram, Input, Output
 from cattorch.experimental import Kernel, analyze, build_kernel_benchmark, check_kernel
+from sprite_helpers import SpriteEmulator
 from cattorch.scratch import (
     add, append, change_var, clear, div, item, mathop, mul, render, repeat, set_var, sub, var,
 )
@@ -75,7 +76,8 @@ def test_a_kernel_replaces_a_builtin_kernel_for_one_export(tmp_path):
 def test_approximate_kernels_apply_only_in_fast_mode(tmp_path):
     rough = Kernel(torch.ops.aten.mish, _pointwise(lambda x: mul(x, 0.6)), approximate=True)
     model, value = nn.Mish().eval(), torch.randn(2, 4)
-    exact = transpile(model, value, tmp_path / "exact", kernels=[rough])
+    with pytest.warns(UserWarning, match="runs only with optimization='fast'"):
+        exact = transpile(model, value, tmp_path / "exact", kernels=[rough])
     assert exact.fallback_operations == (("aten.mish.default", 1),)
     assert exact.approximate_operations == ()
     fast = transpile(model, value, tmp_path / "fast", kernels=[rough], optimization="fast")
@@ -100,8 +102,8 @@ def test_kernels_must_be_kernels(tmp_path):
 
 
 def test_kernels_apply_to_generation_and_programs(tmp_path):
-    from test_generation_automatic import nano, prefill_and_decode, load_sprite
-    from cattorch.util.scratch.emulator import ScratchEmulator
+    from shared_models import nano
+    from sprite_helpers import load_sprite, prefill_and_decode
 
     class Block(nn.Module):
         def __init__(self):
@@ -115,7 +117,7 @@ def test_kernels_apply_to_generation_and_programs(tmp_path):
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / "gen", kernels=[MISH])
     assert result.fallback_operations == ()
     with torch.no_grad():
-        prefill_and_decode(ScratchEmulator(load_sprite(result.path)), model, [1, 2], [3])
+        prefill_and_decode(SpriteEmulator(load_sprite(result.path)), model, [1, 2], [3])
 
     program = ExportProgram(entrypoints=(EntryPoint(
         "squash", arguments=(Input("value", torch.randn(4)),), returns=(Output("value"),),

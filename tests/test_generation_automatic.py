@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
+from cattorch import interface
 import math
-import sys
-import zipfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -14,29 +11,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from cattorch import (
-    CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
+    CattorchWarning, CodegenConfig, FastConfig, GenerationProgram, QuantizationConfig,
     UnsupportedModelError, transpile,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_autoregressive import VOCAB, NanoGPT, NanoMQA, RopeLM, tiny_decoder  # noqa: E402
-from test_optimization import CachedLM  # noqa: E402
+from shared_models import VOCAB, CachedLM, NanoGPT, NanoMQA, RopeLM, nano, tiny_decoder
+from cattorch.interface import TOKEN_IDS
+from sprite_helpers import SpriteEmulator, assert_logits, load_sprite, logits_of, prefill_and_decode
+from scratch_status import INTERRUPTED
 
 TOLERANCE = 1e-4
-
-
-def load_sprite(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
-
-
-def logits_of(model, prefix):
-    with torch.no_grad():
-        output = model(torch.tensor([prefix]))
-    if not isinstance(output, torch.Tensor):
-        output = output[0] if isinstance(output, tuple) else output.logits
-    return output[0, -1].flatten()
 
 
 def emulator_for(model, tmp_path, name="auto", *, codegen=None, **program):
@@ -44,35 +28,7 @@ def emulator_for(model, tmp_path, name="auto", *, codegen=None, **program):
     result = transpile(
         model, GenerationProgram(**program), tmp_path / name, codegen=codegen,
     )
-    return ScratchEmulator(load_sprite(result.path)), result
-
-
-def assert_logits(emulator, model, prefix):
-    actual = torch.tensor(emulator.lists["cattorch logits"])
-    torch.testing.assert_close(
-        actual, logits_of(model, prefix), atol=TOLERANCE, rtol=0,
-    )
-
-
-def prefill_and_decode(emulator, model, prompt, more):
-    emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = list(prompt)
-    emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "ok"
-    prefix = list(prompt)
-    assert_logits(emulator, model, prefix)
-    for token in more:
-        prefix.append(token)
-        emulator.lists["cattorch tokens"] = [token]
-        emulator.run_procedure("cattorch decode")
-        assert emulator.variables["cattorch status"] == "ok"
-        assert_logits(emulator, model, prefix)
-    return prefix
-
-
-def nano():
-    torch.manual_seed(5)
-    return NanoGPT(layers=2, width=16, heads=2, context=16).eval()
+    return SpriteEmulator(load_sprite(result.path)), result
 
 
 MODELS = {
@@ -124,16 +80,17 @@ def test_overflow_rolls_back_and_reset_recovers(tmp_path):
         name: list(emulator.lists[name])
         for name in ("_cattorch K cache 1", "_cattorch V cache 2")
     }
-    emulator.lists["cattorch tokens"] = [6]
+    kept = list(emulator.lists["cattorch logits"])
+    emulator.lists[TOKEN_IDS] = [6]
     emulator.run_procedure("cattorch decode")
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 5
     for name, values in caches.items():
         assert emulator.lists[name] == values
-    emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill exceeds maximum context"
+    assert emulator.variables["cattorch status"] == interface.too_many_items(emulator.public(interface.TOKEN_IDS))
     emulator.run_procedure("cattorch reset")
     prefill_and_decode(emulator, model, [4], [2])
 
@@ -142,7 +99,7 @@ def test_top_k_reports_the_largest_logits(tmp_path):
     model = nano()
     emulator, _ = emulator_for(model, tmp_path, max_context=8, top_k=3)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [2, 9, 4]
+    emulator.lists[TOKEN_IDS] = [2, 9, 4]
     emulator.run_procedure("cattorch prefill")
     expected = logits_of(model, [2, 9, 4]).topk(3)
     assert emulator.lists["cattorch top k ids"] == expected.indices.tolist()
@@ -160,18 +117,18 @@ def test_hidden_prefill_skips_the_final_layers_attention_and_mlp(tmp_path, shari
     for hidden in (False, True):
         emulator, _ = emulator_for(
             model, tmp_path, f"{sharing}_{hidden}", max_context=16,
-            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing),
+            hidden_prefill=hidden, codegen=CodegenConfig(layer_sharing=sharing == "auto"),
         )
         shared = "_cattorch shared transformer layer" in emulator._procedures
         assert shared == (sharing == "auto")
         emulator.run_procedure("cattorch init")
         before = sum(emulator.opcode_counts.values())
-        emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6, 7, 8]
+        emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6, 7, 8]
         emulator.run_procedure("cattorch prefill")
         counts[hidden] = sum(emulator.opcode_counts.values()) - before
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8])
         # The skipped tokens still filled the final layer's cache.
-        emulator.lists["cattorch tokens"] = [9]
+        emulator.lists[TOKEN_IDS] = [9]
         emulator.run_procedure("cattorch decode")
         assert_logits(emulator, model, [1, 2, 3, 4, 5, 6, 7, 8, 9])
     assert counts[True] < counts[False] * 0.8
@@ -182,12 +139,144 @@ def test_decode_before_any_prefill_writes_logits(tmp_path, sharing):
     torch.manual_seed(13)
     model = CachedLM(context=8, layers=2).eval()
     emulator, _ = emulator_for(
-        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing),
+        model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=sharing == "auto"),
     )
-    emulator.lists["cattorch tokens"] = [3]
+    emulator.lists[TOKEN_IDS] = [3]
     emulator.run_procedure("cattorch decode")
     assert emulator.variables["cattorch status"] == "ok"
     assert_logits(emulator, model, [3])
+
+
+def procedure_callers(sprite):
+    """Map each defined procedure to the procedures whose definitions call it."""
+    blocks = {key: block for key, block in sprite["blocks"].items() if isinstance(block, dict)}
+
+    def top(key):
+        while blocks[key].get("parent"):
+            key = blocks[key]["parent"]
+        return key
+
+    def name(definition):
+        return blocks[blocks[definition]["inputs"]["custom_block"][1]]["mutation"]["proccode"]
+
+    callers = {
+        name(key): set() for key, block in blocks.items()
+        if block["opcode"] == "procedures_definition"
+    }
+    for key, block in blocks.items():
+        if block["opcode"] == "procedures_call":
+            root = top(key)
+            if blocks[root]["opcode"] == "procedures_definition":
+                callers[block["mutation"]["proccode"]].add(name(root))
+    return callers
+
+
+def canvas_calls(sprite):
+    """The procedures that loose call blocks on the canvas run."""
+    return {
+        block["mutation"]["proccode"] for block in sprite["blocks"].values()
+        if isinstance(block, dict) and block["opcode"] == "procedures_call"
+        and block.get("topLevel")
+    }
+
+
+@pytest.mark.parametrize("sharing", ["off", "auto"])
+def test_private_procedures_run_only_from_public_ones(tmp_path, sharing):
+    torch.manual_seed(13)
+    model = CachedLM(context=8, layers=2).eval()
+    result = transpile(
+        model, GenerationProgram(max_context=8, top_k=2), tmp_path / "gen",
+        codegen=CodegenConfig(layer_sharing=sharing == "auto"),
+    )
+    sprite = load_sprite(result.path)
+    callers = procedure_callers(sprite)
+    # The blocks a call runs, each run by a broadcast of its message.
+    public = {interface.internal_name(interface.PUBLIC_PREFIX + message.removeprefix("gen "))
+              for message in result.broadcasts}
+    assert public <= set(callers)
+    assert not [name for name, by in callers.items() if not by and name not in public]
+    assert canvas_calls(sprite) == set()
+
+
+class Stopped(Exception):
+    """Scratch's stop button, pressed while a block runs."""
+
+
+def stop_on_call(emulator, procedure, call):
+    """Stop the project as the ``call``-th run of ``procedure`` starts.
+
+    Returns a function that undoes it.
+    """
+    start = emulator._procedures[procedure]
+    chain = emulator._chain_runner(start)
+    calls = 0
+
+    def run():
+        nonlocal calls
+        calls += 1
+        if calls == call:
+            raise Stopped
+        chain()
+
+    emulator._chains[start] = run
+    return lambda: emulator._chains.__setitem__(start, chain)
+
+
+def stop_during(emulator, public, procedure, call, tokens=None):
+    restore = stop_on_call(emulator, procedure, call)
+    if tokens is not None:
+        emulator.lists[TOKEN_IDS] = tokens
+    with pytest.raises(Stopped):
+        emulator.run_procedure(public)
+    restore()
+
+
+@pytest.mark.parametrize(("public", "procedure", "call", "tokens"), [
+    ("cattorch prefill", "_cattorch token step for epoch %s", 4, [1, 2, 3, 4, 5, 6]),
+    ("cattorch decode", "_cattorch token step for epoch %s", 1, [5]),
+    ("cattorch reset", "_cattorch reset state", 1, None),
+])
+def test_a_stopped_call_makes_decode_fail_until_reset_or_prefill(
+    tmp_path, public, procedure, call, tokens,
+):
+    model = nano()
+    emulator, _ = emulator_for(model, tmp_path, max_context=16, top_k=2)
+    prefill_and_decode(emulator, model, [2, 7], [])
+    stop_during(emulator, public, procedure, call, tokens)
+    length = emulator.variables["cattorch cache length"]
+    outputs = list(emulator.lists["cattorch logits"]), list(emulator.lists["cattorch top k ids"])
+    emulator.lists[TOKEN_IDS] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == INTERRUPTED
+    # A refused decode writes nothing.
+    assert (emulator.lists["cattorch logits"], emulator.lists["cattorch top k ids"]) == outputs
+    assert emulator.variables["cattorch cache length"] == length
+    emulator.run_procedure("cattorch reset")
+    assert emulator.variables["cattorch status"] == "ok"
+    emulator.lists[TOKEN_IDS] = [3]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == "ok"
+    assert_logits(emulator, model, [3])
+    stop_during(emulator, public, procedure, call, tokens)
+    prefill_and_decode(emulator, model, [4, 1], [6])
+
+
+GPTQ = QuantizationConfig(bits=8, method="gptq", min_quantized_values=16)
+
+
+@pytest.mark.parametrize(("options", "message"), [
+    ({"quantization": GPTQ}, r"GPTQ needs calibration=, an iterable of \[1, length\] token"),
+    ({"quantization": GPTQ, "calibration": []}, "GPTQ requires nonempty calibration"),
+    ({"calibration": [torch.tensor([[1, 2]])]}, "calibration= is only used by GPTQ"),
+    ({"quantization": GPTQ, "calibration": [torch.tensor([[1, 2, VOCAB]])]},
+     rf"calibration\[0\] has token {VOCAB} at position 2; token IDs must be "
+     rf"whole numbers from 0 to {VOCAB - 1}"),
+    ({"quantization": GPTQ, "calibration": [torch.tensor([[1, 2]]), torch.tensor([[2.5]])]},
+     r"calibration\[1\] has token 2.5 at position 0"),
+])
+def test_calibration_errors_name_calibration(tmp_path, options, message):
+    with pytest.raises(ValueError, match=message):
+        transpile(nano(), GenerationProgram(max_context=8), tmp_path / "gptq", **options)
 
 
 def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
@@ -222,7 +311,7 @@ def test_layers_differing_in_a_constant_are_not_shared(tmp_path):
     torch.manual_seed(0)
     model = Scaled().eval()
     emulator, _ = emulator_for(
-        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing="auto"),
+        model, tmp_path, max_context=4, codegen=CodegenConfig(layer_sharing=True),
     )
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, model, [1, 2, 3], [4])
@@ -234,7 +323,7 @@ def test_reduced_precision_models_export(tmp_path, dtype):
     model = tiny_decoder("llama", layers=1).to(dtype).eval()
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3]
     emulator.run_procedure("cattorch prefill")
     expected = logits_of(model.float(), [1, 2, 3])
     actual = torch.tensor(emulator.lists["cattorch logits"])
@@ -256,7 +345,7 @@ def test_banned_tokens_with_negative_infinity_export(tmp_path):
     model = Banned().eval()
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
-    emulator.lists["cattorch tokens"] = [1, 2, 3]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3]
     emulator.run_procedure("cattorch prefill")
     logits = emulator.lists["cattorch logits"]
     assert logits[0] == logits[5] == -math.inf
@@ -268,16 +357,16 @@ def test_token_ids_outside_the_vocabulary_are_rejected(tmp_path):
     emulator, _ = emulator_for(model, tmp_path, max_context=8)
     emulator.run_procedure("cattorch init")
     for tokens in ([1, VOCAB], [1, -1], [1, 2.5], [1, "abc"]):
-        emulator.lists["cattorch tokens"] = list(tokens)
+        emulator.lists[TOKEN_IDS] = list(tokens)
         emulator.run_procedure("cattorch prefill")
-        assert emulator.variables["cattorch status"].startswith("token ids must be"), tokens
+        assert emulator.variables["cattorch status"] == interface.invalid_item(emulator.public(TOKEN_IDS)), tokens
         assert emulator.lists["cattorch logits"] == []
-    emulator.lists["cattorch tokens"] = [VOCAB - 1]
+    emulator.lists[TOKEN_IDS] = [VOCAB - 1]
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
-    emulator.lists["cattorch tokens"] = [VOCAB]
+    emulator.lists[TOKEN_IDS] = [VOCAB]
     emulator.run_procedure("cattorch decode")
-    assert emulator.variables["cattorch status"].startswith("token ids must be")
+    assert emulator.variables["cattorch status"] == interface.invalid_item(emulator.public(TOKEN_IDS))
 
 
 def test_rotate_half_rope_uses_the_rotary_kernel(tmp_path, monkeypatch):
@@ -305,8 +394,8 @@ def test_caches_and_position_are_not_static_weights(exported):
     sprite = load_sprite(result.path)
     names = [entry[0] for entry in sprite["lists"].values()]
     assert "_cattorch K cache 1" in names
-    assert not any(name.startswith("W_") and "cache" in name for name in names)
-    assert not any("position" in name for name in names if name.startswith("W_"))
+    assert not any(name.startswith("_W_") and "cache" in name for name in names)
+    assert not any("position" in name for name in names if name.startswith("_W_"))
 
 
 def test_fast_softmax_kernel_skips_the_maximum_pass(tmp_path):
@@ -318,9 +407,9 @@ def test_fast_softmax_kernel_skips_the_maximum_pass(tmp_path):
     )
     exact = transpile(model, GenerationProgram(max_context=8), tmp_path / "exact")
     names = lambda result: {e[0] for e in load_sprite(result.path)["variables"].values()}
-    assert "maximum" in names(exact) and "maximum" not in names(fast)
+    assert "_maximum" in names(exact) and "_maximum" not in names(fast)
     assert fast.block_count < exact.block_count
-    emulator = ScratchEmulator(load_sprite(fast.path))
+    emulator = SpriteEmulator(load_sprite(fast.path))
     prefill_and_decode(emulator, model, [1, 2, 3], [4, 5])
 
 
@@ -329,14 +418,14 @@ def test_layer_sharing_banks_the_caches(tmp_path):
     model = CachedLM(context=8, layers=3).eval()
     shared = transpile(
         model, GenerationProgram(max_context=8), tmp_path / "shared",
-        codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=True, unrolling="compact"),
     )
     plain = transpile(
         model, GenerationProgram(max_context=8), tmp_path / "plain",
-        codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
     assert shared.block_count < plain.block_count * 0.8
-    emulator = ScratchEmulator(load_sprite(shared.path))
+    emulator = SpriteEmulator(load_sprite(shared.path))
     assert "_cattorch shared transformer layer" in emulator._procedures
     assert "_cattorch K cache" in emulator.lists
     prefill_and_decode(emulator, model, [1, 3, 5], [2, 4])
@@ -345,27 +434,32 @@ def test_layer_sharing_banks_the_caches(tmp_path):
 def test_layer_sharing_falls_back_for_models_without_block_layers(tmp_path):
     # Hugging Face layers live in `model.layers`, not `blocks.N`.
     hf = tiny_decoder("gpt2").eval()
-    result = transpile(
-        hf, GenerationProgram(max_context=8), tmp_path / "hf",
-        codegen=CodegenConfig(layer_sharing="auto"),
-    )
-    emulator = ScratchEmulator(load_sprite(result.path))
+    with pytest.warns(CattorchWarning, match="no repeated layers to share"):
+        result = transpile(
+            hf, GenerationProgram(max_context=8), tmp_path / "hf",
+            codegen=CodegenConfig(layer_sharing=True),
+        )
+    assert any("`blocks.0`" in item for item in result.warnings)
+    emulator = SpriteEmulator(load_sprite(result.path))
     assert "_cattorch shared transformer layer" not in emulator._procedures
     prefill_and_decode(emulator, hf, [1, 2, 3], [4])
 
 
-def test_unfactorable_layers_retry_without_layer_sharing(tmp_path, caplog):
+def test_unfactorable_layers_retry_without_layer_sharing(tmp_path):
     model = nano()
     # A different MLP width in the second layer defeats the shared procedure.
     model.blocks[1].mlp = torch.nn.Sequential(
         torch.nn.Linear(16, 24), torch.nn.GELU(), torch.nn.Linear(24, 16),
     )
     model.eval()
-    with caplog.at_level("WARNING", logger="cattorch"):
-        emulator, _ = emulator_for(
-            model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing="auto"),
+    with pytest.warns(CattorchWarning, match="exported without layer sharing"):
+        emulator, result = emulator_for(
+            model, tmp_path, max_context=8, codegen=CodegenConfig(layer_sharing=True),
         )
-    assert "exporting without layer sharing" in caplog.text
+    assert any(
+        "exported without layer sharing" in item and "`blocks.1`" in item
+        for item in result.warnings
+    )
     assert "_cattorch shared transformer layer" not in emulator._procedures
     # Per-layer caches again: the retry does not bank them.
     assert "_cattorch K cache 1" in emulator.lists and "_cattorch K cache" not in emulator.lists
@@ -450,16 +544,18 @@ def test_long_context_shards_the_caches_and_tables(tmp_path, small_list_limit):
     context = 48  # 48 rows x 64 = 3,072 items, above the lowered list limit
     model = LongContextLM(context).eval()
     result = transpile(model, GenerationProgram(max_context=context), tmp_path / "long")
-    assert "_cattorch K cache 1" in result.sharded_lists
-    assert "_cattorch V cache 1" in result.sharded_lists
-    emulator = ScratchEmulator(load_sprite(result.path))
+    emulator = SpriteEmulator(load_sprite(result.path))
+    # The caches are internal: split, but not listed in sharded_lists.
+    assert "_cattorch K cache 1 shard 2" in emulator.lists
+    assert "_cattorch V cache 1 shard 2" in emulator.lists
+    assert not any("cache" in name for name in result.sharded_lists)
     prefill_and_decode(emulator, model, [3, 1, 4], [1])
     assert len(emulator.lists["_cattorch K cache 1"]) == 4 * 64
 
 
 def test_generation_program_signature_and_validation():
     program = GenerationProgram(64)
-    assert (program.method, program.max_context) == ("forward", 64)
+    assert (program.method, program.max_context) == (None, 64)
     assert GenerationProgram(max_context=32, method="decode").method == "decode"
     with pytest.raises(TypeError):
         GenerationProgram()
@@ -467,8 +563,10 @@ def test_generation_program_signature_and_validation():
         GenerationProgram("forward", torch.tensor([[1]]), 64)
     with pytest.raises(TypeError, match="keyword-only"):
         GenerationProgram("forward")
-    with pytest.raises(ValueError, match="positive"):
-        GenerationProgram(max_context=0)
+    for small in (0, 1, 2):
+        with pytest.raises(ValueError, match=f"at least 3, not {small}"):
+            GenerationProgram(max_context=small)
+    assert GenerationProgram(max_context=3).max_context == 3
 
 
 def test_non_causal_model_is_rejected_at_export(tmp_path):
@@ -480,3 +578,35 @@ def test_non_causal_model_is_rejected_at_export(tmp_path):
     )).eval()
     with pytest.raises(UnsupportedModelError, match="isn't causal"):
         transpile(bert, GenerationProgram(max_context=8), tmp_path / "bert")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_generation_export_copies_the_model_once(tmp_path, monkeypatch, dtype):
+    # One copy to adapt and quantize; without layer sharing there is no
+    # second attempt, so tracing gets the step itself.
+    import copy
+
+    torch.manual_seed(0)
+    model = NanoGPT(layers=2, width=16, heads=2, context=8).eval().to(dtype)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    copies = []
+    deepcopy = copy.deepcopy
+    depth = [0]
+
+    def counting(value, *args, **kwargs):
+        # copy.deepcopy recurses through the module-level name too.
+        if isinstance(value, nn.Module) and not depth[0]:
+            copies.append(type(value).__name__)
+        depth[0] += 1
+        try:
+            return deepcopy(value, *args, **kwargs)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(copy, "deepcopy", counting)
+    transpile(
+        model, GenerationProgram(max_context=8), tmp_path / "g",
+        quantization=QuantizationConfig(bits=8, min_quantized_values=64),
+    )
+    assert copies == ["NanoGPT"]
+    assert all(torch.equal(before[key], value) for key, value in model.state_dict().items())

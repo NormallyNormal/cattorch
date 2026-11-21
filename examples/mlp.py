@@ -4,7 +4,9 @@
 
 writes ``build/quadrants.sprite3`` and a runnable ``build/quadrants.sb3``:
 edit the two numbers in the "quadrants input" list and press space to see the
-predicted quadrant. The same model exports from the command line with
+predicted quadrant. Any sprite can do the same: fill "quadrants input",
+broadcast "quadrants forward" and wait, and read "quadrants status" and
+"quadrants output". The same model exports from the command line with
 
     cattorch export examples/mlp.py:trained --project --labels "top right,top left,bottom left,bottom right"
 """
@@ -22,7 +24,7 @@ import cattorch
 LABELS = ["top right", "top left", "bottom left", "bottom right"]
 
 
-@cattorch.example(lambda: (torch.tensor([[0.5, -0.25]]),))
+@cattorch.example_inputs(lambda: (torch.tensor([[0.5, -0.25]]),))
 class Quadrants(nn.Module):
     def __init__(self):
         super().__init__()
@@ -52,12 +54,12 @@ def trained(steps: int = 300) -> Quadrants:
 
 def main(output: Path = Path("build"), steps: int = 300) -> cattorch.ProjectResult:
     model = trained(steps)
-    # The @example marker supplies the inputs.
+    # The @example_inputs marker supplies the inputs.
     result = cattorch.transpile(model, None, output / "quadrants")
     assert cattorch.verify(model, None, result).passed
     example = torch.tensor([[0.5, -0.25]])
     return cattorch.build_project(
-        output / "quadrants", result, example_inputs=example, labels=LABELS,
+        result, output / "quadrants", example_inputs=example, labels=LABELS,
     )
 
 

@@ -8,7 +8,7 @@ Parameters, buffers, and constants are stored in the sprite, and tensor
 arguments become Scratch input lists.
 
 For persistent state, use [`@entrypoint` markers](markers.md) or an
-[`ExportProgram`](programs-and-moe.md#named-entrypoints-and-state).
+[`ExportProgram`](programs-and-moe.md#named-entry-points-and-state).
 
 ## Operations
 
@@ -16,18 +16,19 @@ For persistent state, use [`@entrypoint` markers](markers.md) or an
 |---|---|
 | Convolution | `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and `nn.ConvTranspose1d/2d/3d`, batched or unbatched, with any stride, padding (including `"same"`), dilation, groups (including depthwise), and output padding. 3D and transposed convolutions are built from the 1D and 2D kernels, so they cost more blocks |
 | Pooling | `nn.MaxPool1d/2d/3d`, `nn.AvgPool1d/2d/3d`, `nn.AdaptiveAvgPool1d/2d/3d`, `nn.AdaptiveMaxPool1d/2d/3d`, batched or unbatched, with every option, including `return_indices=True` |
-| Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item |
+| Linear algebra | `nn.Linear`, `@`, `torch.matmul`, including broadcast batch dimensions and vectors; a stored weight broadcast over a batch is stored once per batch item; `torch.einsum`, `torch.cdist` |
+| Embeddings | `nn.Embedding`; `nn.EmbeddingBag` and `F.embedding_bag` in `sum`, `mean` and `max` modes, with `per_sample_weights`, `padding_idx` and `include_last_offset`, and a 2D input or offsets that are fixed in the model or passed as an input. The offsets' shape fixes the number of bags, and offsets passed as an input must be valid for PyTorch (start at 0, never decrease, and end with the number of indices under `include_last_offset`): an offset outside 0 to the number of indices, or a first offset that isn't 0, is refused (see [index inputs](#index-inputs)), and other invalid offsets give undefined results; only the bags are computed, not `offset2bag` or the other results of `torch.ops.aten.embedding_bag`. `max_norm` is rejected: rescale the table before export |
 | Activations | ReLU, ReLU6, hardtanh, hardswish, sigmoid, tanh, GELU (exact and tanh forms), SiLU, Mish, softplus, leaky ReLU, ELU |
-| Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.rsqrt` |
+| Normalization | BatchNorm1d/2d (including without running statistics), LayerNorm, RMSNorm, GroupNorm, InstanceNorm, `F.normalize`, `torch.norm` and `torch.linalg.vector_norm`, `torch.rsqrt` |
 | Attention primitives | softmax, log-softmax, embeddings, registered-buffer `masked_fill`, `F.scaled_dot_product_attention` (causal or with a static mask), `cattorch.rotary_embedding` |
-| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
+| Arithmetic | tensor/scalar `+`, `-`, `*`, `/`, `//`, `%`; unary `-`; `exp`, `exp2`, `log`, `log2`, `log10`, `sqrt`, `rsqrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `round`, `reciprocal`, `erf`, `erfc`, `lgamma`, `mvlgamma`; trigonometric, inverse trigonometric, and hyperbolic functions, `atan2`, `hypot`; `clamp`; `torch.pow` with any exponent, including a tensor; `logsumexp`, `logaddexp` |
 | Reduction | `sum`, `mean`, `prod`, `amax`, `amin`, `max`/`min` (with indices), `argmax`, `argmin`, `any`, `all`, `var`, `std`, `median`, `kthvalue`, over any dimensions; `cumsum`, `cumprod`, `cummax`, `cummin`; `torch.topk`, `torch.sort`, `argsort` |
 | Comparison and selection | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~` on comparisons, `torch.where`, `torch.maximum`, `torch.minimum`; results are 0/1 tensors |
-| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like` |
+| Tensor creation | `arange`, `ones`, `zeros`, `full`, `ones_like`, `zeros_like`, `F.one_hot` with `num_classes` |
 | Shape and layout | `view`, `reshape`, `flatten`, `unflatten`, `squeeze`, `unsqueeze`, `contiguous`, `clone`, transpose, permute, `.T` |
 | Tensor composition | split, split-with-sizes, chunk, concat, stack, fixed dimension slicing with a positive step |
-| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
-| In-place updates | `x /= y`, `x.copy_(y)`, and slice or index assignment such as `x[..., :4] = y` on a tensor the model created, with step-one slices; updates of inputs, parameters, or a tensor read through an earlier view are rejected |
+| Data movement | `expand`, `repeat`, `flip`, `roll`, `F.pad` (constant, reflect, replicate), `tril`, `triu`, nearest upsampling; `gather`, `index_select`, `take`, `take_along_dim`, and tensor indexing such as `x[ids]` or `x[:, ids]`; `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_fill`, `index_reduce`, and `index_put`, with any integer indices, including ones computed from the input; `x[mask] = value` with a boolean mask |
+| In-place updates | `x += 1`, `x.clamp_(-1, 1)`, `x.copy_(y)`, and slice or index assignment such as `x[0] = 0` or `x[..., :4] = y`, with step-one slices, on a tensor the model computed or on a `forward` input. Every in-place method and augmented assignment (`x %= 2`, `x.remainder_(2)`, `x.trunc_()`) exports exactly when its out-of-place form does, keeping PyTorch's rule that a float result can't be written into an integer tensor. The sprite computes the updated value and leaves the input list unchanged. Every view of the updated tensor read afterwards, including the one written through and views taken before the update (slices, `select`, `view`, `transpose`, `permute`, `expand`), reads the updated values. In-place shape changes (`x.t_()`, `x.unsqueeze_(0)`) are rejected; write `x = x.t()`. Updates of a parameter or buffer (use [`@entrypoint` state](markers.md#entry-points-and-state)), and updates seen through any other kind of view, such as `as_strided`, are rejected |
 
 Any computation whose inputs are all parameters, buffers, or constants runs
 once during export, whatever operations it uses. Masks such as
@@ -38,8 +39,9 @@ These operations cover many MLPs and CNNs, along with transformer components
 such as multi-head attention, combined QKV projections, rotary position
 embeddings, causal masks, pre-norm residual blocks, and SwiGLU gates. Support
 depends on the operations the model actually runs, not on its architecture
-name. `nn.MultiheadAttention`, `nn.TransformerEncoder`, and nanoGPT- or
-Llama-style attention written in plain PyTorch export without changes. A
+name. `nn.MultiheadAttention` (with a boolean or float `attn_mask`),
+`nn.TransformerEncoder`, and nanoGPT- or Llama-style attention written in
+plain PyTorch export without changes. A
 wrapper around a supported module can still fail, for example when a block
 returns a tuple; see [troubleshooting](troubleshooting.md#unpack-module-tuples-in-the-wrapper).
 
@@ -58,7 +60,7 @@ SDPA support. Your model and its config aren't modified, and an explicit
 `use_cache=` in `example_kwargs` still wins.
 
 This exports a stateless forward pass over the example's sequence length. It
-doesn't add a KV cache. For cached generation, pass the same unwrapped model to
+doesn't add a K/V cache. For cached generation, pass the same unwrapped model to
 a [`GenerationProgram`](generation.md):
 
 ```python
@@ -71,6 +73,15 @@ against the model's own `forward` during export. GPT-2, Llama, and Qwen2
 causal language models work this way; BERT doesn't, because its attention isn't
 causal.
 
+Hugging Face Mamba, Mamba-2, and RWKV causal language models generate through
+a [`RecurrentGenerationProgram`](recurrent-generation.md), again without a
+wrapper. cattorch builds their one-token step and states and checks them
+against the model's forward:
+
+```python
+cattorch.transpile(model, cattorch.RecurrentGenerationProgram(), "model.sprite3")
+```
+
 Mixture-of-experts models from transformers, such as Mixtral, Qwen2-MoE,
 Qwen3-MoE, OLMoE, and DeepSeek-V3, export the same way, with or without a
 `GenerationProgram`. Their experts classes, marked with transformers'
@@ -79,7 +90,7 @@ that take their routes from the model's own router, and only the selected expert
 run in Scratch. Experts with their own gate function, such as GPT-OSS's
 clamped GLU, run that function in Scratch. Experts using operations that
 [experts](programs-and-moe.md#mixture-of-experts) don't support, such as a
-hand-written normalization, can't export yet. GPT-OSS, with its attention
+hand-written normalization, can't export. GPT-OSS, with its attention
 sinks and sliding-window layers, exports with or without a `GenerationProgram`.
 
 Use `cattorch.rotary_embedding(value, cosine, sine)` for adjacent-pair RoPE.
@@ -94,11 +105,12 @@ through the [`@moe` marker](markers.md), or the experimental `ExpertFamily`
 and `SparseMoE` classes and `routed_experts` with your own router code; see
 [programs and sparse MoE](programs-and-moe.md#mixture-of-experts).
 
-Operations without their own entry, such as `F.normalize`, `nn.Mish`, or
-`var`, export when PyTorch can express them in terms of supported
-operations. They may run slower than an operation with a dedicated kernel;
-`TranspileResult.fallback_operations` and `warnings` list the ones a sprite
-uses. [Operator coverage](operator-coverage.md) shows which operators pass
+Some listed operations, such as `nn.Mish`, `var`, and 3D convolutions, have
+no kernel of their own. They export through PyTorch's decomposition into
+supported operations, and so does any other operation PyTorch can express
+that way, such as `torch.lerp` or `F.hardsigmoid`. They may run slower than
+an operation with a dedicated kernel; `TranspileResult.fallback_operations`
+and `warnings` list the ones a sprite uses. [Operator coverage](operator-coverage.md) shows which operators pass
 PyTorch's own test samples.
 
 `nn.GRU`, `nn.LSTM` (including `proj_size`) and `nn.RNN` export with stacked
@@ -108,20 +120,24 @@ sprite doesn't grow with the sequence length, and the sequence can vary at
 run time (see [variable-length inputs](#variable-length-inputs)). To process
 one step per call, write a step method around a cell and keep the hidden
 state in a buffer; [`@cattorch.entrypoint`](markers.md) exports it with the
-state kept between calls.
+state kept between calls. A GRU or LSTM language model with a one-token `step`
+becomes a text generator with a
+[`RecurrentGenerationProgram`](recurrent-generation.md).
 
 A listed operation can still be rejected for an unsupported shape,
 broadcasting pattern, or option. The error names the operation that failed.
 
 ## Inputs and outputs
 
-- The first tensor argument is flattened into `input`; later tensor arguments
-  use `input_1`, `input_2`, and so on. Tensor values in `example_kwargs`
+- The first tensor argument is flattened into the global `NAME input` list;
+  later tensor arguments use `NAME input_1`, `NAME input_2`, and so on. Tensor values in `example_kwargs`
   follow the positional ones, in dict order.
-- The model may return a tensor or a nested tuple, list, dictionary, or
-  Hugging Face `ModelOutput` of tensors. Leaves are flattened into `output`,
-  `output_1`, and so on in order. Non-tensor leaves are skipped with a
-  warning; at least one tensor is required.
+- The model may return a tensor or a nested tuple, list, dictionary,
+  NamedTuple, or Hugging Face `ModelOutput` of tensors. Leaves are flattened
+  into `NAME output`, `NAME output_1`, and so on in order. Non-tensor leaves are
+  skipped with a warning; at least one tensor is required. Tensors inside
+  any other object, such as a dataclass, aren't read: such an output raises
+  `UnsupportedModelError` naming it, rather than losing them.
 - Input shapes are fixed to the shapes of the example values, unless one
   input is [variable-length](#variable-length-inputs).
 - A model with modules in training mode is exported as an evaluation-mode
@@ -133,12 +149,74 @@ broadcasting pattern, or option. The error names the operation that failed.
   and conversions to `bool` produce 0 or 1.
 - Scratch reads NaN as 0 whenever it does arithmetic or math with it, so
   values that are NaN in PyTorch, such as `sqrt` of a negative number, can
-  give different results downstream, and `torch.isnan` is always 0. `verify`
-  runs the sprite with Scratch's rules and reports such differences.
+  give different results downstream, and `torch.isnan` is always 0.
+  `torch.nan_to_num` works with its default `nan=0`; another replacement value
+  is rejected, since Scratch can't tell NaN from 0. `verify` runs the sprite
+  with Scratch's rules and reports such differences. Known cases where
+  PyTorch gives NaN: a softmax over a row that is all `-inf` gives equal
+  probabilities, `std` or `var` with a correction over one item gives 0, and
+  `atan2` of two infinities gives NaN where PyTorch gives an odd multiple of
+  pi/4.
+- Integer arithmetic doesn't wrap around at the dtype's range: `uint8` 250 + 10
+  is 260, not 4. Values are exact up to 2^53, and an integer input takes whole
+  numbers from -2^53 to 2^53: a larger one, or `Infinity`, is refused with
+  `invalid item: LIST`.
+- Arithmetic runs in double precision, so a float32 result that lands exactly
+  on a rounding boundary in PyTorch can round the other way, as
+  `torch.round(x, decimals=1)` does for -0.05 (-0.0 in PyTorch, -0.1 in the
+  sprite). A zero can also come out as 0 where PyTorch gives -0; `atan2`,
+  `signbit` and `copysign` read the sign of -0 as PyTorch does.
+- Indices are checked as PyTorch checks them; see
+  [index inputs](#index-inputs). Other run-time checks a model makes of its
+  input values, such as `torch._assert_async`, are left out.
 
 An unsupported operation raises `UnsupportedOperationError`, naming the
 operation and the module it came from. Other export problems, such as a
 return value without any tensors, raise `UnsupportedModelError`.
+
+## Index inputs
+
+An integer input the model uses as an index is checked before the block
+runs: an item outside the valid indices of an operation that uses it is
+refused with `invalid item: LIST`, LIST being the input, and the block
+writes no output. The valid indices are PyTorch's:
+
+| Operation | Valid indices |
+|---|---|
+| `nn.Embedding`, `F.embedding`, `nn.EmbeddingBag`, `F.embedding_bag` | 0 to the table's rows minus 1 |
+| `gather`, `take_along_dim`, `index_select`, `scatter`, `scatter_add`, `scatter_reduce`, `index_add`, `index_copy`, `index_reduce` | 0 to the size of the dimension minus 1 |
+| `F.one_hot` | 0 to `num_classes` minus 1. Give `num_classes`: without it, PyTorch takes it from the largest index, and the export fails |
+| Tensor indexing such as `x[ids]` or `x[ids, other]`, `index_put` and assignment such as `x[ids] = v`, `index_fill`, `take`, `put` | minus the size to the size minus 1: a negative index counts from the end |
+| `nn.EmbeddingBag` and `F.embedding_bag` offsets | 0 to the number of indices |
+
+- An input that several operations use, or that indexes several
+  dimensions, must be valid for each of them.
+- The check follows the input through reshapes, views, copies and integer
+  casts, such as `table[ids.long().view(-1, 1)]`.
+- Only the values an operation reads are checked. An item the model writes
+  over before the operation uses it, as `ids[0] = 0` or `ids[:, 0] %= 5`
+  does, can hold anything, as in PyTorch.
+- An index the model computes from its inputs in another way, such as
+  `x[ids + 1]`, a loss's targets, or a value written into an index input,
+  is checked as the call runs, after PyTorch's conversion to an integer:
+  one out of range fails the call with `invalid item: LIST`, LIST being
+  the input it comes from (the first one, if several), and it writes no
+  output.
+- In a [program](programs-and-moe.md#named-entry-points-and-state), a state
+  the model uses as an index is checked the same way: an entry point whose
+  model moved it out of range, as a counter past a table's rows, fails with
+  `invalid item: NAME state STATE` and changes no state. A
+  `RecurrentGenerationProgram` can't use a state as an index, as a prefill
+  could take it out of range part way through its tokens; the export
+  refuses it.
+- Indices in range by construction aren't checked: those that come from
+  constants, `argmax`, `argmin`, `topk` or `sort` over a dimension no larger
+  than the one indexed, `clamp` into range, or `% size`.
+- `take_along_dim` takes 0 to the size minus 1: PyTorch doesn't check its
+  indices on every device, and reads past the end on some.
+- A [generation sprite](generation.md) can't use an index computed from the
+  token IDs, which it would have to check part way through a step; the
+  export refuses it.
 
 ## Variable-length inputs
 
@@ -154,7 +232,9 @@ result = cattorch.transpile(model, torch.randn(4, 16), "model.sprite3",
 as the tokens in a `(1, tokens)` input; name a tensor in `example_kwargs` by
 its key. The Scratch input list then takes any whole number of items, and
 the output lists grow with it. `TensorSpec.shape` shows the bounded
-dimension as a `BoundedDimension`.
+dimension as a `BoundedDimension`. cattorch traces the model with one item
+along the dimension, whatever the lower bound, so the model must run on one
+item.
 
 Most operations treat the items independently, as models treat a batch or
 tokens processed one at a time. These operations mix them, and follow the
@@ -174,6 +254,18 @@ length too:
 - Fixed slices at either end, such as `x[0]`, `x[-1]` or `x[:, -1]`.
 - Arithmetic with the length itself, as in `x.sum(0) / x.shape[0]`.
 - Recurrent layers, whose final state (`h_n`) has a fixed shape.
+- Rows times a batched weight, such as `[n, 4] @ [3, 4, 5]` or
+  `[n, 4] @ [2, 3, 4, 5]`, whose result holds the items after the batch
+  dimensions (`[3, n, 5]`). What follows can repeat fixed operands along
+  the items, such as a per-head bias `[3, 1, 5]` or scale `[3, 1, 1]`, and
+  reduce or softmax over any dimension, but can't broadcast a variable-length
+  operand, as in `y.amax(-1, keepdim=True) + bias`; transpose the items to
+  the front first for that. A variable batch against a batched weight, such
+  as `[n, 1, 3, 4] @ [3, 4, 5]` or a weight on the left, runs once per item.
+  Rows inside a batch against a batched weight (`x.transpose(0, 1) @ w` for
+  an `[n, 3, 4]` input) are rejected.
+- `nn.EmbeddingBag` over a 2D input, along its bags, or along the indices of
+  a `(1, indices)` input. A 1D input with offsets can't vary.
 
 A tensor can have only one dimension that varies, so self-attention across
 the items (`x @ x.T`, `nn.TransformerEncoderLayer` over a variable sequence)
@@ -187,13 +279,31 @@ cattorch traces the model with one item, and again with two to tell bounds
 like `x[-1]` and `x[0]` apart. It then checks the sprite against the model at
 several lengths during export. A model that builds something from the length,
 such as `torch.arange(tokens.shape[1])` for positions or a `cumsum`, fails
-that check. Language models should use a [`GenerationProgram`](generation.md)
+that check, as does a write to a fixed item, such as `x[0] = 1`. The error
+says at which length the export's numbers differ from the model's. With lossy storage (`quantization=`, float16 storage, `sig_figs`),
+the sprite is checked against a copy of the model holding the values it
+stores, so the check is as strict as for an exact export; with
+`optimization="fast"`, that copy computes GELU as fast mode's QuickGELU
+does (its other approximations are the same numbers in exact arithmetic).
+The tolerance grows with the values compared, and with the float32 rounding
+of PyTorch's own result, measured against the same model run in float64.
+Effects the check can't reproduce, fast mode's weight transforms, an
+approximate kernel passed to the export, and GPTQ in `transpile`, are
+allowed ten times the difference at the shortest length, in proportion to
+the length. Language models should use a [`GenerationProgram`](generation.md)
 instead, which handles prompts of any length up to `max_context`.
 
-Entry points take the same bounds with `Input(..., dynamic=(1, 32))`, or
-`@cattorch.entrypoint(dynamic={"rows": (1, 32)})` in [markers](markers.md),
-for an input's first dimension. Export checks each such input at several
-lengths in the same way, calling the entry point from the initial state. An
+Entry points take the same bounds, in the same form, with
+`Input(..., dynamic={1: (1, 32)})`, or
+`@cattorch.entrypoint(dynamic={"rows": {1: (1, 32)}})` in [markers](markers.md);
+`(1, 32)` alone is short for the first dimension, as for `transpile`, and
+the command line's `--dynamic INPUT.DIM=MIN:MAX` is the same again. Export checks each such input, and each
+[append state](programs-and-moe.md#state) an entry point reads, at several
+lengths in the same way, one at a time and then together; an append state
+the entry point grows is checked up to the longest it can be before that
+call fills it. A GPTQ program is checked against its own quantized weights.
+Both are traced with one row, whatever the least length, so the method must
+run on one row of each. An
 entry point whose operations can't follow the length runs once per item, as
 `forward` does, if it has one variable-length input and updates no state.
 

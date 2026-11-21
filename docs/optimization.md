@@ -15,6 +15,8 @@ Scratch's floating-point behavior.
 export with those options is not lossless.
 
 ```python
+from cattorch import transpile
+
 artifact = transpile(model, example, "model", optimization="exact")
 ```
 
@@ -36,14 +38,17 @@ By default, fast mode:
 - Computes LayerNorm variance in one pass as `E[x²] - E[x]²`.
 - Skips subtracting the maximum in softmax and reuses exponentials.
 
-Fast softmax can overflow on large positive logits. One-pass LayerNorm can lose
+QuickGELU differs from GELU by up to about 0.02 per activation, which
+accumulates through the layers: a small language model whose logits reach
+about 18 can be off by about 0.05, all of it from this replacement. Turn
+`activations` off if that matters. Fast softmax can overflow on large positive logits. One-pass LayerNorm can lose
 precision when all values share a large offset. Sigmoid, tanh, SiLU, and ELU
 stay exact.
 
 Each approximation can be turned off separately:
 
 ```python
-from cattorch import FastConfig
+from cattorch import FastConfig, transpile
 
 config = FastConfig(activations=True, layer_norm=False, softmax=False)
 transpile(model, example, "model_fast", optimization="fast", fast_config=config)
@@ -58,7 +63,7 @@ off by default, because how much accuracy they cost depends on the model.
 from cattorch import FastConfig, FastLayerConfig, transpile
 
 config = FastConfig(
-    weights=FastLayerConfig(rank_ratio=0.5, pruning=0.25),
+    layers=FastLayerConfig(rank_ratio=0.5, block_pruning=0.25),
     neuron_pruning=0.25,
     overrides={
         "head": FastLayerConfig(),
@@ -72,9 +77,10 @@ transpile(model, example, "model_fast", optimization="fast", fast_config=config)
 the matrix's full rank. A matrix is only factored if the two smaller matrices
 need fewer multiplications than the original.
 
-`pruning` removes the smallest-magnitude weights in whole groups so the
-generated loops can skip them: groups of four input weights in linear layers,
-and whole input-channel kernels in convolutions. `neuron_pruning` removes
+`block_pruning` removes the smallest-magnitude weights in whole groups so the
+generated loops can skip them: groups of four input weights in linear layers
+and `x @ weight` products, and whole input-channel kernels in ungrouped 1D and
+2D convolutions. `neuron_pruning` removes
 entire hidden units, but only where cattorch can confirm a
 `Linear -> activation -> Linear` path, and hidden channels in
 `StackedSwiGLUMoE` experts.
@@ -82,6 +88,24 @@ entire hidden units, but only where cattorch can confirm a
 An `overrides` entry replaces the whole policy for the named module. A
 `x @ weight` product with a stored weight uses the global policy. Products of
 two runtime tensors, such as attention scores, stay exact.
+
+A low-rank factorization puts two plain layers in place of the module, so
+it applies only where the module does nothing but use its weight: a module
+whose class has its own `forward` (a subclass of `nn.Linear` with extra
+steps), one with forward hooks, and one inside a `torch.nn` module that may
+read its parameters itself, such as `out_proj` of `nn.MultiheadAttention` or
+the layers of `nn.TransformerEncoderLayer`, keep their weights, and the
+export warns. Block pruning, which keeps the module, still applies to them.
+Neuron pruning, which also puts new layers in place, skips a pair of layers
+with forward hooks the same way.
+
+A transform only changes the module it applies to. When the model also
+reads that module's parameters directly, outside the module, such as
+`x @ self.up.weight.T` (in any method a program exports), the module is left
+untransformed, so those reads keep the original values, and the export warns
+which modules were left. If `torch.fx` can't trace the model, that can't be
+checked, and the export warns that a direct read of a block-pruned weight
+would read the pruned values.
 
 Transforms are applied to a copy; your model is not modified.
 

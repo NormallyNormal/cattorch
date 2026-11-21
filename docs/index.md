@@ -19,6 +19,8 @@ connecting it to the rest of a project.
   and Scratch's size limits.
 - [KV-cached generation](generation.md): export a language model and generate
   text one token at a time.
+- [Recurrent generation](recurrent-generation.md): generate with GRU and LSTM
+  language models, Mamba, Mamba-2, and RWKV.
 - [Tokenizers](tokenizers.md): export character, BPE, or SentencePiece
   tokenizers.
 - [Projects and the command line](projects-and-cli.md): build a runnable
@@ -45,6 +47,7 @@ connecting it to the rest of a project.
 - [Stability](stability.md): what cattorch 1.x keeps compatible, and what's
   experimental.
 - [Glossary](glossary.md): cattorch and Scratch terms used in these guides.
+- [Migrating to 1.0](migrating-to-1.0.md): update 0.5 code and Scratch projects for 1.0.
 
 ## Contribute
 

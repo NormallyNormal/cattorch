@@ -2,8 +2,8 @@
 
 A kernel's ``emit`` function returns a tuple of the statements built here;
 ``cattorch.experimental.Kernel`` describes how they join the sprite. This is
-the subset of cattorch's internal kernel language that is public. It may
-change before 1.0, together with the kernel interface.
+the subset of cattorch's internal kernel language that is public. It can
+change in any release, together with the kernel interface.
 
 Expressions: :func:`var`, :func:`item`, :func:`length`, arithmetic
 (:func:`add`, :func:`sub`, :func:`mul`, :func:`div`, :func:`mod`), comparisons

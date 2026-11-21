@@ -4,16 +4,20 @@
 Usage:
   node benchmarks/run_project_vm.cjs project.sb3 [--answer=TEXT ...] [--key=space]
       [--list=NAME=JSON ...] [--var=NAME=VALUE ...] [--no-flag]
-      [--broadcast=MESSAGE ...] [--out=FILE]
+      [--broadcast=MESSAGE ...] [--sprite=FILE.sprite3 ...] [--out=FILE]
 
-Sets each --list (a JSON array) and --var given before the first --broadcast
+Uploads each --sprite into the project as the editor's "Upload sprite" does
+(vm.addSprite, which creates on the stage the globals the sprite uses but
+doesn't define, and selects it). Then sets each --list (a JSON array) and --var given before the first --broadcast
 on the stage, then clicks the green flag (unless --no-flag) or presses --key,
 and waits for the project to stop. The remaining options run in order: a
 --broadcast is sent and waited for, as "broadcast and wait" does, and a --list
 or --var is set, so each call can get its own inputs. Each "ask and wait"
 gets the next --answer (an empty answer once they run out). Prints the
 stage's global lists and variables plus everything sprites said, as JSON, or
-writes it to --out, since the VM logs warnings to stdout.
+writes it to --out, since the VM logs warnings to stdout. Infinities and NaN
+are written as the strings "Infinity", "-Infinity" and "NaN", as Scratch
+writes them, since JSON has no such numbers; a --list may use them too.
 */
 
 'use strict';
@@ -24,6 +28,11 @@ const VirtualMachine = require('@scratch/scratch-vm');
 const values = prefix => process.argv
     .filter(argument => argument.startsWith(prefix))
     .map(argument => argument.slice(prefix.length));
+
+// JSON.stringify writes non-finite numbers as null; keep them as strings.
+const nonFinite = (key, value) => (
+    typeof value === 'number' && !Number.isFinite(value) ? String(value) : value
+);
 
 const assignment = text => {
     const split = text.indexOf('=');
@@ -38,6 +47,7 @@ const main = async () => {
     const vm = new VirtualMachine();
     vm.setTurboMode(true);
     await vm.loadProject(fs.readFileSync(projectPath));
+    for (const sprite of values('--sprite=')) await vm.addSprite(fs.readFileSync(sprite));
     vm.start();
     const stage = vm.runtime.getTargetForStage();
     const named = name => {
@@ -99,7 +109,8 @@ const main = async () => {
     for (const variable of Object.values(stage.variables)) {
         if (variable.type !== 'broadcast_msg') data[variable.name] = variable.value;
     }
-    const result = JSON.stringify({questions, said, stage: data}, null, 1);
+    const editing = vm.editingTarget ? vm.editingTarget.getName() : null;
+    const result = JSON.stringify({questions, said, stage: data, editing}, nonFinite, 1);
     if (output) {
         fs.writeFileSync(output, result);
     } else {

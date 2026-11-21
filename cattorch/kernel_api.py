@@ -9,8 +9,8 @@ A ``Kernel`` pairs an operator with an ``emit`` function. ``emit`` receives a
 ``KernelContext`` describing the operation by name (shapes, dtypes, static
 flags, scalar arguments) and returns a body of ``cattorch.scratch``
 statements. The context also allocates the lists and variables the body uses.
-``_ContextInstruction`` adapts that to the positional ``Instruction`` protocol,
-so tensor rebinding, sharding and compaction work unchanged.
+``_KernelInstruction`` binds a kernel to one call's arguments for the
+compiler, which renames its ``T`` slots to the call's lists.
 
 Rules for kernel authors:
 
@@ -40,15 +40,16 @@ Rules for kernel authors:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import torch
 
+from cattorch.errors import warn
 from cattorch.fast import FastConfig
 from cattorch.util.argument import Argument
-from cattorch.util.instruction.generic import _tensor_slots
-from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.scratch.dsl import Program, Statement
 
 
@@ -65,6 +66,9 @@ class TensorInfo:
     #: or ``None``. ``shape`` is then the traced shape, and the list's length
     #: gives the actual one.
     dynamic_axis: int | None = None
+    #: A stored weight's values, known at export, or ``None``. Read them to
+    #: specialize the code, for example to skip zero blocks; don't change them.
+    value: torch.Tensor | None = field(default=None, compare=False, repr=False)
 
     @property
     def numel(self) -> int:
@@ -131,22 +135,38 @@ class KernelContext:
         self.list_values: dict[str, list] = {}
         self.temporary_sizes: dict[str, int] = {}
         self.options: dict[str, object] = {}
+        # Each tensor input's list name in the compiler, to find its values.
+        self.sources: dict[str, str] = {}
+        #: The names of the arguments the call passed, in order.
+        self.argument_names: tuple[str, ...] = ()
+        # Operations the library's own kernels lowered approximately, for
+        # ``TranspileResult.approximate_operations``.
+        self.approximated: list[str] = []
 
     @classmethod
     def from_arguments(
         cls, target: object, output: Argument | str, args: tuple[Argument, ...],
-        operator=None,
+        operator=None, names: tuple[str, ...] | None = None,
     ) -> KernelContext:
         operator = resolve_operator(target) if operator is None else operator
-        names, defaults = _schema_names(operator, len(args))
+        argument_names: list[str]
+        defaults: dict[str, object]
+        if names:
+            # A kernel the compiler builds itself names its arguments.
+            argument_names = [*names, *(f"arg{i}" for i in range(len(names), len(args)))]
+            defaults = {}
+        else:
+            argument_names, defaults = _schema_names(operator, len(args))
         slots, output_slot = _tensor_slots(args)
         inputs: dict[str, TensorInfo] = {}
         scalars: dict[str, object] = {
             name: value for name, value in defaults.items()
         }
+        sources: dict[str, str] = {}
         for position, argument in enumerate(args):
-            name = names[position]
+            name = argument_names[position]
             if position in slots and argument.name != "_none":
+                sources[name] = str(argument.name)
                 inputs[name] = TensorInfo(
                     name,
                     slots[position],
@@ -164,24 +184,42 @@ class KernelContext:
             )
         else:
             out = TensorInfo("output", output_slot, ())
-        return cls(
+        context = cls(
             str(target), inputs, scalars, out, tuple(slots.values()),
         )
+        context.sources = sources
+        context.argument_names = tuple(argument_names[:len(args)])
+        return context
 
     @classmethod
-    def from_node(cls, node: torch.fx.Node, operator=None) -> KernelContext:
-        """Build a context from an FX node, for validators before lowering."""
+    def from_node(
+        cls, node: torch.fx.Node, operator=None, *, dynamic_axes=None, resolve_weight=None,
+        names: tuple[str, ...] | None = None,
+    ) -> KernelContext:
+        """Build a context from an FX node, for validators before lowering.
+
+        ``dynamic_axes`` maps node names to their variable-length axis, and
+        ``resolve_weight`` returns a node's stored tensor, so the context
+        matches the one ``emit`` gets.
+        """
+        dynamic_axes = dynamic_axes or {}
         arguments = []
+        values = {}
         for arg in node.args:
             if arg is None:
                 arguments.append(Argument("_none", torch.Size([])))
             elif hasattr(arg, "name"):
                 value = arg.meta.get("val") if hasattr(arg, "meta") else None
+                stored = resolve_weight(arg.name) if resolve_weight is not None else None
+                stored = stored if isinstance(stored, torch.Tensor) else None
+                if stored is not None:
+                    values[arg.name] = stored
                 arguments.append(Argument(
                     arg.name,
                     getattr(value, "shape", torch.Size([])),
                     dtype=getattr(value, "dtype", None),
-                    static=arg.op == "get_attr",
+                    static=arg.op == "get_attr" or stored is not None,
+                    dynamic_axis=dynamic_axes.get(arg.name),
                 ))
             else:
                 arguments.append(Argument(f"C_{arg}", torch.Size([]), value=arg))
@@ -191,7 +229,12 @@ class KernelContext:
             getattr(value, "shape", torch.Size([])),
             dtype=getattr(value, "dtype", None),
         )
-        return cls.from_arguments(node.target, output, tuple(arguments), operator)
+        context = cls.from_arguments(node.target, output, tuple(arguments), operator, names=names)
+        for name, info in list(context.inputs.items()):
+            stored = values.get(context.sources.get(name, ""))
+            if stored is not None:
+                context.inputs[name] = replace(info, value=stored)
+        return context
 
     @property
     def output(self) -> TensorInfo:
@@ -238,6 +281,55 @@ class KernelContext:
         return name
 
 
+def _single_overload(packet: torch._ops.OpOverloadPacket) -> torch._ops.OpOverload:
+    """A packet's ``default`` overload, if it takes tensors.
+
+    ``torch.ops.aten.add`` has no tensor ``default``: its ``default`` adds two
+    Python numbers, so the model's ``add.Tensor`` would never match.
+    """
+    def takes_tensors(name):
+        schema = getattr(packet, name)._schema
+        return not schema.is_mutable and any(
+            "Tensor" in str(argument.type) for argument in schema.arguments
+        )
+
+    if "default" in packet.overloads() and takes_tensors("default"):
+        return packet.default
+    overloads = [
+        name for name in packet.overloads() if "out" not in name and takes_tensors(name)
+    ]
+    choices = " or ".join(f"torch.ops.{packet}.{name}" for name in overloads[:3])
+    raise ValueError(
+        f"{packet} doesn't name one tensor operation; pass an overload such as {choices}"
+    )
+
+
+# The kernels an export's instructions ran, while ``warn_unused_kernels`` records.
+_KERNELS_USED: ContextVar[set[int] | None] = ContextVar("cattorch_kernels_used", default=None)
+
+
+@contextmanager
+def warn_unused_kernels(kernels, *, fast: bool):
+    """Warn, after the export succeeds, about each of ``kernels`` it never ran."""
+    used: set[int] = set()
+    token = _KERNELS_USED.set(used)
+    try:
+        yield
+    finally:
+        _KERNELS_USED.reset(token)
+    for kernel in kernels:
+        if id(kernel) in used:
+            continue
+        if kernel.approximate and not fast:
+            reason = "an approximate kernel runs only with optimization='fast'"
+        else:
+            reason = f"the model has no {kernel.target_name} call for it to lower"
+        warn(
+            f"the kernel passed for {kernel.target_name} was not used: {reason}",
+            stacklevel=4,
+        )
+
+
 @dataclass(frozen=True)
 class Kernel:
     """A Scratch lowering for one operation.
@@ -262,14 +354,24 @@ class Kernel:
     validator: Callable[[KernelContext], str | None] | None = None
     fast_flag: str | None = None
     approximate: bool = False
+    #: Names of the positional arguments, for an internal target with no
+    #: PyTorch schema to name them.
+    arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         target = getattr(self.target, "operator", self.target)
         if isinstance(target, torch._ops.OpOverloadPacket):
-            target = target.default
+            target = _single_overload(target)
+        if not isinstance(target, (torch._ops.OpOverload, str)):
+            raise TypeError(
+                "kernel target must be an operation such as torch.ops.aten.gelu.default, "
+                f"its name \"aten.gelu.default\", or a cattorch.op; got {target!r}"
+            )
         object.__setattr__(self, "target", target)
         if not callable(self.emit):
             raise TypeError("kernel emit must be callable")
+        if not isinstance(self.approximate, bool):
+            raise TypeError(f"kernel approximate must be True or False, not {self.approximate!r}")
         if self.validator is not None and not callable(self.validator):
             raise TypeError("kernel validator must be callable or None")
         if not self.target_name:
@@ -287,36 +389,71 @@ class Kernel:
     def program_name(self) -> str:
         return self.name or self.target_name.replace(".", "_")
 
-    def instruction_class(self) -> type[Instruction]:
-        """The registry-facing ``Instruction`` type that runs this kernel."""
+    def instruction_class(self) -> type[_KernelInstruction]:
+        """The registry-facing type that runs this kernel on one call."""
         return type(
             f"{self.program_name}_instruction",
-            (_ContextInstruction,),
+            (_KernelInstruction,),
             {"kernel": self},
         )
 
 
-class _ContextInstruction(Instruction):
-    """Adapts a ``Kernel`` to the positional instruction protocol."""
+def _tensor_slots(args) -> tuple[dict[int, str], str]:
+    """Map argument positions to ``T`` list slots, and return the output slot.
+
+    The transpiler binds every non-constant argument, including explicit
+    ``_none`` placeholders, to consecutive ``T`` lists before the output.
+    """
+    slots: dict[int, str] = {}
+    for position, argument in enumerate(args):
+        if not str(argument.name).startswith("C_"):
+            slots[position] = f"T{len(slots) + 1}"
+    return slots, f"T{len(slots) + 1}"
+
+
+class _KernelInstruction:
+    """A ``Kernel`` bound to one call's arguments.
+
+    ``args`` are positional ``Argument`` values; constants are named ``C_``.
+    ``options`` may be set before ``finalize`` to fill ``KernelContext.options``.
+    """
 
     kernel: Kernel
     # The transpiler passes the output's shape and dtype as an ``Argument``.
     wants_output_info = True
+
+    def __init__(self, torch_name, output: Argument | str, *args: Argument):
+        self.torch_name = torch_name
+        self.output = output
+        self.args = args
+        self.options: dict[str, object] = {}
+        self.context = KernelContext.from_arguments(
+            self.kernel.target_name, output, args, self._operator(),
+            names=self.kernel.arguments,
+        )
+        used = _KERNELS_USED.get()
+        if used is not None:
+            used.add(id(self.kernel))
+        self.temporary_sizes: dict[str, int] = {}
 
     @classmethod
     def _operator(cls):
         # Resolved late: a custom op may be defined after the kernel is.
         return resolve_operator(cls.kernel.target)
 
-    def prepare(self):
-        self.context = KernelContext.from_arguments(
-            self.kernel.target_name, self.output, self.args, self._operator(),
-        )
-        self.temporary_sizes: dict[str, int] = {}
+    def transform_weights(self, static_lists):
+        """Give each stored-weight input its values."""
+        context = self.context
+        for name, info in list(context.inputs.items()):
+            source = context.sources.get(name, "")
+            if info.static and source.startswith("W_"):
+                value = static_lists.get(source.removeprefix("W_"))
+                if isinstance(value, torch.Tensor):
+                    context.inputs[name] = replace(info, value=value)
 
     def finalize(self):
         context = self.context
-        context.options = dict(getattr(self, "options", None) or {})
+        context.options = dict(self.options or {})
         body = tuple(self.kernel.emit(context))
         self.temporary_sizes = dict(context.temporary_sizes)
         return Program(
@@ -328,10 +465,15 @@ class _ContextInstruction(Instruction):
         ).compile()
 
     @classmethod
-    def validate_node(cls, node: torch.fx.Node) -> str | None:
+    def validate_node(
+        cls, node: torch.fx.Node, *, dynamic_axes=None, resolve_weight=None,
+    ) -> str | None:
         if cls.kernel.validator is None:
             return None
-        return cls.kernel.validator(KernelContext.from_node(node, cls._operator()))
+        return cls.kernel.validator(KernelContext.from_node(
+            node, cls._operator(), dynamic_axes=dynamic_axes, resolve_weight=resolve_weight,
+            names=cls.kernel.arguments,
+        ))
 
 
 def active_kernel_targets(kernels, *, fast: bool, config: FastConfig) -> frozenset[str]:

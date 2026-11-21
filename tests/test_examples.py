@@ -43,3 +43,13 @@ def test_text_generator_example(tmp_path):
     said = emulator.sprites["Demo"].said
     continued = [text for text in said if text.startswith("twinkle") and text != "twinkle..."]
     assert len(continued[-1]) == len("twinkle") + 3
+
+
+def test_recurrent_generator_example(tmp_path):
+    example = load("recurrent_generator")
+    project = example.main(tmp_path, steps=20, max_new_tokens=3)
+    emulator = ProjectEmulator(project.path, answers=["twinkle", ""])
+    emulator.green_flag()
+    said = emulator.sprites["Demo"].said
+    continued = [text for text in said if text.startswith("twinkle") and text != "twinkle..."]
+    assert len(continued[-1]) == len("twinkle") + 3

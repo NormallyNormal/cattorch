@@ -48,11 +48,6 @@ def _configure(model: torch.nn.Module) -> None:
         model.set_attn_implementation(target)
         change = f", attention {current} -> {target}"
     log.info("prepared %s for export: use_cache=False%s", type(model).__name__, change)
-    _configure_experts(model)
-
-
-def _configure_experts(model: torch.nn.Module) -> None:
-    """Experts are replaced module by module; see ``convert_huggingface_experts``."""
 
 
 # ── Experts ──────────────────────────────────────────────────────────────────
@@ -147,7 +142,7 @@ def convert_huggingface_experts(module: torch.nn.Module, path: str) -> HuggingFa
 
     from cattorch.errors import UnsupportedModelError
 
-    where = path or "<root>"
+    where = repr(path) if path else "the top level"
     name = type(module).__name__
 
     def matrix(stack):

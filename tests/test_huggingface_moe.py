@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from cattorch import UnsupportedModelError, transpile, verify
+from cattorch import transpile, verify
 from cattorch.huggingface import HuggingFaceExperts
 from cattorch.experts import _expert_family_context
 from cattorch.operator_registry import default_registry
@@ -16,6 +16,8 @@ moe = pytest.importorskip("transformers.integrations.moe")
 if not hasattr(moe, "use_experts_implementation"):
     pytest.skip("transformers has no experts interface", allow_module_level=True)
 from transformers.activations import ACT2FN  # noqa: E402
+from cattorch.interface import TOKEN_IDS
+from sprite_helpers import load_emulator
 
 EXPERTS, WIDTH, HIDDEN = 4, 6, 5
 
@@ -253,11 +255,8 @@ def test_tiny_huggingface_moe_models_export_unwrapped(tmp_path, kind):
 @torch.no_grad()
 @pytest.mark.parametrize("kind", ["mixtral", "qwen2_moe", "deepseek_v3", "gpt_oss"])
 def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
-    import json
-    import zipfile
 
     from cattorch import GenerationProgram
-    from cattorch.util.scratch.emulator import ScratchEmulator
 
     config_name, extra = MODELS[kind]
     config_class = getattr(transformers, config_name, None)
@@ -270,8 +269,7 @@ def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
     before = dict(default_registry().expert_families)
     result = transpile(model, GenerationProgram(max_context=8), tmp_path / kind)
     assert default_registry().expert_families == before
-    with zipfile.ZipFile(result.path) as archive:
-        emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+    emulator = load_emulator(result.path)
 
     def assert_logits(prefix):
         expected = model(torch.tensor([prefix])).logits[0, -1]
@@ -280,13 +278,13 @@ def test_tiny_huggingface_moe_models_generate_with_a_cache(tmp_path, kind):
 
     emulator.run_procedure("cattorch init")
     prefix = [3, 17, 5]
-    emulator.lists["cattorch tokens"] = list(prefix)
+    emulator.lists[TOKEN_IDS] = list(prefix)
     emulator.run_procedure("cattorch prefill")
     assert emulator.variables["cattorch status"] == "ok"
     assert_logits(prefix)
     for token in (40, 9):
         prefix.append(token)
-        emulator.lists["cattorch tokens"] = [token]
+        emulator.lists[TOKEN_IDS] = [token]
         emulator.run_procedure("cattorch decode")
         assert emulator.variables["cattorch status"] == "ok"
         assert_logits(prefix)

@@ -6,15 +6,11 @@ The suite checks the first passing sample of each operator so it stays fast;
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
 pytest.importorskip("expecttest", reason="OpInfo samples need expecttest")
 
-sys.path.insert(0, str(Path(__file__).parent))
-import opinfo_conformance as conformance  # noqa: E402
+import opinfo_conformance as conformance  # noqa: E402 - after the skip
 
 
 def _first_per_operator() -> list[str]:

@@ -1,409 +1,728 @@
-# Unreleased
+# 1.0.0 - 2026-11-17
 
-## New features
-
-- Experimental custom kernels: `transpile(..., kernels=[Kernel(...)])` lowers
-  an operation with your own Scratch code for that export, replacing a
-  built-in kernel or a PyTorch decomposition. Kernels receive a context
-  naming each input's list, shape, dtype, and whether it is a stored weight,
-  and return statements from the new `cattorch.scratch` module. A validator
-  can reject calls, and `approximate=True` kernels apply only in fast mode.
-  `check_kernel` compares a kernel with PyTorch in the emulator, and
-  `build_kernel_benchmark` times it in Scratch. See
-  [custom kernels and operations](docs/custom-kernels.md).
-- `cattorch.op` declares a new operation from an annotated function. It
-  exports whole, with a kernel attached through `@operation.kernel`, or
-  through its function when it has none.
-- `transpile(..., dynamic={0: (1, 32)})` exports a model whose input length
-  varies at run time within bounds, such as a batch or a sequence of
-  independent tokens. Operations without a runtime-length kernel run once per
-  item, and a model whose operations can't follow the length runs whole once
-  per item. The export is checked against the model at several lengths, so a
-  model that uses the length itself fails instead of exporting wrong numbers.
-  Reductions, softmax, matrix products over the items, `cat` with fixed-size
-  tensors, fixed slices at either end (`x[-1]`) and arithmetic with
-  `x.shape[0]` follow the length too, which covers mean pooling and attention
-  from fixed queries over a variable-length memory. An entry point that
-  appends to state can read the grown state in the same call.
-  Entry points take `Input(..., dynamic=(1, 32))` or
-  `@entrypoint(dynamic=...)`, with the same check at several lengths and,
-  for one that updates no state, the same run once per item. See
-  [variable-length inputs](docs/supported-models.md#variable-length-inputs).
-- Markers (`cattorch.entrypoint` and others), decorators that describe a model's export interface
-  without changing how it runs in PyTorch. `@entrypoint` exports methods as
-  Scratch blocks and turns the buffers they update into persistent state,
-  with `capacity=` for a buffer that grows. `@example` gives `forward` example
-  inputs, `@export_forward` swaps in an export-only method for a class,
-  `@moe` declares a block's routing (including shared experts and scaled
-  outputs), `@generate` picks a generation method, and `@adapter` builds a
-  `ModuleAdapter` from a function. `transpile(model, None, path)` and
-  `verify(model, None, result)` take the interface from the markers. See
-  [markers](docs/markers.md).
-- `build_project` writes a runnable Scratch project around exported sprites.
-  Each operation is bridged to global lists, so other sprites can run it with
-  `broadcast and wait`. A plain model gets list monitors and runs on the green
-  flag, with an optional label for a classifier's prediction. A text generator
-  gets its tokenizer and a Demo sprite that asks for a prompt and continues
-  it, sampling at an adjustable temperature. See
-  [projects and the command line](docs/projects-and-cli.md).
-- A `cattorch` command: `cattorch export MODEL` exports and verifies a model
-  from a Python file, module, or saved `.pt`, with inputs from its markers or
-  `--shape`; `cattorch generate` exports a text generator, from a file or
-  `--hf REPO`, with its tokenizer. `--project` also builds the project.
-- An `examples/` directory: an MLP, a CNN, and a character-level text
-  generator, each trained in seconds and exported with its project.
-- Recurrent layers (`nn.GRU`, `nn.LSTM`, `nn.RNN`) run as one Scratch loop
-  over time instead of unrolling every step, so the sprite no longer grows
-  with the sequence length. With `dynamic=` the sequence length can vary at
-  run time, and the final state is a fixed-shape output. `nn.GRUCell` and
-  `nn.LSTMCell` now export, so a step method with its hidden state in a
-  buffer works as an entry point.
-- `TranspileResult.approximate_operations` lists the operations that used an
-  approximate kernel in fast mode, and `verify` repeats it in its result.
-- `GenerationProgram(max_context=64)` exports an ordinary stateless
-  `forward(tokens) -> logits` model as a KV-cached generator, with no
-  `example_token`, combined QKV projection, or position wrapper. Separate
-  q/k/v projections, `arange` positions, RoPE, grouped-query and
-  single-KV-head attention work, and so do unwrapped Hugging Face GPT-2,
-  Llama, and Qwen2. cattorch checks the cached step against `forward` during
-  export. See [KV-cached generation](docs/generation.md).
-- Hand-written mixture-of-experts blocks, with a `ModuleList` of identical
-  experts, a linear router, `topk`, and a loop over the experts, export
-  without changes. cattorch finds the `SparseMoE` routing configuration that
-  reproduces the block on probe inputs and warns with a `CustomMoEWarning`
-  naming it. See [hand-written MoE blocks](docs/programs-and-moe.md#hand-written-moe-blocks).
-- Slice and index assignment into a tensor the model created, such as
-  `x[..., :4] = y` or `x[1] = y` into a `torch.empty` or `torch.zeros`
-  buffer, exports as ordinary dataflow. Uninitialized buffers become zeros.
-- `gather` and `scatter` accept indices computed at run time, such as
-  `topk` results, along any dimension. This covers DeepSeek-V3's
-  group-limited router, and DeepSeek-V3 models now export, with or without a
-  `GenerationProgram`.
-- `GenerationProgram` accepts sliding-window masks (Mistral, GPT-OSS), ALiBi
-  biases, and GPT-OSS attention sinks. A windowed decode step reads only the
-  window's cache rows.
-- Hidden prefill also skips the final layer's query projection and RoPE for
-  prompt tokens before the last.
-- Hugging Face GPT-2, Llama, Qwen2, and BERT models export directly, without
-  a wrapper. On the export copy, the cache and extra outputs are turned off
-  and an attention implementation that traces is selected, so no
-  `example_kwargs` are needed. Your model isn't modified.
-- `transpile` and `verify` take `example_kwargs`. Tensor values become input
-  lists after the positional inputs; other values are fixed for the export.
-- Non-tensor outputs, such as `None` or a `DynamicCache`, are skipped with a
-  warning instead of rejected, and `ModelOutput` is unwrapped.
-- `.item()` and Python branches on tensors that don't depend on the model's
-  inputs, such as masks built from `torch.arange`, are evaluated during export.
-- `torch.no_grad()` and `torch.autocast` blocks inside `forward` no longer
-  block export.
-- A model with modules in training mode is exported as an evaluation-mode
-  copy with a warning, instead of being rejected for training-mode dropout.
-  `verify` compares against the same evaluation-mode copy.
-- Computations whose inputs are all parameters, buffers, or constants now run
-  during export, whatever operations they use. nanoGPT's `bias == 0` causal
-  mask and RoPE tables built with `torch.outer` in `forward` no longer need
-  rewriting.
-- New elementwise operations: `exp`, `log`, `log10`, `sqrt`, `abs`, `floor`,
-  `ceil`, `reciprocal`, `erf`, `clamp`, `hardtanh`/`relu6`, comparisons,
-  logical not (including `~` on bool tensors), `torch.where`, `torch.maximum`,
-  and `torch.minimum`.
-  `torch.pow` accepts integer exponents from -4 to 4 and ±0.5.
-- Exact GELU (the `nn.GELU()` default) is supported, so Hugging Face BERT
-  models export without changes. This includes `ExpertFamily` experts, which
-  previously required `approximate="tanh"`.
-- `F.log_softmax` is supported.
-- `unflatten` and `squeeze` are supported. With them, `nn.MultiheadAttention`
-  and `nn.TransformerEncoder` export.
-- Conversions to floating dtypes, such as `x.float()` on integer inputs, are
-  no longer rejected. Conversions to integer dtypes truncate, and conversions
-  to `bool` produce 0 or 1.
-- Operations without a dedicated kernel now export through PyTorch's own
-  decompositions when those lead to supported operations. Among them are
-  `nn.LSTM` and `nn.GRU` (unrolled over the example's sequence length),
-  GroupNorm, InstanceNorm, `F.normalize`, Mish, softplus, hardswish, `var`,
-  `std`, and `cumsum`.
-- New reductions over any dimensions: `sum`, `mean`, `prod`, `amax`, `amin`,
-  `max`/`min` with indices, `argmax`, `argmin`, `any`, and `all`. `torch.topk`
-  is supported.
-- New data-movement operations: `expand`, `repeat`, `flip`, `roll`, padding,
-  `tril`/`triu`, nearest upsampling, and `gather`/`index_select`/indexing with
-  indices that don't depend on the input.
-- `sin` and `cos`, adaptive max pooling, and
-  `F.scaled_dot_product_attention` with a static `attn_mask`.
-- BatchNorm without running statistics uses batch statistics, as PyTorch does.
-- Experimental: `routed_experts(value, expert_ids, weights, experts)` runs an
-  `ExpertFamily` on routes computed by your own router code, such as a linear
-  layer, softmax or sigmoid, and `torch.topk`. It replaces the value-dependent
-  expert loop of a typical MoE block, so shared experts and other router
-  variations export without rebuilding the block as a `SparseMoE`. Only the
-  selected experts run in Scratch. See
-  [routing with your own router code](docs/programs-and-moe.md#routing-with-your-own-router-code).
-- Hugging Face mixture-of-experts models, such as Mixtral, Qwen2-MoE, Qwen3-MoE,
-  and OLMoE, export directly, with `transpile` or `GenerationProgram`. Experts
-  classes marked with transformers' `@use_experts_implementation` run through
-  `routed_experts` on the export copy, whatever their weight layout, biases,
-  gating, or post-expert norm. Experts with their own gate function, such as
-  GPT-OSS's clamped GLU, run it inside the expert program.
-- In-place updates of computed tensors, such as `x /= x.sum()` or `x.mul_(2)`,
-  export as ordinary operations. Updates seen through a view taken before the
-  update are still rejected.
-- `ExpertFamily` experts can use `torch.pow` with the same exponents as
-  elsewhere, so ReLU² experts work. `SparseMoE` and `ExpertFamily` also work
-  with automatic `GenerationProgram` export.
-
-- `TranspileResult.fallback_operations` lists the operations without a kernel
-  of their own that ran as PyTorch decompositions, with how many calls the
-  sprite runs, and `warnings` names them. `analyze` reports them for each
-  entrypoint. Calls computed at export aren't counted.
-- [Operator coverage](docs/operator-coverage.md) lists how PyTorch's own
-  operator samples (OpInfo) fare, generated by
-  `tests/opinfo_conformance.py`. About 1,390 of 1,550 samples pass, and the
-  test suite keeps every recorded pass passing.
-- New operations: `torch.sign`, `trunc`, `round` (half to even, as in
-  PyTorch), `%` and `torch.remainder`, `torch.fmod`, floor and truncating
-  division (`//`, `rounding_mode=`), `&`, `|`, and `^` on boolean masks,
-  `torch.logical_and`/`or`/`xor`, and `torch.full_like`.
-- Tensors with no elements, and anything computed only from them, are
-  computed during export, so empty inputs and dimensions no longer fail.
-- Every convolution option: dilation, groups (including depthwise), unbatched
-  inputs, and `padding="same"`. `nn.ConvTranspose1d/2d/3d` and `nn.Conv3d`
-  export too, built from the 1D and 2D kernels.
-- Every pooling option: `ceil_mode`, dilation, `count_include_pad=False`,
-  `divisor_override`, `return_indices=True`, unbatched inputs, adaptive max
-  pooling, and 3D pooling.
-- `torch.pow` accepts any exponent, including a tensor; negative bases with
-  fractional exponents give NaN, as in PyTorch.
-- New operations: `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`,
-  `asinh`, `acosh`, `atanh`, `exp2`, `log2`, `erfc`, `hypot`, `fmax`,
-  `fmin`, `isfinite`, `copysign`, `logaddexp`, `logsumexp`, `logcumsumexp`,
-  `round(decimals=)`, `cumprod`, `torch.cdist`, `F.pdist`, `F.bilinear`,
-  `addbmm`, and `real`/`angle` on real tensors.
-- Results that the model computes but never uses no longer run in Scratch.
-- Indexing with indices computed from the input: `index_select`, `take`,
-  and tensor indexing such as `x[ids]`, `x[:, ids]`, or `x[i, j]` read through
-  a runtime `gather`. `scatter_add`, `scatter_reduce` (every reduction, with or
-  without `include_self`), `index_add`, `index_copy`, `index_fill`,
-  `index_reduce`, `index_put`, `x[ids] = y`, and `x[mask] = value` work with
-  any integer indices.
-- `torch.sort`, `argsort`, `msort`, `kthvalue`, `median`, `cummax`, `cummin`,
-  and `torch.isin`.
-- CI runs a set of exported sprites in the official Scratch VM and compares
-  them with PyTorch: an MLP, a CNN, a transformer layer, every weight storage
-  format, a variable-length input, a stateful program, and cached generation
-  with its tokenizer. `benchmarks/run_project_vm.cjs` takes `--list`,
-  `--var`, `--broadcast`, `--no-flag` and `--out` to drive a project's
-  bridges.
-- The Scratch interface is versioned: [Scratch interface](docs/scratch-interface.md)
-  lists every public block, list, variable, and broadcast, and within interface
-  version 1 none is renamed or removed. Each sprite records its version in the
-  `cattorch interface version` variable, and `cattorch.interface` holds the
-  version and the public names.
-- Plain model sprites set `cattorch status` and broadcast
-  `cattorch init complete` and `cattorch forward complete` when those blocks
-  finish, as generation and program sprites do.
-- Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
-  `StateInput`, `StateUpdate`, `ProgramCall`), `marked_program`,
-  `ModuleAdapter`, `AdapterContext`, and `CustomMoEWarning` are stable and
-  imported from `cattorch`. Importing them from `cattorch.experimental` still
-  works with a `DeprecationWarning`. [Stability](docs/stability.md) lists what
-  1.x keeps compatible; the kernel interface, `op`, the explicit MoE classes,
-  and `analyze` stay experimental.
-- An `@entrypoint` method's non-tensor results, such as `None`, are skipped
-  with a warning, as they are for `forward`, instead of silently.
-- `torch.matmul` with broadcast batch dimensions, such as `[3, 4] @ [2, 4, 5]`
-  or `[2, 1, 3, 4] @ [5, 4, 6]`, and a vector times a batch of matrices.
-
-## Performance
-
-- `torch.addmm` with a bias vector, which GPT-2's `Conv1D` layers use, runs on
-  the linear kernel instead of a separate multiply and add. A two-layer GPT-2
-  sprite has about 22% fewer blocks.
-- Hugging Face style RoPE (`x * cos + rotate_half(x) * sin`, as in Llama,
-  Qwen2 and Mistral) runs as one rotary loop instead of slices, negation,
-  `cat` and three elementwise passes. A two-layer Llama sprite has about 14%
-  fewer blocks.
-- Hidden prefill skips the final layer's query, attention output and MLP for
-  prompt tokens when layers are shared too, not just the output head. A
-  three-layer shared model runs about 18% fewer Scratch operations for an
-  8-token prompt.
-
-## Fixes
-
-- Layer sharing merged layers that differ only in a constant, such as an
-  attention window or a residual scale, and ran every layer with the first
-  layer's value. Such layers are no longer shared.
-- With layer sharing, a `cattorch decode` before any prefill wrote the hidden
-  state to `cattorch logits` instead of the logits.
-- A model that reads input-dependent values with `tolist()` or `.numpy()`
-  exported the example's values as constants. It is now rejected, like
-  `.item()`.
-- With `dynamic=`, a broadcast that adds dimensions to the variable-length
-  input, such as `x.unsqueeze(-1) * weight`, gave wrong numbers at every
-  length.
-- The export-time check of variable-length exports compared each length with
-  the error at the shortest one, so a sprite equally wrong everywhere passed,
-  and it never checked lengths past 32. Exact exports must now match at every
-  checked length, including the maximum (up to 1024 items).
-- An `@entrypoint` whose growing buffer also changed its old rows, as in
-  `cat([seen * 0.5, row])` or prepending, exported and then lost the change.
-  It is now rejected.
-- A buffer registered under two names in an `@entrypoint` model was read as a
-  constant through the second name.
-- The emulator kept NaN through arithmetic, where Scratch reads it as 0, so
-  `verify` could pass a sprite that gives different numbers in Scratch.
-- Hugging Face dynamic-NTK RoPE past `max_position_embeddings` exported for
-  generation with wrong logits. Generation now checks shorter prompts too and
-  rejects models whose positions depend on the prompt length.
-- `BPETokenizer` accepted normalizers, pre-tokenizers, `fuse_unk` and
-  `byte_fallback`, then tokenized differently from Hugging Face; it now
-  rejects them. `transpile_tokenizer` exported WordPiece, WordLevel and Unigram
-  tokenizers one character at a time; it now rejects those with
-  multi-character tokens.
-- SentencePiece sprites with `scratch_casefold=True` used the uppercase byte
-  token for a lowercase letter without a vocabulary entry, and encoded a run
-  of unknown characters as one unknown token each.
-- `nn.LayerNorm(bias=False)`, `elementwise_affine=False`, and `F.layer_norm`
-  with a weight but no bias failed with an `IndexError`.
-- A BatchNorm used more than once, as in a Siamese encoder, normalized with
-  the wrong standard deviation after its first use.
-- Sharing identical weights could keep a copy no block read, so another
-  weight's list was left empty and read as zeros. This showed up with
-  quantization or fast-mode low rank as an unexpectedly large error.
-- A Linear followed by BatchNorm1d was folded even when the BatchNorm
-  normalized another axis, as for `(batch, tokens, features)` inputs, giving
-  wrong numbers or an `AssertionError`.
-- Reading a list of more than 200,000 values at positions taken from another
-  such list, as broadcasting and large transposes do, returned zeros past the
-  first 200,000 values. `x[i]` on such an input copied it into a list that
-  lost the same values.
-- `cattorch prepare for save` emptied input lists, which in a program sprite
-  hold its state, so the next call failed until `cattorch reset`.
-- `sig_figs` rounded integer buffers, such as permutations and token offsets.
-- A kernel passed with `kernels=` for an elementwise operation ran on the
-  traced size when its input grew at run time. It now runs once per item, and
-  export fails where it can't.
-- Automatic MoE detection swapped a block that caps how many tokens an
-  expert takes for plain top-k routing, which is wrong once an expert is full.
-- `cumsum` and `cumprod` ran as a decomposition whose size grows with the
-  square of the length: a 1,600-item `cumsum` made 11.8 MB of JSON, and a
-  210,000-item one didn't finish. They now run as one pass.
-- float16 and bfloat16 models, including Hub checkpoints loaded by
-  `cattorch generate --hf`, were rejected for generation with a misleading
-  message. They are exported in float32.
-- The command line printed a traceback for an unsupported operation instead
-  of an error message.
-- Generation models with `-inf` logits, as for banned tokens, were rejected.
-- `build_project` gave a sprite named `cattorch` global lists that collided
-  with its own, and could make two sprites named `Demo`. Such sprites are
-  renamed, like duplicates.
-- Generation sprites had two `cattorch status` variables, so a failed cache
-  transaction never reported its status.
-- Generation sprites accepted token IDs outside the vocabulary, fractions and
-  text, and reported `ok`. They now report an error.
-- A variable-length `cattorch forward` accepted any input length and reported
-  `ok`. It now reports too few items, too many, or a partial item.
-- A variable-length export whose output gives several rows per item, as
-  `x.reshape(-1, 2)` does, crashed.
-- `frontend="export"` leaked raw `torch.export` errors.
-- `transpile` rejected `adapters=` for plain and variable-length exports.
-
-- `@cattorch.moe` stopped working once anything imported
-  `cattorch.experimental`, because the module holding the MoE classes had the
-  same name and replaced the marker. That module is now `cattorch.experts`.
-- With a variable-length input or append state, three cases gave wrong values:
-  - adding a fixed `[1, features]` tensor to the variable-length rows;
-  - transposing across the variable axis while it had one item in the trace;
-  - reshaping a tensor whose variable axis isn't its first dimension, as
-    attention heads do.
-- A linear layer whose result could be computed at export, such as one
-  applied to `torch.zeros`, followed by an addition and an activation made
-  export fail when a view of the result was the output.
-- A tuple or other non-tensor positional example input fails with a
-  `TypeError` that says to pass the tensors separately, instead of an
-  `AttributeError`.
-- `nn.SELU`, `nn.CELU`, and `F.elu` with a `scale` argument ignored the
-  scale and gave wrong output.
-- A view of a constant, such as a reshaped index table, passed to a
-  data-movement operation like `index_select` lost its shape and failed.
-- With a runtime-length input (append state or a dynamic input), embedding
-  lookups and fused arithmetic processed only the traced length.
-- `F.rms_norm` without a weight failed during export.
-- An arithmetic operation with a constant on the left, such as `1 - x`, on a
-  0-dimensional tensor gave an empty or wrong output.
-- `F.batch_norm` with running statistics passed as inputs, not buffers, gave
-  wrong output.
-- `nn.AdaptiveAvgPool2d` on an unbatched `(C, H, W)` input gave wrong output.
-- `transpose`, `.t()`, and `mean` on 0-dimensional tensors failed during
-  export.
-- Operations whose PyTorch decomposition leads back to themselves, such as
-  `x ** y` with a tensor exponent, failed with a recursion error. They now
-  raise `UnsupportedOperationError` naming the operation.
-- `verify` ran a Hugging Face model with its own config, so a model with
-  `output_hidden_states` or `use_cache` on failed with an output-count
-  mismatch. It now compares against a copy with the same export defaults as
-  `transpile`.
-- Exports with many operations were slow: each operation copied everything
-  generated so far. Export of a small two-layer MoE model is about 3 times
-  faster.
-- When `forward` fails at `max_context` tokens with an `IndexError`, the
-  export error now says that `max_context` is probably larger than a position
-  table.
-- A linear layer followed by two residual additions, as in
-  `x + (shared(x) + routed)`, added the first residual twice and gave wrong
-  output.
-- Layer sharing could fail with a `KeyError` when one stored tensor would
-  fill more than one slot of a layer bank. Sharing is now skipped instead.
-- A 0-dimensional parameter, buffer, or constant failed during export.
-  Hugging Face models with `eager` attention hit this.
-- Concatenating with an empty tensor, as Hugging Face caches do on their
-  first step, failed during code generation.
-- A tensor read through a view after its last direct use could be overwritten
-  by a later operation, giving wrong output. Graph outputs that are also used
-  later were affected the same way.
-- `F.max_pool2d(x, 2)` and other pooling calls without an explicit stride
-  failed during export.
-
-## Deprecations
-
-- `transpile(..., frontend="export")` is deprecated and will be removed in
-  2.0. It supports a subset of what the default `frontend="fx"` does, without
-  its decompositions and pattern recognition. It now warns with a
-  `DeprecationWarning`.
+cattorch 1.0 freezes the public Python API, the `cattorch` command line and
+the Scratch interface for 1.x; see [stability](docs/stability.md). Upgrading
+from 0.5.0? [Migrating to 1.0](docs/migrating-to-1.0.md) shows what to change
+in your code and your Scratch projects.
 
 ## Breaking changes
 
-- cattorch needs Python 3.11 or newer and PyTorch 2.10 or newer, up from
-  Python 3.10 and PyTorch 2.6. Python 3.10 reached its end of life in
-  October 2026.
-- `cattorch.experimental.stacked_swiglu_moe_adapter` is removed. MoE blocks
-  with SwiGLU experts switch to `StackedSwiGLUMoE` by themselves. For a block
-  whose expert weights are stacked into one tensor each, an `@adapter` that
-  returns `StackedSwiGLUMoE` does the same; see
+Requirements:
+
+- cattorch needs Python 3.11 or newer (was 3.10), PyTorch 2.10 or newer (was
+  2.6), and now depends on NumPy 1.24 or newer.
+
+Python API:
+
+- `transpile`: every parameter after `model, example_inputs, output_path` is
+  keyword-only, including `sig_figs` (`transpile(m, x, path, 3)` →
+  `transpile(m, x, path, sig_figs=3)`).
+- `transpile(frontend=...)` is removed, with the `torch.export` path that
+  `frontend="export"` selected. Drop the argument; every export is traced
+  with FX.
+- `calibration_inputs=`, `calibration_calls=` and `calibration_sequences=` →
+  `calibration=`, whose items take the form the export is called with:
+  tensors or tuples, `ProgramCall`s, or `[1, length]` token tensors.
+- `StorageConfig` no longer takes the integer precisions `"int8"`, `"int6"`
+  and `"int4"`, deprecated in 0.5.0, or their `group_size`,
+  `min_quantized_values`, `scale_precision` and `grouping` fields. Pass
+  `quantization=QuantizationConfig(bits=8)` instead.
+- `QuantizationConfig.fallback` is removed; its only value, `"symmetric"`,
+  is the behaviour.
+- `FastConfig.weights` → `FastConfig.layers`; `FastLayerConfig.pruning` →
+  `FastLayerConfig.block_pruning`.
+- `CodegenConfig(layer_sharing="auto" | "off")` → `layer_sharing=True |
+  False`.
+- `GenerationProgram`: `max_context` is the first field and the only
+  positional one, and must be at least 3; `example_token` is removed; `method` is optional (the
+  method marked `@generate`, else `forward`). The method is now a stateless
+  `forward(tokens) -> logits` over the whole sequence, from which cattorch
+  derives the cached step; a 0.5.0 method that takes one token must become
+  an ordinary forward over the sequence. See
+  [KV-cached generation](docs/generation.md#requirements).
+- Generation exports return a `GenerationResult` instead of a
+  `TranspileResult`: `inputs` describes `NAME token ids` as
+  `[1, 1..max_context]` (it was `cattorch tokens`, `(1, 1)`), `outputs` holds
+  `NAME logits` as `(vocabulary,)` (it was `(1, 1, vocabulary)`) and the
+  top-k lists, and `max_context`, `vocabulary_size` and `top_k` are fields.
+- A generation export with `QuantizationConfig(bits=4)` or `bits=6` stores
+  the output head (such as `lm_head`, or GPT-2's tied embedding table) in
+  int8. The sprite is larger and its logits much closer to the float
+  model's. `head_bits=4` (or `6`) restores the previous export; see
+  [the output head](docs/storage.md#the-output-head-of-a-language-model).
+- `TranspileResult.output` and `.additional_outputs` → `.outputs`, every
+  output in order; `.output` remains as a property for `outputs[0]`.
+- `TokenizerResult.tokenizer_type` values `"CharTokenizer"`,
+  `"BPETokenizer"`, `"SentencePieceBPETokenizer"` → `"char"`, `"bpe"`,
+  `"sentencepiece-bpe"`.
+- `ProgramCallVerifyResult.states`, a tuple of `(name, VerifyResult)`
+  pairs → a mapping from state name to `VerifyResult`.
+- Benchmark builders: `iterations=` → `repeats=`.
+  `build_generation_benchmark_suite` cases are `(name, model, program,
+  prompt)` instead of `(name, model, stateless_input, prompt)`; the program's
+  `max_context` must hold the prompt and every decode. `analyze_benchmark`
+  returns a `BenchmarkAnalysis` instead of a dict, and a case's seconds are
+  per call instead of the total of all timed calls. Benchmark projects' stage
+  variable `cattorch benchmark iterations` (`cattorch storage benchmark
+  iterations`) is `cattorch benchmark repeats`.
+- The `cattorch-benchmark` script → `cattorch analyze-benchmark PROJECT`.
+- Programs, adapters and their classes are imported from `cattorch`;
+  importing them from `cattorch.experimental` warns with a
+  `DeprecationWarning`. In `cattorch.experimental`,
+  `stacked_swiglu_moe_adapter` is removed (SwiGLU expert blocks switch to
+  `StackedSwiGLUMoE` by themselves, and an `@adapter` returning one covers
+  stacked expert weights), and `analyze`'s `program` parameter is
+  `example_inputs`.
+- Tokenizers that a sprite would tokenize differently are rejected with
+  `ValueError` instead of exported: `BPETokenizer` with a normalizer,
+  pre-tokenizer, `fuse_unk` or `byte_fallback`; `CharTokenizer` and
+  `transpile_tokenizer` with multi-character tokens, or a tokenizer that
+  doesn't encode one character at a time; SentencePiece models that aren't
+  BPE or have user-defined symbols. `scratch_casefold=True` on a tokenizer
+  that isn't SentencePiece raises `ValueError` instead of being ignored.
+- `FastConfig(neuron_pruning=...)` on a model `torch.fx` can't trace
+  symbolically, such as any generation export, raises
+  `UnsupportedModelError` instead of skipping the pruning.
+
+Scratch interface (re-export a 0.5.0 sprite to get these):
+
+- A sprite is used without opening it, from any other sprite. Its calls are
+  broadcasts named after the export (NAME, the `name` argument, by default
+  the file name): `NAME forward`, `NAME init`, `NAME reset`, `NAME prefill`,
+  `NAME decode`, `NAME prepare for save`, `NAME ENTRY`, `NAME tokenize`,
+  `NAME detokenize`, each run by a `when I receive` script in the sprite.
+  Its blocks are internal (`_cattorch forward`, ...); 0.5.0's custom blocks
+  `cattorch forward` and the rest, which only the sprite's own scripts
+  could run, are gone. Call with `broadcast [NAME forward] and wait`, then
+  read `NAME status`. See
+  [using a sprite without opening it](docs/scratch-interface.md#using-a-sprite-without-opening-it).
+- What a project reads or writes is global, named after the export, and
+  created by Scratch on the stage when the sprite is uploaded (or bound to
+  an existing global of that name): a model's `input`, `output`, ... lists
+  → `NAME input`, `NAME output`, ...; a program's `cattorch ENTRY INPUT`,
+  `cattorch ENTRY OUTPUT` and `cattorch state STATE` → `NAME ENTRY INPUT`,
+  `NAME ENTRY OUTPUT` and `NAME state STATE`; a generator's
+  `cattorch tokens` and `cattorch logits` → `NAME token ids` and
+  `NAME logits`; a tokenizer's `input` and `output` variables (text) and
+  `token_ids` list → `NAME text` and `NAME token ids`; long lists' shards
+  `LIST shard 2` → `NAME LIST shard 2`. The sprite's run-time variables are
+  `NAME status` and a generator's `NAME cache length`. Constants stay in
+  the sprite, read with `([VAR] of [NAME])`: `cattorch interface version`,
+  the storage descriptors, `cattorch max context`, shard counts, and
+  `cattorch initialized`.
+- Completion broadcasts are `NAME OP complete` (a program's
+  `cattorch ENTRY complete` → `NAME ENTRY complete`, a generator's
+  `cattorch prefill complete` → `NAME prefill complete`), and every call
+  sends one whenever it ends, whatever happened, not only after a
+  successful call: a script reacting to it must check `NAME status`. A call
+  that decodes the weights itself sends only its own.
+- Every model, generation and program sprite answers
+  `cattorch prepare for save`, so one broadcast prepares a whole project
+  for saving.
+- `NAME status` is `not finished` from when a call starts until it ends. A
+  second broadcast of a running call's message restarts it in Scratch,
+  which returns the first caller's `broadcast and wait` at once: it reads
+  `not finished`, never an earlier call's `ok`. See
+  [overlapping calls](docs/scratch-interface.md#overlapping-calls).
+- Globals that Scratch creates on upload start as 0 or empty:
+  `NAME status` reads `0` until a call ends, `NAME text` holds `0`, and a
+  program's state lists are empty until its first call or `NAME init` fills
+  them from the stored initial values (a project you save keeps them).
+- A NAME whose broadcasts Scratch can't tell apart from each other or from
+  `cattorch prepare for save` (it matches them ignoring case), or that
+  Scratch keeps for its menus (`_stage_`, ...), is refused at export. Two sprites exported under one
+  NAME share their globals and broadcasts; export copies under different
+  names.
+- `cattorch storage compression` values `costume-base92` and
+  `costume-base92-huffman-int4` → `base92` and `base92-huffman-int4`.
+- Status values, one per situation, naming the global list at fault:
+  `invalid length: LIST` and `invalid dynamic length: LIST` →
+  `wrong number of items: LIST`; `dynamic capacity exceeded: LIST` →
+  `too many items: LIST`; `state capacity exceeded: STATE` →
+  `state full: NAME state STATE`; `maximum context exceeded` →
+  `context full`; `decode requires exactly one token`,
+  `prefill requires at least one token` and `prefill exceeds maximum context`
+  → `wrong number of items`, `too few items` and `too many items` of
+  `NAME token ids`. See
+  [status values](docs/scratch-interface.md#status-values).
+- A call that fails changes nothing: a generation prefill or decode with
+  invalid input no longer empties `NAME logits` and the top-k lists, and
+  a failed prefill no longer resets the cache first. Prefill no longer
+  empties `NAME token ids`.
+- Input lists are checked: a model's forward with the
+  wrong number of items or a non-number item, an integer list item that isn't
+  a whole number from -2^53 to 2^53 (`Infinity` isn't one), and a generation
+  call with a token ID that isn't a whole number in the vocabulary, fail
+  with a status instead of computing meaningless output. A bool list must
+  hold Scratch's `true` and `false` or the numbers 1 and 0; text such as
+  `true`, which some operations read as true and others as false, fails with
+  `invalid item: LIST`, and a bool input converted to numbers reads 1 and 0
+  instead of passing `true` and `false` through to the output.
+- Indices are checked as PyTorch checks them: an integer input used as an
+  index, by tensor indexing, `gather`, `index_select`, `take`,
+  `take_along_dim`, `one_hot`, `scatter`, `index_add`, `index_put`, an
+  embedding or an embedding bag's offsets, must hold indices valid for every
+  operation that uses it, and an index computed from the inputs, such as
+  `x[ids + 1]` or a loss's targets, is checked as the call runs; either
+  fails with `invalid item: LIST` naming the input. Only the values an
+  operation reads are checked: an item the model writes over first, as
+  `ids[0] = 0` does, can hold anything, and a float written into an index
+  input is checked once converted to an integer. `index_select`,
+  `index_add`, `index_copy`, `index_reduce` and `take_along_dim` refuse
+  negative indices, as PyTorch does, and `F.one_hot` needs `num_classes`.
+  A generator can't index with an index computed from the token IDs. See
+  [index inputs](docs/supported-models.md#index-inputs).
+- A program checks the length of its state lists, not their items: an
+  append state must hold from its initial rows up to its capacity. State
+  lists belong to the sprite; see
+  [state](docs/programs-and-moe.md#state). A state the model uses as an
+  index is checked like an index input, so an entry point whose model moved
+  a counter past a table's rows fails with `invalid item: NAME state
+  STATE` and keeps the state, instead of reporting `ok` with zeros. A
+  `RecurrentGenerationProgram` that uses a state as an index is refused.
+- `ExportProgram` refuses entry point names whose broadcasts Scratch would
+  match as one, since it matches them ignoring case: names that differ only
+  in case, a name like another's completion (`x complete` beside `x`), and
+  `init`, `reset` and `prepare for save` in any case.
+- An input or state list split into shards is checked shard by shard: each
+  must hold its part, every shard but the last holding items holding exactly
+  200,000, or the call fails with `wrong number of items: LIST`; a
+  program's split lists check every shard's items. See
+  [long lists](docs/scratch-interface.md#long-lists).
+- Prepare for save keeps the global lists. It used to empty a
+  model's input and output lists and a program's input and state lists.
+- Every internal block, list and variable starts with `_`, including the
+  0.5.0 ones that started with `cattorch ` (`cattorch decode float32`,
+  `cattorch K cache 1`, `cattorch select top k`, ...) or had no prefix
+  (`index`, `sum`, `T1`, a tokenizer's `tokens`). The public names are the
+  broadcasts and globals named after the export, and the sprite's own
+  variables starting with `cattorch `.
+
+## New features
+
+### Interface and stability
+
+- The [Scratch interface](docs/scratch-interface.md) is versioned. It lists
+  every public broadcast, list and variable and every `NAME status` value;
+  within interface version 1 (all of 1.x) none is renamed or removed. Each
+  sprite has a `cattorch interface version` variable, and Python has
+  `cattorch.INTERFACE_VERSION`.
+- Every call, in every kind of sprite, sets `NAME status` and does a
+  `broadcast and wait` of its `NAME OP complete` broadcast whenever it
+  ends, unless it is stopped or restarted. Model and tokenizer sprites gain
+  a status and their broadcasts; program sprites gain
+  `cattorch initialized`, `NAME reset complete` and
+  `NAME prepare for save complete`; generation sprites gain
+  `NAME prepare for save`.
+- Result objects name what a project uses: `inputs`, `outputs`, a
+  program's entry point lists and states, and `sharded_lists` give the
+  global list names (`NAME input`), and `TranspileResult.procedures`,
+  `GenerationResult.procedures` and `ProgramResult.procedures` →
+  `broadcasts`, the messages that run the sprite (`NAME forward`, ...);
+  `EntryPointResult.procedure` → `broadcast` (`NAME ENTRY`), with
+  `completion_broadcast` `NAME ENTRY complete`.
+- [Stability](docs/stability.md) says what 1.x keeps compatible and what is
+  experimental. `cattorch.__version__` and `cattorch --version` give the
+  installed version.
+- `CattorchWarning` is the base class of every warning cattorch emits, and
+  every warning an export gives is also in its result's `warnings`.
+- `CodegenConfig(layer_sharing=True)` warns, saying why, whenever it shares
+  nothing, for every kind of export, including a model with no `blocks.N`
+  layers. A program reports each entry point whose layers couldn't be
+  shared, and warns once if no entry point has layers. See
+  [layer sharing](docs/code-generation.md#layer-sharing).
+
+### Generation
+
+- `GenerationProgram(max_context=...)` exports an ordinary stateless
+  `forward(tokens) -> logits` as a KV-cached generator and checks the cached
+  step against `forward` at export, and that `forward`'s answer for a token
+  doesn't depend on the prompt's length, at lengths spread up to
+  `max_context`. Separate or combined Q/K/V projections,
+  learned positions, RoPE, grouped-query and single-KV-head attention,
+  sliding windows (Mistral, GPT-OSS), ALiBi and attention sinks work, and so
+  do unwrapped Hugging Face GPT-2, Llama and Qwen2. Models with float16 or
+  bfloat16 weights are exported in float32. See
+  [KV-cached generation](docs/generation.md).
+- `verify` runs a generation sprite's `prefill`, `decode` and `reset` calls
+  and compares each call's logits, top-k lists and `NAME status` with
+  PyTorch; see [verify a generator](docs/generation.md#verify-a-generator).
+
+### Recurrent generation
+
+- `RecurrentGenerationProgram` exports token-by-token generation for models
+  whose tokens mix through a recurrence, such as GRU and LSTM language
+  models: a `step(token, *states) -> (logits, *new_states)` method and the
+  states' initial values. Hugging Face Mamba, Mamba-2 and RWKV causal
+  language models need no step: `RecurrentGenerationProgram()` builds one.
+  The sprite has the same blocks, lists and statuses as a
+  `GenerationProgram`'s, and `max_context` is optional. See
+  [recurrent generation](docs/recurrent-generation.md).
+
+### Programs, markers and mixture of experts
+
+- Programs (`ExportProgram`, `EntryPoint`, `Input`, `Output`, `State`,
+  `StateInput`, `StateUpdate`, `ProgramCall`), `ModuleAdapter` and
+  `AdapterContext` are stable and imported from `cattorch`.
+- [Markers](docs/markers.md) describe the export interface on your own
+  classes without changing how they run: `@entrypoint` exports a method as a
+  block and turns the buffers it updates into state, which each entry point
+  takes only if it reads or writes it (a parameter, another tensor
+  attribute, or a Python value changed on every call, fails the export
+  instead of being baked in), `@example_inputs` gives
+  `forward` example inputs, `@export_forward` swaps in an export-only method,
+  `@moe` declares a block's routing, `@generate` picks a generation method,
+  and `@adapter` builds a `ModuleAdapter`. `transpile(model, None, path)` and
+  `verify(model, None, result)` read them; `marked_program` returns the
+  `ExportProgram` they describe.
+- `adapters=` works with every kind of export, not only programs.
+- Hand-written mixture-of-experts blocks with a `ModuleList` of experts and a
+  linear router usually export without changes, with a `CustomMoEWarning` naming the
+  routing found. Hugging Face Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE,
+  DeepSeek-V3 and GPT-OSS export directly. Experimental `routed_experts`
+  runs an `ExpertFamily` on routes from your own router code. See
   [mixture of experts](docs/programs-and-moe.md#mixture-of-experts).
-- `op` moved back to `cattorch.experimental`, next to the kernel interface it
-  uses. Only names outside `cattorch.experimental` are stable; see
-  [stability](docs/stability.md).
-- Tokenizer sprites read and write the `cattorch text` variable and the
-  `cattorch token ids` list, instead of the `input` and `output` variables and
-  the `token_ids` list, so every public name starts with `cattorch `. The
-  `tokens` list is internal.
-- Internal blocks, lists, and variables whose names started with `cattorch `,
-  such as the weight decoders and the generation caches (`cattorch K cache 1`),
-  now start with `_cattorch`. Names starting with `cattorch ` are the public
-  interface.
-- `StorageConfig` no longer takes the deprecated `"int8"`, `"int6"` and
-  `"int4"` precisions or their `group_size`, `min_quantized_values`,
-  `scale_precision` and `grouping` fields. Pass
-  `quantization=QuantizationConfig(bits=8)` instead, which groups weights by
-  row and uses float16 scales by default.
-- The legacy cached-generation recognizer is removed, along with
-  `GenerationProgram.example_token`. Export the model's stateless
-  `forward(tokens) -> logits` with `GenerationProgram(max_context=...)`
-  instead: replace a one-token decoder that reads its position from a zero
-  buffer with a forward over the whole sequence. In Scratch timings on a
-  TinyStories-sized model, the automatic path matched or beat the legacy one.
-- `max_context` is now the first field of `GenerationProgram` and the only
-  positional one; `method`, `hidden_prefill`, and `top_k` are keyword-only.
+- An entry point can take no arguments.
+
+### Models and operations
+
+- Many more operations, among them exact GELU, `log_softmax`, the
+  elementwise math, trigonometric and comparison functions, reductions over
+  any dimensions, `topk` and `sort`, `cumsum` and `cumprod`, every
+  convolution and pooling option (dilation, groups, `padding="same"`,
+  transposed and 3D), `gather`, `scatter` and indexing with indices computed
+  at run time, `nn.EmbeddingBag`, broadcast batched `matmul`, and in-place
+  updates of tensors the model creates or of its inputs, with every in-place
+  method and augmented assignment whose out-of-place form exports (`x %= 2`
+  included). `torch.pow` takes
+  any exponent. See [supported models](docs/supported-models.md) and
+  [operator coverage](docs/operator-coverage.md).
+- Operations without a kernel of their own export through PyTorch's
+  decompositions when those reach supported operations;
+  `TranspileResult.fallback_operations` lists them, and fast mode's
+  approximations are in `approximate_operations`.
+- `nn.RNN`, `nn.GRU` and `nn.LSTM` (stacked, bidirectional, `proj_size`) and
+  their cells export, running as one Scratch loop over time.
+- Hugging Face GPT-2, Llama, Qwen2 and BERT models export without a wrapper;
+  `ModelOutput` is unwrapped and non-tensor outputs are skipped with a
+  warning.
+- `transpile` and `verify` take `example_kwargs`.
+- Computations that depend only on parameters, buffers and constants, such
+  as masks and RoPE tables built in `forward`, run at export, and so do
+  Python branches and `.item()` on them.
+- A model in training mode is exported as an evaluation-mode copy, with a
+  warning, instead of being rejected.
+- `torch.no_grad()` and `torch.autocast` blocks inside `forward` are
+  ignored.
+
+### Variable-length inputs
+
+- `transpile(..., dynamic={0: (1, 32)})` lets one input's length vary at run
+  time within bounds, checked against the model at several lengths at
+  export; program entry points take `Input(dynamic=...)`. See
+  [variable-length inputs](docs/supported-models.md#variable-length-inputs).
+
+### Quantization
+
+- `QuantizationConfig(overrides=...)` gives some weights other settings: a
+  module path or parameter name mapped to bits, `None` for float16, or a
+  `QuantizationOverride`. `head_bits` sets a generation export's output head.
+  Keys name the model's own parameters: a layer fast mode factorizes gives
+  its overrides to its factors. See
+  [per-weight settings](docs/storage.md#per-weight-settings).
+- More weights are stored in integers and calibrated by GPTQ: convolution
+  kernels, weights the model
+  copies or slices before use (such as a fused QKV weight; a weight read
+  directly and through a copy is quantized once), weights computed
+  from parameters (`weight_norm`, `spectral_norm`, `w * g`, LoRA sums, and
+  a weight masked by a buffer, a tensor attribute or a constant built in
+  `forward`), and
+  weights of `bmm`, `einsum`, `tensordot`, `F.bilinear`, `nn.MultiheadAttention`,
+  recurrent layers and `nn.RNNCell`, `nn.LSTMCell` and `nn.GRUCell`. A 1D or 2D convolution's kernels are grouped over
+  each output channel's fan-in, as a linear layer's are, instead of along
+  the kernel width. See
+  [symmetric quantization behavior](docs/storage.md#symmetric-quantization-behavior).
+- A matrix whose integer storage wouldn't be smaller than float16, such as
+  one with `group_size=1` or a prime input width, stays float16. GPTQ uses
+  symmetric quantization for a matrix with more than 8,192 inputs. The
+  report says so in both cases.
+- `result.quantization` reports what storage stores, read from storage's own
+  record of each list it stored, with `name[float16]` and `name[remaining]`
+  entries and `TensorQuantizationReport.sources` and `override`. A
+  program's entry points are reported together, and a position table read
+  at constant positions has an entry for the rows stored, with or without
+  layer sharing.
+
+### Command line and projects
+
+- `build_project` writes a runnable `.sb3` around exported sprites, which
+  keep their global interface: list monitors and a green-flag run for a
+  model, a classifier's `NAME predict`, a text generator's `NAME sample`
+  and prompt-and-continue demo. It opens with its small Demo sprite
+  selected, not a model's.
+- `add_to_project` (and `cattorch add PROJECT SPRITE... --output OUT`)
+  adds exported sprites to a project of your own without the editor, whose
+  Upload Sprite selects a sprite and can freeze or crash on a large one.
+  The sprites go after the project's own, so it still opens on its first
+  sprite; their globals and messages use the ones the project already has;
+  nothing of the project's changes; and `replace=True` (`--replace`) puts a
+  retrained model in its sprite's place.
+- The `cattorch` command: `cattorch export` exports and verifies a model from
+  a Python file, module or `.pt`, `cattorch generate` exports a text
+  generator and its tokenizer (also `--hf REPO`), and `--project` builds the
+  project. See [projects and the command line](docs/projects-and-cli.md).
+- An `examples/` directory with small models that train in seconds and
+  export with their projects.
+
+### Verification and benchmarking
+
+- `verify` works for every kind of export, and takes the export's
+  `adapters`, `quantization`, `storage` and `sig_figs` so PyTorch computes
+  with the values the sprite stores, each matrix product reading the list it
+  reads in the sprite, such as a float16 copy of a quantized weight.
+  `VerifyResult.approximate_operations` names fast-mode approximations. Its
+  reference is your own code: a marked model's methods run on its buffers, a
+  generation model's forward, and a Hugging Face recurrent model's forward
+  rather than the step cattorch writes.
+- Every benchmark builder takes `repeats`, `warmups` and `transpile`'s export
+  options, and generation benchmarks take a `GenerationProgram` or
+  `RecurrentGenerationProgram`. See
+  [verification and benchmarking](docs/verification-and-benchmarking.md).
+- `benchmarks/run_project_vm.cjs` runs a project in the official Scratch VM.
+- Every export checks that the code it generates computes each value before
+  reading it, and that every list a block reads exists. A failure raises a
+  `RuntimeError` naming an internal error instead of writing a sprite that
+  would compute wrong numbers.
+
+### Custom kernels (experimental)
+
+- `transpile(..., kernels=[Kernel(...)])` lowers an operation with your own
+  Scratch code from `cattorch.scratch`; `check_kernel` and
+  `build_kernel_benchmark` test and time it, and `op` declares a new
+  operation. All are in `cattorch.experimental`; see
+  [custom kernels and operations](docs/custom-kernels.md).
+
+## Performance
+
+- Exports of large models are several times faster and use a fraction of the
+  memory. GPTQ uses the blocked (lazy batch) update and is several times
+  faster.
+- A token embedding tied to the output head is stored once even when it
+  spans several lists.
+- A float16 or float32 weight larger than one stored list is cut at whole
+  rows, so each multiply reads one list item. It was cut mid-row, which
+  made a model such as a 3M-parameter transformer of `nn.TransformerEncoderLayer`s
+  run about twice as slowly in float32 as in int8.
+- A program state that starts as one value everywhere, such as zeros, no
+  longer stores its initial copy.
+- Hidden prefill also skips the final layer's query, attention output and
+  MLP for prompt tokens before the last, with or without layer sharing.
+- Layer sharing also shares repeated layers at the start of a model, which
+  read the model's input.
+- Rotate-half RoPE (`x * cos + rotate_half(x) * sin`) runs as one rotary
+  loop.
+- In-place operations, such as `x.clamp_(-1, 1)`, `x.sigmoid_()` and
+  `x[0] = 0`, run the kernel of their out-of-place operation instead of a
+  PyTorch decomposition.
+
+## Fixes
+
+Python:
+
+- Combined-QKV attention gave wrong output with a batch of more than one, or
+  when Q, K or V was also used elsewhere.
+- Layer sharing gave wrong output when the layers did more than pass one
+  tensor along: a skip connection across layers, two tensors passed between
+  layers, every layer reading the model's input, or a tensor entering the
+  first layer that was also used later. These models are now exported
+  unshared, with a warning; see
+  [layer sharing](docs/code-generation.md#layer-sharing).
+- Layer sharing gave wrong output when code outside the layers read a
+  layer's weight other than `blocks.0`'s, such as an output head tied to a
+  layer's weight or a tensor with the same values, and when the model's loop
+  ran code between two layers that read no layer's output. That code reads
+  the layer's rows of the shared bank now, and code between layers keeps the
+  model unshared, with a warning that says so (it used to blame weight
+  deduplication, and a layer whose operations were all fused into code
+  outside it was said to be misnumbered).
+- Layer sharing with one layer quantized differently, such as
+  `overrides={"blocks.3.fc2": 8}`, stored every layer's weights in float16,
+  while the report and warning blamed `blocks.0` alone. Such layers are now
+  exported unshared with a warning, each keeping the storage it asked for,
+  and the report of a shared bank names every layer's weights.
+- `masked_fill` on an integer or boolean tensor wrote a fractional fill
+  value as it was instead of casting it to the tensor's type.
+- A SiLU multiplied by itself (`s * s`) or by another SiLU
+  (`F.silu(a) * F.silu(b)`) gave zeros, and causal attention whose scores are
+  `t @ t` for one transposed tensor read values that were never computed.
+- A Linear followed by two residual additions added the first one twice, and
+  a residual add that broadcasts the Linear's output gave too few values.
+- A Linear followed by BatchNorm1d was folded even when the BatchNorm
+  normalized another axis, and a BatchNorm used twice normalized wrongly
+  after its first use.
+- A tensor read through a view after its last direct use could be
+  overwritten by a later operation.
+- Reading a list of more than 200,000 values at positions taken from another
+  such list returned zeros past the first 200,000.
+- Program inputs, states and outputs longer than a Scratch list could give
+  wrong values with status `ok`.
+- A result's `sharded_lists` also named internal lists, such as weights and
+  K/V caches; it names only the public lists, whose shards your scripts read
+  and write.
+- `x @ W` with a large stored weight could fail with an internal error.
+- Crashes: `MaxPool1d(1)`, `Conv2d(stride=(2,))`, pooling without an
+  explicit stride, softmax and `transpose` of 0-d tensors, `mean(dim=())`,
+  `nn.LayerNorm(bias=False)`, `F.rms_norm` without a weight, 0-d parameters,
+  `torch.eye` with 256 rows or more,
+  concatenating an empty tensor, `F.linear` with a vector weight, and a
+  `RecursionError` reading a tensor split into hundreds of lists.
+- Wrong output: `1 - x` on a 0-d tensor, `F.batch_norm` with statistics
+  passed as inputs, unbatched `AdaptiveAvgPool2d`, `F.elu` with a `scale`,
+  and `bool + bool`.
+- In a mixture-of-experts layer, operations on an expert's own parameters
+  read the first expert's values for every expert.
+- Layer sharing merged layers that differ only in a constant, could fail
+  with a `KeyError`, and a decode before any prefill wrote the hidden state
+  to the logits.
+- Layer sharing gave wrong output when the tensor entering the first shared
+  layer was also returned or used after the layers, and dropped an output
+  copied after the last layer, such as a returned input.
+- `FastConfig(neuron_pruning=...)` also pruned parameters the model reads
+  directly elsewhere, such as `x @ self.up.weight.T`, changing those outputs'
+  values and shapes, and low-rank factorization and block pruning changed
+  such reads too. A module whose parameters are read outside it, in any
+  exported method, is now left untransformed, with a warning.
+- A tied embedding was read in the wrong layout in fast mode with weight
+  transforms, and fast weight pruning of `x @ W` changed `W` for other uses.
+- Fast low-rank factorization replaced a layer with two plain layers whatever
+  else it did, so a subclass of `nn.Linear` or a convolution with its own
+  `forward`, such as one that clamps its output, lost those steps and gave
+  wrong output, and a layer's forward hooks were dropped. A layer inside
+  `nn.MultiheadAttention`, `nn.TransformerEncoderLayer` or another `torch.nn`
+  module that reads its weight itself made the export fail with a false
+  "check that example_inputs match" error. Such layers now keep their
+  weights, with a warning; neuron pruning skips layers with forward hooks
+  the same way.
+- `x.put_()`, `x.addr_()`, `x.addmm_()` and `x.addmv_()` were refused
+  although their out-of-place forms export, with reasons that didn't apply
+  ("neither is x.put(...)", "an in-place update through a view"). Every
+  in-place method now runs as its out-of-place form, whether or not PyTorch
+  has a decomposition for it.
+- A `dynamic=` export that writes the first item of the variable-length
+  dimension, or joins `x[:, :1]` and `x[:, 1:]` with `cat`, was refused
+  saying the model might use the length itself. It names the cause now:
+  such a slice holds nothing in the one-item trace.
+- Reading input-dependent values with `tolist()` or `.numpy()` exported the
+  example's values as constants; it is rejected, like `.item()`.
+- `sig_figs` rounded integer buffers.
+- Two states sharing one initial tensor read one state's list for both.
+- An entry point that computed something from an append state's length,
+  such as `history.sum(0) / history.shape[0]`, `history.var(0)` or
+  `torch.arange(history.shape[0])`, used the length it was traced with.
+  Arithmetic with a length now follows it at run time, for each of an entry
+  point's append states and variable-length inputs, a number computed from
+  two lengths together is rejected, and export checks every entry point at
+  several lengths of each append state it reads, rejecting what the sprite
+  can't follow.
+- Program entry points were traced one after another on one copy of the
+  model, so what one changed outside its states, such as `self.scale = 2.0`,
+  reached the sprites of those traced after it, from their first call. Each
+  entry point is now traced, and GPTQ calibration calls run, from the model
+  as given. `verify`'s default calls run the entry points again in reverse
+  order, from a fresh sprite, which a single order could hide this behind.
+- `@entrypoint`: a buffer registered as `None` that a method set to a
+  tensor, or one a method set to `None`, became no state, with no warning
+  and wrong numbers from the second call. Both fail the export now. A
+  method that returns nothing and changes no buffer says so, rather than
+  naming `returns=`.
+- `@entrypoint`: a tensor in a dictionary, or an attribute that started as
+  `None`, set from the inputs on every call was reported as changed "on its
+  first call only", with wrong numbers. The second call that tells them
+  apart now uses other inputs, and any change made again fails the export,
+  as the docs said. A change on the first call only is allowed if later
+  calls of every entry point give what they would from the initial values,
+  and fails otherwise, as `self.scale = 2.0` read by another entry point
+  does. Old-style `nn.utils.spectral_norm`, refused as a tensor attribute
+  change, exports with a warning.
+- `@entrypoint`: a submodule registered under two names whose buffer was a
+  state made every entry point not using it fail, saying it read the
+  buffer.
+- Two states that are interleaved columns of one tensor (`base[:, 0]` and
+  `base[:, 1]`) were refused as views of each other; only tensors sharing an
+  element are.
+- An in-place update of a tensor that isn't a state could be blamed on an
+  unrelated parameter with the same values.
+- GPTQ programs skipped the entry point length checks, so a method that
+  depended on an append state's length exported wrong numbers that the same
+  export without GPTQ refused. They are checked against the export's own
+  quantized weights.
+- The length check never compared the entry point that grows an append
+  state past four rows, so a dependence on the length starting there
+  exported wrong numbers. It checks the state as long as the call can take
+  it, and halfway there.
+- The length checks refused valid models: large values (rows near 3e4, whose
+  float32 rounding PyTorch's own result carries) and fast mode, whose
+  QuickGELU error grows with the number of items summed. The tolerance now
+  allows the float32 error measured against a float64 run, and fast mode is
+  compared with a model computing GELU as QuickGELU; what the check can't
+  reproduce is allowed an error that grows with the length.
+- An entry point whose method can't run on the one row it is traced with,
+  as `xs[-2]` with `dynamic={"xs": (2, 8)}` or an append state starting
+  with two rows does, raised a bare `IndexError` or blamed the example
+  inputs; it says the input or state is traced with one row.
+- Quantization: the report could claim int8 or int4 for weights storage
+  kept in float16, a weight with small values or groups of one could be
+  stored in float16 without a warning, `min_quantized_values` was applied to
+  each list of a split weight, vector parameters were quantized like
+  matrices, and sliced weights were quantized twice.
+- Quantization: parameters the export never reads, such as a submodule
+  `forward` doesn't call or the rows of `weight[:256]` past 256, were
+  quantized, reported and counted in `quantized_values`; they are neither
+  now. A weight above `min_quantized_values` read in slices below it was
+  rounded to integers and then stored in float16; the slices are stored in
+  integers, as the whole weight would be. A table gathered by token whose
+  first rows a matrix product also read, as `h @ embedding[:16]` does, was
+  quantized in the product's layout for those rows, so the whole table was
+  stored in float16 with its other rows rounded to integers; the gather now
+  decides the table's layout and the product reads a float16 copy. A
+  float16 list holding values of several report entries says so, instead of
+  claiming each was quantized along another axis.
+- `verify` with `quantization=` failed on a correct sprite whose storage
+  shares one list between a weight and a view of it with another shape,
+  such as `w` and `w.view(1024, 32)`. Storage now stores such a list in the
+  fewest bits any of its shapes allows, whichever use comes first, and
+  `verify` reads it for every use.
+- GPTQ errors name the calibration item that failed, whatever the model
+  raised, and calibration items are checked before calibration: a token
+  sequence longer than `max_context` or not `[1, length]`, or a tensor item
+  that doesn't match the example inputs, is a `ValueError` naming it.
+- A tuple passed as one example input raises a `TypeError` that says to pass
+  the tensors separately, and a wrongly shaped one reports the model's own
+  error.
+- The emulator behind `verify` kept NaN through arithmetic, where Scratch
+  reads it as 0, and read numbers from text differently from Scratch: it
+  read non-ASCII digits such as `１` and trimmed Python's whitespace instead
+  of JavaScript's. It now follows scratch-vm, checked against it value by
+  value, in its casts, comparisons (by UTF-16 code units), number-to-text
+  forms (`1e-7`, `0.00001`, `true`), text lengths and letters (in UTF-16
+  units), booleans (`"0"` and `"false"` are false), list positions (`last`,
+  `all`, `0x2`), `mod` with infinities, `pick random` bounds, costume
+  switching by number, and `for each` counts read before every iteration.
+- The emulator's `round`, `mathop`, repeat counts and costume numbers could
+  differ from Scratch in the last bit, or raise where Scratch gives NaN:
+  `round` of 0.49999999999999994 gave 1, `sin` of 1e308 raised, and `ln`,
+  `log`, `e ^`, `10 ^`, the trigonometric functions and their inverses used
+  Python's C library where Scratch uses V8's own versions of them. It now
+  computes them as V8 does, `-0` included, checked against scratch-vm bit
+  for bit.
+- Mistakes that ended in an internal exception raise one naming the
+  problem: a `model` that isn't a module or `example_inputs` that are a dict
+  or a number (`TypeError`), a NaN or non-numeric `verify` tolerance, a
+  `verify` sprite path given without `.sprite3` (now read, as `transpile`
+  named it) or that names a project, `analyze_benchmark` on a file that
+  isn't a benchmark project (`ValueError`), and a benchmark case whose
+  `example_inputs` aren't tensors (`TypeError`, before anything is
+  exported). A model that raises in `verify` or within its `dynamic=`
+  bounds raises `UnsupportedModelError` with the inputs' shapes, as
+  `transpile` does.
+- A model returning tensors inside a dataclass failed with "requires at
+  least one tensor output", or lost them with a warning; the error now names
+  the container and the supported ones.
+- Tokenizer exports accepted a falsy `codegen` of another type, such as
+  `{}`, and any truthy `scratch_casefold`, such as `"no"`; they raise
+  `TypeError` as `transpile` does. `CodegenConfig`'s `layer_sharing` and
+  `unrolling`, which a tokenizer ignored, raise `ValueError` for one.
+  `CharTokenizer` and `BPETokenizer` given a SentencePiece model point to
+  `SentencePieceBPETokenizer` instead of saying they take one.
+- SentencePiece tokenizer sprites decoded the unknown token as nothing; they
+  decode it as SentencePiece does (` ⁇ ` by default).
+- `QuantizationConfig`'s GPTQ-only `damp_percent`, `block_size` and
+  `min_calibration_rows` were ignored with `method="symmetric"`; setting
+  them raises `ValueError`. A GPTQ config that sets them can still give
+  some weights `QuantizationOverride(method="symmetric")`. A `FastLayerConfig` rank at or above a weight's
+  full rank was skipped silently; it warns, as other skipped
+  factorizations do.
+- An `output_path` that names no file (empty, ending in a separator, only an
+  extension such as `.sprite3`, or an existing directory) raises
+  `ValueError` instead of writing a hidden `..sprite3` or `.sprite3.sprite3`
+  or a file beside the directory, and so does such a `-o`.
+- `cattorch generate --project` failed with "eos_token_id ... is not a token
+  ID of the model", after writing the sprites, when the tokenizer's end
+  token was past the model's token IDs (such as an added `</s>`) and no
+  `--eos-token-id` was given. The demo then has no end token, and a warning
+  says so. A negative or non-finite `--temperature`, a negative
+  `--eos-token-id`, and `--project` without a tokenizer are rejected before
+  anything is written, and an `--eos-token-id` past the model's IDs before
+  the tokenizer and project are. The
+  benchmark builders append `.sb3` as every other writer does, instead of
+  replacing the last suffix (`results.v2` wrote `results.sb3`).
+- Character and BPE tokenizer sprites ignored Hugging Face added tokens, so
+  a special token such as `</s>` in the text, or an ordinary added token
+  such as `dog cat`, gave other token IDs with no warning. They now match
+  added tokens in the text first, as the tokenizer does; see
+  [added and special tokens](docs/tokenizers.md#added-and-special-tokens).
+  Added tokens with `single_word=True`, or with a character outside the
+  Basic Multilingual Plane, raise `ValueError`. With `split_special_tokens`
+  the sprite reads special tokens as text, as the tokenizer does, and
+  exporting leaves the tokenizer's settings as they were.
+- Tokenizer sprites left out the tokens a tokenizer's post-processor adds
+  around every text, such as `<s>` before it, so `NAME tokenize` gave
+  other IDs than `tokenizer.encode(text)`. They now write them too, for
+  `TemplateProcessing`, `BertProcessing` and `RobertaProcessing`, and for a
+  SentencePiece processor made with `add_bos` or `add_eos`; any other
+  post-processor, and SentencePiece's `reverse` or `enable_sampling`, raises
+  `ValueError`. See
+  [special tokens added around the text](docs/tokenizers.md#special-tokens-added-around-the-text).
+- With `split_special_tokens=True`, a character tokenizer or BPE sprite
+  wrote a one-character special token's own ID where the tokenizer gives
+  the unknown token, because the model's vocabulary lacks it.
+- `BPETokenizer` exported a model with `ignore_merges=True` and merged
+  anyway, so a text that is itself a vocabulary entry could get other IDs.
+  It raises `ValueError` unless the merges build every vocabulary entry,
+  when the option changes nothing.
+- Tokenizer sprites looked characters up case-insensitively, so `The`
+  encoded like `the`. Sprites whose vocabulary has letters now look
+  characters up by costume name, so don't change their costumes. SentencePiece `scratch_casefold=True`
+  sprites mishandled lowercase letters without a vocabulary entry and runs of
+  unknown characters.
+
+Scratch:
+
+- Calls from several scripts at once, or stopped part way, could report `ok`
+  with wrong outputs, lose a reset, or leave the weights, cache or states
+  corrupted for every later call. They now report
+  `another call ran during this one` or
+  `an earlier call was stopped or is still running; reset first`; see
+  [overlapping calls](docs/scratch-interface.md#overlapping-calls).
+- Generation top-k could list ID -1 with `-Infinity` when fewer than `top_k`
+  logits were finite.
+- Generation sprites had a second, unused `cattorch status` variable.
+- Initialization left the last compressed weights in a variable, so a saved
+  project stored them twice.
+- `cattorch prepare for save` clears every internal working list, including
+  those of recurrent layers, experts and cached attention and a generator's
+  copy of the prompt, which it used to leave holding the last call's values.
+- Loose call blocks on the canvas ran internal procedures directly; they
+  now broadcast the sprite's messages, as a project calls it.
+
+## Known limitations
+
+- Call a sprite from one script at a time. Two rare overlaps are
+  still not detected; see
+  [overlapping calls](docs/scratch-interface.md#overlapping-calls).
+- Tokenizers other than character, raw BPE and SentencePiece BPE, such as
+  WordPiece and Unigram, are rejected; see
+  [tokenizers](docs/tokenizers.md#compatibility).
+- Generation needs causal attention as the only place tokens mix, and a
+  fixed `max_context`; see
+  [requirements](docs/generation.md#requirements).
+- Training and autograd aren't supported. State can be updated in place by
+  slices, index tensors and masks, but not through a 0-d index tensor
+  (`buffer[position] = x`; use `buffer[position.reshape(1)]`) or a strided
+  or transposed view, nor read through a view taken before the update; see
+  [limitations](docs/programs-and-moe.md#limitations).
+- Scratch reads NaN as 0, and integer arithmetic doesn't wrap around; see
+  [inputs and outputs](docs/supported-models.md#inputs-and-outputs).
 
 # 0.5.0 - 2026-09-14
 
@@ -486,7 +805,7 @@
   operations.
 - `verify(quantization=...)` for programs now uses the same float16 rules as
   export, including for MoE bias banks.
-- An entrypoint input and output that share a name must now have the same
+- An entry point input and output that share a name must now have the same
   shape.
 - `verify` now matches Scratch for `ln`, `log`, `sqrt`, `floor`, and `ceiling`
   of out-of-range values, for `mod` by zero, for fractional repeat counts, and

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal, cast
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from cattorch.util.scratch.dsl import (
@@ -23,7 +24,6 @@ from cattorch.util.scratch.dsl import (
     delete,
     div,
     eq,
-    gt,
     if_,
     if_else,
     item,
@@ -53,10 +53,7 @@ BASE92_ALPHABET = "".join(
     chr(code) for code in range(33, 127) if chr(code) not in {'"', "\\"}
 )
 assert len(BASE92_ALPHABET) == 92 and len(set(BASE92_ALPHABET)) == 92
-
-# Retained as a source-level compatibility alias. New payloads and generated
-# sprites use the complete Base92 alphabet.
-BASE85_ALPHABET = BASE92_ALPHABET[:85]
+_BASE92_CODES: npt.NDArray[np.uint8] = np.frombuffer(BASE92_ALPHABET.encode("ascii"), dtype=np.uint8)
 
 
 @dataclass(frozen=True)
@@ -76,7 +73,11 @@ class StorageConfig:
     scale_precision: Literal["float32", "float16"] = field(
         default="float32", init=False, repr=False,
     )
-    grouping: Literal["flat", "row"] = field(default="flat", init=False, repr=False)
+    # Every (integer precision, maximum group size) quantization may use,
+    # with per-weight overrides; empty means ``(precision, group_size)``.
+    integer_formats: tuple[tuple[str, int], ...] = field(
+        default=(), init=False, repr=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.compression, bool):
@@ -90,8 +91,12 @@ class StorageConfig:
             raise ValueError("precision must be 'float32' or 'float16'")
 
 
-def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
-    """The storage a ``QuantizationConfig`` implies: its integer format and groups."""
+def quantized_storage(storage: StorageConfig, quantization, report=None) -> StorageConfig:
+    """The storage a ``QuantizationConfig`` implies: its integer format and groups.
+
+    ``report``, the ``QuantizationReport`` of the export's quantization, adds
+    the formats only it knows of, such as an output head's.
+    """
     result = StorageConfig(compression=storage.compression)
     # Integer formats aren't a public StorageConfig option, so set them past
     # the frozen dataclass's validation.
@@ -100,7 +105,10 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
         ("group_size", quantization.group_size),
         ("min_quantized_values", quantization.min_quantized_values),
         ("scale_precision", quantization.scale_precision),
-        ("grouping", "row"),
+        (
+            "integer_formats",
+            getattr(report, "_integer_formats", ()) or quantization._integer_formats(),
+        ),
     ):
         object.__setattr__(result, name, value)
     return result
@@ -108,29 +116,52 @@ def quantized_storage(storage: StorageConfig, quantization) -> StorageConfig:
 
 def encode_values(values, precision: Literal["float32", "float16"]) -> str:
     """Encode numeric values with the Scratch costume-name Base92 codec."""
-    code = ">f" if precision == "float32" else ">e"
     return _encode_bytes(_float_bytes(values, precision))
 
 
 def _float_bytes(values, precision: Literal["float32", "float16"]) -> bytes:
-    code = ">f" if precision == "float32" else ">e"
-    return b"".join(_pack_value(code, value) for value in values)
+    """Big-endian IEEE values, rounded to nearest even.
+
+    Values past the format's range become infinities. A NaN keeps its sign;
+    in float16 it is always the quiet NaN 0x7e00, as ``struct`` packs it.
+    """
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if precision == "float16":
+        nan = np.isnan(array)
+        if nan.any():
+            array = np.where(nan, np.copysign(np.nan, array), array)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return array.astype(">f4" if precision == "float32" else ">f2").tobytes()
+
+
+# Groups encoded per step, to bound the 64-bit temporaries for long payloads.
+_BASE92_CHUNK_GROUPS = 1 << 16
 
 
 def _encode_bytes(raw: bytes) -> str:
-    """Encode bytes as one pad digit followed by 13-byte Base92 groups."""
+    """Encode bytes as one pad digit followed by 13-byte Base92 groups.
+
+    Each group is two 52-bit halves of eight digits each.
+    """
     padding = (-len(raw)) % 13
-    padded = raw + bytes(padding)
-    encoded: list[str] = [BASE92_ALPHABET[padding]]
-    mask = 2**52 - 1
-    for offset in range(0, len(padded), 13):
-        packed = int.from_bytes(padded[offset:offset + 13], "big")
-        for half in (packed >> 52, packed & mask):
-            digits = [0] * 8
+    data: npt.NDArray[np.uint8] = np.frombuffer(raw + bytes(padding), dtype=np.uint8).reshape(-1, 13)
+    parts = [BASE92_ALPHABET[padding]]
+    for start in range(0, len(data), _BASE92_CHUNK_GROUPS):
+        chunk: npt.NDArray[np.uint64] = data[start:start + _BASE92_CHUNK_GROUPS].astype(np.uint64)
+        high: npt.NDArray[np.uint64] = np.zeros(len(chunk), dtype=np.uint64)
+        for column in range(7):
+            high = (high << np.uint64(8)) | chunk[:, column]
+        low = high & np.uint64(0xF)
+        high >>= np.uint64(4)
+        for column in range(7, 13):
+            low = (low << np.uint64(8)) | chunk[:, column]
+        digits: npt.NDArray[np.uint8] = np.empty((len(chunk), 16), dtype=np.uint8)
+        for half, offset in ((high, 0), (low, 8)):
             for index in range(7, -1, -1):
-                half, digits[index] = divmod(half, 92)
-            encoded.extend(BASE92_ALPHABET[digit] for digit in digits)
-    return "".join(encoded)
+                digits[:, offset + index] = half % np.uint64(92)
+                half = half // np.uint64(92)
+        parts.append(_BASE92_CODES[digits.reshape(-1)].tobytes().decode("ascii"))
+    return "".join(parts)
 
 
 def quantize_values(
@@ -140,6 +171,17 @@ def quantize_values(
     scale_precision: Literal["float32", "float16"] = "float32",
 ) -> tuple[list[int], list[float]]:
     """Return signed integer codes and float32 reconstruction scales."""
+    codes, scales = _quantize_arrays(values, precision, group_size, scale_precision)
+    return codes.tolist(), scales.tolist()
+
+
+def _quantize_arrays(
+    values,
+    precision: Literal["int8", "int6", "int4"],
+    group_size: int,
+    scale_precision: Literal["float32", "float16"],
+) -> tuple[np.ndarray, np.ndarray]:
+    """``quantize_values`` as int64 codes and float64 scales."""
     if precision not in {"int8", "int6", "int4"}:
         raise ValueError("precision must be 'int8', 'int6', or 'int4'")
     if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 1:
@@ -147,43 +189,70 @@ def quantize_values(
     if scale_precision not in {"float32", "float16"}:
         raise ValueError("scale_precision must be 'float32' or 'float16'")
 
-    numbers = [float(value) for value in values]
-    if any(not math.isfinite(number) for number in numbers):
+    numbers = np.asarray(values, dtype=np.float64).reshape(-1)
+    if not np.isfinite(numbers).all():
         raise ValueError("integer weight quantization requires finite values")
     maximum_code = {"int8": 127, "int6": 31, "int4": 7}[precision]
-    codes: list[int] = []
-    scales: list[float] = []
-    for start in range(0, len(numbers), group_size):
-        group = numbers[start:start + group_size]
-        maximum = max((abs(number) for number in group), default=0.0)
-        scale = maximum / maximum_code if maximum else 1.0
-        scale_code = ">f" if scale_precision == "float32" else ">e"
+    if not numbers.size:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    starts = np.arange(0, numbers.size, group_size)
+    maxima = np.maximum.reduceat(np.abs(numbers), starts)
+    scales = group_scales(maxima, maximum_code, scale_precision)
+    overflow = ~np.isfinite(scales)
+    if overflow.any():
         scale_guidance = (
             "use scale_precision='float32'"
             if scale_precision == "float16"
             else "rescale the tensor before export"
         )
-        try:
-            scale = struct.unpack(scale_code, struct.pack(scale_code, scale))[0]
-        except OverflowError as error:
-            raise ValueError(
-                f"quantization scale {scale!r} is outside the finite "
-                f"{scale_precision} range; {scale_guidance}"
-            ) from error
-        if not math.isfinite(scale):
-            raise ValueError(
-                f"quantization scale is outside the finite {scale_precision} "
-                f"range; {scale_guidance}"
-            )
-        if maximum and scale == 0:
-            # Preserve a finite reconstruction for groups whose ideal scale
-            # falls below the selected IEEE format's smallest subnormal.
-            scale = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
-        scales.append(scale)
-        for number in group:
-            code = round(number / scale) if maximum else 0
-            codes.append(max(-maximum_code, min(maximum_code, code)))
-    return codes, scales
+        raise ValueError(
+            f"quantization scale {float(maxima[overflow][0] / maximum_code)!r} is outside "
+            f"the finite {scale_precision} range; {scale_guidance}"
+        )
+    codes = np.rint(numbers / np.repeat(scales, group_size)[:numbers.size])
+    return np.clip(codes, -maximum_code, maximum_code).astype(np.int64), scales
+
+
+def group_scales(
+    maxima: np.ndarray,
+    maximum_code: int,
+    scale_precision: Literal["float32", "float16"],
+) -> np.ndarray:
+    """Each group's scale, as float64, from its largest absolute value.
+
+    This is the one scale rule of integer storage: quantization rounds with
+    it, the encoder encodes with it, and storage checks values against it.
+    Storage only sees reconstructed values, so the rule is a fixed point:
+    applied to a group reconstructed with its scale, it gives that scale
+    back. The scale nearest ``maximum / maximum_code`` does, except when
+    rounding it to the scale precision, which is coarse for subnormal
+    scales, leaves the group's largest code below ``maximum_code`` and the
+    scale derived from that code different. Such a group instead takes the
+    largest representable scale below ``maximum / maximum_code``, whose
+    largest code is ``maximum_code``. A group of zeros has scale 1; a group
+    whose scale is below the smallest subnormal has the smallest one.
+    Scales beyond the format's range are infinite, for the caller to reject.
+    """
+    dtype = np.float32 if scale_precision == "float32" else np.float16
+    smallest = math.ldexp(1.0, -149 if scale_precision == "float32" else -24)
+    maxima = np.asarray(maxima, dtype=np.float64)
+    nonzero = maxima != 0
+    ideal = np.where(nonzero, maxima / maximum_code, 1.0)
+    with np.errstate(over="ignore"):
+        scales = ideal.astype(dtype).astype(np.float64)
+    scales[nonzero & (scales == 0)] = smallest
+    finite = np.isfinite(scales)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        top = np.minimum(np.rint(maxima / scales), maximum_code)
+        recovered = (top * scales / maximum_code).astype(dtype).astype(np.float64)
+    recovered[(top > 0) & (recovered == 0)] = smallest
+    inconsistent = nonzero & finite & (top > 0) & (recovered != scales)
+    if inconsistent.any():
+        below = ideal[inconsistent].astype(dtype)
+        above = below.astype(np.float64) > ideal[inconsistent]
+        below[above] = np.nextafter(below[above], dtype(0))
+        scales[inconsistent] = np.maximum(below.astype(np.float64), smallest)
+    return scales
 
 
 def quantize_codebook_values(
@@ -241,36 +310,61 @@ def encode_quantized_values(
 
 
 def _quantized_bytes(
-    codes: list[int], precision: Literal["int8", "int6", "int4"],
+    codes, precision: Literal["int8", "int6", "int4"],
 ) -> bytes:
     """Pack centered integer codes before their common Base92 encoding."""
+    maximum_code = {"int8": 127, "int6": 31, "int4": 7}.get(precision)
+    if maximum_code is None:
+        raise ValueError("precision must be 'int8', 'int6', or 'int4'")
+    codes = np.asarray(codes, dtype=np.int64).reshape(-1)
+    if codes.size and np.abs(codes).max() > maximum_code:
+        raise ValueError(f"{precision} codes must lie in [{-maximum_code}, {maximum_code}]")
+    centered = codes + maximum_code
     if precision == "int8":
         # Code 255 is deliberately unused. Centering removes a sign branch
         # from the Scratch startup decoder.
-        return bytes(code + 127 for code in codes)
+        return centered.astype(np.uint8).tobytes()
     if precision == "int6":
         # Four centered six-bit codes occupy three bytes. Continuous Base92
         # packing approaches 12 characters per 13 bytes while
         # sharing the faster costume decoder with every format.
-        packed: list[int] = []
-        for index in range(0, len(codes), 4):
-            group = [code + 31 for code in codes[index:index + 4]]
-            group.extend([31] * (4 - len(group)))
-            packed.extend((
-                group[0] * 4 + group[1] // 16,
-                (group[1] % 16) * 16 + group[2] // 4,
-                (group[2] % 4) * 64 + group[3],
-            ))
-        raw_size = math.ceil(len(codes) * 6 / 8)
-        return bytes(packed[:raw_size])
-    if precision == "int4":
-        packed = []
-        for index in range(0, len(codes), 2):
-            high = codes[index] + 7
-            low = codes[index + 1] + 7 if index + 1 < len(codes) else 7
-            packed.append(high * 16 + low)
-        return bytes(packed)
-    raise ValueError("precision must be 'int8', 'int6', or 'int4'")
+        group = np.pad(centered, (0, -centered.size % 4), constant_values=31).reshape(-1, 4)
+        packed = np.stack((
+            group[:, 0] * 4 + group[:, 1] // 16,
+            (group[:, 1] % 16) * 16 + group[:, 2] // 4,
+            (group[:, 2] % 4) * 64 + group[:, 3],
+        ), axis=1)
+        return packed.astype(np.uint8).tobytes()[:math.ceil(codes.size * 6 / 8)]
+    pair = np.pad(centered, (0, centered.size % 2), constant_values=7).reshape(-1, 2)
+    return (pair[:, 0] * 16 + pair[:, 1]).astype(np.uint8).tobytes()
+
+
+def integer_storage_bytes(
+    counts, precision: Literal["int8", "int6", "int4"], group_size: int,
+    scale_precision: Literal["float32", "float16"], *, groups: int | None = None,
+) -> int:
+    """The payload and scale bytes integer storage spends on one tensor.
+
+    ``counts`` says how often each code occurs, the most negative first; for
+    int8 and int6 only its total matters. The cost is what the encoder
+    writes: packed codes (for int4, a Huffman stream with a code built for
+    this tensor alone) and a scale per group, ``groups`` of them or one per
+    ``group_size`` values. Base92 text grows every format by the same
+    ratio, so this compares directly with two bytes per value for float16.
+    """
+    counts = np.asarray(counts, dtype=np.int64).reshape(-1)
+    values = int(counts.sum())
+    if groups is None:
+        groups = math.ceil(values / group_size)
+    scale_bytes = groups * (4 if scale_precision == "float32" else 2)
+    if precision == "int8":
+        return values + scale_bytes
+    if precision == "int6":
+        return math.ceil(values * 6 / 8) + scale_bytes
+    frequencies = Counter({symbol: int(count) for symbol, count in enumerate(counts) if count})
+    lengths = _length_limited_huffman_lengths(frequencies)
+    bits = sum(frequencies[symbol] * length_ for symbol, length_ in lengths.items())
+    return math.ceil(bits / 8) + scale_bytes
 
 
 def _int4_symbols(spec: EncodedList):
@@ -405,24 +499,11 @@ def rounded_values(
     scale_precision: Literal["float32", "float16"] = "float32",
 ):
     """Round values to the exact numbers represented by the selected format."""
-    if precision in {"int8", "int6", "int4"}:
-        codes, scales = quantize_values(
-            values, precision, group_size, scale_precision,
-        )
-        return [
-            code * scales[index // group_size]
-            for index, code in enumerate(codes)
-        ]
-    code = ">f" if precision == "float32" else ">e"
-    return [struct.unpack(code, _pack_value(code, value))[0] for value in values]
-
-
-def _pack_value(code: str, value) -> bytes:
-    number = float(value)
-    try:
-        return struct.pack(code, number)
-    except OverflowError:
-        return struct.pack(code, math.copysign(math.inf, number))
+    if precision == "float32" or precision == "float16":
+        dtype = ">f4" if precision == "float32" else ">f2"
+        return np.frombuffer(_float_bytes(values, precision), dtype=dtype).astype(np.float64).tolist()
+    codes, scales = _quantize_arrays(values, precision, group_size, scale_precision)
+    return (codes * np.repeat(scales, group_size)[:codes.size]).tolist()
 
 
 def power_table(precision: Literal["float32", "float16"]) -> list[float]:
@@ -505,10 +586,9 @@ def _decoded_value(precision):
                 ),
             ),
         ),
-        if_else(
+        if_(
             eq(var("decode sign"), 1),
             (set_var("decode value", mul(-1, var("decode value"))),),
-            (set_var("decode value", var("decode value")),),
         ),
     )
     return classify
@@ -556,7 +636,7 @@ def _emit_byte(byte, spec: EncodedList):
     return (
         set_var("decode bits", add(mul(var("decode bits"), 256), byte)),
         change_var("decode byte count", 1),
-        if_else(
+        if_(
             eq(var("decode byte count"), byte_count),
             (
                 *_decoded_value(spec.precision),
@@ -564,7 +644,6 @@ def _emit_byte(byte, spec: EncodedList):
                 set_var("decode bits", 0),
                 set_var("decode byte count", 0),
             ),
-            (set_var("decode value", var("decode value")),),
         ),
     )
 
@@ -967,72 +1046,11 @@ def _copy_decoded(destination: str):
 
 
 def build_shared_unpack_program(specs: list[EncodedList]) -> Program:
-    """Build compact wrappers around shared per-precision decoders."""
-    if specs and all(spec.payload_bytes is not None for spec in specs):
-        return _build_banked_unpack_program(specs)
-
-    body: list[Statement] = []
-    for spec in specs:
-        if spec.precision in {"int8", "int6", "int4"}:
-            if not spec.scale_payload_name or spec.scale_payload is None:
-                raise ValueError("quantized encoded lists require scale metadata")
-            body.extend((
-                set_var(_ACTIVE_PAYLOAD, var(spec.scale_payload_name)),
-                call(_BYTE_DECODER),
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                call(f"cattorch decode {spec.scale_precision}"),
-                clear(_DECODED_SCALES),
-                for_each(
-                    "decode copy index", length(_DECODED_VALUES),
-                    (append(
-                        _DECODED_SCALES,
-                        item(_DECODED_VALUES, var("decode copy index")),
-                    ),),
-                ),
-                set_var(_ACTIVE_PAYLOAD, var(spec.payload_name)),
-            ))
-            body.append(call(_BYTE_DECODER))
-            body.extend((
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                set_var("decode scale start", 1),
-                set_var("decode total values", spec.value_count or 0),
-                set_var("decode group size", spec.group_size or 1),
-                call(f"cattorch decode {spec.precision}"),
-            ))
-        else:
-            body.extend((
-                set_var(_ACTIVE_PAYLOAD, var(spec.payload_name)),
-                call(_BYTE_DECODER),
-                set_var("decode byte start", 1),
-                set_var("decode byte length", length(_DECODED_BYTES)),
-                call(f"cattorch decode {spec.precision}"),
-            ))
-        body.extend(_copy_decoded(spec.name))
-    body.extend((clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES)))
-    variables = (
-        _ACTIVE_PAYLOAD, "decode copy index", "decode total values", "decode group size",
-        "decode byte start", "decode byte length", "decode scale start",
-        *(spec.payload_name for spec in specs),
-        *(spec.scale_payload_name for spec in specs if spec.scale_payload_name),
-    )
-    variable_values = {spec.payload_name: spec.payload for spec in specs}
-    variable_values.update({
-        spec.scale_payload_name: spec.scale_payload
-        for spec in specs
-        if spec.scale_payload_name and spec.scale_payload is not None
-    })
-    return Program(
-        "unpack_weights",
-        variables=variables,
-        variable_values=variable_values,
-        lists=(
-            _DECODED_BYTES, _DECODED_VALUES, _DECODED_SCALES,
-            *(spec.name for spec in specs),
-        ),
-        body=tuple(body),
-    )
+    """Build the init program that decodes ``specs`` through the shared
+    per-precision decoders, from each list's raw ``payload_bytes``."""
+    if any(spec.payload_bytes is None for spec in specs):
+        raise ValueError("shared unpacking needs every encoded list's payload_bytes")
+    return _build_banked_unpack_program(specs)
 
 
 def _huffman_bank(
@@ -1238,9 +1256,10 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
                 body.extend(_copy_decoded(spec.name))
                 byte_offset += len(spec.payload_bytes)
 
+    # Leave no copy of a payload behind: a saved project would store it.
     body.extend((
         clear(_DECODED_BYTES), clear(_DECODED_VALUES), clear(_DECODED_SCALES),
-        clear(_HUFFMAN_TABLE),
+        clear(_HUFFMAN_TABLE), set_var(_ACTIVE_PAYLOAD, 0),
     ))
     return Program(
         "unpack_banked_weights",
@@ -1259,11 +1278,11 @@ def _build_banked_unpack_program(specs: list[EncodedList]) -> Program:
 
 
 def build_unpack_program(specs: list[EncodedList]) -> Program:
-    """Build a self-contained decoder, retained for direct DSL consumers.
+    """Build a self-contained decoder of each list's Base92 ``payload``.
 
     Production exports use :func:`build_shared_unpack_program` plus the shared
-    decoder procedures. Keeping this form makes a decoder program independently
-    executable, which is useful for unit tests and small custom sprites.
+    decoder procedures. This form runs on its own: the storage tests use it as
+    a reference decoder, and a benchmark builder times it.
     """
     if any(spec.precision == "int6" for spec in specs):
         raise ValueError("int6 requires the shared production decoder")

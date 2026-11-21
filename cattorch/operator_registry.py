@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import copy
-import warnings
+import itertools
+import math
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Literal, cast
 
@@ -14,39 +15,29 @@ from cattorch.huggingface import (
     convert_huggingface_experts, is_huggingface_experts, prepare_huggingface_models,
 )
 from cattorch.builtin_kernels import BUILTIN_KERNELS
-from cattorch.kernel_api import Kernel
+from cattorch.kernel_api import Kernel, _KernelInstruction
 from cattorch.moe_detection import detect_custom_moe
 from cattorch.adapters import AdapterContext, ModuleAdapter as PublicModuleAdapter
-from cattorch.util.instruction.instruction import Instruction
-from cattorch.util.instruction.optimized import (
-    FastElementwiseInstruction,
-    FastLayerNormInstruction,
-    FastSoftmaxInstruction,
-    LinearInstruction,
-    OptimizedBatchNormInstruction,
-    OptimizedConvolutionInstruction,
-    OptimizedElementwiseInstruction,
-    OptimizedEmbeddingInstruction,
-    OptimizedLayerNormInstruction,
-    OptimizedLogSoftmaxInstruction,
-    OptimizedMaskedFillInstruction,
-    OptimizedMatMulInstruction,
-    OptimizedMeanInstruction,
-    OptimizedPoolingInstruction,
-    OptimizedRMSNormInstruction,
-    OptimizedSoftmaxInstruction,
-    OptimizedTransposeInstruction,
+from cattorch.util.instruction.optimized_convolution import CONVOLUTION_KERNELS, POOLING_KERNELS
+from cattorch.util.instruction.optimized_elementwise import FAST_GELU_KERNEL, elementwise_kernel
+from cattorch.util.instruction.optimized_linear import LINEAR_KERNEL, matmul_kernel
+from cattorch.util.instruction.optimized_normalization import (
+    BATCH_NORM_KERNEL, FAST_LAYER_NORM_KERNEL, FAST_SOFTMAX_KERNEL, LAYER_NORM_KERNEL,
+    LOG_SOFTMAX_KERNELS, MEAN_KERNEL, RMS_NORM_KERNEL, SOFTMAX_KERNELS,
 )
 from cattorch.util.instruction.optimized_moe import (
-    ExpertFamilyMoEInstruction, RoutedExpertsInstruction, StackedSwiGLUMoEInstruction,
+    EXPERT_FAMILY_MOE_KERNEL, ROUTED_EXPERTS_KERNEL, STACKED_SWIGLU_MOE_KERNEL,
+)
+from cattorch.util.instruction.optimized_tensor import (
+    EMBEDDING_KERNEL, MASKED_FILL_KERNEL, TRANSPOSE_KERNELS,
 )
 from cattorch.util.instruction.generic import (
-    IndexMapInstruction, REDUCTIONS, ReductionInstruction,
+    INDEX_MAP_KERNEL, REDUCTION_KERNELS, REDUCTIONS,
 )
 
 
-# An Instruction subclass, or a function that picks one from the arguments.
-KernelFactory = Callable[..., Instruction]
+# A kernel's instruction class, or a function that picks one from the arguments.
+KernelFactory = Callable[..., _KernelInstruction]
 Validator = Callable[[torch.fx.Node, FastConfig, bool], str | None]
 Observation = tuple[torch.Tensor, torch.Tensor, str]
 Observer = Callable[[object, tuple, dict, object], Iterable[Observation]]
@@ -78,13 +69,20 @@ class OperationRule:
         return self.exact_kernel
 
 
-def eval_mode_copy_warning() -> None:
-    warnings.warn(
-        "the model has modules in training mode; it was exported in evaluation "
-        "mode (dropout disabled, batch norm using running statistics)",
-        UserWarning,
-        stacklevel=3,
-    )
+def eval_mode_copy_warning(model: torch.nn.Module) -> None:
+    """Warn when exporting ``model`` in evaluation mode changes what it computes."""
+    from cattorch.errors import warn
+    from cattorch.graph_transforms import mode_dependent_modules
+
+    modules = mode_dependent_modules(model)
+    if modules:
+        shown = ", ".join(repr(path) for path in modules[:3])
+        more = f" and {len(modules) - 3} more" if len(modules) > 3 else ""
+        warn(
+            f"the model has modules in training mode ({shown}{more}); it was exported "
+            "in evaluation mode (dropout disabled, batch norm using running statistics)",
+            stacklevel=3,
+        )
 
 
 class OperatorRegistry:
@@ -95,11 +93,23 @@ class OperatorRegistry:
         self._module_adapters: dict[type[torch.nn.Module], PrivateModuleAdapter] = {}
         self._expert_families: dict[int, object] = {}
         self._next_expert_family = 0
+        # Targets given an approximate kernel through ``register_kernel``.
+        self._approximate_targets: set[str] = set()
+
+    def for_export(self, *, adapters=(), kernels=()) -> "OperatorRegistry":
+        """A copy with an export's adapters and kernels registered."""
+        registry = self.clone()
+        for adapter in adapters:
+            registry.register_adapter(adapter)
+        for kernel in kernels:
+            registry.register_kernel(kernel)
+        return registry
 
     def clone(self) -> OperatorRegistry:
         result = OperatorRegistry()
         result._operations = self._operations.copy()
         result._module_adapters = self._module_adapters.copy()
+        result._approximate_targets = set(self._approximate_targets)
         return result
 
     @property
@@ -139,8 +149,15 @@ class OperatorRegistry:
             rule = OperationRule(target=kernel.target_name)
         instruction = kernel.instruction_class()
         if not kernel.approximate:
-            rule = replace(rule, exact_kernel=instruction)
+            # An exact kernel also replaces the built-in approximate one, so
+            # fast mode runs it too, unless an approximate kernel was passed.
+            fast_kernel = (
+                rule.fast_kernel if kernel.target_name in self._approximate_targets else None
+            )
+            rule = replace(rule, exact_kernel=instruction, fast_kernel=fast_kernel,
+                           fast_flag=rule.fast_flag if fast_kernel else None)
         else:
+            self._approximate_targets.add(kernel.target_name)
             rule = replace(
                 rule, fast_kernel=instruction,
                 fast_flag=cast(Literal["activations", "layer_norm", "softmax"] | None,
@@ -151,13 +168,31 @@ class OperatorRegistry:
     def operation(self, target: str) -> OperationRule | None:
         return self._operations.get(target)
 
+    def replaced_targets(self, *, fast: bool, config: FastConfig) -> frozenset[str]:
+        """Operations whose kernel here isn't the library's own, such as a
+        kernel passed to an export."""
+        default = _DEFAULT_REGISTRY
+        return frozenset(
+            target for target in self._operations
+            if self.kernel(target, fast=fast, config=config)
+            is not default.kernel(target, fast=fast, config=config)
+        )
+
     def kernel(
         self, target: str, *, fast: bool, config: FastConfig,
     ) -> KernelFactory | None:
         rule = self.operation(target)
         return None if rule is None else rule.kernel(fast=fast, config=config)
 
-    def validate(self, node: torch.fx.Node, *, fast: bool, config: FastConfig) -> str | None:
+    def validate(
+        self, node: torch.fx.Node, *, fast: bool, config: FastConfig,
+        dynamic_axes=None, resolve_weight=None,
+    ) -> str | None:
+        """A reason ``node`` can't be lowered, or ``None``.
+
+        ``dynamic_axes`` and ``resolve_weight`` give a kernel's validator the
+        same facts its ``emit`` gets: variable-length axes and stored values.
+        """
         rule = self.operation(str(node.target))
         if rule is None:
             return None
@@ -167,14 +202,20 @@ class OperatorRegistry:
         # A context kernel validates only when it is the one that will run.
         selected = rule.kernel(fast=fast, config=config)
         validate_node = getattr(selected, "validate_node", None)
-        return None if validate_node is None else validate_node(node)
+        return None if validate_node is None else validate_node(
+            node, dynamic_axes=dynamic_axes, resolve_weight=resolve_weight,
+        )
 
     def observe(
         self, target: str, func: object, args: tuple, kwargs: dict, result: object,
     ):
         rule = self.operation(target)
-        return () if rule is None or rule.observer is None else tuple(
-            rule.observer(func, args, kwargs, result)
+        observer = (
+            _DECOMPOSED_OBSERVERS.get(target)
+            if rule is None or rule.observer is None else rule.observer
+        )
+        return () if observer is None else tuple(
+            observer(func, args, kwargs, result)
         )
 
     def register_module_adapter(
@@ -194,12 +235,17 @@ class OperatorRegistry:
         model: torch.nn.Module,
         *,
         state_names: frozenset[str] = frozenset(),
+        _copy: bool = True,
     ) -> torch.nn.Module:
-        """Apply registered adapters to an export-owned model copy."""
-        model = copy.deepcopy(model)
-        if any(module.training for module in model.modules()):
-            model.eval()
-            eval_mode_copy_warning()
+        """Apply registered adapters to an export-owned model copy.
+
+        ``_copy=False`` adapts ``model`` in place, for a caller that already
+        made the copy and doesn't use it otherwise.
+        """
+        if _copy:
+            model = copy.deepcopy(model)
+        eval_mode_copy_warning(model)
+        model.eval()
         prepare_huggingface_models(model)
         replacements: dict[int, torch.nn.Module] = {}
 
@@ -225,7 +271,7 @@ class OperatorRegistry:
                 result = adapter(module, AdapterContext(path, state_names))
                 if not isinstance(result, torch.nn.Module):
                     raise TypeError(
-                        f"module adapter for {path or '<root>'} returned "
+                        f"the module adapter for {repr(path) if path else 'the top-level module'} returned "
                         f"{type(result).__name__}, not nn.Module"
                     )
                 replacements[identity] = result
@@ -296,7 +342,7 @@ ELEMENTWISE_OPS = frozenset({
     "aten.where.self", "aten.where.ScalarSelf", "aten.where.ScalarOther",
     "aten.where.Scalar", "aten.sin.default", "aten.cos.default",
     "aten.tan.default", "aten.asin.default", "aten.acos.default", "aten.atan.default",
-    "aten.exp2.default", "aten.log2.default", "aten.erfc.default",
+    "aten.exp2.default", "aten.log2.default", "aten.erfc.default", "aten.lgamma.default",
 })
 
 # Pure data-movement operations. The transpiler describes each call as a
@@ -329,6 +375,14 @@ def _validate_add_sub(node, _config, _fast) -> str | None:
     return None if alpha == 1 else f"The alpha={alpha!r} variant is not supported"
 
 
+_REDUCTION_INSTRUCTIONS = {
+    kernel.target_name: kernel.instruction_class() for kernel in REDUCTION_KERNELS
+}
+
+
+_MEAN_INSTRUCTION = MEAN_KERNEL.instruction_class()
+
+
 def _mean_kernel(torch_name, output, *args):
     """Use the tuned mean kernel for consecutive dimensions, else the generic one."""
     dims = args[1].value
@@ -336,11 +390,11 @@ def _mean_kernel(torch_name, output, *args):
         dims = (dims,)
     ndim = len(args[0].shape)
     if ndim == 0:
-        return ReductionInstruction(torch_name, output, *args)
+        return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
     normalized = sorted({dim % ndim for dim in dims or range(ndim)})
     if normalized and normalized == list(range(normalized[0], normalized[-1] + 1)):
-        return OptimizedMeanInstruction(torch_name, output, *args)
-    return ReductionInstruction(torch_name, output, *args)
+        return _MEAN_INSTRUCTION(torch_name, output, *args)
+    return _REDUCTION_INSTRUCTIONS[str(torch_name)](torch_name, output, *args)
 
 
 def _validate_bitwise_not(node, _config, _fast) -> str | None:
@@ -416,10 +470,471 @@ def _observe_linear(_func, args, _kwargs, _result):
     return ((args[0], args[1], "linear"),)
 
 
-def _observe_rhs_matmul(_func, args, _kwargs, _result):
-    if len(args) < 2:
+def _observe_addmm(_func, args, _kwargs, _result):
+    """``bias + left @ right``, as in GPT-2's ``Conv1D``: ``right`` is the weight."""
+    if len(args) < 3:
         return ()
-    return ((args[0], args[1], "rhs_matmul"),)
+    return ((args[1], args[2], "rhs_matmul"),)
+
+
+def _matrix_products(left, right) -> list[Observation]:
+    """Either side of ``left @ right`` as a weight, one matrix at a time.
+
+    A matrix on the right maps ``left``'s rows; one on the left maps
+    ``right``'s columns, as a linear weight would. Batched matrices are
+    observed one per batch, with every row their batch broadcasts to them.
+    The capture keeps only parameters.
+    """
+    if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+        return []
+    if left.ndim == 0 or right.ndim == 0:
+        return []
+    rows = left if left.ndim > 1 else left.unsqueeze(0)
+    columns = right if right.ndim > 1 else right.unsqueeze(-1)
+    try:
+        batch = torch.broadcast_shapes(rows.shape[:-2], columns.shape[:-2])
+    except RuntimeError:
+        return []
+    observations: list[Observation] = []
+    if right.ndim > 1:
+        observations.extend(_batched_matrices(rows, right, batch, "rhs_matmul"))
+    if left.ndim > 1:
+        observations.extend(
+            _batched_matrices(columns.transpose(-1, -2), left, batch, "linear")
+        )
+    return observations
+
+
+def _batched_matrices(value, weight, batch, orientation) -> list[Observation]:
+    """``weight``'s matrices, each with the rows of ``value`` it maps."""
+    if weight.ndim == 2:
+        return [(value, weight, orientation)]
+    leading = (1,) * (len(batch) - (weight.ndim - 2)) + tuple(weight.shape[:-2])
+    weight = weight.reshape(*leading, *weight.shape[-2:])
+    value = value.expand(*batch, *value.shape[-2:])
+    observations = []
+    for index in itertools.product(*map(range, leading)):
+        # A matrix broadcast along a dimension maps every row along it.
+        rows = value[tuple(
+            slice(None) if size == 1 and full > 1 else position
+            for position, size, full in zip(index, leading, batch)
+        )]
+        observations.append((rows, weight[index], orientation))
+    return observations
+
+
+def _observe_matmul(_func, args, _kwargs, _result):
+    """``x @ weight``, ``weight @ x``, and their batched forms."""
+    return _matrix_products(*args[:2]) if len(args) >= 2 else ()
+
+
+def _observe_baddbmm(_func, args, _kwargs, _result):
+    return _matrix_products(*args[1:3]) if len(args) >= 3 else ()
+
+
+def _observe_mv(_func, args, _kwargs, _result):
+    """``weight @ vector``: a linear layer on one row."""
+    if len(args) < 2 or not isinstance(args[1], torch.Tensor):
+        return ()
+    return ((args[1].unsqueeze(0), args[0], "linear"),)
+
+
+def _observe_addmv(_func, args, _kwargs, _result):
+    if len(args) < 3 or not isinstance(args[2], torch.Tensor):
+        return ()
+    return ((args[2].unsqueeze(0), args[1], "linear"),)
+
+
+def _einsum_subscripts(equation: str, operands) -> tuple[list[str], str] | None:
+    """Operand and output subscripts, with each ``...`` spelled out."""
+    equation = equation.replace(" ", "")
+    inputs, arrow, output = equation.partition("->")
+    terms = inputs.split(",")
+    if len(terms) != len(operands):
+        return None
+    spare = iter(sorted(
+        set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") - set(equation)
+    ))
+    widest = max(
+        (operand.ndim - len(term.replace("...", "")) for term, operand in zip(terms, operands)
+         if "..." in term),
+        default=0,
+    )
+    broadcast = "".join(next(spare) for _ in range(widest))
+    spelled = []
+    for term, operand in zip(terms, operands):
+        if "..." in term:
+            count = operand.ndim - len(term.replace("...", ""))
+            term = term.replace("...", broadcast[widest - count:])
+        if len(term) != operand.ndim or not term.isalpha():
+            return None
+        spelled.append(term)
+    if not arrow:
+        counts = {letter: inputs.count(letter) for letter in "".join(spelled)}
+        output = broadcast + "".join(
+            sorted(letter for letter, count in counts.items() if count == 1 and letter not in broadcast)
+        )
+    else:
+        output = output.replace("...", broadcast)
+    return spelled, output
+
+
+def _einsum_weight(x, x_terms: str, weight, weight_terms: str, output: str):
+    """Observations of ``weight`` as one matrix per batch in an einsum.
+
+    ``weight`` must contract exactly one index with ``x``, put indices
+    shared with ``x`` and the output first, and keep the rest, all outputs,
+    on one side of the contracted index.
+    """
+    if len(set(x_terms)) != len(x_terms) or len(set(weight_terms)) != len(weight_terms):
+        return []
+    contracted = [c for c in weight_terms if c in x_terms and c not in output]
+    batch = [c for c in weight_terms if c in x_terms and c in output]
+    outputs = [c for c in weight_terms if c not in x_terms]
+    if (
+        len(contracted) != 1 or not outputs
+        or any(c not in output for c in outputs)
+        or any(c not in weight_terms and c not in output for c in x_terms)
+        or weight_terms[:len(batch)] != "".join(batch)
+        or any(x.shape[x_terms.index(c)] != weight.shape[weight_terms.index(c)] for c in batch)
+    ):
+        return []
+    (inner,) = contracted
+    matrix_terms = weight_terms[len(batch):]
+    if matrix_terms[0] == inner:
+        orientation = "rhs_matmul"
+    elif matrix_terms[-1] == inner:
+        orientation = "linear"
+    else:
+        return []
+    width = x.shape[x_terms.index(inner)]
+    rows = [c for c in x_terms if c not in batch and c != inner]
+    ordered = x.permute([x_terms.index(c) for c in (*batch, *rows, inner)])
+    observations = []
+    batches = [weight.shape[index] for index in range(len(batch))]
+    for flat in range(math.prod(batches)):
+        index = []
+        for size in reversed(batches):
+            index.append(flat % size)
+            flat //= size
+        position = tuple(reversed(index))
+        matrix = weight[position]
+        if matrix.ndim > 2:
+            shape = (width, -1) if orientation == "rhs_matmul" else (-1, width)
+            try:
+                matrix = matrix.view(shape)
+            except RuntimeError:
+                return []
+        observations.append((ordered[position].reshape(-1, width), matrix, orientation))
+    return observations
+
+
+def _observe_einsum(_func, args, _kwargs, _result):
+    """A two-operand einsum that applies one operand to the other as a matrix."""
+    if len(args) < 2 or not isinstance(args[0], str) or len(args[1]) != 2:
+        return ()
+    operands = args[1]
+    if not all(isinstance(operand, torch.Tensor) for operand in operands):
+        return ()
+    spelled = _einsum_subscripts(args[0], operands)
+    if spelled is None:
+        return ()
+    (left_terms, right_terms), output = spelled
+    left, right = operands
+    return (
+        *_einsum_weight(left, left_terms, right, right_terms, output),
+        *_einsum_weight(right, right_terms, left, left_terms, output),
+    )
+
+
+def _observe_tensordot(_func, args, _kwargs, _result):
+    """A matrix contracted over one of its dimensions with the other operand."""
+    if len(args) < 4:
+        return ()
+    left, right, left_dims, right_dims = args[:4]
+    observations = []
+    for x, x_dims, weight, weight_dims in (
+        (left, left_dims, right, right_dims), (right, right_dims, left, left_dims),
+    ):
+        if (
+            not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2 or len(weight_dims) != 1 or len(x_dims) != 1
+        ):
+            continue
+        inner = weight_dims[0] % 2
+        rows = x.movedim(x_dims[0], -1)
+        observations.append((rows, weight, "rhs_matmul" if inner == 0 else "linear"))
+    return observations
+
+
+def _observe_bilinear(_func, args, _kwargs, _result):
+    """``left`` applied to each output's ``[left, right]`` matrix.
+
+    cattorch lowers the product as one matrix product of ``left`` with every
+    output's matrix side by side, so each matrix is grouped over ``left``.
+    """
+    if len(args) < 3 or not isinstance(args[2], torch.Tensor) or args[2].ndim != 3:
+        return ()
+    left, weight = args[0], args[2]
+    return tuple((left, weight[output], "rhs_matmul") for output in range(weight.shape[0]))
+
+
+def _observe_native_attention(_func, args, _kwargs, result):
+    """``nn.MultiheadAttention``'s fused inference path.
+
+    The packed input projection sees the query, key and value. The output
+    projection's input is reconstructed when there is no mask, and kept only
+    if it reproduces the operation's result.
+    """
+    if len(args) < 9:
+        return ()
+    query, key, value, embed_dim, heads, qkv_weight, qkv_bias, proj_weight, proj_bias = args[:9]
+    if not all(
+        isinstance(item, torch.Tensor)
+        for item in (query, key, value, qkv_weight, proj_weight)
+    ):
+        return ()
+    if query is key and key is value:
+        observations = [(query, qkv_weight, "linear")]
+    else:
+        observations = [
+            (source, qkv_weight[index * embed_dim:(index + 1) * embed_dim], "linear")
+            for index, source in enumerate((query, key, value))
+        ]
+    mask = args[9] if len(args) > 9 else None
+    if mask is None and query.ndim == 3 and embed_dim % heads == 0:
+        biases = (
+            qkv_bias.chunk(3) if isinstance(qkv_bias, torch.Tensor) else (None,) * 3
+        )
+        projected = [
+            torch.nn.functional.linear(source, weight, bias)
+            for source, weight, bias in zip(
+                (query, key, value), qkv_weight.chunk(3), biases,
+            )
+        ]
+        batch = query.shape[0]
+        q, k, v = (
+            item.reshape(batch, item.shape[1], heads, -1).transpose(1, 2) for item in projected
+        )
+        attended = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        attended = attended.transpose(1, 2).reshape(batch, query.shape[1], embed_dim)
+        output = result[0] if isinstance(result, tuple) else result
+        replay = torch.nn.functional.linear(attended, proj_weight, proj_bias)
+        if (
+            isinstance(output, torch.Tensor) and output.shape == replay.shape
+            and torch.allclose(output, replay, rtol=1e-4, atol=1e-5)
+        ):
+            observations.append((attended, proj_weight, "linear"))
+    return tuple(observations)
+
+
+def _observe_recurrent(func, args, _kwargs, result):
+    """``nn.RNN``, ``nn.LSTM`` and ``nn.GRU`` weights, with the rows they read.
+
+    A layer's input weight reads the layer's input sequence: the model's
+    for the first layer, the previous layer's output for the others, which
+    replaying the first layers alone gives. A hidden weight reads the
+    initial state and every step's output but the last its direction
+    computes. The order of rows doesn't matter to calibration. A projected
+    LSTM's projection reads the cell output before projection, which no
+    output shows, so it isn't observed. With dropout between layers in
+    training mode a replay would differ, so only the first layer is.
+    """
+    if len(args) < 9 or not isinstance(args[0], torch.Tensor):
+        return ()
+    sequence, hidden, params, biases, layers, dropout, train, bidirectional, batch_first = args[:9]
+    directions = 2 if bidirectional else 1
+    output = result[0] if isinstance(result, tuple) else result
+    if not layers or len(params) % (layers * directions) or not isinstance(output, torch.Tensor):
+        return ()
+    per_layer = len(params) // (layers * directions)
+    # Projected LSTMs carry a projection after the biases.
+    if per_layer not in ({4, 5} if biases else {2, 3}):
+        return ()
+    states = tuple(hidden) if isinstance(hidden, (list, tuple)) else (hidden,)
+    replayable = not (train and dropout)
+    time = 1 if batch_first and sequence.ndim == 3 else 0
+    observations = []
+    layer_input = sequence
+    for layer in range(layers if replayable else 1):
+        if layer + 1 == layers:
+            layer_output = output
+        else:
+            count = (layer + 1) * directions
+            replayed = func(
+                sequence,
+                tuple(state[:count] for state in states)
+                if isinstance(hidden, (list, tuple)) else hidden[:count],
+                params[:count * per_layer], biases, layer + 1, dropout, train,
+                bidirectional, batch_first,
+            )
+            layer_output = replayed[0] if isinstance(replayed, tuple) else replayed
+        width = layer_output.shape[-1] // directions
+        for direction in range(directions):
+            index = layer * directions + direction
+            weights = params[index * per_layer:(index + 1) * per_layer]
+            observations.append((layer_input, weights[0], "linear"))
+            initial = states[0][index].unsqueeze(time)
+            steps = layer_output[..., direction * width:(direction + 1) * width]
+            # The forward direction ends at the last step, the reverse one
+            # at the first.
+            length = steps.shape[time] - 1
+            steps = steps.narrow(time, 1 if direction else 0, length)
+            observations.append((torch.cat((initial, steps), time), weights[1], "linear"))
+        layer_input = layer_output
+    return tuple(observations)
+
+
+def _observe_recurrent_cell(_func, args, _kwargs, _result):
+    """``nn.RNNCell``, ``nn.LSTMCell`` and ``nn.GRUCell`` weights: the input
+    weight reads the step's input, and the hidden weight the state it
+    starts from (an LSTM cell's hidden state, not its cell state)."""
+    if len(args) < 4 or not isinstance(args[0], torch.Tensor):
+        return ()
+    value, hidden, input_weight, hidden_weight = args[:4]
+    state = hidden[0] if isinstance(hidden, (list, tuple)) and hidden else hidden
+    observations = [(value, input_weight, "linear")]
+    if isinstance(state, torch.Tensor):
+        observations.append((state, hidden_weight, "linear"))
+    return tuple(observations)
+
+
+def _observe_convolution(func, args, kwargs, _result):
+    """Each group of a convolution's kernels, with the windows it reads.
+
+    A convolution is a linear map of every input window (im2col), so each
+    group's kernels are observed as one matrix over its input channels and
+    kernel positions, in the order storage keeps them. A transposed
+    convolution is the plain convolution, with its kernel flipped, of the
+    input spread by its stride and padded; flipping that input instead keeps
+    the windows in the weight's own kernel order, and only reorders them.
+
+    The windows are returned as views, ``[..., channels, *kernel]``, for the
+    capture to read a slice at a time; the orientation tells it the weight
+    is a group of output-major (``conv``) or input-major
+    (``conv_transpose``) kernels.
+    """
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return ()
+    bound = {
+        argument.name: argument.default_value
+        for argument in schema.arguments if argument.has_default_value()
+    }
+    bound.update(zip((argument.name for argument in schema.arguments), args))
+    bound.update(kwargs)
+    value, weight = bound.get("input"), bound.get("weight")
+    if (
+        not isinstance(value, torch.Tensor) or not isinstance(weight, torch.Tensor)
+        or weight.ndim < 3
+    ):
+        return ()
+    dimensions = weight.ndim - 2
+    transposed = bool(bound.get("transposed", "conv_transpose" in str(func)))
+    groups = int(bound.get("groups", 1))
+    kernel = list(weight.shape[2:])
+
+    def per_dimension(name, default):
+        item = bound.get(name, default)
+        item = list(item) if isinstance(item, (list, tuple)) else [item]
+        return item * dimensions if len(item) == 1 else item
+
+    stride = per_dimension("stride", 1)
+    dilation = per_dimension("dilation", 1)
+    padding = bound.get("padding", 0)
+    if value.ndim == dimensions + 1:
+        value = value.unsqueeze(0)
+    if value.ndim != dimensions + 2 or len(stride) != dimensions:
+        return ()
+    if transposed:
+        output_padding = per_dimension("output_padding", 0)
+        for index in range(dimensions):
+            axis = 2 + index
+            if stride[index] > 1:
+                shape = list(value.shape)
+                shape[axis] = (shape[axis] - 1) * stride[index] + 1
+                spread = value.new_zeros(shape)
+                every = [slice(None)] * value.ndim
+                every[axis] = slice(None, None, stride[index])
+                spread[tuple(every)] = value
+                value = spread
+        explicit = per_dimension("padding", 0)
+        pads = []
+        for index in range(dimensions):
+            before = dilation[index] * (kernel[index] - 1) - int(explicit[index])
+            pads.append((before, before + int(output_padding[index])))
+        stride = [1] * dimensions
+    elif padding == "valid":
+        pads = [(0, 0)] * dimensions
+    elif padding == "same":
+        pads = []
+        for index in range(dimensions):
+            total = dilation[index] * (kernel[index] - 1)
+            pads.append((total // 2, total - total // 2))
+    else:
+        pads = [(int(item), int(item)) for item in per_dimension("padding", 0)]
+    flat_pads: list[int] = []
+    for before, after in reversed(pads):
+        flat_pads += [before, after]
+    if any(flat_pads):
+        # Negative padding crops, as a transposed convolution's does.
+        value = torch.nn.functional.pad(value, flat_pads)
+    if transposed:
+        value = value.flip(list(range(2, 2 + dimensions)))
+    for index in range(dimensions):
+        span = dilation[index] * (kernel[index] - 1) + 1
+        if value.shape[2 + index] < span:
+            return ()
+        value = value.unfold(2 + index, span, stride[index])
+        if dilation[index] > 1:
+            value = value[..., ::dilation[index]]
+    # [batch, *positions, channels, *kernel]
+    windows = value.permute(
+        0, *range(2, 2 + dimensions), 1, *range(2 + dimensions, 2 + 2 * dimensions),
+    )
+    channels = windows.shape[dimensions + 1] // groups
+    outputs = weight.shape[0] // groups
+    observations: list[Observation] = []
+    for group in range(groups):
+        rows = windows.narrow(dimensions + 1, group * channels, channels)
+        if transposed:
+            kernels = weight.narrow(0, group * channels, channels)
+            observations.append((rows, kernels, "conv_transpose"))
+        else:
+            kernels = weight.narrow(0, group * outputs, outputs)
+            observations.append((rows, kernels, "conv"))
+    return observations
+
+
+# Operations the frontend rewrites before lowering, so they have no rule of
+# their own, but which eager calibration still sees under their own name.
+_DECOMPOSED_OBSERVERS: dict[str, Observer] = {
+    "aten.addmm.default": _observe_addmm,
+    "aten.baddbmm.default": _observe_baddbmm,
+    "aten.mv.default": _observe_mv,
+    "aten.addmv.default": _observe_addmv,
+    "aten.einsum.default": _observe_einsum,
+    "aten.tensordot.default": _observe_tensordot,
+    "aten.bilinear.default": _observe_bilinear,
+    "aten._native_multi_head_attention.default": _observe_native_attention,
+    "aten.lstm.input": _observe_recurrent,
+    "aten.gru.input": _observe_recurrent,
+    "aten.rnn_tanh.input": _observe_recurrent,
+    "aten.rnn_relu.input": _observe_recurrent,
+    "aten.gru_cell.default": _observe_recurrent_cell,
+    "aten.lstm_cell.default": _observe_recurrent_cell,
+    "aten.rnn_tanh_cell.default": _observe_recurrent_cell,
+    "aten.rnn_relu_cell.default": _observe_recurrent_cell,
+    **{
+        target: _observe_convolution
+        for target in (
+            "aten.conv1d.default", "aten.conv2d.default", "aten.conv3d.default",
+            "aten.conv1d.padding", "aten.conv2d.padding", "aten.conv3d.padding",
+            "aten.conv_transpose1d.default", "aten.conv_transpose2d.input",
+            "aten.conv_transpose3d.input", "aten.convolution.default",
+        )
+    },
+}
 
 
 def _observe_stacked_swiglu(_func, args, _kwargs, _result):
@@ -494,7 +1009,7 @@ def _observe_routed_family(value, ids, banks, handle):
     captured = getattr(family, "_gptq_captured_template", None)
     if captured is None:
         captured = capture_model(
-            family.template, (family.example_input,), frontend="fx",
+            family.template, (family.example_input,),
         )
     template_state = {}
     template_state.update(dict(
@@ -551,36 +1066,41 @@ def _observe_routed_family(value, ids, banks, handle):
 def _build_default_registry() -> OperatorRegistry:
     registry = OperatorRegistry()
     exact: dict[str, KernelFactory] = {
-        "cattorch.expert_family_moe.default": ExpertFamilyMoEInstruction,
-        "cattorch.routed_experts.default": RoutedExpertsInstruction,
-        "cattorch.stacked_swiglu_moe.default": StackedSwiGLUMoEInstruction,
-        "aten.linear.default": LinearInstruction,
-        "aten.softmax.int": OptimizedSoftmaxInstruction,
-        "aten.log_softmax.int": OptimizedLogSoftmaxInstruction,
-        "aten._log_softmax.default": OptimizedLogSoftmaxInstruction,
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (
+                EXPERT_FAMILY_MOE_KERNEL, ROUTED_EXPERTS_KERNEL, STACKED_SWIGLU_MOE_KERNEL,
+            )
+        },
+        "aten.linear.default": LINEAR_KERNEL.instruction_class(),
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (*SOFTMAX_KERNELS, *LOG_SOFTMAX_KERNELS)
+        },
         "aten.mean.dim": _mean_kernel,
         **{
-            operation: ReductionInstruction
+            operation: _REDUCTION_INSTRUCTIONS[operation]
             for operation in REDUCTIONS if operation != "aten.mean.dim"
         },
-        **{operation: IndexMapInstruction for operation in INDEX_MAP_OPS},
-        "aten.layer_norm.default": OptimizedLayerNormInstruction,
-        "aten.rms_norm.default": OptimizedRMSNormInstruction,
-        "aten.batch_norm.default": OptimizedBatchNormInstruction,
-        "aten.embedding.default": OptimizedEmbeddingInstruction,
-        "aten.numpy_T.default": OptimizedTransposeInstruction,
-        "aten.transpose.int": OptimizedTransposeInstruction,
-        "aten.permute.default": OptimizedTransposeInstruction,
-        "aten.masked_fill.Scalar": OptimizedMaskedFillInstruction,
-        "aten.conv1d.default": OptimizedConvolutionInstruction,
-        "aten.conv2d.default": OptimizedConvolutionInstruction,
-        "aten.max_pool1d.default": OptimizedPoolingInstruction,
-        "aten.max_pool2d.default": OptimizedPoolingInstruction,
-        "aten.avg_pool1d.default": OptimizedPoolingInstruction,
-        "aten.avg_pool2d.default": OptimizedPoolingInstruction,
-        "aten.adaptive_avg_pool2d.default": OptimizedPoolingInstruction,
-        **{operation: OptimizedElementwiseInstruction for operation in ELEMENTWISE_OPS},
-        **{operation: OptimizedMatMulInstruction for operation in MATMUL_OPS},
+        **{operation: INDEX_MAP_KERNEL.instruction_class() for operation in INDEX_MAP_OPS},
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (
+                LAYER_NORM_KERNEL, RMS_NORM_KERNEL, BATCH_NORM_KERNEL,
+                EMBEDDING_KERNEL, MASKED_FILL_KERNEL, *TRANSPOSE_KERNELS,
+            )
+        },
+        **{
+            kernel.target_name: kernel.instruction_class()
+            for kernel in (*CONVOLUTION_KERNELS, *POOLING_KERNELS)
+        },
+        **{
+            operation: elementwise_kernel(operation).instruction_class()
+            for operation in ELEMENTWISE_OPS
+        },
+        **{
+            operation: matmul_kernel(operation).instruction_class() for operation in MATMUL_OPS
+        },
     }
     validators = {
         "aten.add.Tensor": _validate_add_sub,
@@ -602,8 +1122,9 @@ def _build_default_registry() -> OperatorRegistry:
         "cattorch.expert_family_moe.default": _observe_expert_family,
         "cattorch.routed_experts.default": _observe_routed_experts,
         "aten.linear.default": _observe_linear,
-        "aten.mm.default": _observe_rhs_matmul,
-        "aten.matmul.default": _observe_rhs_matmul,
+        "aten.mm.default": _observe_matmul,
+        "aten.matmul.default": _observe_matmul,
+        "aten.bmm.default": _observe_matmul,
     }
     fast: dict[
         str,
@@ -612,9 +1133,9 @@ def _build_default_registry() -> OperatorRegistry:
             Literal["activations", "layer_norm", "softmax"] | None,
         ],
     ] = {
-        "aten.gelu.default": (FastElementwiseInstruction, "activations"),
-        "aten.layer_norm.default": (FastLayerNormInstruction, "layer_norm"),
-        "aten.softmax.int": (FastSoftmaxInstruction, "softmax"),
+        "aten.gelu.default": (FAST_GELU_KERNEL.instruction_class(), "activations"),
+        "aten.layer_norm.default": (FAST_LAYER_NORM_KERNEL.instruction_class(), "layer_norm"),
+        "aten.softmax.int": (FAST_SOFTMAX_KERNEL.instruction_class(), "softmax"),
     }
     for target, kernel in exact.items():
         fast_kernel, fast_flag = fast.get(target, (None, None))

@@ -247,6 +247,16 @@ def _runtime_slice(value: torch.Tensor, dim: int, start: int, end: int) -> torch
     return _sliced(value, dim, start, end).clone()
 
 
+@op(
+    name="cattorch::runtime_expand",
+    fake=lambda value, like, dim: torch.empty(like.shape, dtype=value.dtype),
+)
+def _runtime_expand(value: torch.Tensor, like: torch.Tensor, dim: int) -> torch.Tensor:
+    """``value``, of ``like``'s shape but one item along ``dim``, repeated
+    to ``like``'s runtime extent there."""
+    return value.expand(like.shape).clone()
+
+
 # ── Private ops for the automatic generation step module ────────────────────
 # These are not exported: ``cattorch.autoregressive.build_step_module`` inserts
 # them, and the generation lowering gives them dedicated Scratch kernels.
@@ -333,6 +343,23 @@ def _cached_attention_fake(
     q, k, v, k_cache, v_cache, position, scale, kv_groups, window=0, slopes=None, sinks=None,
 ):
     return q.new_empty((*q.shape[:-1], v.shape[-1]))
+
+
+@torch.library.custom_op("cattorch::check_index", mutates_args=())
+def _check_index(index: torch.Tensor, low: int, high: int, position: int) -> torch.Tensor:
+    """``index``, which the sprite checks is from ``low`` to ``high - 1`` as it runs.
+
+    Indices the model computes from its inputs, such as ``idx + 1``, can't be
+    checked before the call: the sprite checks them here, and an index out
+    of range fails the call with ``invalid item`` naming input ``position``
+    (``decompositions._mark_index``). PyTorch raises for one itself.
+    """
+    return index.clone()
+
+
+@_check_index.register_fake
+def _check_index_fake(index, low, high, position):
+    return torch.empty_like(index)
 
 
 @torch.library.custom_op("cattorch::advance_position", mutates_args=("position",))

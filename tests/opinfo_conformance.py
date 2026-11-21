@@ -39,6 +39,10 @@ COVERAGE = ROOT / "docs" / "operator-coverage.md"
 # Samples tried per operator variant; OpInfo's later samples mostly repeat the
 # first ones with other broadcasting or keyword combinations.
 SAMPLES_PER_OPERATOR = 4
+# Later samples tried for argument values the first ones don't use, and how
+# far into an operator's samples to look for them.
+EXTRA_SAMPLES = 4
+SCANNED_SAMPLES = 64
 # A guard against hangs, not a speed limit: the slowest recorded case, a 3D
 # transposed convolution, emulates for about 30 s locally and over 60 s on CI
 # runners.
@@ -70,7 +74,7 @@ _SKIPPED_NAMES = frozenset({
     "triangular_solve", "symeig", "eig", "eigvals", "torch._scaled_mm",
     "jiterator_unary", "jiterator_binary", "jiterator_binary_return_by_ref",
     "jiterator_4inputs_with_extra_args", "jiterator_2inputs_2outputs",
-    "view_as_complex", "view_as_real", "complex", "polar", "nn.functional.embedding_bag",
+    "view_as_complex", "view_as_real", "complex", "polar",
     "byte", "char", "short", "int", "long", "half", "bfloat16", "chalf",
     "cdouble", "cfloat", "double", "float", "bool", "cpu", "cuda", "to",
     "data_ptr", "nn.functional.multi_head_attention_forward",
@@ -119,17 +123,38 @@ def operator_db():
     ]
 
 
+def _arguments(sample) -> tuple[str, ...]:
+    """A sample's non-tensor arguments, such as ``p`` or a reduction mode."""
+    leaves = pytree.tree_leaves((sample.input, sample.args, sample.kwargs))
+    return tuple(repr(leaf) for leaf in leaves if not isinstance(leaf, torch.Tensor))
+
+
 def _samples(op):
-    """The first samples of ``op``, reproducibly."""
+    """The first samples of ``op``, then later ones with new arguments, reproducibly.
+
+    OpInfo often lists one argument value many times before the next (all of
+    ``cdist``'s first samples use ``p=1``), so after the first samples up to
+    ``EXTRA_SAMPLES`` more are taken, each with non-tensor arguments no
+    earlier one has. They are numbered after the first ones, so the first
+    samples keep their keys.
+    """
     torch.manual_seed(_seed(_operator_name(op)))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         samples = op.sample_inputs("cpu", torch.float32, requires_grad=False)
         result = []
-        for sample in samples:
-            result.append(sample)
-            if len(result) == SAMPLES_PER_OPERATOR:
+        seen = set()
+        extra = 0
+        for index, sample in enumerate(samples):
+            if index == SCANNED_SAMPLES or extra == EXTRA_SAMPLES:
                 break
+            arguments = _arguments(sample)
+            if index < SAMPLES_PER_OPERATOR:
+                result.append(sample)
+            elif arguments not in seen:
+                result.append(sample)
+                extra += 1
+            seen.add(arguments)
     return result
 
 
@@ -242,6 +267,9 @@ def _run_case(op, sample, directory, *, static_integers=False) -> tuple[str, str
     model, inputs = build(op, sample, static_integers=static_integers)
     if model is None:
         return "skip", inputs
+    if any(value.is_floating_point() and value.isnan().any() for value in inputs):
+        # A sprite rejects a NaN input item (`invalid item`), as its contract says.
+        return "skip", "NaN input"
     try:
         # The eager reference can warn about deprecated PyTorch arguments.
         with torch.no_grad(), warnings.catch_warnings():
@@ -362,14 +390,16 @@ def write_coverage(results) -> str:
         "",
         "This page lists how PyTorch's own operator samples (OpInfo) fare when",
         "exported with cattorch and run in its Scratch emulator. Each operator is",
-        f"tried with up to {SAMPLES_PER_OPERATOR} float32 samples, and a sample",
+        f"tried with up to {SAMPLES_PER_OPERATOR} float32 samples, and up to",
+        f"{EXTRA_SAMPLES} more whose other arguments differ from those, and a sample",
         "passes when its export matches eager PyTorch. A sample can fail for",
         "an argument a model rarely uses, so a partial or failing operator may",
         "still work in your model; see [supported models](supported-models.md)",
         "for what cattorch is designed to handle.",
         "",
         f"Of {tried} samples tried with PyTorch {torch_version()}, {totals['pass']} pass.",
-        "Samples were skipped when their output is random, complex, or not a tensor.",
+        "Samples were skipped when their output is random, complex, or not a tensor,",
+        "or an input holds NaN, which a sprite rejects.",
         "",
     ]
     for title, key in (
@@ -396,8 +426,8 @@ def _short_reason(detail: str) -> str:
     """A failure message without the error class and documentation links."""
     text = re.sub(r";? *(supported operations:|see) https?://\S+", "", detail)
     unsupported = re.match(
-        r"UnsupportedOperationError: Unsupported operation: ([\w.]+); "
-        r"exported node: [\w.]+(?:; (.*))?", text,
+        r"UnsupportedOperationError: unsupported operation ([\w.]+)"
+        r"(?: in module '[^']*')?(?:; (.*))?", text,
     )
     if unsupported:
         operation, reason = unsupported.groups()
@@ -407,7 +437,7 @@ def _short_reason(detail: str) -> str:
         text = f"needs an input's value at export (`{operation}`)"
     else:
         text = re.sub(r"^\w+Error: ", "", text)
-        text = text.replace("the FX frontend could not trace this model ", "tracing failed ")
+        text = text.replace("PyTorch couldn't trace this model ", "tracing failed ")
     text = text.split("; a common cause")[0]
     return text.replace("|", "\\|").replace("\n", " ")[:160]
 

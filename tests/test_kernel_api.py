@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
@@ -27,6 +24,7 @@ from cattorch.util.scratch.dsl import (
     set_var,
     var,
 )
+from sprite_helpers import load_sprite
 
 
 @torch.library.custom_op("cattorch_kernel_test::scale_shift", mutates_args=())
@@ -102,11 +100,6 @@ def _export(tmp_path, model, registry, *, name="model", **options):
         _registry=registry, **options,
     )
     return model, value, result
-
-
-def _sprite(result):
-    with zipfile.ZipFile(result.path) as archive:
-        return json.loads(archive.read("sprite.json"))
 
 
 def test_tensor_info_derived_properties():
@@ -353,7 +346,7 @@ def test_large_temp_list_is_sharded(tmp_path):
     registry = _registry(Kernel(TARGET, emit))
     model, value, result = _export(tmp_path, ScaleShift(), registry)
     assert verify(model, value, result, atol=1e-5, rtol=0).passed
-    names = [entry[0] for entry in _sprite(result)["lists"].values()]
+    names = [entry[0] for entry in load_sprite(result)["lists"].values()]
     shards = [name for name in names if name.startswith("_kernel_test_buffer")]
     assert len(shards) == 2, shards
 
@@ -392,7 +385,7 @@ def test_a_user_kernel_on_growing_state_is_rejected(tmp_path):
             super().__init__()
             self.register_buffer("seen", torch.zeros(0, 3))
 
-        @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 8})
+        @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 8})
         def add(self, row):
             self.seen = torch.cat([self.seen, row.reshape(1, 3)])
             return torch.relu(self.seen).sum(0)
@@ -400,3 +393,40 @@ def test_a_user_kernel_on_growing_state_is_rejected(tmp_path):
     relu = Kernel(torch.ops.aten.relu.default, emit, name="relu")
     with pytest.raises(UnsupportedModelError, match="kernel passed for aten.relu"):
         transpile(Memory().eval(), None, tmp_path / "memory", kernels=[relu])
+
+
+def test_a_user_linear_kernel_gets_the_plain_weight(tmp_path):
+    # The library lays a large Linear weight out in four-row groups; a user's
+    # kernel gets the weight as PyTorch stores it, with no layout options.
+    def emit(ctx):
+        source, weight = ctx.inputs["input"], ctx.inputs["weight"]
+        rows, inner = weight.shape
+        column, read, total = ctx.temp_var("column"), ctx.temp_var("read"), ctx.temp_var("total")
+        out = ctx.output.list
+        # Each output sums one weight row, times the input's first value.
+        return (
+            clear(out),
+            set_var(read, 1),
+            repeat(rows, (
+                set_var(total, 0),
+                set_var(column, 1),
+                repeat(inner, (
+                    change_var(total, item(weight.list, var(read))),
+                    change_var(read, 1),
+                    change_var(column, 1),
+                )),
+                append(out, mul(var(total), item(source.list, 1))),
+            )),
+        )
+
+    linear = nn.Linear(256, 256, bias=False).eval()
+    value = torch.randn(1, 256)
+    result = _transpile(
+        linear, value, tmp_path / "linear", storage=StorageConfig(compression=False),
+        _registry=_registry(Kernel("aten.linear.default", emit)),
+    )
+    class Expected(nn.Module):
+        def forward(self, value):
+            return linear.weight.sum(1) * value[:, :1]
+
+    assert verify(Expected().eval(), value, result, atol=1e-3).passed

@@ -174,7 +174,7 @@ class Memory(nn.Module):
         self.register_buffer("seen", torch.zeros(0, 3))
         self.query = nn.Parameter(torch.randn(3))
 
-    @entrypoint(example=lambda: (torch.ones(3),), capacity={"seen": 6})
+    @entrypoint(example_inputs=lambda: (torch.ones(3),), capacity={"seen": 6})
     def remember(self, row):
         self.seen = torch.cat([self.seen, row.reshape(1, 3)])
         weights = (self.seen @ self.query).softmax(0)
