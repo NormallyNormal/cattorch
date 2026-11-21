@@ -14,7 +14,8 @@ to see an exported transformer running in vanilla Scratch.
 pip install cattorch
 ```
 
-cattorch requires Python 3.10 or newer and PyTorch 2.6 or newer.
+cattorch requires Python 3.11 or newer and PyTorch 2.10 or newer. Tokenizer
+export also needs `pip install "cattorch[tokenizers]"`.
 
 ```python
 import torch
@@ -30,9 +31,23 @@ assert verify(model, example, artifact).passed
 print(artifact.path)  # build/model.sprite3
 ```
 
-Import the file using Scratch's **Upload Sprite** option. On the imported
-sprite, fill the `input` list, click `cattorch forward`, and read `output`.
-The first call initializes the model automatically.
+Import the file using Scratch's **Upload Sprite** option, then select
+another sprite: you never need to open the model's sprite, which is slow to
+show in the editor when it's large. Uploading selects the sprite, so for a
+large one, add it to your project without the editor instead:
+`cattorch.add_to_project("game.sb3", artifact, "game_with_model.sb3")`, or
+`cattorch add game.sb3 build/model.sprite3 --output game_with_model.sb3`.
+From any sprite, fill the global
+`model input` list, `broadcast [model forward] and wait`, and read
+`model status` (`ok`) and `model output`. The lists and broadcasts are named
+after the export (`model`, from the file name, or `name=`). The first call
+decodes the weights automatically.
+
+For a complete project instead, with the inputs and outputs on the stage
+and a demo, pass the result to `cattorch.build_project`,
+or export from the terminal with `cattorch export my_models.py:Net --project`.
+See [projects and the command line](https://github.com/NormallyNormal/cattorch/blob/main/docs/projects-and-cli.md)
+and the [examples](https://github.com/NormallyNormal/cattorch/tree/main/examples).
 
 cattorch exports inference only; train your model in PyTorch and call
 `model.eval()` before exporting. The [getting-started guide](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md)
@@ -44,9 +59,12 @@ covers input layout, connecting other sprites, and saving after a run.
   [supported operations](https://github.com/NormallyNormal/cattorch/blob/main/docs/supported-models.md).
 - Exact inference by default, with optional approximate kernels and smaller
   weight storage.
-- Cached text generation and character, BPE, or SentencePiece tokenizer sprites.
-- Experimental multi-method models, persistent state, and sparse
-  mixture-of-experts models.
+- Cached text generation, recurrent generation (GRU and LSTM language models,
+  Mamba, Mamba-2, RWKV), and character, BPE, or SentencePiece tokenizer sprites.
+- Multi-method models with persistent state, and sparse mixture-of-experts
+  models.
+- Runnable demo projects, including a prompt-and-continue text generator,
+  and a `cattorch` command.
 - Numerical verification and benchmark projects that measure speed in Scratch.
 
 ## Documentation
@@ -55,6 +73,7 @@ covers input layout, connecting other sprites, and saving after a run.
 - [Getting started](https://github.com/NormallyNormal/cattorch/blob/main/docs/getting-started.md)
 - [API reference](https://github.com/NormallyNormal/cattorch/blob/main/docs/api-reference.md)
 - [Troubleshooting](https://github.com/NormallyNormal/cattorch/blob/main/docs/troubleshooting.md)
+- [Migrating from 0.5 to 1.0](https://github.com/NormallyNormal/cattorch/blob/main/docs/migrating-to-1.0.md)
 
 ## License
 

@@ -29,14 +29,17 @@ class CodegenConfig:
     display names. Public model/tokenizer interfaces keep their documented
     names so other sprites can continue to call and inspect them.
 
-    ``compact_schema`` drops redundant false-valued block fields. It stays
-    opt-in until it has been tested more widely in browser import, edit, and
-    save.
+    ``compact_schema`` drops redundant false-valued block fields. It is off
+    by default because it is tested less widely in browser import, edit,
+    and save.
 
-    ``layer_sharing="auto"`` factors compatible ``blocks.N`` transformer
-    stacks into one procedure and banks their weights. Cached generation also
-    interleaves equal-width per-layer K/V rows into shared banks. It falls back
-    when incompatible layouts make the transform unsafe, and is opt-in for now.
+    ``layer_sharing=True`` factors compatible repeated ``blocks.N`` layers
+    into one procedure and banks their weights. Cached generation also
+    interleaves equal-width per-layer K/V rows into shared banks. Sharing is
+    all or nothing: if any layer doesn't fit, or there are no ``blocks.N``
+    layers, the model is exported without it, with a warning that says why
+    (in a program, per entry point that has layers; see
+    ``docs/code-generation.md``).
     """
 
     target_json_bytes: int | None = 4 * 1024 * 1024
@@ -44,7 +47,7 @@ class CodegenConfig:
     id_namespace: str | None = None
     compact_internal_names: bool = False
     compact_schema: bool = False
-    layer_sharing: Literal["auto", "off"] = "off"
+    layer_sharing: bool = False
 
     def __post_init__(self) -> None:
         if self.target_json_bytes is not None and (
@@ -75,8 +78,8 @@ class CodegenConfig:
             raise TypeError("compact_internal_names must be a bool")
         if not isinstance(self.compact_schema, bool):
             raise TypeError("compact_schema must be a bool")
-        if self.layer_sharing not in {"auto", "off"}:
-            raise ValueError("layer_sharing must be 'auto' or 'off'")
+        if not isinstance(self.layer_sharing, bool):
+            raise TypeError("layer_sharing must be a bool")
 
 
 __all__ = ["CodegenConfig"]

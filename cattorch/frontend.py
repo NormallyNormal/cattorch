@@ -1,35 +1,48 @@
-"""Graph capture backends normalized into cattorch's internal contract."""
+"""Graph capture (FX tracing) normalized into cattorch's internal contract."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextvars import ContextVar
+import dataclasses
 from dataclasses import dataclass
 from threading import RLock
-from typing import Literal
+from typing import Callable
+
+import contextlib
+import functools
+import itertools
+import logging
+import math
+import threading
 
 import torch
-import math
 from torch.fx import Graph, GraphModule, Node
+import torch.fx.experimental.proxy_tensor as proxy_tensor
 from torch.fx.experimental.proxy_tensor import make_fx
-from torch.export import export
 from torch.utils._pytree import tree_flatten
-from torch._decomp import get_decompositions
+from torch._decomp import core_aten_decompositions, get_decompositions
 
+from cattorch.decompositions import (
+    POINTWISE_DECOMPOSITIONS, fold_input_index_checks, traced_from_input,
+)
 from cattorch.errors import UnsupportedModelError
+from cattorch.errors import warn as warn_export
 
 
-Frontend = Literal["fx", "export"]
+log = logging.getLogger(__name__)
+
 _CAPTURE_LOCK = RLock()
 
 
 @dataclass(frozen=True)
 class CapturedGraph:
-    """Frontend-neutral graph and model interface consumed by analysis.
+    """Traced graph and model interface consumed by analysis.
 
-    Parameters and buffers are normalized into ``state_inputs`` regardless of
-    whether the frontend represented them as placeholders or ``get_attr``
-    nodes. ``user_output_names`` contains one entry per returned pytree leaf;
-    ``None`` marks a non-node leaf so the common analyzer can report the same
-    unsupported-output error for every frontend.
+    Parameters and buffers are collected into ``state_inputs`` from their
+    ``get_attr`` nodes. ``user_output_names`` contains one entry per returned
+    pytree leaf; ``None`` marks a non-node leaf so the analyzer can report an
+    unsupported output.
     """
 
     graph: Graph
@@ -37,61 +50,91 @@ class CapturedGraph:
     state_inputs: dict[str, torch.Tensor]
     user_input_names: frozenset[str]
     user_output_names: tuple[str | None, ...]
-    frontend: Frontend
 
 
-def _export_model(model, example_inputs):
-    """Export without inheriting old TorchDynamo's tiny process-wide limit."""
-    config = getattr(getattr(torch, "_dynamo", None), "config", None)
-    overrides = {}
-    if config is not None:
-        for name in (
-            "cache_size_limit",
-            "recompile_limit",
-            "accumulated_cache_size_limit",
-        ):
-            value = getattr(config, name, None)
-            if isinstance(value, int) and value < 1024:
-                overrides[name] = 1024
-    if overrides and hasattr(config, "patch"):
-        with config.patch(**overrides):
-            return export(model, example_inputs)
-    return export(model, example_inputs)
+def flat_example_inputs(example_inputs, example_kwargs=None) -> tuple[torch.Tensor, ...]:
+    """Return the tensors a traced graph takes as inputs, in placeholder order.
+
+    Positional tensors come first, then tensor-valued keyword arguments in
+    dict order. Non-tensor keyword arguments are constants of the trace.
+    """
+    return (*example_inputs, *(
+        value for value in (example_kwargs or {}).values()
+        if isinstance(value, torch.Tensor)
+    ))
 
 
-def _capture_export(model, example_inputs) -> CapturedGraph:
-    exported = _export_model(model, example_inputs)
-    state_inputs: dict[str, torch.Tensor] = {}
-    user_inputs: set[str] = set()
-    constants = getattr(exported, "constants", {})
-    for spec in exported.graph_signature.input_specs:
-        argument_name = getattr(spec.arg, "name", None)
-        if argument_name is None:
-            continue
-        kind = getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
-        if kind == "USER_INPUT":
-            user_inputs.add(argument_name)
-            continue
-        target = spec.target
-        if target in exported.state_dict:
-            state_inputs[argument_name] = exported.state_dict[target]
-        elif target in constants:
-            state_inputs[argument_name] = constants[target]
+def _holds_tensors(item, depth: int = 0) -> bool:
+    """Whether an object the output traversal doesn't enter holds tensors."""
+    if isinstance(item, torch.Tensor):
+        return True
+    if depth > 8:
+        return False
+    if isinstance(item, Mapping):
+        children = list(item.values())
+    elif isinstance(item, (tuple, list)):
+        children = list(item)
+    elif dataclasses.is_dataclass(item) and not isinstance(item, type):
+        children = [getattr(item, field.name, None) for field in dataclasses.fields(item)]
+    else:
+        return False
+    return any(_holds_tensors(child, depth + 1) for child in children)
 
-    user_outputs = tuple(
-        getattr(spec.arg, "name", None)
-        for spec in exported.graph_signature.output_specs
-        if getattr(spec.kind, "name", str(spec.kind).rsplit(".", 1)[-1])
-        == "USER_OUTPUT"
-    )
-    return CapturedGraph(
-        graph=exported.graph,
-        graph_module=exported.graph_module,
-        state_inputs=state_inputs,
-        user_input_names=frozenset(user_inputs),
-        user_output_names=user_outputs,
-        frontend="export",
-    )
+
+def reject_tensor_containers(leaves) -> None:
+    """Raise for an output leaf that holds tensors in a container cattorch doesn't enter.
+
+    Model outputs are read from tensors, tuples, lists, dicts and Hugging
+    Face ``ModelOutput``s; other leaves are dropped. A leaf holding tensors,
+    such as a dataclass of tensors, would lose them, so it is an error.
+    ``leaves`` are the dropped leaves, as ``(path, item)``.
+    """
+    holding = [
+        f"{path} ({type(item).__name__})" for path, item in leaves if _holds_tensors(item)
+    ]
+    if holding:
+        raise UnsupportedModelError(
+            "the model returns tensors inside " + ", ".join(holding) + ", which cattorch "
+            "doesn't read outputs from; return a tensor, or a tuple, list, dict or "
+            "NamedTuple of tensors (a Hugging Face ModelOutput works too)"
+        )
+
+
+def tensor_output_leaves(value, *, warn: bool) -> list[torch.Tensor]:
+    """Return the tensor leaves of a model output, in traversal order.
+
+    Mappings (including Hugging Face ``ModelOutput``), tuples, lists, and
+    namedtuples are searched. Every other leaf, such as ``None``, a Python
+    number, or a ``DynamicCache``, is dropped; ``warn`` reports the dropped
+    paths once. Raises when no tensor is found.
+    """
+    leaves: list[torch.Tensor] = []
+    dropped: list[tuple[str, str]] = []
+
+    def visit(item, path: str) -> None:
+        if isinstance(item, torch.Tensor):
+            leaves.append(item)
+        elif isinstance(item, Mapping):
+            for key, child in item.items():
+                visit(child, f"{path}[{key!r}]")
+        elif isinstance(item, (tuple, list)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
+        else:
+            dropped.append((path, type(item).__name__))
+            dropped_items.append((path, item))
+
+    dropped_items: list[tuple[str, object]] = []
+    visit(value, "output")
+    reject_tensor_containers(dropped_items)
+    if not leaves:
+        raise UnsupportedModelError("cattorch requires at least one tensor output")
+    if warn and dropped:
+        warn_export(
+            "ignoring non-tensor model outputs: "
+            + ", ".join(f"{path} ({kind})" for path, kind in dropped),
+        )
+    return leaves
 
 
 def _resolve_attr(module: GraphModule, target: str):
@@ -142,11 +185,6 @@ def _sdpa_decomposition(
     """Fixed-shape math SDPA using operations with proven Scratch kernels."""
     if dropout_p != 0:
         raise RuntimeError("cattorch SDPA decomposition requires dropout_p=0")
-    if attn_mask is not None:
-        raise RuntimeError(
-            "cattorch SDPA decomposition currently requires attn_mask=None; "
-            "express a static mask with masked_fill outside SDPA"
-        )
     if enable_gqa:
         repeats = query.shape[-3] // key.shape[-3]
         key = _repeat_interleave_decomposition(key, repeats, -3)
@@ -164,44 +202,973 @@ def _sdpa_decomposition(
             dtype=torch.bool,
         )
         scores = torch.ops.aten.masked_fill.Scalar(scores, mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = torch.ops.aten.masked_fill.Scalar(
+                scores, torch.ops.aten.logical_not.default(attn_mask), float("-inf"),
+            )
+        else:
+            scores = torch.ops.aten.add.Tensor(scores, attn_mask)
     probabilities = torch.ops.aten.softmax.int(scores, -1)
     return torch.ops.aten.matmul.default(probabilities, value)
 
 
-def _fx_decompositions() -> dict:
-    table = get_decompositions((torch.ops.aten.stack.default,))
-    table.update({
+def _extreme_with_index(extreme, argument):
+    def decomposition(value, dim, keepdim=False):
+        return (
+            extreme(value, [dim], keepdim),
+            argument(value, dim, keepdim),
+        )
+    return decomposition
+
+
+def _prims_var(value, dims, correction=1, *, output_dtype=None):
+    dims = list(range(value.ndim)) if dims is None else list(dims)
+    count = 1
+    for dim in dims:
+        count *= value.shape[dim]
+    centered = torch.ops.aten.sub.Tensor(
+        value, torch.ops.aten.mean.dim(value, dims, True),
+    )
+    squares = torch.ops.aten.mul.Tensor(centered, centered)
+    total = torch.ops.aten.sum.dim_IntList(squares, dims)
+    return torch.ops.aten.div.Tensor(total, max(count - correction, 0))
+
+
+def _prims_broadcast_in_dim(value, shape, broadcast_dimensions):
+    view_shape = [1] * len(shape)
+    for source, target in enumerate(broadcast_dimensions):
+        view_shape[target] = value.shape[source]
+    return torch.ops.aten.expand.default(
+        torch.ops.aten.reshape.default(value, view_shape), list(shape),
+    )
+
+
+def _prims_prod(value, dims, *, output_dtype=None):
+    for dim in sorted((dim % value.ndim for dim in dims), reverse=True):
+        value = torch.ops.aten.prod.dim_int(value, dim)
+    return value
+
+
+# Some PyTorch decompositions are written against primitives. Map the ones
+# that reach models back to ATen operations cattorch lowers.
+_PRIMITIVE_DECOMPOSITIONS = {
+    "var": _prims_var,
+    "broadcast_in_dim": _prims_broadcast_in_dim,
+    "sum": lambda value, dims, *, output_dtype=None: torch.ops.aten.sum.dim_IntList(
+        value, list(dims) if dims is not None else None,
+    ),
+    "log1p": lambda value: torch.ops.aten.log.default(
+        torch.ops.aten.add.Tensor(value, 1),
+    ),
+    "expm1": lambda value: torch.ops.aten.sub.Tensor(
+        torch.ops.aten.exp.default(value), 1,
+    ),
+    "signbit": lambda value: torch.ops.aten.lt.Scalar(value, 0),
+    "prod": _prims_prod,
+}
+
+
+_aten = torch.ops.aten
+
+
+def _addmm(bias, left, right, *, beta=1, alpha=1):
+    """GPT-2's ``Conv1D``: ``bias + left @ right`` is a linear layer.
+
+    Other calls, with scaling or a bias that isn't one value per output
+    column, use PyTorch's decomposition.
+    """
+    if beta != 1 or alpha != 1 or bias.shape != (right.shape[-1],):
+        generic = _available_decompositions()[_aten.addmm.default]
+        return _recorded_fallback("aten.addmm.default", generic)(
+            bias, left, right, beta=beta, alpha=alpha,
+        )
+    return _aten.linear.default(left, _aten.t.default(right), bias)
+
+
+# Pointwise operations whose PyTorch decompositions end in primitives
+# cattorch can't lower, written with ones it can.
+_POINTWISE_DECOMPOSITIONS = {**POINTWISE_DECOMPOSITIONS, _aten.addmm.default: _addmm}
+
+
+def _topk_decomposition(value, k, dim=-1, largest=True, sorted=True):
+    # Scratch always produces sorted results; unsorted order is unspecified.
+    return (
+        torch.ops.cattorch.topk_values(value, k, dim, largest),
+        torch.ops.cattorch.topk_indices(value, k, dim, largest),
+    )
+
+
+def _static_scalar_decomposition(operator):
+    """Evaluate ``.item()`` on values that don't depend on the model inputs.
+
+    Hugging Face mask construction branches on tensors built from ``arange``.
+    Those are fixed for the traced shapes, so the Python value is specialised.
+    Values reachable from an input placeholder return ``NotImplemented`` and
+    keep the data-dependent error.
+    """
+    def decomposition(value, *args, **kwargs):
+        if traced_from_input(value) is not False:
+            return NotImplemented
+        with proxy_tensor.disable_proxy_modes_tracing():
+            result = operator(value, *args, **kwargs)
+        log.info("specialised %s on input-independent value: %r", operator, result)
+        return result
+    return decomposition
+
+
+def _resolve_operator(name: str):
+    """Return the ``OpOverload`` for a dispatcher name like ``aten::outer``."""
+    qualified, _, overload = name.partition(".")
+    packet_name = qualified.split("::", 1)[1]
+    try:
+        packet = getattr(torch.ops.aten, packet_name)
+        return getattr(packet, overload or "default")
+    except (AttributeError, RuntimeError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _available_decompositions() -> dict:
+    """Every ATen decomposition PyTorch provides, by operator overload.
+
+    Registered decompositions come first. Composite operations, which PyTorch
+    implements in terms of other operations but keeps whole when capturing
+    before autograd, decompose through ``OpOverload.decompose``.
+    """
+    table: dict[torch._ops.OpOverload, Callable] = {}
+    for source in (core_aten_decompositions(), torch._decomp.decomposition_table):
+        for operator, function in source.items():
+            if isinstance(operator, torch._ops.OpOverload):
+                table.setdefault(operator, function)
+    for name in torch._C._dispatch_get_all_op_names():
+        if not name.startswith("aten::") or not torch._C._dispatch_has_kernel_for_dispatch_key(
+            name, "CompositeImplicitAutograd",
+        ):
+            continue
+        operator = _resolve_operator(name)
+        if operator is not None and operator not in table:
+            table[operator] = operator.decompose
+    return table
+
+
+@functools.lru_cache(maxsize=1)
+def _in_place_operators() -> tuple:
+    """Every ATen in-place operator overload, ``x.op_(...)``, by schema."""
+    found = []
+    for name in torch._C._dispatch_get_all_op_names():
+        packet = name.partition(".")[0].removeprefix("aten::")
+        if (
+            not name.startswith("aten::") or not packet.endswith("_")
+            or packet.startswith("_")
+        ):
+            continue
+        operator = _resolve_operator(name)
+        if operator is not None:
+            found.append(operator)
+    return tuple(found)
+
+
+class _TensorView:
+    """Minimal ``fx.Node`` stand-in so validators can inspect live arguments."""
+
+    name = "argument"
+
+    def __init__(self, value):
+        self.meta = {"val": value}
+
+
+class _CallView:
+    def __init__(self, operator, args, kwargs):
+        self.target = operator
+        self.args = tuple(
+            _TensorView(value) if isinstance(value, torch.Tensor) else value
+            for value in args
+        )
+        self.kwargs = kwargs
+
+
+# Operations an export's own kernels lower, so tracing keeps them whole.
+_KEPT_OPERATIONS: ContextVar[frozenset[str]] = ContextVar(
+    "cattorch_kept_operations", default=frozenset(),
+)
+
+
+@contextlib.contextmanager
+def keep_operations(names):
+    """Don't decompose ``names`` in captures made inside this block."""
+    token = _KEPT_OPERATIONS.set(_KEPT_OPERATIONS.get() | frozenset(names))
+    try:
+        yield
+    finally:
+        _KEPT_OPERATIONS.reset(token)
+
+
+# ``node.meta`` key naming the operation whose generic PyTorch decomposition
+# produced the node, and which call of it, as ``(operation, call)``.
+FALLBACK_META = "cattorch_fallback"
+_fallback_calls = itertools.count()
+
+
+def _recorded_fallback(name: str, decomposition):
+    """Tag the nodes ``decomposition`` traces with the operation it replaces.
+
+    Lowering reports these as operations without a kernel of their own. An
+    outer decomposition runs after its inner ones and overwrites their tags,
+    so each node names the operation the model called.
+    """
+    def record(*args, **kwargs):
+        mode = proxy_tensor.get_proxy_mode()
+        if mode is None:
+            return decomposition(*args, **kwargs)
+        graph = mode.tracer.graph
+        last = graph._root.prev
+        result = decomposition(*args, **kwargs)
+        call = (name, next(_fallback_calls))
+        node = last.next
+        while node is not graph._root:
+            node.meta[FALLBACK_META] = call
+            node = node.next
+        return result
+    return record
+
+
+def _decompose_when_rejected(operator, validator, decomposition):
+    from cattorch.fast import FastConfig
+
+    def conditional(*args, **kwargs):
+        if validator(_CallView(operator, args, kwargs), FastConfig(), False) is None:
+            return NotImplemented
+        return decomposition(*args, **kwargs)
+    return conditional
+
+
+# Operations with a kernel whose validator can reject some calls, and whose
+# PyTorch decomposition leads to operations cattorch supports. Other rejected
+# calls keep their operation so the error names it and gives the reason.
+# ``matmul`` stays whole even when rejected: the cached-attention recognizer
+# depends on seeing broadcasting matmuls as written.
+_DECOMPOSE_WHEN_REJECTED = frozenset({"aten.batch_norm.default"})
+
+
+def _eye_decomposition(n, m=None, *, dtype=None, layout=None, device=None, pin_memory=None):
+    """``torch.eye``: PyTorch's own decomposition counts rows in the
+    smallest unsigned type that holds them, which ``arange`` can't make
+    past 255 rows."""
+    columns = n if m is None else m
+    rows = torch.arange(n, device=device).unsqueeze(-1)
+    return (rows == torch.arange(columns, device=device)).to(
+        dtype if dtype is not None else torch.get_default_dtype(),
+    )
+
+
+def own_decompositions() -> dict:
+    """The ATen decompositions cattorch writes itself, by operator overload.
+
+    The tracer calls each with the arguments the caller gave, leaving out
+    those at their schema default, so every argument with a default needs
+    one in the decomposition too; ``tests/test_frontend.py`` checks this.
+    """
+    table = {
         torch.ops.aten.repeat_interleave.self_int: _repeat_interleave_decomposition,
         torch.ops.aten.select.int: _select_decomposition,
         torch.ops.aten.scaled_dot_product_attention.default: _sdpa_decomposition,
+        torch.ops.aten.max.dim: _extreme_with_index(
+            torch.ops.aten.amax.default, torch.ops.aten.argmax.default,
+        ),
+        torch.ops.aten.min.dim: _extreme_with_index(
+            torch.ops.aten.amin.default, torch.ops.aten.argmin.default,
+        ),
+        torch.ops.aten.topk.default: _topk_decomposition,
+        torch.ops.aten.eye.default: _eye_decomposition,
+        torch.ops.aten.eye.m: _eye_decomposition,
+    }
+    table.update(_POINTWISE_DECOMPOSITIONS)
+    for operator in (
+        torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default,
+    ):
+        table[operator] = _static_scalar_decomposition(operator)
+    return table
+
+
+# In-place operations whose out-of-place form returns a new tensor but which
+# change a tensor's shape or storage, not its values, and the copy itself.
+# Those whose out-of-place form returns a view, such as squeeze_, are
+# recognized by their schema.
+_NOT_VALUE_UPDATES = frozenset({"copy_", "resize_", "resize_as_", "set_"})
+
+
+def _in_place_as_copy(operator, decomposition, registry, kept) -> Callable | None:
+    """``x.op_(...)`` as ``x.copy_(op(x, ...))``, for every value update.
+
+    PyTorch's own decomposition of an in-place operation decomposes the
+    operation itself, so ``x.clamp_()`` would run as primitives rather than
+    the clamp kernel, and ``x.remainder_()`` as a primitive cattorch doesn't
+    lower, where ``remainder`` has a decomposition of cattorch's own. As a
+    copy, ``op`` takes whichever route it takes out of place, so the two
+    forms export alike. Written as a copy, the capture's in-place handling
+    turns it into dataflow (``_replace_intermediate_copies``). ``fill_``
+    copies a constant of the tensor's shape (times the value, for a tensor
+    value), and runs ``decomposition`` for a variable-length tensor.
+    """
+    aten = torch.ops.aten
+    packet = operator.overloadpacket.__name__
+    if operator in (aten.fill_.Tensor, aten.fill_.Scalar):
+        def fill(self, value):
+            shape = list(self.shape)
+            if not all(isinstance(size, int) for size in shape):
+                return decomposition(self, value)
+            if isinstance(value, torch.Tensor):
+                filled = aten.mul.Tensor(aten.full.default(shape, 1, dtype=self.dtype), value)
+            else:
+                filled = aten.full.default(shape, value, dtype=self.dtype)
+            return aten.copy_.default(self, filled)
+        return fill
+    if not packet.endswith("_") or packet.startswith("_") or packet in _NOT_VALUE_UPDATES:
+        return None
+    if operator == aten.polygamma_.default:
+        # polygamma_(n) is polygamma(n, x): the tensor is its second argument.
+        def polygamma(self, n):
+            return aten.copy_.default(self, aten.polygamma.default(n, self))
+        return polygamma
+    functional = getattr(aten, packet[:-1], None)
+    if functional is None:
+        return None
+    out_of_place = _functional_overload(operator, functional)
+    if out_of_place is None:
+        return None
+
+    def update(self, *args, **kwargs):
+        result = out_of_place(self, *args, **kwargs)
+        if result is self or _same_memory(result, self):
+            return self  # an identity for this input, as conj_physical of a real tensor
+        # copy_ would cast silently where the in-place operation raises,
+        # such as for an integer tensor's x.add_(0.5).
+        if not torch.can_cast(result.dtype, self.dtype):
+            raise RuntimeError(
+                f"result type {_dtype_name(result.dtype)} can't be cast to the "
+                f"desired output type {_dtype_name(self.dtype)}"
+            )
+        return aten.copy_.default(self, result)
+    return update
+
+
+def _same_memory(first, second) -> bool:
+    try:
+        return first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):  # tensors without storage
+        return False
+
+
+def _functional_overload(operator, functional):
+    """The overload of ``functional`` taking ``operator``'s arguments, or ``None``.
+
+    Overload names don't always line up: ``pow_.Scalar`` takes a scalar
+    exponent, like ``pow.Tensor_Scalar``, while ``pow.Scalar`` takes a
+    scalar base. The one whose argument names and types match is used.
+    """
+    def signature(schema):
+        return [
+            (argument.name, str(argument.type).replace("(a!)", ""), argument.kwarg_only)
+            for argument in schema.arguments
+        ]
+
+    wanted = signature(operator._schema)
+    names = [operator._overloadname] + [
+        name for name in functional.overloads() if name != operator._overloadname
+    ]
+    for name in names:
+        if name not in functional.overloads():
+            continue
+        candidate = getattr(functional, name)
+        schema = candidate._schema
+        if signature(schema) == wanted and all(
+            result.alias_info is None for result in schema.returns
+        ):
+            return candidate
+    return None
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    """``torch.int64`` as PyTorch's errors name it, ``Long``."""
+    return {
+        torch.bool: "Bool", torch.uint8: "Byte", torch.int8: "Char", torch.int16: "Short",
+        torch.int32: "Int", torch.int64: "Long", torch.float16: "Half",
+        torch.bfloat16: "BFloat16", torch.float32: "Float", torch.float64: "Double",
+    }.get(dtype, str(dtype).removeprefix("torch."))
+
+
+def _fx_decompositions() -> dict:
+    """Decompose every operation cattorch can't lower directly.
+
+    Operations with a registered kernel, or that graph analysis handles itself,
+    are kept whole. Everything else becomes PyTorch's decomposition, repeated
+    until the graph only contains kept operations or ones with no
+    decomposition.
+    """
+    from cattorch.graph import _graph_handled_operations
+    from cattorch.operator_registry import default_registry
+
+    registry = default_registry()
+    kept = _graph_handled_operations()
+    primitives = _primitive_decompositions()
+    table = {}
+    for operator, decomposition in _available_decompositions().items():
+        name = str(operator)
+        rule = registry.operation(name)
+        # An operation whose reference is a same-named primitive with no
+        # mapping back to ATen would only rename the unsupported operation.
+        packet = operator.overloadpacket.__name__
+        dead_end = hasattr(torch.ops.prims, packet) and packet not in primitives
+        if rule is None and name not in kept:
+            fallback = _recorded_fallback(name, decomposition)
+            in_place = _in_place_as_copy(operator, fallback, registry, kept)
+            if in_place is not None:
+                table[operator] = in_place
+            elif not dead_end:
+                table[operator] = fallback
+        elif (
+            rule is not None and rule.validator is not None
+            and name in _DECOMPOSE_WHEN_REJECTED
+        ):
+            table[operator] = _recorded_fallback(name, _decompose_when_rejected(
+                operator, rule.validator, decomposition,
+            ))
+    # In-place operations PyTorch has no decomposition for, such as
+    # ``x.put_()``, take their out-of-place form's route too.
+    for operator in _in_place_operators():
+        if operator in table or registry.operation(str(operator)) is not None:
+            continue
+        if str(operator) in kept:
+            continue
+        in_place = _in_place_as_copy(operator, operator, registry, kept)
+        if in_place is not None:
+            table[operator] = in_place
+    table.update(get_decompositions((torch.ops.aten.stack.default,)))
+    table.update(own_decompositions())
+    for name, decomposition in primitives.items():
+        table[getattr(torch.ops.prims, name).default] = decomposition
+    kept_by_export = _KEPT_OPERATIONS.get()
+    # Operations declared with ``cattorch.experimental.op`` and no kernel in
+    # this export run as their eager function.
+    from cattorch.custom_ops import declared_without_kernel
+    for operator, operation in declared_without_kernel(kept_by_export):
+        table[operator] = _recorded_fallback(str(operator), operation.eager)
+    return {
+        operator: _without_cycles(operator, decomposition)
+        for operator, decomposition in table.items()
+        if str(operator) not in kept_by_export
+    }
+
+
+_decomposing = threading.local()
+
+
+def _without_cycles(operator, decomposition):
+    """Keep ``operator`` whole when its decomposition leads back to it.
+
+    ``aten.sign`` decomposes to ``prims.sign``, which maps back to
+    ``aten.sign``. The inner call is traced as written, so lowering names the
+    operation instead of the trace failing with a recursion error.
+    """
+    def decompose(*args, **kwargs):
+        active = _decomposing.__dict__.setdefault("operators", set())
+        if operator in active:
+            return NotImplemented
+        active.add(operator)
+        try:
+            return decomposition(*args, **kwargs)
+        finally:
+            active.discard(operator)
+    return decompose
+
+
+# Elementwise primitives with an ATen operation of the same name and meaning.
+_ELEMENTWISE_PRIMITIVES = (
+    "add", "sub", "mul", "neg", "exp", "log", "sqrt", "rsqrt", "abs", "sin",
+    "cos", "tanh", "erf", "floor", "ceil", "reciprocal", "maximum", "minimum",
+    "where", "eq", "ne", "lt", "le", "gt", "ge", "bitwise_not", "sign",
+)
+
+
+def _primitive_decompositions() -> dict:
+    aten = torch.ops.aten
+
+    def same_named(name):
+        packet = getattr(aten, name)
+        overload = "Tensor" if "Tensor" in packet.overloads() else (
+            "self" if "self" in packet.overloads() else "default"
+        )
+        return getattr(packet, overload)
+
+    def divide(left, right):
+        integers = all(
+            not isinstance(value, torch.Tensor) or not value.is_floating_point()
+            for value in (left, right)
+        ) and not any(isinstance(value, float) for value in (left, right))
+        if integers:
+            return aten.div.Tensor_mode(left, right, rounding_mode="trunc")
+        return aten.div.Tensor(left, right)
+
+    def power(base, exponent):
+        if isinstance(exponent, torch.Tensor):
+            return aten.pow.Tensor_Tensor(base, exponent)
+        return aten.pow.Tensor_Scalar(base, exponent)
+
+    table = {}
+    for name in _ELEMENTWISE_PRIMITIVES:
+        try:
+            table[name] = same_named(name)
+        except AttributeError:
+            continue
+    table.update(_PRIMITIVE_DECOMPOSITIONS)
+    table.update({
+        "div": divide,
+        "pow": power,
+        "convert_element_type": lambda value, dtype: aten.to.dtype(value, dtype),
+        "reshape": lambda value, shape: aten.reshape.default(value, list(shape)),
+        "squeeze": lambda value, dims: aten.squeeze.dims(value, list(dims)),
+        "transpose": lambda value, permutation: aten.permute.default(
+            value, list(permutation),
+        ),
+        "view_of": lambda value: aten.alias.default(value),
+        "amax": lambda value, dims, *, output_dtype=None: aten.amax.default(
+            value, list(dims) if dims is not None else [],
+        ),
+        "amin": lambda value, dims, *, output_dtype=None: aten.amin.default(
+            value, list(dims) if dims is not None else [],
+        ),
     })
     return table
 
 
-def _capture_fx(model, example_inputs) -> CapturedGraph:
+@contextlib.contextmanager
+def _onednn_disabled():
+    enabled = torch._C._get_mkldnn_enabled()
+    torch._C._set_mkldnn_enabled(False)
+    try:
+        yield
+    finally:
+        torch._C._set_mkldnn_enabled(enabled)
+
+
+_PYTHON_CONVERSIONS = ("tolist", "numpy", "__array__")
+
+
+@contextlib.contextmanager
+def _input_conversions_rejected():
+    """Reject ``tolist()`` and NumPy conversions of values that depend on inputs.
+
+    Unlike ``.item()``, they read the data without the tracer seeing it, so
+    the example's values would be baked into the sprite as constants.
+    """
+    originals = {name: getattr(torch.Tensor, name) for name in _PYTHON_CONVERSIONS}
+
+    def guarded(name):
+        original = originals[name]
+
+        @functools.wraps(original)
+        def conversion(self, *args, **kwargs):
+            if traced_from_input(self):
+                raise UnsupportedModelError(
+                    f"the model calls Tensor.{name}() on a value computed from its "
+                    "inputs; Scratch would keep the example's values as constants. "
+                    "Keep the computation in tensor operations"
+                )
+            return original(self, *args, **kwargs)
+        return conversion
+
+    for name in _PYTHON_CONVERSIONS:
+        setattr(torch.Tensor, name, guarded(name))
+    try:
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(torch.Tensor, name, original)
+
+
+# Mode switches that make_fx records but that have no effect on a traced
+# inference graph. Enter-autocast results are consumed by the matching exit.
+# Run-time checks of input values, such as F.one_hot's check that its
+# indices are in range, can't stop a Scratch script: like an out-of-range
+# index elsewhere, a value that fails one is the caller's error.
+_IGNORED_CALLS = tuple(
+    target for target in (
+        getattr(torch._C, "_set_grad_enabled", None),
+        getattr(getattr(torch.amp, "autocast_mode", None), "_enter_autocast", None),
+        getattr(getattr(torch.amp, "autocast_mode", None), "_exit_autocast", None),
+        torch.ops.aten._assert_async.default,
+        torch.ops.aten._assert_async.msg,
+    ) if target is not None
+)
+
+
+def _erase_mode_switches(graph: Graph) -> None:
+    for node in reversed(list(graph.nodes)):
+        if node.op == "call_function" and any(node.target is t for t in _IGNORED_CALLS):
+            node.replace_all_uses_with(None)
+            graph.erase_node(node)
+
+
+def _returns_alias(node: Node) -> bool:
+    """Whether ``node``'s result may share storage with one of its inputs.
+
+    ``x.to(dtype)`` returns ``x`` itself when the dtype doesn't change, and a
+    copy otherwise, as PyTorch's type promotion around a decomposition
+    inserts it.
+    """
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return True
+    if getattr(getattr(node.target, "overloadpacket", None), "__name__", "") == "to":
+        return _same_dtype_cast(node)
+    return any(value.alias_info is not None for value in schema.returns)
+
+
+def _same_dtype_cast(node: Node) -> bool:
+    """Whether ``node`` is an ``x.to(...)`` that returns ``x`` itself."""
+    if getattr(getattr(node.target, "overloadpacket", None), "__name__", "") != "to":
+        return False
+    parent = node.args[0] if node.args else None
+    before = parent.meta.get("val") if isinstance(parent, Node) else None
+    after = node.meta.get("val")
+    return (
+        isinstance(before, torch.Tensor) and isinstance(after, torch.Tensor)
+        and before.dtype == after.dtype and before.device == after.device
+        and not node.kwargs.get("copy", False)
+        and node.kwargs.get("memory_format") in {None, torch.preserve_format}
+    )
+
+
+_VIEW_SLICE = torch.ops.aten.slice.Tensor
+_VIEW_SELECT = torch.ops.aten.select.int
+# Views that keep every element and only change the shape. Assigning through
+# one assigns the whole parent, viewed back to the parent's shape.
+_SHAPE_VIEWS = {
+    torch.ops.aten.view.default, torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.unsqueeze.default, torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.dims, torch.ops.aten.squeeze.default,
+}
+# Views that are a function of their input's values alone, so a view taken
+# before an in-place update can be taken again from the updated tensor.
+_REBUILDABLE_VIEWS = _SHAPE_VIEWS | {
+    _VIEW_SLICE, _VIEW_SELECT, torch.ops.aten.transpose.int, torch.ops.aten.permute.default,
+    torch.ops.aten.t.default, torch.ops.aten.expand.default, torch.ops.aten.alias.default,
+    torch.ops.aten.unfold.default, torch.ops.aten.diagonal.default,
+    # Only one that keeps the dtype is a view (``_returns_alias``).
+    torch.ops.aten.to.dtype, torch.ops.aten.to.dtype_layout,
+}
+# Uninitialized buffers that a model fills by slice assignment. They become
+# zeros, so no unspecified values are stored in the sprite.
+_EMPTY_AS_ZEROS = {
+    torch.ops.aten.empty.memory_format: torch.ops.aten.zeros.default,
+    torch.ops.aten.new_empty.default: torch.ops.aten.new_zeros.default,
+    torch.ops.aten.empty_like.default: torch.ops.aten.zeros_like.default,
+}
+
+
+def _region_view(node: Node) -> tuple[int, int, int] | None:
+    """``(dim, start, end)`` written through a step-one slice or a select.
+
+    A shape-only view writes all of its parent and gives ``(-1, 0, 0)``.
+    """
+    parent = node.args[0]
+    shape = parent.meta.get("val").shape if isinstance(parent, Node) else None
+    if shape is None:
+        return None
+    if _same_dtype_cast(node):
+        return -1, 0, 0
+    if node.target in _SHAPE_VIEWS:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and value.numel() == math.prod(shape):
+            return -1, 0, 0
+        return None
+    if node.target is _VIEW_SLICE:
+        given = tuple(node.args[1:])
+        dim, start, end, step = given + (0, None, None, 1)[len(given):]
+        dim = node.kwargs.get("dim", dim)
+        start = node.kwargs.get("start", start)
+        end = node.kwargs.get("end", end)
+        if node.kwargs.get("step", step) != 1:
+            return None
+        dim %= len(shape)
+        size = shape[dim]
+        start = 0 if start is None else start
+        end = size if end is None else end
+        start = max(0, min(size, start + size if start < 0 else start))
+        end = max(start, min(size, end + size if end < 0 else end))
+        return dim, start, end
+    if node.target is _VIEW_SELECT:
+        dim, index = node.args[1:3]
+        dim %= len(shape)
+        index = index + shape[dim] if index < 0 else index
+        return dim, index, index + 1
+    return None
+
+
+def _replace_intermediate_copies(graph: Graph) -> None:
+    """Rewrite in-place updates of intermediate tensors as ordinary dataflow.
+
+    The capture records ``x /= y`` on a computed tensor as ``div`` followed by
+    ``copy_(x, quotient)``, and ``x[..., :4] = y`` as ``copy_`` into a slice
+    view of ``x``. When ``x`` is a fresh tensor rather than a view, the copy
+    becomes a new tensor: the source itself, or ``x`` with the sliced region
+    replaced (a ``cat`` of the untouched parts and the source). Later reads of
+    ``x`` take that tensor, and later reads of a view of ``x`` (the one written
+    through, or any other taken before the copy) take that view of the new
+    tensor. A copy seen through a view that can't be taken again, such as
+    ``as_strided``, is left for graph analysis to reject. An input updated in place, as ``x += 1`` or
+    ``x.clamp_(-1, 1)`` in ``forward`` do, is rewritten the same way: the
+    sprite computes the updated value without writing to the input's list.
+    Copies into parameters and buffers, strided slices, or other views are
+    left for graph analysis to reject.
+    """
+    def views_of(base: Node, position: int) -> list[Node] | None:
+        """The views of ``base`` taken before the copy, parents first.
+
+        ``None`` if one of them that is read after the copy (itself or
+        through a view of it) can't be rebuilt from the updated value.
+        """
+        found: list[Node] = []
+        stack = [base]
+        while stack:
+            parent = stack.pop()
+            for user in parent.users:
+                if (
+                    user.op == "call_function" and order.get(user, position) < position
+                    and _returns_alias(user) and user not in found
+                ):
+                    found.append(user)
+                    stack.append(user)
+        found.sort(key=order.__getitem__)
+        for view in found:
+            if view.target not in _REBUILDABLE_VIEWS and read_after(view, position):
+                return None
+        return found
+
+    def read_after(node: Node, position: int) -> bool:
+        return any(
+            order.get(user, -1) > position
+            or (_returns_alias(user) and read_after(user, position))
+            for user in node.users
+        )
+
+    for copy in [node for node in graph.nodes if node.target is torch.ops.aten.copy_.default]:
+        order = {node: index for index, node in enumerate(graph.nodes)}
+        target, source = copy.args[:2]
+        if (
+            not isinstance(target, Node) or not isinstance(source, Node)
+            or target.op not in {"call_function", "placeholder"}
+            or copy.kwargs.get("non_blocking", False)
+        ):
+            continue
+        # Walk slice and select views up to the tensor that owns the storage.
+        chain: list[tuple[Node, tuple[int, int, int], bool]] = []
+        base = target
+        while base.op == "call_function" and _returns_alias(base):
+            region = _region_view(base)
+            if region is None:
+                break
+            chain.append((base, region, base.target is _VIEW_SELECT))
+            base = base.args[0]
+        if base.op == "placeholder":
+            pass  # an input: the caller's tensor, which nothing else aliases
+        elif base.op != "call_function" or _returns_alias(base):
+            continue
+        position = order[copy]
+        # Every view of the storage read after the copy (the one written
+        # through, its parents, or another view of the same tensor) must see
+        # the new values: each is rebuilt from the updated tensor.
+        views = views_of(base, position)
+        if views is None:
+            continue
+        expected, actual = target.meta.get("val"), source.meta.get("val")
+        if not isinstance(expected, torch.Tensor) or not isinstance(actual, torch.Tensor):
+            continue
+
+        def call(operation, args, meta_value):
+            node = graph.call_function(operation, args)
+            node.meta.update(copy.meta)
+            node.meta["val"] = meta_value
+            return node
+
+        with graph.inserting_before(copy):
+            # ``copy_`` casts and broadcasts its source to the target.
+            value = source
+            if actual.dtype != expected.dtype:
+                value = call(torch.ops.aten.to.dtype, (value, expected.dtype),
+                             actual.to(expected.dtype))
+            if tuple(actual.shape) != tuple(expected.shape):
+                value = call(torch.ops.aten.expand.default, (value, list(expected.shape)),
+                             expected)
+            for view, (dim, start, end), selected in chain:
+                parent = view.args[0]
+                whole = parent.meta["val"]
+                if dim < 0:
+                    value = call(torch.ops.aten.view.default, (value, list(whole.shape)),
+                                 whole)
+                    continue
+                if selected:
+                    value = call(torch.ops.aten.unsqueeze.default, (value, dim),
+                                 whole.narrow(dim, start, 1))
+                pieces = []
+                if start > 0:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, 0, start),
+                                       whole.narrow(dim, 0, start)))
+                pieces.append(value)
+                if end < whole.shape[dim]:
+                    pieces.append(call(_VIEW_SLICE, (parent, dim, end, whole.shape[dim]),
+                                       whole.narrow(dim, end, whole.shape[dim] - end)))
+                if len(pieces) > 1:
+                    value = call(torch.ops.aten.cat.default, (pieces, dim), whole)
+            rebuilt = {base: value}
+            for view in views:
+                if not read_after(view, position):
+                    continue
+                # Its parent is read after the copy through it, so it was
+                # rebuilt first.
+                node = graph.call_function(
+                    view.target, (rebuilt[view.args[0]], *view.args[1:]), dict(view.kwargs),
+                )
+                node.meta.update(view.meta)
+                rebuilt[view] = node
+        if chain and base.target in _EMPTY_AS_ZEROS:
+            base.target = _EMPTY_AS_ZEROS[base.target]
+            base.kwargs = {
+                key: item for key, item in base.kwargs.items() if key != "memory_format"
+            }
+        for old, new in rebuilt.items():
+            for user in list(old.users):
+                if user is not copy and order.get(user, -1) > position:
+                    user.replace_input_with(old, new)
+        # ``copy_`` returns the tensor written to, as ``row.mul_(2)`` does.
+        copy.replace_all_uses_with(rebuilt.get(target, value))
+        graph.erase_node(copy)
+        for view, _, _ in chain:
+            if not view.users:
+                graph.erase_node(view)
+
+
+def _slice_cat_pieces(graph: Graph) -> None:
+    """Replace a slice of a ``cat`` that starts at a piece boundary by the pieces.
+
+    ``torch.cat([history, row])[len(history):]`` is ``row`` whatever
+    ``history``'s length, which is how append state commits its new rows.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or str(node.target) != "aten.slice.Tensor":
+            continue
+        source = node.args[0]
+        if not isinstance(source, Node) or str(source.target) != "aten.cat.default":
+            continue
+        pieces = list(source.args[0])
+        rank = len(source.meta["val"].shape)
+        cat_dim = (source.args[1] if len(source.args) > 1 else 0) % rank
+        dim = (node.args[1] if len(node.args) > 1 else 0) % rank
+        start = node.args[2] if len(node.args) > 2 else 0
+        end = node.args[3] if len(node.args) > 3 else None
+        step = node.args[4] if len(node.args) > 4 else 1
+        total = source.meta["val"].shape[cat_dim]
+        if dim != cat_dim or step != 1 or not isinstance(start, int) or (
+            end is not None and end < total
+        ):
+            continue
+        offset = 0
+        for index, piece in enumerate(pieces):
+            if offset == start and 0 < index:
+                kept = pieces[index:]
+                with graph.inserting_before(node):
+                    replacement = kept[0] if len(kept) == 1 else graph.call_function(
+                        source.target, (kept, cat_dim),
+                    )
+                if replacement is not kept[0]:
+                    replacement.meta = dict(node.meta)
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+                break
+            offset += piece.meta["val"].shape[cat_dim]
+
+
+def _capture_fx(model, example_inputs, example_kwargs=None) -> CapturedGraph:
+    example_kwargs = dict(example_kwargs or {})
+    tensor_names = [
+        key for key, value in example_kwargs.items()
+        if isinstance(value, torch.Tensor)
+    ]
+    positional_count = len(example_inputs)
+    # Program entrypoints keep their explicit contract: every returned leaf
+    # must be a tensor, so nothing is dropped for them.
+    from cattorch.program_runtime import MethodModule
+    keep_all_leaves = isinstance(model, MethodModule)
+
     # make_fx only records module ownership when the traced callable exposes
     # the original module through this conventional attribute.
-    def forward(*args):
-        return model(*args)
+    def forward(*flat):
+        # Tensor keywords arrive after the positional tensors; every other
+        # keyword is bound as a constant of the trace.
+        kwargs = dict(example_kwargs)
+        kwargs.update(zip(tensor_names, flat[positional_count:]))
+        output = model(*flat[:positional_count], **kwargs)
+        if keep_all_leaves:
+            return output
+        return tuple(tensor_output_leaves(output, warn=True))
 
     forward._orig_mod = model  # type: ignore[attr-defined]
     try:
-        graph_module = make_fx(
-            forward,
-            decomposition_table=_fx_decompositions(),
-            tracing_mode="real",
-            pre_dispatch=True,
-            record_module_stack=True,
-            _error_on_data_dependent_ops=True,
-        )(*example_inputs)
+        # With oneDNN enabled, PyTorch's LSTM decomposition emits an
+        # oneDNN-only operation instead of the portable cell arithmetic.
+        with _onednn_disabled(), _input_conversions_rejected():
+            graph_module = make_fx(
+                forward,
+                decomposition_table=_fx_decompositions(),
+                tracing_mode="real",
+                pre_dispatch=True,
+                record_module_stack=True,
+                _error_on_data_dependent_ops=True,
+            )(*flat_example_inputs(example_inputs, example_kwargs))
+    except UnsupportedModelError:
+        raise
     except Exception as exc:
+        raised = _eager_failure(model, example_inputs, example_kwargs)
+        if raised is not None:
+            # Not a tracing problem: the model fails on these inputs.
+            raise UnsupportedModelError(model_failure(
+                "the model", raised, flat_example_inputs(example_inputs, example_kwargs),
+            )) from exc
+        if "aten.item.default" in str(exc) or "_local_scalar_dense" in str(exc):
+            raise UnsupportedModelError(
+                "PyTorch couldn't trace this model: it converts a tensor to a Python "
+                "number, which is fixed when the model is traced. This happens with "
+                "float(x), x.item(), a branch on a tensor's value, or indexing with a "
+                "0-d integer tensor such as x[i] = y. To index with a tensor, give it "
+                "one item, as x[i.reshape(1)] = y.unsqueeze(0), or use torch.where; "
+                "see https://github.com/NormallyNormal/cattorch/blob/main/docs/"
+                "troubleshooting.md#keep-one-inference-return-path"
+            ) from exc
         raise UnsupportedModelError(
-            "the FX frontend could not trace this model "
-            f"({type(exc).__name__}: {exc}); a common cause is control flow that "
-            "depends on tensor values or converting tensors to Python numbers, see "
+            f"PyTorch couldn't trace this model ({type(exc).__name__}: {_first_line(exc)}); "
+            "a common cause is control flow that depends on tensor values or "
+            "converting tensors to Python numbers, see "
             "https://github.com/NormallyNormal/cattorch/blob/main/docs/"
             "troubleshooting.md#keep-one-inference-return-path"
         ) from exc
+
+    # A wrapper around an already-traced graph (automatic generation) knows
+    # which modules its operations came from; the tracer saw only the graph.
+    restore = getattr(model, "restore_module_stacks", None)
+    if callable(restore):
+        restore(graph_module.graph)
+
+    _erase_mode_switches(graph_module.graph)
+    _replace_intermediate_copies(graph_module.graph)
+    # Index operations now read what the model wrote into an input, if
+    # anything: the checks of an input's own values move before the call.
+    fold_input_index_checks(graph_module.graph)
+    _slice_cat_pieces(graph_module.graph)
+    # Unused results, such as pooling indices nobody reads, would otherwise
+    # still run in Scratch. Mutations are kept.
+    graph_module.graph.eliminate_dead_code()
+    graph_module.recompile()
 
     nodes = list(graph_module.graph.nodes)
     state_inputs: dict[str, torch.Tensor] = {}
@@ -225,7 +1192,7 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
         leaves, _ = tree_flatten(value)
         output_names = tuple(leaf.name if isinstance(leaf, Node) else None for leaf in leaves)
 
-    return CapturedGraph(
+    captured = CapturedGraph(
         graph=graph_module.graph,
         graph_module=graph_module,
         state_inputs=state_inputs,
@@ -233,22 +1200,91 @@ def _capture_fx(model, example_inputs) -> CapturedGraph:
             node.name for node in nodes if node.op == "placeholder"
         ),
         user_output_names=output_names,
-        frontend="fx",
+    )
+    _check_input_count(captured, example_inputs, example_kwargs)
+    return captured
+
+
+def model_failure(caller: str, raised: BaseException, inputs) -> str:
+    """The message for user code (``caller``) that raised ``raised`` on ``inputs``."""
+    shapes = ", ".join(str(tuple(value.shape)) for value in inputs)
+    return (
+        f"{caller} raised {type(raised).__name__} when called with inputs of shape "
+        f"{shapes}: {_first_line(raised)}; check that example_inputs match what "
+        "it takes"
     )
 
 
-def capture_model(model, example_inputs, *, frontend: Frontend = "fx") -> CapturedGraph:
-    """Capture ``model`` and normalize frontend-specific state and outputs."""
+def _first_line(error: BaseException) -> str:
+    return str(error).strip().splitlines()[0] if str(error).strip() else ""
+
+
+def _eager_failure(model, example_inputs, example_kwargs) -> Exception | None:
+    """What running ``model`` on the inputs raises, outside tracing, if anything.
+
+    It runs on copies, so a model that changes its state when called is
+    left as it was.
+    """
+    import copy
+
+    try:
+        with torch.no_grad():
+            copy.deepcopy(model)(
+                *copy.deepcopy(tuple(example_inputs)), **copy.deepcopy(dict(example_kwargs or {})),
+            )
+    except Exception as error:  # noqa: BLE001 - reported to the user
+        return error
+    return None
+
+
+def _own_tensor(value):
+    """A copy of ``value`` with storage no other traced value shares."""
+    if not isinstance(value, torch.Tensor):
+        return value
+    return value.detach().clone().requires_grad_(value.requires_grad)
+
+
+def distinct_example_inputs(example_inputs, example_kwargs=None):
+    """Give every traced tensor argument its own storage.
+
+    The tracer identifies a tensor by the object: the same tensor passed as
+    two arguments (two states sharing one initial value), or an argument
+    that is also a parameter or buffer of the model, would trace as one
+    input, so the graph would read one argument's list for both. A copy per
+    argument keeps each its own input. Tracing also runs the model on these
+    tensors, so an in-place update in ``forward`` can't reach the caller's.
+    """
+    inputs = tuple(_own_tensor(value) for value in example_inputs)
+    kwargs = None if example_kwargs is None else {
+        key: _own_tensor(value) for key, value in example_kwargs.items()
+    }
+    return inputs, kwargs
+
+
+def _check_input_count(captured: CapturedGraph, example_inputs, example_kwargs) -> None:
+    expected = len(flat_example_inputs(example_inputs, example_kwargs))
+    found = len(captured.user_input_names)
+    if found != expected:
+        # Every later stage binds argument lists to placeholders by position;
+        # a merged or dropped input would silently read the wrong list.
+        raise RuntimeError(
+            f"cattorch internal error: the traced graph has {found} inputs for "
+            f"{expected} tensor arguments; please report this model"
+        )
+
+
+def capture_model(model, example_inputs, *, example_kwargs=None) -> CapturedGraph:
+    """Trace ``model`` with FX and normalize its state and outputs."""
+    example_inputs, example_kwargs = distinct_example_inputs(example_inputs, example_kwargs)
     # ProxyTensor and TorchDynamo both manipulate process-global tracing state.
     # Concurrent captures can therefore corrupt one another even for unrelated
     # models. Serializing this short export-only phase makes the public API safe
     # to call from worker threads; RLock also permits internal nested captures.
     with _CAPTURE_LOCK:
-        if frontend == "fx":
-            return _capture_fx(model, example_inputs)
-        if frontend == "export":
-            return _capture_export(model, example_inputs)
-        raise ValueError(f"frontend must be 'fx' or 'export', got {frontend!r}")
+        return _capture_fx(model, example_inputs, example_kwargs)
 
 
-__all__ = ["CapturedGraph", "Frontend", "capture_model"]
+__all__ = [
+    "CapturedGraph", "capture_model", "flat_example_inputs",
+    "tensor_output_leaves",
+]

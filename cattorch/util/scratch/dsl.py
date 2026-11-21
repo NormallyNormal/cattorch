@@ -7,6 +7,7 @@ in this module and rendered as readable pseudocode for review.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from collections import Counter
 from contextlib import contextmanager
@@ -95,6 +96,11 @@ class Random(Expr):
 
 
 @dataclass(frozen=True)
+class Answer(Expr):
+    """The text typed into the last ``ask and wait``."""
+
+
+@dataclass(frozen=True)
 class CostumeNumber(Expr):
     """The current costume's one-based index.
 
@@ -102,6 +108,32 @@ class CostumeNumber(Expr):
     in vanilla Scratch.  Ordinary Scratch string comparisons remain
     case-insensitive.
     """
+
+
+@dataclass(frozen=True)
+class Argument(Expr):
+    """The value a procedure was called with for its argument ``name``."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class Timer(Expr):
+    """Seconds since the timer was last reset."""
+
+
+@dataclass(frozen=True)
+class DaysSince2000(Expr):
+    """Days since 2000-01-01, with sub-millisecond resolution."""
+
+
+def argument(name: str) -> Argument:
+    return Argument(name)
+
+
+def argument_id(name: str) -> str:
+    """The ID that a procedure's prototype and calls give argument ``name``."""
+    return f"cattorch_argument_{name}"
 
 
 def value(expr: Expr | int | float | str) -> Expr:
@@ -268,6 +300,8 @@ class IfElse(Statement):
 @dataclass(frozen=True)
 class ProcedureCall(Statement):
     name: str
+    # (argument name, value) pairs, in the order of the procedure's prototype.
+    arguments: tuple[tuple[str, Expr], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +312,21 @@ class SwitchCostume(Statement):
 @dataclass(frozen=True)
 class BroadcastAndWait(Statement):
     message: str
+
+
+@dataclass(frozen=True)
+class ResetTimer(Statement):
+    pass
+
+
+@dataclass(frozen=True)
+class Ask(Statement):
+    question: Expr
+
+
+@dataclass(frozen=True)
+class Say(Statement):
+    message: Expr
 
 
 def set_var(name: str, expr) -> SetVariable:
@@ -357,8 +406,10 @@ def if_else(condition, then_body: Iterable[Statement], else_body: Iterable[State
     return IfElse(value(condition), tuple(then_body), tuple(else_body))
 
 
-def call(name: str) -> ProcedureCall:
-    return ProcedureCall(name)
+def call(name: str, **arguments) -> ProcedureCall:
+    return ProcedureCall(
+        name, tuple((key, value(expr)) for key, expr in arguments.items()),
+    )
 
 
 def switch_costume(expr) -> SwitchCostume:
@@ -369,6 +420,31 @@ def broadcast_and_wait(message: str) -> BroadcastAndWait:
     if not isinstance(message, str) or not message:
         raise ValueError("broadcast message must be a non-empty string")
     return BroadcastAndWait(message)
+
+
+def reset_timer() -> ResetTimer:
+    return ResetTimer()
+
+
+def timer() -> Timer:
+    return Timer()
+
+
+def days_since_2000() -> DaysSince2000:
+    return DaysSince2000()
+
+
+def ask(question) -> Ask:
+    """Show ``question`` and wait for the user to type an answer."""
+    return Ask(value(question))
+
+
+def answer() -> Answer:
+    return Answer()
+
+
+def say(message) -> Say:
+    return Say(value(message))
 
 
 def costume_number() -> CostumeNumber:
@@ -419,8 +495,11 @@ class Program:
         variable_values: Mapping[str, int | float | str] | None = None,
         body: Iterable[Statement] = (),
         optimize_loops: bool = True,
+        when_flag_clicked: bool = False,
     ):
         self.name = name
+        # Start the stack with a green-flag hat instead of leaving it loose.
+        self.when_flag_clicked = when_flag_clicked
         self.variables = tuple(variables)
         self.lists = tuple(lists)
         self.list_values = {
@@ -476,6 +555,11 @@ class _Lowerer:
         if self.program.optimize_loops:
             statements = _optimize_index_loops(statements)
         root, _ = self._statements(statements, None)
+        if self.program.when_flag_clicked:
+            hat = self._id()
+            self.blocks[hat] = {**self._base("event_whenflagclicked", None), "next": root}
+            self.blocks[root]["parent"] = hat
+            root = hat
         self.blocks[root]["topLevel"] = True
         self.blocks[root]["x"] = 0
         self.blocks[root]["y"] = 0
@@ -592,9 +676,15 @@ class _Lowerer:
             block = self._base("procedures_call", parent)
             block["mutation"] = {
                 "tagName": "mutation", "children": [],
-                "proccode": statement.name, "argumentids": "[]",
+                "proccode": statement.name,
+                "argumentids": json.dumps(
+                    [argument_id(name) for name, _ in statement.arguments],
+                    separators=(",", ":"),
+                ),
             }
             self.blocks[block_id] = block
+            for name, expr in statement.arguments:
+                block["inputs"][argument_id(name)] = self._expr(expr, block_id, text=True)
         elif isinstance(statement, BroadcastAndWait):
             broadcast_id = self.broadcast_ids.setdefault(
                 statement.message,
@@ -605,6 +695,16 @@ class _Lowerer:
                 1, [11, statement.message, broadcast_id],
             ]
             self.blocks[block_id] = block
+        elif isinstance(statement, ResetTimer):
+            self.blocks[block_id] = self._base("sensing_resettimer", parent)
+        elif isinstance(statement, Ask):
+            block = self._base("sensing_askandwait", parent)
+            self.blocks[block_id] = block
+            block["inputs"]["QUESTION"] = self._expr(statement.question, block_id, text=True)
+        elif isinstance(statement, Say):
+            block = self._base("looks_say", parent)
+            self.blocks[block_id] = block
+            block["inputs"]["MESSAGE"] = self._expr(statement.message, block_id, text=True)
         elif isinstance(statement, SwitchCostume):
             block = self._base("looks_switchcostumeto", parent)
             self.blocks[block_id] = block
@@ -639,9 +739,9 @@ class _Lowerer:
 
         return block_id
 
-    def _expr(self, expr: Expr, parent: str) -> list:
+    def _expr(self, expr: Expr, parent: str, *, text: bool = False) -> list:
         if isinstance(expr, Literal):
-            type_code = 10 if isinstance(expr.value, str) else 4
+            type_code = 10 if isinstance(expr.value, str) or text else 4
             return [1, [type_code, expr.value]]
         if isinstance(expr, Variable):
             return [3, [12, expr.name, self.var_ids[expr.name]], [10, ""]]
@@ -699,6 +799,16 @@ class _Lowerer:
             self.blocks[block_id] = block
             block["inputs"]["FROM"] = self._expr(expr.low, block_id)
             block["inputs"]["TO"] = self._expr(expr.high, block_id)
+        elif isinstance(expr, Answer):
+            self.blocks[block_id] = self._base("sensing_answer", parent)
+        elif isinstance(expr, Timer):
+            self.blocks[block_id] = self._base("sensing_timer", parent)
+        elif isinstance(expr, DaysSince2000):
+            self.blocks[block_id] = self._base("sensing_dayssince2000", parent)
+        elif isinstance(expr, Argument):
+            block = self._base("argument_reporter_string_number", parent)
+            block["fields"]["VALUE"] = [expr.name, None]
+            self.blocks[block_id] = block
         elif isinstance(expr, CostumeNumber):
             block = self._base("looks_costumenumbername", parent)
             block["fields"]["NUMBER_NAME"] = ["number", None]
@@ -784,7 +894,7 @@ def _resolve_static_unrolling(
 def _expr_uses_variable(expr: Expr, name: str) -> bool:
     if isinstance(expr, Variable):
         return expr.name == name
-    if isinstance(expr, (Literal, ListLength, CostumeNumber)):
+    if isinstance(expr, (Literal, ListLength, CostumeNumber, Answer, Argument)):
         return False
     if isinstance(expr, ListItem):
         return _expr_uses_variable(expr.index, name)
@@ -820,10 +930,16 @@ def _statement_accesses_variable(statement: Statement, name: str) -> bool:
         return statement.name == name or _expr_uses_variable(statement.value, name)
     if isinstance(statement, ChangeVariable):
         return statement.name == name or _expr_uses_variable(statement.value, name)
-    if isinstance(statement, (ClearList, ProcedureCall, BroadcastAndWait)):
+    if isinstance(statement, ProcedureCall):
+        return any(_expr_uses_variable(expr, name) for _, expr in statement.arguments)
+    if isinstance(statement, (ClearList, BroadcastAndWait)):
         return False
     if isinstance(statement, SwitchCostume):
         return _expr_uses_variable(statement.value, name)
+    if isinstance(statement, Ask):
+        return _expr_uses_variable(statement.question, name)
+    if isinstance(statement, Say):
+        return _expr_uses_variable(statement.message, name)
     if isinstance(statement, AppendList):
         return _expr_uses_variable(statement.value, name)
     if isinstance(statement, ReplaceListItem):
@@ -991,8 +1107,16 @@ def _render_expr(expr: Expr) -> str:
         return f"round({_render_expr(expr.value)})"
     if isinstance(expr, Random):
         return f"random({_render_expr(expr.low)}, {_render_expr(expr.high)})"
+    if isinstance(expr, Argument):
+        return f"argument({expr.name!r})"
     if isinstance(expr, CostumeNumber):
         return "costume_number()"
+    if isinstance(expr, Answer):
+        return "answer()"
+    if isinstance(expr, Timer):
+        return "timer()"
+    if isinstance(expr, DaysSince2000):
+        return "days_since_2000()"
     raise TypeError(type(expr).__name__)
 
 
@@ -1042,8 +1166,17 @@ def _render_statements(statements: Iterable[Statement], lines: list[str], depth:
             lines.append(f"{indent}else:")
             _render_statements(statement.else_body, lines, depth + 1)
         elif isinstance(statement, ProcedureCall):
-            lines.append(f"{indent}call {statement.name}")
+            arguments = ", ".join(
+                f"{name}={_render_expr(expr)}" for name, expr in statement.arguments
+            )
+            lines.append(f"{indent}call {statement.name}" + (f"({arguments})" if arguments else ""))
         elif isinstance(statement, BroadcastAndWait):
             lines.append(f"{indent}broadcast and wait {statement.message}")
         elif isinstance(statement, SwitchCostume):
             lines.append(f"{indent}switch costume to {_render_expr(statement.value)}")
+        elif isinstance(statement, Ask):
+            lines.append(f"{indent}ask {_render_expr(statement.question)} and wait")
+        elif isinstance(statement, Say):
+            lines.append(f"{indent}say {_render_expr(statement.message)}")
+        elif isinstance(statement, ResetTimer):
+            lines.append(f"{indent}reset timer")

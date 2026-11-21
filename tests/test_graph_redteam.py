@@ -13,6 +13,7 @@ class FunctionModel(nn.Module):
     def __init__(self, function):
         super().__init__()
         self.function = function
+        self.eval()
 
     def forward(self, *inputs):
         return self.function(*inputs)
@@ -134,33 +135,29 @@ def test_linear_division_by_zero_falls_back_from_epilogue(tmp_path):
     assert verify(model, value, result).passed
 
 
+@pytest.mark.parametrize(("left", "right"), [
+    ((1, 3, 4), (2, 4, 5)),
+    ((4,), (2, 4, 5)),
+    ((2, 3, 4), (4,)),
+    ((3, 4), (2, 4, 5)),
+    ((2, 1, 3, 4), (1, 5, 4, 6)),
+    ((5, 3, 4), (2, 5, 4, 6)),
+])
+def test_matmul_broadcasts_batch_dimensions(tmp_path, left, right):
+    torch.manual_seed(0)
+    model = FunctionModel(lambda a, b: a @ b).eval()
+    inputs = (torch.randn(left), torch.randn(right))
+    result = transpile(model, inputs, tmp_path / "broadcast")
+    assert verify(model, inputs, result).passed
+
+
 @pytest.mark.parametrize(
     ("model", "inputs", "message"),
     [
         (
-            FunctionModel(lambda left, right: left @ right),
-            (torch.randn(1, 3, 4), torch.randn(2, 4, 5)),
-            "identical batch dimensions",
-        ),
-        (
-            FunctionModel(lambda left, right: left @ right),
-            (torch.randn(4), torch.randn(2, 4, 5)),
-            "vector-by-batched",
-        ),
-        (
             FunctionModel(lambda left, right: torch.add(left, right, alpha=2)),
             (torch.randn(2, 3), torch.randn(2, 3)),
             "alpha=2",
-        ),
-        (
-            FunctionModel(lambda value: value.mean((0, 2))),
-            (torch.randn(2, 3, 4),),
-            "consecutive",
-        ),
-        (
-            FunctionModel(lambda value: torch.pow(value, 3)),
-            (torch.randn(2, 3),),
-            "exponents 0 and 2",
         ),
     ],
 )
@@ -174,36 +171,49 @@ def test_unsupported_semantic_variants_are_rejected(
 @pytest.mark.parametrize(
     "model",
     [
-        nn.Conv2d(2, 3, 3, dilation=2),
-        nn.Conv2d(4, 4, 3, groups=2),
-        nn.MaxPool2d(2, dilation=2),
-        nn.MaxPool2d(2, ceil_mode=True),
-        nn.AvgPool2d(3, padding=1, count_include_pad=False),
-        nn.AvgPool2d(2, divisor_override=7),
+        nn.Conv2d(2, 3, 3, dilation=2).eval(),
+        nn.Conv2d(4, 4, 3, groups=2).eval(),
+        nn.MaxPool2d(2, dilation=2).eval(),
+        nn.MaxPool2d(2, ceil_mode=True).eval(),
+        nn.AvgPool2d(3, padding=1, count_include_pad=False).eval(),
+        nn.AvgPool2d(2, divisor_override=7).eval(),
     ],
 )
-def test_unimplemented_convolution_and_pooling_options_are_rejected(
-    tmp_path, model,
-):
+def test_convolution_and_pooling_options_match(tmp_path, model):
     channels = 4 if isinstance(model, nn.Conv2d) and model.groups == 2 else 2
-    with pytest.raises(UnsupportedOperationError):
-        transpile(model, torch.randn(1, channels, 8, 8), tmp_path / "options")
+    value = torch.randn(1, channels, 8, 8)
+    result = transpile(model, value, tmp_path / "options")
+    assert verify(model, value, result, atol=1e-5).passed
 
 
-def test_batchnorm_without_running_statistics_is_rejected(tmp_path):
+def test_fractional_powers_match(tmp_path):
+    model = FunctionModel(lambda value: torch.pow(value.abs(), 1.5) + value ** 7)
+    value = torch.randn(2, 3)
+    assert verify(model, value, transpile(model, value, tmp_path / "power")).passed
+
+
+def test_batchnorm_without_running_statistics_uses_batch_statistics(tmp_path):
     model = nn.BatchNorm2d(3, track_running_stats=False).eval()
-    with pytest.raises(UnsupportedOperationError, match="running statistics"):
-        transpile(model, torch.randn(2, 3, 4, 4), tmp_path / "batchnorm")
+    value = torch.randn(2, 3, 4, 4)
+    result = transpile(model, value, tmp_path / "batchnorm")
+    assert verify(model, value, result, atol=1e-5).passed
 
 
-def test_default_gelu_requires_fast_activations(tmp_path):
+def test_mean_over_separated_dimensions(tmp_path):
+    model = FunctionModel(lambda value: value.mean((0, 2)))
+    value = torch.randn(2, 3, 4)
+    result = transpile(model, value, tmp_path / "mean")
+    assert verify(model, value, result).passed
+
+
+def test_default_gelu_is_exact_unless_fast_activations(tmp_path):
     model = nn.GELU().eval()
     value = torch.randn(2, 3)
-    with pytest.raises(UnsupportedOperationError, match="approximate='tanh'"):
-        transpile(model, value, tmp_path / "exact_gelu")
-    with pytest.raises(UnsupportedOperationError, match="approximate='tanh'"):
-        transpile(
-            model, value, tmp_path / "disabled_fast_gelu",
-            optimization="fast", fast_config=FastConfig(activations=False),
-        )
+    exact = transpile(model, value, tmp_path / "exact_gelu")
+    assert verify(model, value, exact, atol=1e-6).passed
+    disabled = transpile(
+        model, value, tmp_path / "disabled_fast_gelu",
+        optimization="fast", fast_config=FastConfig(activations=False),
+    )
+    assert verify(model, value, disabled, atol=1e-6).passed
     transpile(model, value, tmp_path / "fast_gelu", optimization="fast")

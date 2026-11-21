@@ -17,7 +17,7 @@ def _weight_only(policy: FastLayerConfig) -> FastConfig:
         activations=False,
         layer_norm=False,
         softmax=False,
-        weights=policy,
+        layers=policy,
     )
 
 
@@ -30,7 +30,7 @@ def build_cases():
         ("quick_gpt", TinyGPT(16, 2, 32, 8), torch.randint(0, 29, (1, 8))),
         ("catgpt1", TinyGPT(32, 2, 64, 32), torch.randint(0, 29, (1, 32))),
     ]
-    pruning = _weight_only(FastLayerConfig(pruning=0.5))
+    pruning = _weight_only(FastLayerConfig(block_pruning=0.5))
     low_rank = _weight_only(FastLayerConfig(rank_ratio=0.25))
     cases = []
     for name, model, example_input in models:
@@ -47,7 +47,7 @@ def main():
     path = build_benchmark_suite(
         build_cases(),
         OUTPUT,
-        iterations=100,
+        repeats=100,
     )
     print(f"Fast weight suite written: {path}")
 

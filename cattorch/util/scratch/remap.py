@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
-import copy
 import json
+
+
+def _copy(value):
+    """An independent copy of block JSON: nested lists and dicts are rebuilt.
+
+    Block JSON holds only strings, numbers, booleans, ``None``, lists and
+    dicts, so this matches ``copy.deepcopy`` at a fraction of the cost.
+    """
+    if isinstance(value, list):
+        return [_copy(item) if isinstance(item, (list, dict)) else item for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _copy(item) if isinstance(item, (list, dict)) else item
+            for key, item in value.items()
+        }
+    return value
 
 
 def _remap_embedded_reporter(value, mapping: dict[str, str]):
     """Remap the ID in an embedded variable/list/broadcast reporter tuple."""
     if not isinstance(value, list):
         return value
-    result = copy.deepcopy(value)
+    result = _copy(value)
     # Scratch primitive tuples 11, 12 and 13 store their typed data ID last:
     # [11, broadcast name, id], [12, variable name, id], [13, list name, id].
     if len(result) >= 3 and result[0] in {11, 12, 13}:
@@ -21,7 +36,7 @@ def _remap_embedded_reporter(value, mapping: dict[str, str]):
 
 def _remap_input(value, mapping: dict[str, str]):
     """Remap block/data references in one Scratch input specification."""
-    result = copy.deepcopy(value)
+    result = _copy(value)
     if not isinstance(result, list):
         return result
     # Input slots are [kind, primary] or [kind, primary, shadow]. A string in
@@ -37,10 +52,12 @@ def _remap_input(value, mapping: dict[str, str]):
     return result
 
 
-def _remap_blocks(blocks: dict, mapping: dict[str, str]) -> dict:
+def _remap_blocks(
+    blocks: dict, mapping: dict[str, str], share_unchanged: bool = False,
+) -> dict:
     remapped = {}
     for identifier, original in blocks.items():
-        block = copy.deepcopy(original)
+        block = _copy(original)
         for key in ("next", "parent", "comment"):
             reference = block.get(key)
             if isinstance(reference, str):
@@ -71,11 +88,17 @@ def _remap_blocks(blocks: dict, mapping: dict[str, str]) -> dict:
                     [mapping.get(item, item) for item in argument_ids],
                     separators=(",", ":"),
                 )
+        if share_unchanged and block == original:
+            # Nothing in it was remapped: keep the caller's block and let
+            # the copy go, so unchanged blocks are never held twice.
+            block = original
         remapped[mapping.get(identifier, identifier)] = block
     return remapped
 
 
-def remap_ids(data: dict, mapping: dict[str, str]) -> dict:
+def remap_ids(
+    data: dict, mapping: dict[str, str], *, share_unchanged: bool = False,
+) -> dict:
     """Return ``data`` with Scratch IDs remapped without changing literals.
 
     ``data`` may be a complete sprite dictionary or a block dictionary. Only
@@ -83,16 +106,21 @@ def remap_ids(data: dict, mapping: dict[str, str]) -> dict:
     variable values and list contents are deliberately preserved; treating all
     equal JSON strings as references corrupts token vocabularies when a block
     happens to have an ID such as ``"a"``.
+
+    ``share_unchanged`` returns the input's own objects for blocks that hold
+    no remapped ID instead of copies, for a caller that replaces its block
+    dictionary with the result and keeps no other use of the input.
     """
     mapping = {key: value for key, value in mapping.items() if key != value}
     if not mapping:
         return data
 
     if "blocks" not in data:
-        return _remap_blocks(data, mapping)
+        return _remap_blocks(data, mapping, share_unchanged)
 
-    result = copy.deepcopy(data)
-    result["blocks"] = _remap_blocks(result.get("blocks", {}), mapping)
+    # Blocks are rebuilt by _remap_blocks; everything else is copied once.
+    result = {key: _copy(value) for key, value in data.items() if key != "blocks"}
+    result["blocks"] = _remap_blocks(data.get("blocks", {}), mapping, share_unchanged)
     for section in ("variables", "lists", "broadcasts"):
         result[section] = {
             mapping.get(identifier, identifier): value
@@ -100,7 +128,7 @@ def remap_ids(data: dict, mapping: dict[str, str]) -> dict:
         }
     comments = {}
     for identifier, original in result.get("comments", {}).items():
-        comment = copy.deepcopy(original)
+        comment = _copy(original)
         block_id = comment.get("blockId")
         if isinstance(block_id, str):
             comment["blockId"] = mapping.get(block_id, block_id)

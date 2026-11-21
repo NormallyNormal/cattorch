@@ -115,7 +115,7 @@ def build_cases():
 def main():
     torch.manual_seed(123)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    path = build_benchmark_suite(build_cases(), OUTPUT, iterations=100)
+    path = build_benchmark_suite(build_cases(), OUTPUT, repeats=100)
     print(f"Kernel suite written: {path}")
 
 

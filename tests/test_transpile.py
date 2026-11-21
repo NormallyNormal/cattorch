@@ -5,54 +5,12 @@ Each test transpiles a PyTorch model, runs the resulting Scratch sprite
 through the emulator, and compares the output against PyTorch.
 """
 
-import json
-import os
-import zipfile
-
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cattorch.errors import UnsupportedOperationError
-from cattorch.transpiler import transpile
-from cattorch.util.scratch.emulator import ScratchEmulator
-
-TOLERANCE = 1e-4
-
-
-def _run_sprite(model: nn.Module, x: torch.Tensor) -> tuple[list[float], list[float]]:
-    """Transpile a model, run through emulator, return (expected, actual)."""
-    with torch.no_grad():
-        expected = model(x).flatten().tolist()
-
-    path = os.path.join(os.path.dirname(__file__), "_test_output")
-    transpile(model, x, path)
-
-    sprite_path = path + ".sprite3"
-    try:
-        with zipfile.ZipFile(sprite_path, "r") as z:
-            project = json.loads(z.read("sprite.json"))
-    finally:
-        os.remove(sprite_path)
-
-    emu = ScratchEmulator(project)
-    emu.lists["input"] = [float(v) for v in x.flatten().tolist()]
-    emu.run()
-    actual = [float(v) for v in emu.lists.get("output", [])]
-    return expected, actual
-
-
-def _assert_close(expected: list[float], actual: list[float], tolerance=TOLERANCE):
-    assert len(expected) == len(actual), (
-        f"Length mismatch: expected {len(expected)}, got {len(actual)}"
-    )
-    for i, (e, a) in enumerate(zip(expected, actual)):
-        if e == a:
-            continue
-        assert abs(e - a) < tolerance, (
-            f"Index {i}: expected {e:.6f}, got {a:.6f}"
-        )
+from sprite_helpers import assert_outputs_close, run_sprite
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -507,295 +465,295 @@ def seed():
 def test_single_matmul():
     model = SingleMatMul()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_chained_matmul():
     model = ChainedMatMul()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_matmul_with_bias():
     model = MatMulWithBias()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_matmul_relu():
     model = MatMulReLU()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_simple_neural_net():
     model = SimpleNN()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_linear():
     model = LinearModel()
     x = torch.randn(1, 2)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_linear_no_bias():
     model = LinearNoBias()
     x = torch.randn(1, 2)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_stacked_linear():
     model = StackedLinear()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_softmax_1d():
     model = Softmax1D()
     x = torch.randn(4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_softmax_2d():
     model = Softmax2D()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_softmax_3d():
     model = Softmax3D()
     x = torch.randn(3, 4, 5)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_scalar_multiply():
     model = ScalarMul()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_scalar_multiply_chained():
     model = ScalarMulChained()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_layernorm():
     model = LayerNorm1D()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_layernorm_2d():
     model = LayerNorm2D()
     x = torch.randn(2, 3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_view_reshape():
     model = ViewReshape()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_flatten():
     model = FlattenModel()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_scalar_divide():
     model = ScalarDiv()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_embedding():
     model = EmbeddingModel()
     x = torch.tensor([0, 3, 7, 1])
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_embedding_linear():
     model = EmbeddingLinear()
     x = torch.tensor([2, 5, 0])
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_tensor_multiply():
     model = TensorMultiply()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_masked_fill():
     model = MaskedFillModel()
     x = torch.randn(3, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_rms_norm():
     model = RMSNorm1D()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_rms_norm_2d():
     model = RMSNorm2D()
     x = torch.randn(2, 3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_split():
     model = SplitAdd()
     x = torch.randn(2, 12)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_chunk():
     model = ChunkAdd()
     x = torch.randn(2, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_negate():
     model = NegateModel()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_tensor_subtract():
     model = TensorSubtract()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_cat_dim0():
     model = CatDim0()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_cat_dim1():
     model = CatDim1()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_cat_three_way():
     model = CatThreeWay()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_split_cat():
     model = SplitCat()
     x = torch.randn(2, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_arange():
     model = ArangeAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_rope():
     model = RoPEModel(dim=8, max_len=16)
     x = torch.randn(4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_single_head_attention():
     model = SingleHeadAttention(d_model=8)
     x = torch.randn(3, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_transformer_block():
     model = TransformerBlock(d_model=8, d_ff=16)
     x = torch.randn(3, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_sigmoid():
     model = SigmoidModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_tanh():
     model = TanhModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_gelu():
     model = GELUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_silu():
     model = SiLUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_leaky_relu():
     model = LeakyReLUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_elu():
     model = ELUModel()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 # ── Edge case / chained op tests ─────────────────────────────────────────────
@@ -1145,267 +1103,267 @@ class PowMeanRsqrt(nn.Module):
 def test_chained_no_ops():
     model = ChainedNoOps()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_fan_out():
     model = FanOut()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_fan_out_divergent():
     model = FanOutDivergent()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_no_op_output():
     model = NoOpOutput()
     x = torch.randn(1, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_softmax_then_transpose():
     model = SoftmaxThenTranspose()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_residual_with_activations():
     model = ResidualWithActivations()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_deep_chain():
     model = DeepChain()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_layernorm_softmax_chain():
     model = LayerNormSoftmaxChain()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_scalar_chain():
     model = ScalarChain()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_activation_sandwich():
     model = ActivationSandwich()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_double_residual():
     model = DoubleResidual()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv1d():
     model = Conv1dSimple()
     x = torch.randn(1, 2, 8)  # (batch, channels, length)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv2d():
     model = Conv2dSimple()
     x = torch.randn(1, 1, 5, 5)  # (batch, channels, H, W)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv2d_no_bias():
     model = Conv2dNoBias()
     x = torch.randn(1, 1, 5, 5)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv2d_stride():
     model = Conv2dStride()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv2d_relu():
     model = Conv2dReLU()
     x = torch.randn(1, 1, 5, 5)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_tiny_conv_net():
     model = TinyConvNet()
     x = torch.randn(1, 1, 4, 4)  # small spatial dims to keep it fast
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_max_pool2d():
     model = MaxPool2dSimple()
     x = torch.randn(1, 1, 4, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_max_pool2d_padding():
     model = MaxPool2dPadding()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv_max_pool():
     model = ConvMaxPool()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_avg_pool2d():
     model = AvgPool2dSimple()
     x = torch.randn(1, 1, 4, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_avg_pool2d_padding():
     model = AvgPool2dPadding()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_adaptive_avg_pool():
     model = AdaptiveAvgPoolGlobal()
     x = torch.randn(1, 4, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv_pool_linear():
     model = ConvPoolLinear()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_batchnorm2d():
     model = BatchNorm2dSimple()
     model.eval()
     x = torch.randn(1, 3, 4, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_batchnorm1d():
     model = BatchNorm1dSimple()
     model.eval()
     x = torch.randn(1, 4, 8)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_conv_batchnorm_relu():
     model = ConvBatchNormReLU()
     model.eval()
     x = torch.randn(1, 1, 6, 6)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_pow_squared():
     model = PowSquared()
     x = torch.randn(2, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
-def test_pow_general_is_rejected():
+def test_pow_general():
     model = PowGeneral()
     x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs for ln
-    with pytest.raises(UnsupportedOperationError, match="exponents 0 and 2"):
-        _run_sprite(model, x)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_rsqrt():
     model = RSqrtModel()
     x = torch.abs(torch.randn(2, 3)) + 0.1  # positive inputs
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_mean_last_dim():
     model = MeanLastDim()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_mean_first_dim():
     model = MeanFirstDim()
     x = torch.randn(3, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_pow_mean_rsqrt():
     model = PowMeanRsqrt()
     x = torch.randn(2, 4)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_ones():
     model = OnesAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_zeros():
     model = ZerosAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_full():
     model = FullAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_ones_like():
     model = OnesLikeAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)
 
 
 def test_zeros_like():
     model = ZerosLikeAdd()
     x = torch.randn(4, 3)
-    expected, actual = _run_sprite(model, x)
-    _assert_close(expected, actual)
+    expected, actual = run_sprite(model, x)
+    assert_outputs_close(expected, actual)

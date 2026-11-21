@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import zipfile
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -18,7 +16,7 @@ from cattorch.operator_registry import default_registry
 from cattorch.experimental import (
     ExpertFamily, RoutingScores, SparseMoE, StackedSwiGLUMoE, select_routes,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
+from sprite_helpers import load_emulator, load_sprite
 
 
 class Scale(nn.Module):
@@ -258,8 +256,7 @@ def test_generic_expert_block_graph_does_not_grow_with_expert_count(tmp_path):
             ),
         ).eval()
         result = transpile(model, torch.ones(1, 2), tmp_path / f"experts-{experts}")
-        with zipfile.ZipFile(result.path) as archive:
-            counts.append(len(json.loads(archive.read("sprite.json"))["blocks"]))
+        counts.append(len(load_sprite(result.path)["blocks"]))
     assert counts[1] == counts[0]
 
 
@@ -397,6 +394,66 @@ def test_generic_exact_tanh_activations_stay_finite_at_extremes(tmp_path):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("exponent", [2, 3, -2, 0.5, -0.5])
+def test_generic_expert_power(tmp_path, exponent):
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up = nn.Linear(3, 4)
+            self.down = nn.Linear(4, 3)
+
+        def forward(self, value):
+            # Keep the base positive so fractional and negative powers are finite.
+            return self.down((torch.sigmoid(self.up(value)) + 0.5) ** exponent)
+
+    torch.manual_seed(15)
+    model = SparseMoE(
+        nn.Linear(3, 2),
+        ExpertFamily.from_modules([Expert(), Expert()], example_input=torch.ones(1, 3)),
+    ).eval()
+    value = torch.randn(3, 3)
+    result = transpile(model, value, tmp_path / "power-expert")
+    comparison = verify(model, value, result, atol=1e-5)
+    assert comparison.passed, comparison
+
+
+def test_generic_expert_rejects_unsupported_power(tmp_path):
+    class Expert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2)
+
+        def forward(self, value):
+            return self.linear(value) ** 5
+
+    model = SparseMoE(
+        nn.Linear(2, 2),
+        ExpertFamily.from_modules([Expert(), Expert()], example_input=torch.ones(1, 2)),
+    ).eval()
+    with pytest.raises(ValueError, match="pow exponent 5"):
+        transpile(model, torch.ones(1, 2), tmp_path / "power-five")
+
+
+@torch.no_grad()
+def test_generic_exact_gelu_expert_matches_eager_including_the_tail(tmp_path):
+    torch.manual_seed(14)
+    model = SparseMoE(
+        nn.Linear(3, 3),
+        ExpertFamily.from_modules(
+            [nn.Sequential(nn.Linear(3, 6), nn.GELU(), nn.Linear(6, 3)) for _ in range(3)],
+            example_input=torch.ones(1, 3),
+        ),
+        top_k=2,
+    ).eval()
+    value = torch.tensor([[-12.0, 0.5, 3.0], [0.0, -2.0, 40.0], [1e-3, -0.3, -50.0]])
+    result = transpile(model, value, tmp_path / "exact-gelu-expert")
+    comparison = verify(model, value, result, atol=1e-5)
+    assert comparison.passed, comparison
+    variables = load_sprite(result.path)["variables"].values()
+    assert "_expert gelu erfc" in {name for name, _ in variables}
+
+
+@torch.no_grad()
 def test_stacked_swiglu_semantic_module_lowers_to_scratch(tmp_path):
     torch.manual_seed(42)
     model = StackedSwiGLUMoE(
@@ -470,8 +527,13 @@ def test_fast_neuron_pruning_reduces_stacked_swiglu_work():
 
 
 @torch.no_grad()
-def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(tmp_path):
-    width, experts, hidden = 48, 8, 300
+def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(
+    tmp_path, small_list_limit,
+):
+    # Each bank holds 2,048 values over both layers, just over the lowered
+    # limit; one layer's 1,024 fit in a list.
+    small_list_limit(2_000)
+    width, experts, hidden = 8, 4, 32
 
     class Block(nn.Module):
         def __init__(self):
@@ -510,15 +572,17 @@ def test_shared_quantized_moe_banks_keep_groups_aligned_across_shards(tmp_path):
                 bits=4, method="symmetric", min_quantized_values=1,
             ),
             codegen=CodegenConfig(
-                id_namespace="", unrolling="compact", layer_sharing=mode,
+                id_namespace="", unrolling="compact", layer_sharing=mode == "auto",
             ),
         )
-        with zipfile.ZipFile(result.path) as archive:
-            emulator = ScratchEmulator(json.loads(archive.read("sprite.json")))
+        emulator = load_emulator(result.path)
         emulator.lists["input"] = value.flatten().tolist()
         emulator.run_procedure("cattorch forward")
         outputs[mode] = torch.tensor(emulator.lists["output"])
         if mode == "auto":
-            assert "cattorch shared transformer layer" in emulator._procedures
+            assert "_cattorch shared transformer layer" in emulator._procedures
+            assert {
+                f"_W__param_constant{index} shard 2" for index in (1, 2, 3)
+            } <= set(emulator._list_name_to_ids)
 
     torch.testing.assert_close(outputs["auto"], outputs["off"], atol=1e-6, rtol=0)

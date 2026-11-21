@@ -1,40 +1,52 @@
-"""Optimized kernels authored with the internal Scratch DSL."""
+"""Building blocks shared by the library's kernels."""
 
 import math
 
 import torch
 
-from cattorch.util.instruction.instruction import Instruction
 from cattorch.util.scratch.dsl import (
-    Program,
     add,
     append,
     change_var,
-    clear,
     div,
-    eq,
-    gt,
-    if_,
-    if_else,
     item,
-    length,
-    lt,
     mathop,
     mod,
     mul,
-    repeat,
     static_unrolled_repeat,
-    replace,
-    set_var,
     sub,
     var,
 )
 
 
+# Activation formulas shared by the elementwise, linear-epilogue and expert
+# kernels, so their results agree exactly.
+
+def sigmoid_of(value):
+    """``1 / (1 + e^-x)``."""
+    return div(1, add(1, mathop("e ^", mul(-1, value))))
+
+
+def tanh_of(value):
+    """``2 / (1 + e^-2x) - 1``, which doesn't overflow for large ``x``."""
+    return sub(div(2, add(1, mathop("e ^", mul(-2, value)))), 1)
+
+
+def quick_gelu_of(value):
+    """Fast mode's GELU: ``x * sigmoid(1.702 x)``."""
+    return mul(value, div(1, add(1, mathop("e ^", mul(-1.702, value)))))
+
+
+def tanh_gelu_inner(value):
+    """``sqrt(2 / pi) * (x + 0.044715 x^3)``; tanh GELU is
+    ``0.5 x (1 + tanh(inner))``."""
+    return mul(0.7978845608028654, add(value, mul(0.044715, mul(mul(value, value), value))))
+
+
 def _unrolled_dot_statements(
     inner: int,
     *,
-    left_list: str = "T1",
+    left_list: str,
     right_list: str,
     right_index: str,
     right_step: int,
@@ -67,7 +79,7 @@ def _unrolled_dot_statements(
 def _unrolled_offset_dot_statements(
     inner: int,
     *,
-    left_list: str = "T1",
+    left_list: str,
     right_list: str,
     right_offset: str,
     factor: int = 4,
@@ -102,7 +114,8 @@ def _unrolled_copy_statements(
     index: str,
     count: int,
     factor: int = 8,
-    destination: str = "T3",
+    *,
+    destination: str,
 ):
     """Append a contiguous span with the browser-proven lightweight unroll."""
     step = (
@@ -119,6 +132,17 @@ def _static_unrolled_repeat(count: int, step, factor: int = 4):
     return (static_unrolled_repeat(
         count, tuple(step), max_factor=factor, priority=2,
     ),)
+
+
+def argument_at(ctx, position: int, default=None):
+    """The tensor or value a kernel's call passed at ``position``.
+
+    ``default`` if the call passed fewer arguments.
+    """
+    if position >= len(ctx.argument_names):
+        return default
+    name = ctx.argument_names[position]
+    return ctx.inputs[name] if name in ctx.inputs else ctx.scalars.get(name)
 
 
 def _broadcast_index(shape, output_shape, map_name: str, index=None):

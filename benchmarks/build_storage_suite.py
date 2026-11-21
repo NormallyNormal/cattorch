@@ -18,7 +18,7 @@ def main():
         ("quick_gpt", TinyGPT(16, 2, 32, 8).eval(), torch.randint(0, 29, (1, 8))),
         ("catgpt1", TinyGPT(32, 2, 64, 32).eval(), torch.randint(0, 29, (1, 32))),
     ]
-    path = build_storage_benchmark_suite(cases, OUTPUT, iterations=10)
+    path = build_storage_benchmark_suite(cases, OUTPUT, repeats=10)
     print(f"Storage suite written: {path}")
 
 

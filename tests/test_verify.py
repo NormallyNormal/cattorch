@@ -13,18 +13,18 @@ class Outputs(torch.nn.Module):
     def __init__(self, function):
         super().__init__()
         self.function = function
+        self.eval()
 
     def forward(self, value):
         return self.function(value)
 
 
-@pytest.mark.parametrize("frontend", ["fx", "export"])
 @pytest.mark.parametrize("use_path", [False, True])
-def test_verify_nested_outputs_in_export_order(tmp_path, frontend, use_path):
+def test_verify_nested_outputs_in_export_order(tmp_path, use_path):
     model = Outputs(lambda x: {"z": x, "a": (-x, [x.mean(dim=1), x])})
     value = torch.tensor([[1.0, 2.0, 3.0], [-4.0, 5.0, -6.0]])
     artifact = transpile(
-        model, value, tmp_path / "nested", frontend=frontend,
+        model, value, tmp_path / "nested",
         codegen=CodegenConfig(compact_internal_names=True),
     )
     result = verify(model, value, artifact.path if use_path else artifact)
@@ -79,7 +79,7 @@ def test_verify_empty_output_and_sharded_later_output(tmp_path):
         model, value, tmp_path / "sharded",
         codegen=CodegenConfig(compact_internal_names=True),
     )
-    assert "output_1" in artifact.sharded_lists
+    assert "sharded output_1" in artifact.sharded_lists
     result = verify(model, value, artifact.path)
     assert result.passed
     assert result.outputs[0].values_compared == 0

@@ -1,4 +1,4 @@
-"""Experimental multi-entrypoint and persistent-state export contracts.
+"""Multi-entrypoint, persistent-state and generation export contracts.
 
 The objects in this module describe the public Scratch interface without
 coupling it to FX placeholder names.  They are intentionally small immutable
@@ -8,30 +8,88 @@ writing an artifact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
+import math
 import re
+import unicodedata
 from typing import Literal
 
 import torch
+
+from cattorch import interface
 
 
 def _name(value: str, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
+    if any(unicodedata.category(character) == "Cc" for character in value.strip()):
+        raise ValueError(f"{field} {value!r} can't contain control characters such as newlines")
     return value.strip()
+
+
+def dynamic_dimension(value, example: torch.Tensor, where: str) -> dict[int, tuple[int, int]]:
+    """One input's ``dynamic`` bounds in their canonical form, ``{dimension: (minimum, maximum)}``.
+
+    ``value`` is that form, or ``(minimum, maximum)`` for the first
+    dimension. Every API that takes variable-length bounds (``transpile``,
+    ``@entrypoint``, ``Input`` and the command line) accepts both. Only one
+    dimension of an input can vary, and the dimensions before it must have
+    size 1, so its items are whole rows of the flattened list.
+    """
+    if isinstance(value, dict):
+        if len(value) != 1:
+            raise ValueError(f"{where} can vary in one dimension, not {len(value)}")
+        ((dimension, bounds),) = value.items()
+    else:
+        dimension, bounds = 0, value
+    if (
+        not isinstance(bounds, (tuple, list)) or len(bounds) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds)
+        or not 1 <= bounds[0] <= bounds[1]
+    ):
+        raise ValueError(
+            f"dynamic bounds for {where} must be (minimum, maximum), or "
+            "{dimension: (minimum, maximum)}, with 1 <= minimum <= maximum"
+        )
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or not (
+        0 <= dimension < example.ndim
+    ):
+        raise ValueError(f"{where} has no dimension {dimension!r}")
+    if math.prod(example.shape[:dimension]) != 1:
+        raise ValueError(
+            f"the dynamic dimension {dimension} of {where} must come after dimensions of size 1"
+        )
+    if example.shape[dimension] < 1:
+        raise ValueError(f"{where} needs an example with an item along dimension {dimension}")
+    return {dimension: (int(bounds[0]), int(bounds[1]))}
 
 
 @dataclass(frozen=True)
 class Input:
-    """One tensor argument supplied through a public Scratch list."""
+    """One tensor argument supplied through a public Scratch list.
+
+    ``dynamic={dimension: (minimum, maximum)}`` lets that dimension's length
+    vary between those bounds at run time; ``dynamic=(minimum, maximum)`` is
+    short for the first dimension. The field holds the long form.
+    """
 
     name: str
     example: torch.Tensor
+    _: KW_ONLY
+    dynamic: dict[int, tuple[int, int]] | tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "input name"))
         if not isinstance(self.example, torch.Tensor):
             raise TypeError("Input.example must be a torch.Tensor")
+        if self.dynamic is not None:
+            object.__setattr__(
+                self, "dynamic",
+                dynamic_dimension(self.dynamic, self.example, f"input {self.name!r}"),
+            )
+
+    def __hash__(self) -> int:
+        return hash((self.name, id(self.example)))
 
 
 @dataclass(frozen=True)
@@ -62,11 +120,11 @@ class State:
                 or self.capacity < self.initial.shape[0]
             ):
                 raise ValueError(
-                    "append state capacity must be an integer no smaller than "
-                    "its initial leading dimension"
+                    f"append state {self.name!r} needs capacity=, a whole number of rows "
+                    f"no smaller than its initial {self.initial.shape[0]}"
                 )
         elif self.capacity is not None:
-            raise ValueError("capacity is only valid for append state")
+            raise ValueError(f"capacity= is only valid for append state, and {self.name!r} is a replace state")
 
 
 @dataclass(frozen=True)
@@ -116,31 +174,72 @@ class EntryPoint:
     returns: tuple[ReturnBinding, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _name(self.name, "entrypoint name"))
-        if self.name in {"init", "reset", "prepare for save"}:
-            raise ValueError(f"entrypoint name {self.name!r} is reserved for lifecycle procedures")
+        object.__setattr__(self, "name", _name(self.name, "entry point name"))
+        block = interface.entry_procedure(self.name)
+        for lifecycle in interface.PROGRAM_LIFECYCLE:
+            # Scratch matches blocks exactly and broadcasts ignoring case.
+            if block == lifecycle or interface.broadcast_key(
+                interface.completion(block),
+            ) == interface.broadcast_key(interface.completion(lifecycle)):
+                raise ValueError(
+                    f"entry point name {self.name!r} is reserved: its broadcast "
+                    f"{interface.message('NAME', block)!r} would be the program's own "
+                    f"{interface.message('NAME', lifecycle)!r}, which Scratch matches "
+                    "ignoring case"
+                )
         if re.search(r"%[snb]", self.name):
-            raise ValueError("entrypoint names cannot contain Scratch argument placeholders")
-        object.__setattr__(self, "method", _name(self.method, "entrypoint method"))
+            raise ValueError("entry point names can't contain Scratch argument placeholders")
+        object.__setattr__(self, "method", _name(self.method, "entry point method"))
         object.__setattr__(self, "arguments", tuple(self.arguments))
         object.__setattr__(self, "returns", tuple(self.returns))
-        if not self.arguments:
-            raise ValueError("an entrypoint must declare at least one argument")
         if not self.returns:
-            raise ValueError("an entrypoint must declare at least one return binding")
+            raise ValueError(
+                f"entry point {self.name!r} needs at least one value in returns=, an "
+                "Output or a StateUpdate"
+            )
         if any(not isinstance(value, (Input, StateInput)) for value in self.arguments):
-            raise TypeError("entrypoint arguments must be Input or StateInput values")
+            raise TypeError("entry point arguments must be Input or StateInput values")
         if any(not isinstance(value, (Output, StateUpdate)) for value in self.returns):
-            raise TypeError("entrypoint returns must be Output or StateUpdate values")
+            raise TypeError("entry point returns must be Output or StateUpdate values")
         input_names = [value.name for value in self.arguments if isinstance(value, Input)]
         output_names = [value.name for value in self.returns if isinstance(value, Output)]
         if len(input_names) != len(set(input_names)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate input names")
+            raise ValueError(f"entry point {self.name!r} has duplicate input names")
         if len(output_names) != len(set(output_names)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate output names")
+            raise ValueError(f"entry point {self.name!r} has duplicate output names")
         updates = [value.name for value in self.returns if isinstance(value, StateUpdate)]
         if len(updates) != len(set(updates)):
-            raise ValueError(f"entrypoint {self.name!r} has duplicate state updates")
+            raise ValueError(f"entry point {self.name!r} has duplicate state updates")
+
+
+def _check_messages(entry_names: list[str]) -> None:
+    """Refuse entry points whose broadcasts Scratch can't tell apart.
+
+    Scratch matches broadcasts ignoring case, so ``step`` and ``Step`` would
+    share ``NAME step complete``. Entry point E is called by the message
+    ``NAME E``, and its call ends with ``NAME E complete``, so an entry
+    point named ``E complete`` would also run when E's call ends.
+    Block, variable and list names are matched exactly, and the exact
+    checks elsewhere cover them.
+    """
+    seen: dict[str, str] = {}
+    for name in entry_names:
+        key = interface.broadcast_key(name)
+        if key in seen:
+            raise ValueError(
+                f"entry points {seen[key]!r} and {name!r} differ only in case, and Scratch "
+                f"matches their broadcasts ('NAME {name}') ignoring case; rename one"
+            )
+        seen[key] = name
+    for name in entry_names:
+        key = interface.broadcast_key(interface.completion(name))
+        if key in seen:
+            raise ValueError(
+                f"entry point {seen[key]!r} is named like entry point {name!r}'s completion: "
+                f"{name!r}'s call ends by broadcasting "
+                f"'NAME {interface.completion(name)}', which would also run "
+                f"{seen[key]!r}; rename one"
+            )
 
 
 @dataclass(frozen=True)
@@ -154,7 +253,7 @@ class ExportProgram:
         object.__setattr__(self, "entrypoints", tuple(self.entrypoints))
         object.__setattr__(self, "states", tuple(self.states))
         if not self.entrypoints:
-            raise ValueError("ExportProgram requires at least one entrypoint")
+            raise ValueError("ExportProgram requires at least one entry point")
         if any(not isinstance(value, EntryPoint) for value in self.entrypoints):
             raise TypeError("ExportProgram.entrypoints must contain EntryPoint values")
         if any(not isinstance(value, State) for value in self.states):
@@ -162,7 +261,8 @@ class ExportProgram:
         entry_names = [value.name for value in self.entrypoints]
         state_names = [value.name for value in self.states]
         if len(entry_names) != len(set(entry_names)):
-            raise ValueError("entrypoint names must be unique")
+            raise ValueError("entry point names must be unique")
+        _check_messages(entry_names)
         if len(state_names) != len(set(state_names)):
             raise ValueError("state names must be unique")
         states = {value.name: value for value in self.states}
@@ -174,12 +274,15 @@ class ExportProgram:
                 name = f"cattorch {entrypoint.name} {binding.name}"
                 owner = ("entrypoint", entrypoint.name)
                 if name in public_names and public_names[name] != owner:
-                    raise ValueError(f"public list name collision: {name!r}")
+                    raise ValueError(
+                        f"two lists would both be named {name!r}; rename an entry "
+                        "point, input, output or state"
+                    )
                 public_names[name] = owner
             for argument in entrypoint.arguments:
                 if isinstance(argument, StateInput) and argument.name not in states:
                     raise ValueError(
-                        f"entrypoint {entrypoint.name!r} references unknown state "
+                        f"entry point {entrypoint.name!r} references unknown state "
                         f"{argument.name!r}"
                     )
             for returned in entrypoint.returns:
@@ -188,7 +291,7 @@ class ExportProgram:
                 state = states.get(returned.name)
                 if state is None:
                     raise ValueError(
-                        f"entrypoint {entrypoint.name!r} updates unknown state "
+                        f"entry point {entrypoint.name!r} updates unknown state "
                         f"{returned.name!r}"
                     )
                 if returned.mode is not None and returned.mode != state.mode:
@@ -205,28 +308,38 @@ class ExportProgram:
 class GenerationProgram:
     """A complete autoregressive decoder interface for one Scratch sprite.
 
-    The named model method must accept ``example_token`` and return next-token
-    logits. cattorch recognizes its causal attention, adds a KV cache of
-    ``max_context`` tokens, and creates init, reset, prefill, and decode
-    blocks.
+    ``GenerationProgram(max_context=64)`` exports an ordinary stateless
+    ``forward(tokens) -> logits`` model (including an unwrapped Hugging Face
+    causal language model). cattorch traces it at ``max_context`` tokens,
+    derives the one-token step with a K/V cache per attention layer, checks it
+    against the original model, and creates init, reset, prefill, and decode
+    blocks. ``method`` names the method to export; ``None`` (the default)
+    means the model's ``@generate`` method if it has one, else ``forward``.
+    A Hugging Face model's first tensor output (the logits) is the interface.
+    ``hidden_prefill`` skips the output layer for every prompt token but the
+    last; ``top_k`` also lists the largest logits and their token IDs.
     """
 
-    method: str
-    example_token: torch.Tensor
     max_context: int
+    _: KW_ONLY
+    method: str | None = None
     hidden_prefill: bool = True
     top_k: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "method", _name(self.method, "generation method"))
-        if not isinstance(self.example_token, torch.Tensor):
-            raise TypeError("GenerationProgram.example_token must be a torch.Tensor")
-        if self.example_token.numel() != 1:
-            raise ValueError("GenerationProgram.example_token must contain one token")
         if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
-            raise TypeError("GenerationProgram.max_context must be an integer")
-        if self.max_context < 1:
-            raise ValueError("GenerationProgram.max_context must be positive")
+            raise TypeError(
+                "GenerationProgram.max_context must be an integer; the other "
+                "fields are keyword-only, as in GenerationProgram(64, method=...)"
+            )
+        if self.max_context < 3:
+            raise ValueError(
+                f"GenerationProgram.max_context must be at least 3, not {self.max_context}: "
+                "cattorch traces the model at max_context and max_context - 1 tokens "
+                "to find what depends on the length"
+            )
+        if self.method is not None:
+            object.__setattr__(self, "method", _name(self.method, "generation method"))
         if not isinstance(self.hidden_prefill, bool):
             raise TypeError("GenerationProgram.hidden_prefill must be a boolean")
         if self.top_k is not None:
@@ -237,6 +350,74 @@ class GenerationProgram:
 
 
 @dataclass(frozen=True)
+class RecurrentGenerationProgram:
+    """A token-by-token generator for a model whose sequence mixing is a recurrence.
+
+    ``RecurrentGenerationProgram((State("hidden", torch.zeros(1, 1, 64)),))``
+    exports a model method ``step(token, *states) -> (logits, *new_states)``,
+    where ``token`` is a ``[1, 1]`` tensor of one token ID, the states come in
+    the order of ``states``, and the logits flatten to one vocabulary row.
+    It suits GRU and LSTM language models, Mamba and RWKV. The sprite has the
+    same init, reset, prefill and decode blocks as a ``GenerationProgram``;
+    reset restores each state's initial value. ``max_context`` limits how many
+    tokens it reads between resets (None: no limit), and ``reference``
+    names a stateless ``method(tokens) -> logits`` the step is checked
+    against at export.
+
+    ``states=None`` (the default) exports a Hugging Face Mamba, Mamba-2 or
+    RWKV causal language model directly: cattorch supplies its step, states
+    and reference check, so ``RecurrentGenerationProgram()`` is enough.
+    """
+
+    states: tuple[State, ...] | None = None
+    _: KW_ONLY
+    step: str = "step"
+    max_context: int | None = None
+    hidden_prefill: bool = True
+    top_k: int | None = None
+    reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.states is not None:
+            self._check_states()
+        object.__setattr__(self, "step", _name(self.step, "recurrent step"))
+        if self.reference is not None:
+            object.__setattr__(self, "reference", _name(self.reference, "reference method"))
+        if self.states is None and (self.step != "step" or self.reference is not None):
+            raise ValueError(
+                "RecurrentGenerationProgram step= and reference= need states=; without "
+                "states, the Hugging Face model's adapter supplies all three"
+            )
+        if self.max_context is not None:
+            if isinstance(self.max_context, bool) or not isinstance(self.max_context, int):
+                raise TypeError("RecurrentGenerationProgram.max_context must be an integer or None")
+            if self.max_context < 1:
+                raise ValueError("RecurrentGenerationProgram.max_context must be positive")
+        if not isinstance(self.hidden_prefill, bool):
+            raise TypeError("RecurrentGenerationProgram.hidden_prefill must be a boolean")
+        if self.top_k is not None:
+            if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
+                raise TypeError("RecurrentGenerationProgram.top_k must be an integer or None")
+            if not 1 <= self.top_k <= 64:
+                raise ValueError("RecurrentGenerationProgram.top_k must be between 1 and 64")
+
+    def _check_states(self) -> None:
+        if isinstance(self.states, State) or not isinstance(self.states, (tuple, list)):
+            raise TypeError("RecurrentGenerationProgram.states must be a tuple of State values")
+        object.__setattr__(self, "states", tuple(self.states))
+        if not self.states:
+            raise ValueError("RecurrentGenerationProgram needs at least one state")
+        if any(not isinstance(value, State) for value in self.states):
+            raise TypeError("RecurrentGenerationProgram.states must contain State values")
+        names = [state.name for state in self.states]
+        if len(names) != len(set(names)):
+            raise ValueError("RecurrentGenerationProgram state names must be unique")
+        for state in self.states:
+            if state.mode != "replace":
+                raise ValueError(f"recurrent state {state.name!r} must be a replace state")
+
+
+@dataclass(frozen=True)
 class ProgramCall:
     """One named invocation used by calibration and stateful verification."""
 
@@ -244,7 +425,7 @@ class ProgramCall:
     inputs: tuple[torch.Tensor, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "entrypoint", _name(self.entrypoint, "call entrypoint"))
+        object.__setattr__(self, "entrypoint", _name(self.entrypoint, "call entry point"))
         object.__setattr__(self, "inputs", tuple(self.inputs))
         if any(not isinstance(value, torch.Tensor) for value in self.inputs):
             raise TypeError("ProgramCall.inputs must contain only tensors")
@@ -252,5 +433,6 @@ class ProgramCall:
 
 __all__ = [
     "ArgumentBinding", "EntryPoint", "ExportProgram", "GenerationProgram", "Input", "Output",
-    "ProgramCall", "ReturnBinding", "State", "StateInput", "StateUpdate",
+    "ProgramCall", "RecurrentGenerationProgram", "ReturnBinding", "State", "StateInput",
+    "StateUpdate",
 ]

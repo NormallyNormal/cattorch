@@ -1,3 +1,5 @@
+from cattorch import interface
+import copy
 import json
 import zipfile
 
@@ -5,9 +7,9 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import cattorch.frontend as frontend_module
 
 from cattorch import (
+    CattorchWarning,
     CodegenConfig,
     FastConfig,
     FastLayerConfig,
@@ -19,7 +21,6 @@ from cattorch import (
     UnsupportedOperationError,
     verify,
 )
-from cattorch.graph import _GenerationSpec
 from cattorch.transpiler import _prepare_graph
 from cattorch.fast import prepare_fast_matmul_weights, prepare_fast_model
 from cattorch.benchmark import (
@@ -48,33 +49,11 @@ from cattorch.util.scratch.dsl import (
     switch_costume,
     var,
 )
-from cattorch.util.scratch.emulator import ScratchEmulator
-from cattorch.util.instruction.optimized import LinearInstruction
-
-
-def test_export_scopes_older_torch_dynamo_recompile_limits(monkeypatch):
-    config = torch._dynamo.config
-    names = [
-        name
-        for name in (
-            "cache_size_limit",
-            "recompile_limit",
-            "accumulated_cache_size_limit",
-        )
-        if hasattr(config, name)
-    ]
-    observed = {}
-
-    def fake_export(model, inputs):
-        observed.update({name: getattr(config, name) for name in names})
-        return "exported"
-
-    monkeypatch.setattr(frontend_module, "export", fake_export)
-    with config.patch(**{name: 1 for name in names}):
-        assert frontend_module._export_model(nn.Identity(), (torch.ones(1),)) == "exported"
-        assert all(getattr(config, name) == 1 for name in names)
-
-    assert all(value >= 1024 for value in observed.values())
+from cattorch.util.instruction import optimized_linear
+from cattorch.interface import TOKEN_IDS
+from shared_models import CachedAttention, CachedLM, CachedMQALM
+from cattorch.util.scratch.globals import global_references
+from sprite_helpers import SpriteEmulator, load_sprite
 
 
 class LinearActivation(nn.Module):
@@ -144,123 +123,8 @@ class NonDivisibleAdaptivePool(nn.Module):
         return F.adaptive_avg_pool2d(x, (3, 2))
 
 
-class CachedAttention(nn.Module):
-    def __init__(self, width=8, heads=2, context=6):
-        super().__init__()
-        self.heads = heads
-        self.head_width = width // heads
-        self.qkv = nn.Linear(width, width * 3, bias=False)
-        self.projection = nn.Linear(width, width, bias=False)
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context, context, dtype=torch.bool), diagonal=1),
-        )
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        k = k.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        v = v.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
-        weights = F.softmax(
-            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
-        )
-        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
-        return self.projection(joined)
-
-
-class CachedMQAAttention(nn.Module):
-    def __init__(self, width=8, heads=2, context=6):
-        super().__init__()
-        self.heads = heads
-        self.head_width = width // heads
-        self.qkv = nn.Linear(width, width + 2 * self.head_width, bias=False)
-        self.projection = nn.Linear(width, width, bias=False)
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context, context, dtype=torch.bool), diagonal=1),
-        )
-
-    def forward(self, x):
-        batch, length, width = x.shape
-        q, k, v = self.qkv(x).split(
-            (width, self.head_width, self.head_width), dim=-1,
-        )
-        q = q.view(batch, length, self.heads, self.head_width).transpose(1, 2)
-        k = k.view(batch, length, 1, self.head_width).transpose(1, 2)
-        v = v.view(batch, length, 1, self.head_width).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / self.head_width ** 0.5
-        weights = F.softmax(
-            scores.masked_fill(self.mask[:length, :length], float("-inf")), dim=-1,
-        )
-        joined = (weights @ v).transpose(1, 2).reshape(batch, length, width)
-        return self.projection(joined)
-
-
-class CachedBlock(nn.Module):
-    def __init__(self, context=6):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(8)
-        self.attention = CachedAttention(context=context)
-        self.norm2 = nn.LayerNorm(8)
-        self.mlp = nn.Sequential(
-            nn.Linear(8, 12), nn.GELU(approximate="tanh"), nn.Linear(12, 8),
-        )
-
-    def forward(self, x):
-        x = x + self.attention(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
-
-
-class CachedLM(nn.Module):
-    def __init__(self, context=6, layers=2):
-        super().__init__()
-        self.token = nn.Embedding(13, 8)
-        self.position = nn.Embedding(context, 8)
-        self.blocks = nn.Sequential(*(CachedBlock(context) for _ in range(layers)))
-        self.norm = nn.LayerNorm(8)
-        self.head = nn.Linear(8, 13, bias=False)
-
-    def forward(self, tokens):
-        length = tokens.shape[1]
-        x = self.token(tokens) + self.position(torch.arange(length))
-        return self.head(self.norm(self.blocks(x)))
-
-
-class CachedMQALM(CachedLM):
-    def __init__(self, context=6, layers=2):
-        super().__init__(context=context, layers=layers)
-        for block in self.blocks:
-            block.attention = CachedMQAAttention(context=context)
-
-
-class LayerPositionCachedMQABlock(CachedBlock):
-    def __init__(self, context=6):
-        super().__init__(context=context)
-        self.attention = CachedMQAAttention(context=context)
-        self.position = nn.Embedding(context, 8)
-        self.register_buffer("position_index", torch.zeros(1, dtype=torch.long))
-
-    def forward(self, x):
-        position = self.position(self.position_index).view(1, 1, 8)
-        x = x + self.attention(self.norm1(x) + position)
-        return x + self.mlp(self.norm2(x))
-
-
-class LayerPositionCachedMQALM(CachedLM):
-    def __init__(self, context=6, layers=2):
-        super().__init__(context=context, layers=layers)
-        self.blocks = nn.Sequential(*(
-            LayerPositionCachedMQABlock(context=context) for _ in range(layers)
-        ))
-
-
-def _load_sprite(path):
-    with zipfile.ZipFile(path) as archive:
-        return json.loads(archive.read("sprite.json"))
-
-
 def _run(sprite, values):
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = list(values)
     emulator.run()
     return [float(value) for value in emulator.lists["output"]]
@@ -307,7 +171,7 @@ def test_dsl_compiles_and_renders_readable_kernel():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["T1"] = [1, 2, 3]
     emulator.run()
     assert emulator.lists["T2"] == [13]
@@ -322,7 +186,7 @@ def test_dsl_round_reporter():
         body=(append("output", round_(2.6)),),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
     assert emulator.lists["output"] == [3]
     assert "round(2.6)" in program.pseudocode()
@@ -335,7 +199,7 @@ def test_dsl_random_reporter():
         body=(set_var("sample", random(2, 2)),),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
     assert emulator.variables["sample"] == 2
     assert "random(2, 2)" in program.pseudocode()
@@ -408,7 +272,7 @@ def test_dsl_for_each_uses_one_based_indices():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
 
     assert emulator.lists["output"] == [10]
@@ -434,7 +298,7 @@ def test_dsl_auto_lowers_safe_index_mutation_to_for_each():
         ),
     )
     sprite = program.compile()
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.run()
 
     assert emulator.lists["output"] == [2, 4, 6]
@@ -446,12 +310,12 @@ def test_dsl_auto_lowers_safe_index_mutation_to_for_each():
 @pytest.mark.parametrize("mode", ["exact", "fast"])
 def test_optimization_modes_preserve_results(tmp_path, mode):
     torch.manual_seed(4)
-    model = LinearActivation()
+    model = LinearActivation().eval()
     x = torch.randn(2, 3)
     expected = model(x).flatten().tolist()
     path = tmp_path / mode
     transpile(model, x, str(path), optimization=mode)
-    actual = _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+    actual = _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     torch.testing.assert_close(torch.tensor(actual), torch.tensor(expected), atol=1e-4, rtol=0)
 
 
@@ -487,12 +351,12 @@ def test_fast_layer_config_rejects_invalid_values(kwargs):
 @pytest.mark.parametrize("mode", ["exact", "fast"])
 def test_multi_head_causal_softmax_broadcasts_mask_and_stays_finite(tmp_path, mode):
     torch.manual_seed(8)
-    model = MultiHeadCausalSoftmax()
+    model = MultiHeadCausalSoftmax().eval()
     scores = torch.randn(1, 2, 4, 4)
     path = tmp_path / f"causal_{mode}"
     transpile(model, scores, str(path), optimization=mode)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), scores.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), scores.flatten().tolist())
     ).reshape_as(scores)
     expected = model(scores)
     assert torch.isfinite(actual).all()
@@ -501,16 +365,16 @@ def test_multi_head_causal_softmax_broadcasts_mask_and_stays_finite(tmp_path, mo
 
 def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
     torch.manual_seed(5)
-    model = LinearActivation()
+    model = LinearActivation().eval()
     first = torch.randn(2, 3)
     second = torch.randn(2, 3)
     path = tmp_path / "lifecycle"
     transpile(model, first, str(path), optimization="exact")
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     opcodes = {block["opcode"] for block in sprite["blocks"].values()}
     assert {"procedures_definition", "procedures_prototype", "procedures_call"} <= opcodes
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = first.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -525,14 +389,14 @@ def test_exact_lifecycle_is_idempotent_and_repeatable(tmp_path):
 
 
 def test_exact_linear_uses_direct_weight_layout_and_fuses_epilogue(tmp_path):
-    model = LinearActivation()
+    model = LinearActivation().eval()
     x = torch.randn(2, 3)
     base = tmp_path / "exact"
     transpile(model, x, str(base), optimization="exact")
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
     exact_variables = {entry[0] for entry in sprite["variables"].values()}
-    assert "weight_offset" in exact_variables
-    assert "weight_index" not in exact_variables
+    assert "_weight_offset" in exact_variables
+    assert "_weight_index" not in exact_variables
 
 
 def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu(
@@ -545,15 +409,15 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
     sprites = {}
     outputs = {}
     for name, threshold in (("previous", float("inf")), ("grouped", 49_152)):
-        monkeypatch.setattr(LinearInstruction, "grouped_min_macs", threshold)
+        monkeypatch.setattr(optimized_linear, "GROUPED_MIN_MACS", threshold)
         base = tmp_path / name
         transpile(
             model, (value, residual), str(base), optimization="exact",
             storage=StorageConfig(compression=False),
         )
-        sprite = _load_sprite(base.with_suffix(".sprite3"))
+        sprite = load_sprite(base.with_suffix(".sprite3"))
         sprites[name] = sprite
-        emulator = ScratchEmulator(sprite)
+        emulator = SpriteEmulator(sprite)
         emulator.lists["input"] = value.flatten().tolist()
         emulator.lists["input_1"] = residual.flatten().tolist()
         emulator.run()
@@ -566,21 +430,21 @@ def test_grouped_linear_matches_previous_kernel_with_rows_bias_residual_and_relu
     )
     previous_variables = {entry[0] for entry in sprites["previous"]["variables"].values()}
     grouped_variables = {entry[0] for entry in sprites["grouped"]["variables"].values()}
-    assert "sum a" not in previous_variables
-    assert {"sum a", "sum b", "sum c", "sum d", "input value"} <= grouped_variables
+    assert "_sum a" not in previous_variables
+    assert {"_sum a", "_sum b", "_sum c", "_sum d", "_input value"} <= grouped_variables
     grouped_mutations = {
         block.get("fields", {}).get("VARIABLE", [None])[0]
         for block in sprites["grouped"]["blocks"].values()
     }
-    assert "weight" in grouped_mutations
-    assert not {"weight a", "weight b", "weight c", "weight d"} & grouped_mutations
+    assert "_weight" in grouped_mutations
+    assert not {"_weight a", "_weight b", "_weight c", "_weight d"} & grouped_mutations
 
     weight = model.linear.weight.detach()
     expected_prefix = weight[:4, :2].T.flatten().tolist()
     stored = next(
         entry[1]
         for entry in sprites["grouped"]["lists"].values()
-        if entry[0].startswith("W_linear_")
+        if entry[0].startswith("_W_linear_")
     )
     assert stored[:8] == expected_prefix
 
@@ -597,16 +461,16 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
         optimization="exact",
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     physical = [
         entry
         for entry in sprite["lists"].values()
-        if entry[0].startswith("W_linear_")
+        if entry[0].startswith("_W_linear_")
     ]
     assert [len(entry[1]) for entry in physical] == [199_680, 512]
-    assert not any(name.startswith("W_linear_") for name in result.sharded_lists)
+    assert not any(name.startswith("_W_linear_") for name in result.sharded_lists)
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -615,6 +479,83 @@ def test_large_grouped_linear_uses_row_aligned_physical_weights(tmp_path):
         atol=1e-4,
         rtol=0,
     )
+
+
+class _RightMatmul(nn.Module):
+    def __init__(self, inner, outputs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(inner, outputs) / inner**0.5)
+
+    def forward(self, x):
+        return x @ self.weight
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+@pytest.mark.parametrize("outputs", [64, 63])
+@pytest.mark.parametrize("kind", ["linear", "matmul"])
+def test_weight_is_row_sharded_at_the_float_storage_cap(
+    tmp_path, small_list_limit, kind, precision, outputs,
+):
+    # Float storage caps each stored list below the list limit (float32 at a
+    # quarter of it), so a weight between the two must still be cut into
+    # whole rows by the kernel. Left to the generic sharder, its lists end
+    # mid-row and every weight read in the dot product is a sum of reads over
+    # every shard: a float32 TinyGPT (width 256) decoded at half the speed of
+    # the same model in int8.
+    limit = small_list_limit(4_000)
+    torch.manual_seed(0)
+    model = (nn.Linear(32, outputs) if kind == "linear" else _RightMatmul(32, outputs)).eval()
+    value = torch.randn(1, 32)
+    assert limit // 2 < model.weight.numel() <= limit
+    result = transpile(
+        model, value, tmp_path / f"{kind}_{precision}_{outputs}",
+        storage=StorageConfig(precision=precision),
+    )
+    names = [entry[0] for entry in load_sprite(result.path)["lists"].values()]
+    weights = [name for name in names if name.startswith(f"_W_{kind}_")]
+    assert len(weights) > 1
+    assert not any(" shard " in name for name in names)
+    # Storage rounds the weights to its precision before Scratch computes.
+    stored = copy.deepcopy(model)
+    with torch.no_grad():
+        for parameter in stored.parameters():
+            parameter.copy_(parameter.to(getattr(torch, precision)).float())
+    assert verify(stored, value, result).passed
+
+
+class _SwiGLU(nn.Module):
+    def __init__(self, inner, hidden):
+        super().__init__()
+        self.gate = nn.Linear(inner, hidden, bias=False)
+        self.up = nn.Linear(inner, hidden, bias=False)
+
+    def forward(self, x):
+        return nn.functional.silu(self.gate(x)) * self.up(x)
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+def test_swiglu_weights_are_row_sharded_at_the_float_storage_cap(
+    tmp_path, small_list_limit, precision,
+):
+    # The gate and value weights of a gated MLP are cut at whole rows within
+    # what one stored list holds, as a Linear's are, not left for the
+    # generic sharder to split mid-row.
+    limit = small_list_limit(4_000)
+    torch.manual_seed(0)
+    model = _SwiGLU(32, 64).eval()
+    value = torch.randn(1, 32)
+    assert limit // 2 < model.gate.weight.numel() <= limit
+    result = transpile(
+        model, value, tmp_path / f"swiglu_{precision}", storage=StorageConfig(precision=precision),
+    )
+    names = [entry[0] for entry in load_sprite(result.path)["lists"].values()]
+    assert sum("gate_weight" in name for name in names) > 1
+    assert not any(" shard " in name for name in names)
+    stored = copy.deepcopy(model)
+    with torch.no_grad():
+        for parameter in stored.parameters():
+            parameter.copy_(parameter.to(getattr(torch, precision)).float())
+    assert verify(stored, value, result).passed
 
 
 @pytest.mark.parametrize("inner,outputs", [(128, 128), (384, 129)])
@@ -628,15 +569,32 @@ def test_grouped_linear_keeps_fallback_for_small_or_non_multiple_shapes(
         model, value, str(base), optimization="exact",
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
-    assert "sum a" not in variables
-    assert "weight_offset" in variables
+    assert "_sum a" not in variables
+    assert "_weight_offset" in variables
+
+
+def test_linear_epilogue_keeps_two_residuals_apart(tmp_path):
+    class TwoResiduals(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(16, 16)
+            self.second = nn.Linear(16, 16)
+
+        def forward(self, value):
+            return value + (self.first(value) + self.second(value * 2))
+
+    torch.manual_seed(5)
+    model = TwoResiduals().eval()
+    value = torch.randn(1, 4, 16)
+    result = transpile(model, value, str(tmp_path / "two_residuals"))
+    assert verify(model, value, result, atol=1e-5).passed
 
 
 def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
     torch.manual_seed(27)
-    model = ArithmeticChain()
+    model = ArithmeticChain().eval()
     inputs = tuple(torch.randn(2, 3) for _ in range(3))
     graph = _prepare_graph(model, inputs, optimization="exact")
     assert len(graph.elementwise_fusions) == 1
@@ -644,9 +602,9 @@ def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
 
     base = tmp_path / "arithmetic_exact"
     transpile(model, inputs, str(base), optimization="exact")
-    sprite = _load_sprite(base.with_suffix(".sprite3"))
+    sprite = load_sprite(base.with_suffix(".sprite3"))
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     for index, value in enumerate(inputs):
         name = "input" if index == 0 else f"input_{index}"
         emulator.lists[name] = value.flatten().tolist()
@@ -660,7 +618,7 @@ def test_exact_fuses_same_shape_arithmetic_chain(tmp_path):
 
 def test_paired_benchmark_project_and_analyzer(tmp_path):
     project_path = build_paired_benchmark(
-        LinearActivation(), torch.randn(2, 3), tmp_path / "paired.sb3",
+        LinearActivation().eval(), torch.randn(2, 3), tmp_path / "paired.sb3",
         warmups=1, repeats=3,
     )
     with zipfile.ZipFile(project_path) as archive:
@@ -681,18 +639,22 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(project_path)
-    assert report["runs"] == 3
-    assert report["speedup"] == pytest.approx(2.0)
-    assert report["output_max_abs_error"] is None  # Project was built, not run.
+    assert (report.kind, report.baseline, report.candidate) == ("paired", "exact", "fast")
+    assert (report.repeats, report.warmups) == (3, 1)
+    (case,) = report.cases
+    assert case.baseline_timings == (2.0, 2.2, 1.8)
+    assert case.baseline_seconds == pytest.approx(2.0)
+    assert case.speedup == pytest.approx(2.0)
+    assert case.output_max_abs_error is None  # Project was built, not run.
 
     for entry in stage["lists"].values():
         if entry[0] == EXACT_TIMINGS:
             entry[1] = [0.033, 0.033]
         elif entry[0] == FAST_TIMINGS:
             entry[1] = [0, 0]
+    # A sprite's output is the global, on the stage, named after it.
     exact_output = next(
-        entry for entry in project["targets"][1]["lists"].values()
-        if entry[0] == "output"
+        entry for entry in stage["lists"].values() if entry[0] == "cattorch exact output"
     )
     exact_output[1] = [1.0]
     with zipfile.ZipFile(project_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -700,22 +662,22 @@ def test_paired_benchmark_project_and_analyzer(tmp_path):
         for name, data in assets.items():
             archive.writestr(name, data)
 
-    below_resolution = analyze_benchmark(project_path)
-    assert below_resolution["speedup"] is None
-    assert below_resolution["speedup_95_percent_interval"] is None
-    assert below_resolution["output_length_match"] is False
-    assert below_resolution["exact_output_values"] == 1
-    assert below_resolution["fast_output_values"] == 0
+    (below_resolution,) = analyze_benchmark(project_path).cases
+    assert below_resolution.speedup is None
+    assert below_resolution.speedup_95_percent_interval is None
+    assert below_resolution.output_length_match is False
+    assert below_resolution.baseline_output_values == 1
+    assert below_resolution.candidate_output_values == 0
 
 
 def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
     suite_path = build_benchmark_suite(
         [
-            ("first", LinearActivation(), torch.randn(2, 3)),
-            ("second", LinearActivation(), torch.randn(2, 3)),
+            ("first", LinearActivation().eval(), torch.randn(2, 3)),
+            ("second", LinearActivation().eval(), torch.randn(2, 3)),
         ],
         tmp_path / "suite.sb3",
-        iterations=3,
+        repeats=3,
     )
     with zipfile.ZipFile(suite_path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -774,20 +736,22 @@ def test_benchmark_suite_runs_init_before_timed_repeats_and_analyzes(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(suite_path)
-    assert report["kind"] == "suite"
-    assert report["iterations_per_result"] == 3
-    assert [item["speedup"] for item in report["benchmarks"]] == [1.5, 2.0]
+    assert report.kind == "suite"
+    assert report.repeats == 3
+    assert [item.speedup for item in report.cases] == [1.5, 2.0]
+    # Seconds per call: the timed total over the repeats.
+    assert [item.baseline_seconds for item in report.cases] == [1.0, pytest.approx(8 / 3)]
 
 
 def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
     case_config = FastConfig(
         activations=False,
-        weights=FastLayerConfig(pruning=0.5),
+        layers=FastLayerConfig(block_pruning=0.5),
     )
     suite_path = build_benchmark_suite(
-        [("linear", nn.Linear(16, 12), torch.randn(2, 16), case_config)],
+        [("linear", nn.Linear(16, 12).eval(), torch.randn(2, 16), case_config)],
         tmp_path / "fast_suite.sb3",
-        iterations=10,
+        repeats=10,
     )
     with zipfile.ZipFile(suite_path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -812,15 +776,15 @@ def test_fast_benchmark_suite_compares_exact_and_fast(tmp_path):
             archive.writestr(name, data)
 
     report = analyze_benchmark(suite_path)
-    assert report["comparison"] == "exact_vs_fast"
-    assert report["benchmarks"][0]["exact_seconds"] == 2.0
-    assert report["benchmarks"][0]["fast_seconds"] == 1.0
-    assert report["benchmarks"][0]["speedup"] == 2.0
+    assert (report.baseline, report.candidate) == ("exact", "fast")
+    (case,) = report.cases
+    assert (case.baseline_seconds, case.candidate_seconds) == (0.2, 0.1)
+    assert case.speedup == 2.0
 
 
 def test_nonfinite_values_are_valid_json_and_keep_scratch_semantics(tmp_path):
     path = tmp_path / "causal"
-    transpile(CausalMask(), torch.randn(3, 3), str(path))
+    transpile(CausalMask().eval(), torch.randn(3, 3), str(path))
     with zipfile.ZipFile(path.with_suffix(".sprite3")) as archive:
         raw = archive.read("sprite.json").decode()
 
@@ -835,13 +799,13 @@ def test_nonfinite_values_are_valid_json_and_keep_scratch_semantics(tmp_path):
 
 def test_exact_adaptive_pool_handles_nonuniform_receptive_fields(tmp_path):
     torch.manual_seed(19)
-    model = NonDivisibleAdaptivePool()
+    model = NonDivisibleAdaptivePool().eval()
     x = torch.randn(1, 2, 5, 7)
     expected = model(x)
     path = tmp_path / "adaptive_nonuniform"
     transpile(model, x, str(path), optimization="exact")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -849,7 +813,7 @@ def test_exact_adaptive_pool_handles_nonuniform_receptive_fields(tmp_path):
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        (nn.GELU(approximate="tanh"), lambda x: x * torch.sigmoid(1.702 * x)),
+        (nn.GELU(approximate="tanh").eval(), lambda x: x * torch.sigmoid(1.702 * x)),
     ],
     ids=("quick_gelu",),
 )
@@ -858,7 +822,7 @@ def test_fast_activations_use_documented_approximations(tmp_path, model, expecte
     path = tmp_path / type(model).__name__
     transpile(model, x, str(path), optimization="fast")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.tolist())
     )
     torch.testing.assert_close(actual, expected(x), atol=1e-5, rtol=0)
 
@@ -872,7 +836,7 @@ def test_fast_fused_linear_uses_quick_gelu_and_can_be_disabled(tmp_path):
     fast_path = tmp_path / "fused_quick_gelu"
     transpile(model, x, str(fast_path), optimization="fast")
     fast = torch.tensor(
-        _run(_load_sprite(fast_path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(fast_path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape(2, 4)
     torch.testing.assert_close(
         fast, linear * torch.sigmoid(1.702 * linear), atol=1e-4, rtol=0,
@@ -884,7 +848,7 @@ def test_fast_fused_linear_uses_quick_gelu_and_can_be_disabled(tmp_path):
         fast_config=FastConfig(activations=False),
     )
     disabled = torch.tensor(
-        _run(_load_sprite(disabled_path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(disabled_path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape(2, 4)
     torch.testing.assert_close(disabled, model(x), atol=1e-4, rtol=0)
 
@@ -897,19 +861,19 @@ def test_swiglu_fusion_is_exact_in_both_modes(tmp_path, mode):
     path = tmp_path / f"swiglu_{mode}"
     transpile(model, x, str(path), optimization=mode)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(model(x))
     torch.testing.assert_close(actual, model(x), atol=1e-4, rtol=0)
     graph = _prepare_graph(model, (x,), optimization=mode)
     assert len(graph.paired_swiglu_fusions) == 1
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     variables = {entry[0] for entry in sprite["variables"].values()}
-    assert {"gate sum", "value sum", "input value"} <= variables
+    assert {"_gate sum", "_value sum", "_input value"} <= variables
 
 
 def test_fast_layernorm_matches_one_pass_formula(tmp_path):
     torch.manual_seed(23)
-    model = nn.LayerNorm(8)
+    model = nn.LayerNorm(8).eval()
     x = torch.randn(4, 8)
     mean = x.double().mean(dim=-1, keepdim=True)
     variance = x.double().square().mean(dim=-1, keepdim=True) - mean.square()
@@ -917,7 +881,7 @@ def test_fast_layernorm_matches_one_pass_formula(tmp_path):
     path = tmp_path / "fast_layernorm"
     transpile(model, x, str(path), optimization="fast")
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist()),
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist()),
         dtype=torch.double,
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
@@ -966,16 +930,16 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
         str(path),
         storage=StorageConfig(compression=False),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     weights = [
         entry
         for entry in sprite["lists"].values()
-        if entry[0].startswith("W_matmul_")
+        if entry[0].startswith("_W_matmul_")
     ]
     assert [len(entry[1]) for entry in weights] == [199_680, 512]
-    assert not any(name.startswith("W_matmul_") for name in result.sharded_lists)
+    assert not any(name.startswith("_W_matmul_") for name in result.sharded_lists)
 
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = value.flatten().tolist()
     emulator.run()
     torch.testing.assert_close(
@@ -990,8 +954,8 @@ def test_oversized_static_matmul_uses_row_aligned_output_groups(tmp_path):
     "policy",
     [
         FastLayerConfig(rank=4),
-        FastLayerConfig(pruning=0.5),
-        FastLayerConfig(rank=4, pruning=0.5),
+        FastLayerConfig(block_pruning=0.5),
+        FastLayerConfig(rank=4, block_pruning=0.5),
     ],
     ids=("low_rank", "pruned", "low_rank_pruned"),
 )
@@ -1000,14 +964,14 @@ def test_fast_weight_transforms_match_the_transformed_pytorch_model(tmp_path, po
     model = NamedLinear().eval()
     original_weight = model.projection.weight.detach().clone()
     x = torch.randn(3, 16)
-    config = FastConfig(weights=policy, activations=False, layer_norm=False, softmax=False)
+    config = FastConfig(layers=policy, activations=False, layer_norm=False, softmax=False)
     transformed = prepare_fast_model(model, config)
     expected = transformed(x)
 
     path = tmp_path / "fast_weights"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
     torch.testing.assert_close(model.projection.weight, original_weight)
@@ -1016,7 +980,7 @@ def test_fast_weight_transforms_match_the_transformed_pytorch_model(tmp_path, po
 def test_fast_module_override_replaces_global_weight_policy():
     model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
     config = FastConfig(
-        weights=FastLayerConfig(pruning=0.5),
+        layers=FastLayerConfig(block_pruning=0.5),
         overrides={"1": FastLayerConfig()},
     )
     transformed = prepare_fast_model(model, config)
@@ -1028,7 +992,7 @@ def test_fast_unknown_module_override_is_rejected():
     with pytest.raises(ValueError, match="missing"):
         prepare_fast_model(
             nn.Linear(8, 8),
-            FastConfig(overrides={"missing": FastLayerConfig(pruning=0.5)}),
+            FastConfig(overrides={"missing": FastLayerConfig(block_pruning=0.5)}),
         )
 
 
@@ -1036,12 +1000,12 @@ def test_fast_pruned_linear_preserves_non_block_remainder(tmp_path):
     torch.manual_seed(31)
     model = nn.Linear(10, 8).eval()
     x = torch.randn(3, 10)
-    config = FastConfig(weights=FastLayerConfig(pruning=0.5))
+    config = FastConfig(layers=FastLayerConfig(block_pruning=0.5))
     expected = prepare_fast_model(model, config)(x)
     path = tmp_path / "pruned_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1049,9 +1013,9 @@ def test_fast_pruned_linear_preserves_non_block_remainder(tmp_path):
 @pytest.mark.parametrize(
     "policy",
     [
-        FastLayerConfig(pruning=0.5),
+        FastLayerConfig(block_pruning=0.5),
         FastLayerConfig(rank=4),
-        FastLayerConfig(rank=4, pruning=0.5),
+        FastLayerConfig(rank=4, block_pruning=0.5),
     ],
     ids=("pruned", "low_rank", "low_rank_pruned"),
 )
@@ -1068,12 +1032,12 @@ def test_fast_static_matmul_matches_export_time_weight_transform(tmp_path, polic
         activations=False,
         layer_norm=False,
         softmax=False,
-        weights=policy,
+        layers=policy,
     )
     path = tmp_path / "static_matmul"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
     torch.testing.assert_close(model.weight, original)
@@ -1083,13 +1047,13 @@ def test_fast_static_matmul_pruning_preserves_remainder(tmp_path):
     torch.manual_seed(35)
     model = StaticMatmul(inner=10, columns=8).eval()
     x = torch.randn(3, 10)
-    policy = FastLayerConfig(pruning=0.5)
+    policy = FastLayerConfig(block_pruning=0.5)
     expected = x @ prepare_fast_matmul_weights(model.weight, policy)[0]
-    config = FastConfig(weights=policy)
+    config = FastConfig(layers=policy)
     path = tmp_path / "static_matmul_remainder"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1104,42 +1068,42 @@ def test_fast_transposed_static_matmul_is_transformed(tmp_path):
     path = tmp_path / "transposed_static_matmul"
     transpile(
         model, x, str(path), optimization="fast",
-        fast_config=FastConfig(weights=policy),
+        fast_config=FastConfig(layers=policy),
     )
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
 
 def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
     torch.manual_seed(38)
-    model = DynamicMatmul()
+    model = DynamicMatmul().eval()
     left = torch.randn(2, 3, 8)
     right = torch.randn(2, 8, 5)
     path = tmp_path / "dynamic_matmul"
     transpile(
         model, (left, right), str(path), optimization="fast",
-        fast_config=FastConfig(weights=FastLayerConfig(rank_ratio=0.25)),
+        fast_config=FastConfig(layers=FastLayerConfig(rank_ratio=0.25)),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
     # Multiple inputs occupy distinct Scratch lists; use the emulator directly.
-    emulator = ScratchEmulator(sprite)
+    emulator = SpriteEmulator(sprite)
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
     emulator.run()
     actual = torch.tensor(emulator.lists["output"]).reshape(2, 3, 5)
     torch.testing.assert_close(actual, model(left, right), atol=1e-4, rtol=0)
     assert not any(
-        entry[0].startswith("W_fast_") for entry in sprite["lists"].values()
+        entry[0].startswith("_W_fast_") for entry in sprite["lists"].values()
     )
 
 
 @pytest.mark.parametrize(
     ("model", "x", "policy"),
     [
-        (nn.Conv1d(4, 8, 3, padding=1), torch.randn(1, 4, 7), FastLayerConfig(pruning=0.5)),
-        (nn.Conv2d(4, 8, 3, padding=1), torch.randn(1, 4, 4, 5), FastLayerConfig(pruning=0.5)),
+        (nn.Conv1d(4, 8, 3, padding=1), torch.randn(1, 4, 7), FastLayerConfig(block_pruning=0.5)),
+        (nn.Conv2d(4, 8, 3, padding=1), torch.randn(1, 4, 4, 5), FastLayerConfig(block_pruning=0.5)),
         (nn.Conv1d(8, 12, 3, padding=1), torch.randn(1, 8, 7), FastLayerConfig(rank=3)),
         (nn.Conv2d(8, 12, 3, padding=1), torch.randn(1, 8, 4, 5), FastLayerConfig(rank=3)),
     ],
@@ -1148,12 +1112,12 @@ def test_fast_dynamic_matmul_remains_exact_with_weight_policy(tmp_path):
 def test_fast_convolution_transforms_match_transformed_model(tmp_path, model, x, policy):
     torch.manual_seed(37)
     model.eval()
-    config = FastConfig(weights=policy)
+    config = FastConfig(layers=policy)
     expected = prepare_fast_model(model, config)(x)
     path = tmp_path / "fast_conv"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(expected)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
@@ -1182,20 +1146,23 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     path = tmp_path / "cached_generation"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         str(path),
     )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    emulator = ScratchEmulator(sprite)
+    sprite = load_sprite(path.with_suffix(".sprite3"))
+    emulator = SpriteEmulator(sprite)
     assert {
-        "_cattorch token step", "cattorch init", "cattorch reset",
-        "cattorch prefill", "cattorch decode",
+        "_cattorch token step for epoch %s", "_cattorch init", "_cattorch reset",
+        "_cattorch prefill", "_cattorch decode",
     } <= set(emulator._procedures)
-    assert "cattorch prepare for save" not in emulator._procedures
-    assert set(sprite["broadcasts"].values()) == {
-        "cattorch init complete", "cattorch reset complete",
-        "cattorch prefill complete", "cattorch decode complete",
-    }
+    # Messages are the stage's: the sprite sends and answers them.
+    assert sprite["broadcasts"] == {}
+    name = sprite["name"]
+    assert set(global_references(sprite)["broadcasts"].values()) == {
+        f"{name} {block}{suffix}"
+        for block in ("init", "reset", "prefill", "decode", "prepare for save")
+        for suffix in ("", " complete")
+    } | {"cattorch prepare for save"}
     assert emulator.variables["cattorch max context"] == 5
     assert emulator.variables["cattorch cache length"] == 0
 
@@ -1203,40 +1170,42 @@ def test_generation_prefill_decode_reset_and_overflow(tmp_path):
     assert emulator.variables["cattorch status"] == "ok"
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.lists[TOKEN_IDS] = prompt
+    emulator.run_procedure("cattorch prefill")
+    # Each call sends its own completion broadcast, and only that.
     assert emulator.broadcasts == [
-        "cattorch init complete", "cattorch prefill complete",
+        "cached_generation init complete", "cached_generation prefill complete",
     ]
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
     assert emulator.variables["cattorch cache length"] == 3
-    assert len(emulator.lists["cattorch K cache 1"]) == 3 * 8
-    assert len(emulator.lists["cattorch K cache 2"]) == 3 * 8
+    assert len(emulator.lists["_cattorch K cache 1"]) == 3 * 8
+    assert len(emulator.lists["_cattorch K cache 2"]) == 3 * 8
 
     for token in (2, 4):
         prompt.append(token)
-        emulator.lists["cattorch tokens"] = [token]
-        emulator._exec_chain(emulator._procedures["cattorch decode"])
+        emulator.lists[TOKEN_IDS] = [token]
+        emulator.run_procedure("cattorch decode")
         expected = model(torch.tensor([prompt]))[0, -1]
         torch.testing.assert_close(
             torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
         )
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator.lists["cattorch tokens"] = [6]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
+    kept = list(emulator.lists["cattorch logits"])
+    emulator.lists[TOKEN_IDS] = [6]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert emulator.lists["cattorch logits"] == kept
     assert emulator.variables["cattorch cache length"] == 5
 
-    emulator._exec_chain(emulator._procedures["cattorch reset"])
+    emulator.run_procedure("cattorch reset")
     assert emulator.variables["cattorch status"] == "ok"
     assert emulator.variables["cattorch cache length"] == 0
-    assert emulator.lists["cattorch K cache 1"] == []
-    assert emulator.lists["cattorch V cache 2"] == []
+    assert emulator.lists["_cattorch K cache 1"] == []
+    assert emulator.lists["_cattorch V cache 2"] == []
 
 
 def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_path):
@@ -1244,27 +1213,33 @@ def test_generation_rejects_malformed_runtime_inputs_without_mutating_cache(tmp_
     path = tmp_path / "cached_generation_guards"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=3),
+        GenerationProgram(max_context=5, top_k=3),
         path,
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     for invalid in ([], [1, 2]):
-        emulator.lists["cattorch tokens"] = invalid
+        emulator.lists[TOKEN_IDS] = invalid
         emulator.run_procedure("cattorch decode")
-        assert emulator.variables["cattorch status"] == "decode requires exactly one token"
+        assert emulator.variables["cattorch status"] == interface.wrong_number_of_items(
+            emulator.public(interface.TOKEN_IDS),
+        )
         assert emulator.variables["cattorch cache length"] == 0
         assert emulator.lists["cattorch logits"] == []
         assert emulator.lists["cattorch top k ids"] == []
 
-    emulator.lists["cattorch tokens"] = []
+    emulator.lists[TOKEN_IDS] = []
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill requires at least one token"
+    assert emulator.variables["cattorch status"] == interface.too_few_items(
+        emulator.public(interface.TOKEN_IDS),
+    )
     assert emulator.variables["cattorch cache length"] == 0
 
-    emulator.lists["cattorch tokens"] = [1, 2, 3, 4, 5, 6]
+    emulator.lists[TOKEN_IDS] = [1, 2, 3, 4, 5, 6]
     emulator.run_procedure("cattorch prefill")
-    assert emulator.variables["cattorch status"] == "prefill exceeds maximum context"
+    assert emulator.variables["cattorch status"] == interface.too_many_items(
+        emulator.public(interface.TOKEN_IDS),
+    )
     assert emulator.variables["cattorch cache length"] == 0
     assert emulator.lists["cattorch logits"] == []
 
@@ -1275,23 +1250,23 @@ def test_generation_mqa_caches_one_kv_head_and_matches_full_forward(tmp_path):
     path = tmp_path / "cached_mqa_generation"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         str(path),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.lists[TOKEN_IDS] = prompt
+    emulator.run_procedure("cattorch prefill")
     expected = model(torch.tensor([prompt]))[0, -1]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
     )
-    assert len(emulator.lists["cattorch K cache 1"]) == 3 * 4
-    assert len(emulator.lists["cattorch V cache 2"]) == 3 * 4
+    assert len(emulator.lists["_cattorch K cache 1"]) == 3 * 4
+    assert len(emulator.lists["_cattorch V cache 2"]) == 3 * 4
 
-    emulator.lists["cattorch tokens"] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.lists[TOKEN_IDS] = [2]
+    emulator.run_procedure("cattorch decode")
     expected = model(torch.tensor([[*prompt, 2]]))[0, -1]
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]), expected, atol=1e-4, rtol=0,
@@ -1304,26 +1279,26 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
     path = tmp_path / "cached_shared_layers"
     result = transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         path,
-        codegen=CodegenConfig(layer_sharing="auto", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=True, unrolling="compact"),
     )
     baseline = transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5),
+        GenerationProgram(max_context=5),
         tmp_path / "cached_unshared_layers",
-        codegen=CodegenConfig(layer_sharing="off", unrolling="compact"),
+        codegen=CodegenConfig(layer_sharing=False, unrolling="compact"),
     )
-    assert result.block_count < baseline.block_count * 0.75
-    sprite = _load_sprite(result.path)
-    emulator = ScratchEmulator(sprite)
-    assert "cattorch shared transformer layer" in emulator._procedures
-    assert "cattorch K cache" in emulator.lists
-    assert "cattorch V cache" in emulator.lists
-    assert "cattorch K cache 1" not in emulator.lists
+    assert result.block_count < baseline.block_count * 0.8
+    sprite = load_sprite(result.path)
+    emulator = SpriteEmulator(sprite)
+    assert "_cattorch shared transformer layer" in emulator._procedures
+    assert "_cattorch K cache" in emulator.lists
+    assert "_cattorch V cache" in emulator.lists
+    assert "_cattorch K cache 1" not in emulator.lists
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
+    emulator.lists[TOKEN_IDS] = prompt
     emulator.run_procedure("cattorch prefill")
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]),
@@ -1331,10 +1306,10 @@ def test_generation_layer_sharing_banks_caches_and_matches_full_forward(tmp_path
         atol=1e-4,
         rtol=0,
     )
-    assert len(emulator.lists["cattorch K cache"]) == len(prompt) * 2 * 8
+    assert len(emulator.lists["_cattorch K cache"]) == len(prompt) * 2 * 8
     assert emulator.variables["cattorch cache length"] == len(prompt)
 
-    emulator.lists["cattorch tokens"] = [2]
+    emulator.lists[TOKEN_IDS] = [2]
     emulator.run_procedure("cattorch decode")
     torch.testing.assert_close(
         torch.tensor(emulator.lists["cattorch logits"]),
@@ -1351,15 +1326,15 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
     path = tmp_path / "cached_top_k"
     transpile(
         model,
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=5),
+        GenerationProgram(max_context=5, top_k=5),
         str(path),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    assert "cattorch select top k" in emulator._procedures
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
+    assert "_cattorch select top k" in emulator._procedures
 
     prompt = [1, 3, 5]
-    emulator.lists["cattorch tokens"] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
+    emulator.lists[TOKEN_IDS] = prompt
+    emulator.run_procedure("cattorch prefill")
     expected_logits = model(torch.tensor([prompt]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
@@ -1373,8 +1348,8 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["cattorch tokens"] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.lists[TOKEN_IDS] = [2]
+    emulator.run_procedure("cattorch decode")
     expected_logits = model(torch.tensor([[*prompt, 2]]))[0, -1]
     expected_values, expected_ids = torch.topk(expected_logits, 5)
     assert emulator.lists["cattorch top k ids"] == expected_ids.tolist()
@@ -1388,122 +1363,22 @@ def test_generation_single_pass_top_k_matches_torch_and_clears_state(tmp_path):
         rtol=0,
     )
 
-    emulator.lists["cattorch tokens"] = [4]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
+    emulator.lists[TOKEN_IDS] = [4]
+    emulator.run_procedure("cattorch decode")
     assert len(emulator.lists["cattorch top k values"]) == 5
-    emulator.lists["cattorch tokens"] = [6]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
-    assert emulator.variables["cattorch status"] == "maximum context exceeded"
-    assert emulator.lists["cattorch logits"] == []
+    kept = [list(emulator.lists[name]) for name in (
+        "cattorch logits", "cattorch top k values", "cattorch top k ids",
+    )]
+    emulator.lists[TOKEN_IDS] = [6]
+    emulator.run_procedure("cattorch decode")
+    assert emulator.variables["cattorch status"] == interface.CONTEXT_FULL
+    assert [emulator.lists[name] for name in (
+        "cattorch logits", "cattorch top k values", "cattorch top k ids",
+    )] == kept
+
+    emulator.run_procedure("cattorch reset")
     assert emulator.lists["cattorch top k values"] == []
     assert emulator.lists["cattorch top k ids"] == []
-
-    emulator._exec_chain(emulator._procedures["cattorch reset"])
-    assert emulator.lists["cattorch top k values"] == []
-    assert emulator.lists["cattorch top k ids"] == []
-
-
-def test_generation_layer_positions_use_their_own_attention_cache():
-    model = LayerPositionCachedMQALM(context=5, layers=2).eval()
-    graph = _prepare_graph(
-        model,
-        (torch.tensor([[1]]),),
-        optimization="exact",
-        generation=_GenerationSpec(max_context=5),
-    )
-    caches = [
-        graph.generation.position_embeddings[node.name][0]
-        for node in graph.nodes
-        if node.name in graph.generation.position_embeddings
-    ]
-    assert caches == [
-        "cattorch K cache 1",
-        "cattorch K cache 1",
-        "cattorch K cache 2",
-    ]
-
-
-def test_long_generation_fuses_attention_and_emits_qkv_caches_directly(tmp_path):
-    torch.manual_seed(51)
-    model = CachedMQALM(context=64, layers=1).eval()
-    token = torch.tensor([[1]])
-    graph = _prepare_graph(
-        model,
-        (token,),
-        optimization="exact",
-        generation=_GenerationSpec(max_context=64),
-    )
-    assert len(graph.generation.qkv_caches) == 1
-    assert len(graph.generation.prepopulated_scores) == 1
-    assert len(graph.generation.prepopulated_values) == 1
-    assert len(graph.generation.attention_fusions) == 1
-    assert graph.generation.hidden_prefill_qkv in graph.generation.qkv_caches
-
-    prompt = [1, 3, 5, 2]
-    path = tmp_path / "long_cached_attention"
-    transpile(
-        model,
-        GenerationProgram("forward", token, max_context=64),
-        str(path),
-        storage=StorageConfig(compression=False),
-    )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-    emulator.lists["cattorch tokens"] = prompt
-    emulator._exec_chain(emulator._procedures["cattorch prefill"])
-
-    torch.testing.assert_close(
-        torch.tensor(emulator.lists["cattorch logits"]),
-        model(torch.tensor([prompt]))[0, -1],
-        atol=1e-4,
-        rtol=0,
-    )
-    assert len(emulator.lists["cattorch K cache 1"]) == len(prompt) * 4
-    assert len(emulator.lists["cattorch V cache 1"]) == len(prompt) * 4
-
-
-def test_transformer_sized_cached_qkv_uses_interleaved_destination_weights(tmp_path):
-    class WideCachedLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embedding = nn.Embedding(11, 128)
-            self.attention = CachedAttention(width=128, heads=4, context=5)
-            self.head = nn.Linear(128, 11, bias=False)
-
-        def forward(self, tokens):
-            return self.head(self.attention(self.embedding(tokens)))
-
-    torch.manual_seed(52)
-    model = WideCachedLM().eval()
-    token = torch.tensor([[2]])
-    path = tmp_path / "grouped_cached_qkv"
-    transpile(
-        model,
-        GenerationProgram("forward", token, max_context=5, hidden_prefill=False),
-        str(path),
-        storage=StorageConfig(compression=False),
-    )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    qkv_weights = [
-        entry
-        for entry in sprite["lists"].values()
-        if entry[0].startswith("W_qkv_")
-    ]
-    assert [len(entry[1]) for entry in qkv_weights] == [16_384] * 3
-    mutations = {
-        block.get("fields", {}).get("VARIABLE", [None])[0]
-        for block in sprite["blocks"].values()
-    }
-    assert {"sum a", "sum b", "sum c", "sum d", "weight_index"} <= mutations
-
-    emulator = ScratchEmulator(sprite)
-    emulator.lists["cattorch tokens"] = [2]
-    emulator._exec_chain(emulator._procedures["cattorch decode"])
-    torch.testing.assert_close(
-        torch.tensor(emulator.lists["cattorch logits"]),
-        model(token).flatten(),
-        atol=1e-4,
-        rtol=0,
-    )
 
 
 def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
@@ -1515,15 +1390,12 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
         path = tmp_path / f"prefill_{hidden_prefill}"
         transpile(
             model,
-            GenerationProgram(
-                "forward", torch.tensor([[1]]), max_context=5,
-                hidden_prefill=hidden_prefill,
-            ),
+            GenerationProgram(max_context=5, hidden_prefill=hidden_prefill),
             str(path),
         )
-        emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
-        emulator.lists["cattorch tokens"] = prompt
-        emulator._exec_chain(emulator._procedures["cattorch prefill"])
+        emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
+        emulator.lists[TOKEN_IDS] = prompt
+        emulator.run_procedure("cattorch prefill")
         emulators[hidden_prefill] = emulator
 
     expected = model(torch.tensor([prompt]))[0, -1]
@@ -1540,19 +1412,19 @@ def test_hidden_prefill_skips_intermediate_output_heads(tmp_path):
 
 def test_generation_config_validates_hidden_prefill():
     with pytest.raises(TypeError, match="hidden_prefill must be a boolean"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, hidden_prefill=1)
+        GenerationProgram(max_context=5, hidden_prefill=1)
 
 
 @pytest.mark.parametrize("top_k", [True, 1.5, "5"])
 def test_generation_config_validates_top_k_type(top_k):
     with pytest.raises(TypeError, match="top_k must be an integer or None"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
+        GenerationProgram(max_context=5, top_k=top_k)
 
 
 @pytest.mark.parametrize("top_k", [0, 65])
 def test_generation_config_validates_top_k_range(top_k):
     with pytest.raises(ValueError, match="top_k must be between 1 and 64"):
-        GenerationProgram("forward", torch.tensor([[1]]), max_context=5, top_k=top_k)
+        GenerationProgram(max_context=5, top_k=top_k)
 
 
 def test_generation_top_k_cannot_exceed_output_size(tmp_path):
@@ -1560,42 +1432,15 @@ def test_generation_top_k_cannot_exceed_output_size(tmp_path):
     with pytest.raises(ValueError, match=r"top_k \(14\) exceeds output size \(13\)"):
         transpile(
             model,
-            GenerationProgram("forward", torch.tensor([[1]]), max_context=4, top_k=14),
+            GenerationProgram(max_context=4, top_k=14),
             str(tmp_path / "top_k_too_large"),
         )
 
 
-def test_generation_validates_input_shape_and_shards_oversized_cache(tmp_path):
+def test_generation_names_max_context_beyond_the_position_table(tmp_path):
     model = CachedLM(context=4, layers=1).eval()
-    with pytest.raises(ValueError, match="must contain one token"):
-        transpile(
-            model, GenerationProgram("forward", torch.tensor([[1, 2]]), 4),
-            str(tmp_path / "bad_generation"),
-        )
-
-    with pytest.raises(ValueError, match="position table capacity"):
-        transpile(
-            model, GenerationProgram("forward", torch.tensor([[1]]), 5),
-            str(tmp_path / "position_overflow"),
-        )
-
-    class PositionlessCachedLM(CachedLM):
-        def forward(self, tokens):
-            hidden = self.token(tokens)
-            return self.head(self.norm(self.blocks(hidden)))
-
-    model = PositionlessCachedLM(context=4, layers=1).eval()
-    path = tmp_path / "oversized_cache"
-    transpile(
-        model, GenerationProgram("forward", torch.tensor([[1]]), 25_001), str(path),
-    )
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    names = {entry[0] for entry in sprite["lists"].values()}
-    assert "cattorch K cache 1 shard 2" in names
-    assert "cattorch V cache 1 shard 2" in names
-    variables = {entry[0]: entry[1] for entry in sprite["variables"].values()}
-    assert variables["cattorch K cache 1 shard count"] == 2
-    assert variables["cattorch K cache 1 logical length"] == 25_001 * 8
+    with pytest.raises(UnsupportedModelError, match=r"max_context \(5\) is probably larger"):
+        transpile(model, GenerationProgram(max_context=5), str(tmp_path / "overflow"))
 
 
 def test_eval_conv_batchnorm_is_folded_without_mutating_model(tmp_path):
@@ -1606,7 +1451,7 @@ def test_eval_conv_batchnorm_is_folded_without_mutating_model(tmp_path):
     path = tmp_path / "folded_batchnorm"
     transpile(model, x, str(path))
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(model(x))
     torch.testing.assert_close(actual, model(x), atol=1e-4, rtol=0)
     torch.testing.assert_close(model[0].weight, original_weight)
@@ -1629,7 +1474,7 @@ def test_fast_whole_neuron_pruning_changes_hidden_shape_and_exports(tmp_path):
     path = tmp_path / "neuron_pruned"
     transpile(model, x, str(path), optimization="fast", fast_config=config)
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), x.flatten().tolist())
     ).reshape_as(transformed(x))
     torch.testing.assert_close(actual, transformed(x), atol=1e-4, rtol=0)
 
@@ -1638,9 +1483,9 @@ def test_generation_benchmark_suite_bundles_stateless_and_cached(tmp_path):
     model = CachedLM(context=4, layers=1).eval()
     tokens = torch.tensor([[1, 2, 3, 4]])
     path = build_generation_benchmark_suite(
-        [("cached_lm", model, tokens, tokens[:, :2])],
+        [("cached_lm", model, GenerationProgram(4), tokens[:, :2])],
         tmp_path / "generation_suite.sb3",
-        iterations=2,
+        repeats=2,
     )
     with zipfile.ZipFile(path) as archive:
         project = json.loads(archive.read("project.json"))
@@ -1675,9 +1520,12 @@ def test_parameter_resolution_uses_export_signature_without_name_collisions(tmp_
     value = torch.tensor([[1.0, 2.0]])
     path = tmp_path / "colliding_state_names"
     transpile(model, value, str(path), storage=StorageConfig(compression=False))
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    input_names = {entry[0] for entry in sprite["lists"].values() if entry[0].startswith("input")}
-    assert input_names == {"input"}
+    sprite = load_sprite(path.with_suffix(".sprite3"))
+    input_names = {
+        name for name in global_references(sprite)["lists"].values()
+        if name.startswith("colliding_state_names input")
+    }
+    assert input_names == {"colliding_state_names input"}
     torch.testing.assert_close(
         torch.tensor(_run(sprite, value.flatten().tolist())),
         model(value).flatten(),
@@ -1704,7 +1552,7 @@ def test_batchnorm_folding_requires_real_dataflow_connection(tmp_path):
     path = tmp_path / "branched_batchnorm"
     transpile(model, value, str(path), storage=StorageConfig(compression=False))
     actual = torch.tensor(
-        _run(_load_sprite(path.with_suffix(".sprite3")), value.flatten().tolist())
+        _run(load_sprite(path.with_suffix(".sprite3")), value.flatten().tolist())
     ).reshape_as(model(value))
     torch.testing.assert_close(actual, model(value), atol=1e-4, rtol=0)
 
@@ -1723,8 +1571,8 @@ def test_exact_elementwise_supports_general_pytorch_broadcasting(
     left = torch.randn(left_shape)
     right = torch.randn(right_shape)
     path = tmp_path / f"broadcast_{len(left_shape)}_{len(right_shape)}"
-    transpile(Add(), (left, right), str(path), storage=StorageConfig(compression=False))
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    transpile(Add().eval(), (left, right), str(path), storage=StorageConfig(compression=False))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = left.flatten().tolist()
     emulator.lists["input_1"] = right.flatten().tolist()
     emulator.run()
@@ -1743,9 +1591,9 @@ def test_identity_model_materializes_a_distinct_output(tmp_path):
 
     value = torch.randn(2, 3)
     path = tmp_path / "identity"
-    transpile(Identity(), value, str(path))
-    sprite = _load_sprite(path.with_suffix(".sprite3"))
-    assert {entry[0] for entry in sprite["lists"].values()} >= {"input", "output"}
+    transpile(Identity().eval(), value, str(path))
+    sprite = load_sprite(path.with_suffix(".sprite3"))
+    assert set(global_references(sprite)["lists"].values()) >= {"identity input", "identity output"}
     torch.testing.assert_close(
         torch.tensor(_run(sprite, value.flatten().tolist())), value.flatten(),
     )
@@ -1756,22 +1604,28 @@ def test_multiple_model_outputs_are_preserved(tmp_path):
         def forward(self, value):
             return value + 1, value * 2
 
-    result = transpile(Pair(), torch.ones(2), str(tmp_path / "pair"))
-    assert tuple(value.list_name for value in result.outputs) == ("output", "output_1")
+    result = transpile(Pair().eval(), torch.ones(2), str(tmp_path / "pair"))
+    assert tuple(value.list_name for value in result.outputs) == ("pair output", "pair output_1")
 
 
-def test_training_dropout_is_rejected_instead_of_silently_removed(tmp_path):
-    with pytest.raises(UnsupportedOperationError, match=r"model\.eval\(\)"):
-        transpile(nn.Dropout(0.5).train(), torch.ones(4), str(tmp_path / "dropout"))
+def test_training_dropout_is_exported_as_an_evaluation_copy(tmp_path):
+    model = nn.Dropout(0.5).train()
+    with pytest.warns(UserWarning, match="training mode"):
+        result = transpile(model, torch.ones(4), str(tmp_path / "dropout"))
+    assert model.training
+    with pytest.warns(UserWarning, match="training mode"):
+        assert verify(model, torch.ones(4), result).passed
 
 
-def test_semantic_runtime_dtype_cast_is_rejected(tmp_path):
+def test_runtime_integer_cast_truncates_toward_zero(tmp_path):
     class ToInteger(nn.Module):
         def forward(self, value):
             return value.to(torch.int64)
 
-    with pytest.raises(UnsupportedOperationError, match="converting a runtime tensor"):
-        transpile(ToInteger(), torch.tensor([1.2, -2.8]), str(tmp_path / "dtype"))
+    value = torch.tensor([1.2, -2.8, 0.0, 3.0])
+    path = tmp_path / "dtype"
+    transpile(ToInteger().eval(), value, str(path))
+    assert _run(load_sprite(path.with_suffix(".sprite3")), value.tolist()) == [1, -2, 0, 3]
 
 
 def test_evaluation_dropout_remains_a_safe_alias(tmp_path):
@@ -1779,7 +1633,7 @@ def test_evaluation_dropout_remains_a_safe_alias(tmp_path):
     path = tmp_path / "eval_dropout"
     transpile(nn.Dropout(0.5).eval(), value, str(path))
     torch.testing.assert_close(
-        torch.tensor(_run(_load_sprite(path.with_suffix(".sprite3")), value.tolist())),
+        torch.tensor(_run(load_sprite(path.with_suffix(".sprite3")), value.tolist())),
         value,
     )
 
@@ -1793,10 +1647,10 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
     mask = torch.tensor([[True], [False]])
     path = tmp_path / "broadcast_mask"
     transpile(
-        Mask(), (value, mask), str(path),
+        Mask().eval(), (value, mask), str(path),
         storage=StorageConfig(compression=False),
     )
-    emulator = ScratchEmulator(_load_sprite(path.with_suffix(".sprite3")))
+    emulator = SpriteEmulator(load_sprite(path.with_suffix(".sprite3")))
     emulator.lists["input"] = value.flatten().tolist()
     emulator.lists["input_1"] = mask.flatten().tolist()
     emulator.run()
@@ -1804,6 +1658,20 @@ def test_masked_fill_supports_non_suffix_broadcasting(tmp_path):
         torch.tensor(emulator.lists["output"]),
         value.masked_fill(mask, -10.0).flatten(),
     )
+
+
+def test_masked_fill_casts_its_value_to_the_tensors_dtype(tmp_path):
+    class Fill(nn.Module):
+        def forward(self, value):
+            flags = value > 1
+            filled = value.masked_fill(value > 2, 1.5)
+            filled.masked_fill_(value == 0, -2.7)
+            return filled + flags.masked_fill(value > 3, 0.5)
+
+    model = Fill().eval()
+    value = torch.tensor([[0, 1, 2], [3, 4, 2]])
+    result = transpile(model, value, tmp_path / "integer")
+    assert verify(model, value, result).passed
 
 
 def test_neuron_pruning_requires_real_linear_activation_linear_dataflow():
@@ -1844,14 +1712,15 @@ def test_transpile_returns_metadata_and_separates_path_from_sprite_name(tmp_path
     assert result.list_count > 0
     assert result.inputs[0].shape == (1, 3)
     assert result.output.shape == (1, 2)
-    assert {"cattorch init", "cattorch forward", "cattorch prepare for save"} <= set(
-        result.procedures
+    assert result.broadcasts == (
+        "Friendly model init", "Friendly model forward", "Friendly model prepare for save",
     )
-    assert _load_sprite(result.path)["name"] == "Friendly model"
+    assert result.inputs[0].list_name == "Friendly model input"
+    assert load_sprite(result.path)["name"] == "Friendly model"
 
 
 def test_transpile_defaults_sprite_name_to_path_stem_and_avoids_double_extension(tmp_path):
-    result = transpile(nn.ReLU(), torch.ones(2), tmp_path / "folder" / "relu.sprite3")
+    result = transpile(nn.ReLU().eval(), torch.ones(2), tmp_path / "folder" / "relu.sprite3")
     assert result.path.name == "relu.sprite3"
     assert result.sprite_name == "relu"
 
@@ -1859,7 +1728,7 @@ def test_transpile_defaults_sprite_name_to_path_stem_and_avoids_double_extension
 @pytest.mark.parametrize("sig_figs", [True, 0, -1, 1.5])
 def test_transpile_validates_significant_figures(tmp_path, sig_figs):
     with pytest.raises(ValueError, match="sig_figs"):
-        transpile(nn.ReLU(), torch.ones(2), tmp_path / "bad_sig_figs", sig_figs=sig_figs)
+        transpile(nn.ReLU().eval(), torch.ones(2), tmp_path / "bad_sig_figs", sig_figs=sig_figs)
 
 
 def test_verify_reports_exact_and_lossy_export_error(tmp_path):
@@ -1885,22 +1754,183 @@ def test_verify_reports_exact_and_lossy_export_error(tmp_path):
     assert lossy_report.worst_index in {0, 1}
 
 
-def test_unsupported_operation_error_names_module_and_exported_node(tmp_path):
-    class CosineBlock(nn.Module):
+def test_unsupported_operation_error_names_the_operation_and_module(tmp_path):
+    class DigammaBlock(nn.Module):
         def forward(self, value):
-            return torch.cos(value)
+            return torch.digamma(value)
 
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.features = CosineBlock()
+            self.features = DigammaBlock()
 
         def forward(self, value):
             return self.features(value)
 
     with pytest.raises(UnsupportedOperationError) as caught:
-        transpile(Model(), torch.ones(2), tmp_path / "cosine")
+        transpile(Model().eval(), torch.ones(2), tmp_path / "digamma")
     message = str(caught.value)
-    assert "aten.cos.default" in message
-    assert "module: features" in message
-    assert "exported node: cos" in message
+    assert "aten.digamma.default" in message
+    assert "in module 'features'" in message
+    assert "node" not in message
+
+
+class _MLPReadElsewhere(nn.Module):
+    """A Linear -> ReLU -> Linear path whose parameters ``read`` also uses directly."""
+
+    def __init__(self, read):
+        super().__init__()
+        self.read = read
+        self.up = nn.Linear(4, 16)
+        self.activation = nn.ReLU()
+        self.down = nn.Linear(16, 4)
+        self.lin = nn.Linear(4, 4)
+
+    def forward(self, value):
+        mlp = self.down(self.activation(self.up(value)))
+        if self.read == "up_weight":
+            return mlp, value @ self.up.weight.T
+        if self.read == "down_sum":
+            return mlp + self.down.weight.sum()
+        if self.read == "bias_mean":
+            return mlp + self.up.bias.mean()
+        return mlp, self.lin(value) + self.lin.weight.sum()
+
+
+@pytest.mark.parametrize("read", ["up_weight", "down_sum", "bias_mean"])
+def test_neuron_pruning_leaves_mlps_whose_parameters_are_read_elsewhere(tmp_path, read):
+    torch.manual_seed(0)
+    model = _MLPReadElsewhere(read).eval()
+    value = torch.randn(2, 4)
+    config = FastConfig(activations=False, layer_norm=False, softmax=False, neuron_pruning=0.5)
+    with pytest.warns(CattorchWarning, match="left 'up' and 'down' without neuron pruning"):
+        result = transpile(model, value, tmp_path / read, optimization="fast", fast_config=config)
+    assert any("without neuron pruning" in message for message in result.warnings)
+    expected = model(value)
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    assert [tuple(spec.shape) for spec in result.outputs] == [tuple(item.shape) for item in expected]
+    assert verify(model, value, result).passed
+
+
+def test_weight_transforms_leave_modules_whose_parameters_are_read_elsewhere(tmp_path):
+    torch.manual_seed(0)
+    model = _MLPReadElsewhere("lin").eval()
+    config = FastConfig(layers=FastLayerConfig(rank=1, block_pruning=0.5))
+    with pytest.warns(CattorchWarning, match="left 'lin' without its low-rank"):
+        transformed = prepare_fast_model(model, config)
+    assert isinstance(transformed.lin, nn.Linear)
+    assert torch.equal(transformed.lin.weight, model.lin.weight)
+    assert isinstance(transformed.up, nn.Sequential)
+
+
+class _ClampLinear(nn.Linear):
+    """A Linear subclass whose forward does more than read its weight."""
+
+    def forward(self, value):
+        return super().forward(value).clamp(min=0.0) * 3.0
+
+
+class _ClampConv(nn.Conv1d):
+    def forward(self, value):
+        return super().forward(value).clamp(min=0.0) * 3.0
+
+
+@pytest.mark.parametrize("kind", ["linear", "conv"])
+def test_factorization_keeps_a_layer_whose_class_has_its_own_forward(tmp_path, kind):
+    # Factoring puts two plain layers in place of the module, which would
+    # drop the clamp and the scale.
+    torch.manual_seed(0)
+    if kind == "linear":
+        model = nn.Sequential(_ClampLinear(16, 16), nn.Linear(16, 16)).eval()
+        value = torch.randn(3, 16)
+    else:
+        model = nn.Sequential(_ClampConv(8, 8, 3), nn.Conv1d(8, 8, 1)).eval()
+        value = torch.randn(1, 8, 6)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning, match="left '0' without its low-rank factorization: its class"):
+        transformed = prepare_fast_model(model, config)
+    assert type(transformed[0]) is type(model[0])
+    assert torch.equal(transformed[0].weight, model[0].weight)
+    assert isinstance(transformed[1], nn.Sequential)
+    with pytest.warns(CattorchWarning, match="has its own forward"):
+        result = transpile(model, value, tmp_path / kind, optimization="fast", fast_config=config)
+    # Only the plain second layer is approximated.
+    reference = prepare_fast_model(model, config)
+    assert verify(reference, value, result).passed
+
+
+def test_factorization_keeps_a_layer_with_forward_hooks():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 16)).eval()
+    model[0].register_forward_hook(lambda module, args, output: output * 2)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning, match="left '0' without its low-rank factorization: it has forward hooks"):
+        transformed = prepare_fast_model(model, config)
+    assert type(transformed[0]) is nn.Linear and transformed[0]._forward_hooks
+    assert isinstance(transformed[2], nn.Sequential)
+
+
+def test_neuron_pruning_keeps_layers_with_forward_hooks():
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 4)).eval()
+    model[2].register_forward_pre_hook(lambda module, args: (args[0] * 2,))
+    with pytest.warns(CattorchWarning, match="left '2' without neuron pruning: it has forward hooks"):
+        transformed = prepare_fast_model(model, FastConfig(neuron_pruning=0.5))
+    assert transformed[0].out_features == 16
+
+
+@pytest.mark.parametrize("layer", ["attention", "encoder"])
+def test_factorization_keeps_layers_a_torch_module_reads_itself(tmp_path, layer):
+    # nn.MultiheadAttention reads out_proj.weight itself, and the encoder
+    # layer may take a fast path that reads every weight.
+    torch.manual_seed(0)
+    if layer == "attention":
+        inner = nn.MultiheadAttention(16, 2, batch_first=True)
+        names = ["m.out_proj"]
+    else:
+        inner = nn.TransformerEncoderLayer(16, 2, 32, dropout=0.0, batch_first=True)
+        names = ["m.self_attn.out_proj", "m.linear1", "m.linear2"]
+
+    class Wrap(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m = inner
+
+        def forward(self, value):
+            if layer == "attention":
+                return self.m(value, value, value, need_weights=False)[0]
+            return self.m(value)
+
+    model = Wrap().eval()
+    value = torch.randn(1, 3, 16)
+    config = FastConfig(layers=FastLayerConfig(rank=2))
+    with pytest.warns(CattorchWarning) as caught:
+        result = transpile(model, value, tmp_path / layer, optimization="fast", fast_config=config)
+    messages = [str(item.message) for item in caught]
+    for name in names:
+        assert any(
+            f"left {name!r} without its low-rank factorization: it belongs to 'm'" in message
+            for message in messages
+        ), (name, messages)
+    assert verify(model, value, result).passed
+
+
+def test_weight_transforms_check_every_program_method():
+    class TwoMethods(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up = nn.Linear(4, 16)
+            self.activation = nn.ReLU()
+            self.down = nn.Linear(16, 4)
+
+        def forward(self, value):
+            return self.down(self.activation(self.up(value)))
+
+        def weights(self, value):
+            return value @ self.up.weight.T
+
+    model = TwoMethods().eval()
+    config = FastConfig(neuron_pruning=0.5)
+    assert prepare_fast_model(model, config).up.out_features == 8
+    with pytest.warns(CattorchWarning, match="without neuron pruning"):
+        transformed = prepare_fast_model(model, config, methods=("forward", "weights"))
+    assert transformed.up.out_features == 16

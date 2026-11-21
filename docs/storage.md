@@ -3,7 +3,7 @@
 [Documentation home](index.md)
 
 Storage settings control how parameters, buffers, and constants are saved in
-the sprite. Compressed values are decoded once during `cattorch init`, and
+the sprite. Compressed values are decoded once during `NAME init`, and
 inference then runs on ordinary Scratch number lists.
 
 ## Choose a storage mode
@@ -60,14 +60,234 @@ matrix input width that doesn't exceed it, such as 56 for a width of 112.
 Smaller groups usually reduce error but store more scales. Scales are float16 by
 default.
 
+A matrix whose integer storage wouldn't be smaller than float16 stays float16,
+unrounded: the codes and a scale per group would take 16 bits per value or
+more, as with `group_size=1`, a prime input width such as 97 (whose only
+divisor up to 64 is 1), or int8 with float32 scales and groups of 4 or fewer.
+The cost is the storage codec's own for that tensor (for int4, its Huffman
+code). The report gives such a matrix `method="float16"` and says why.
+
+cattorch runs the model once to find each matrix's input width. A weight read
+by `nn.Linear` or `F.linear`, on either side of a matrix product (`x @ weight`,
+`weight @ x`, `torch.mm`, `torch.bmm`, `torch.mv`), by `torch.addmm` (as in
+GPT-2's `Conv1D` layers), `torch.baddbmm` or `torch.addmv`, by a two-operand
+`torch.einsum` or `torch.tensordot` that contracts it over one dimension, or
+by `F.bilinear` and `nn.Bilinear` is grouped over its inputs, and GPTQ
+calibrates it. So are `nn.MultiheadAttention`'s input projection, its output
+projection when the call passes no mask, and the input and hidden weights of
+every layer and direction of `nn.RNN`, `nn.LSTM` and `nn.GRU` and of
+`nn.RNNCell`, `nn.LSTMCell` and `nn.GRUCell`, as a recurrent generation step
+calls them. A cell called without a state reads zeros, so its hidden
+weight sees no calibration data and uses symmetric quantization, with the
+reason in the report. A projected
+LSTM's projection (`weight_hr_l*`) reads a value no output shows, so it uses
+symmetric quantization, and so does every layer but the first when the
+module runs with dropout in training mode. A 1D or 2D convolution is a
+linear map of each input window, so its kernels are grouped like a linear
+layer's, over each output channel's fan-in (input channels times kernel
+positions): a 3x3 convolution from 64 channels has groups of 64 of its 576
+inputs. A 3D convolution is lowered to a 2D convolution per kernel depth,
+and a transposed convolution to a plain one with flipped kernels, so their
+groups stay within the last two kernel dimensions (the last one, in 1D),
+such as 9 values of a 3x3x3 kernel. GPTQ calibrates each group of kernels
+over the input windows it reads, for 1D, 2D and 3D, grouped, depthwise and
+transposed convolutions. Other matrices, such as embeddings, are grouped
+along their last dimension and use symmetric quantization; with GPTQ,
+`result.warnings` names each of them.
+
+Each part of a parameter that a use reads, such as the slices of a fused
+QKV weight, even and odd rows, or one half read by `F.linear` and the other
+on the right of a matrix product, is quantized once, grouped over that use's
+inputs, and reported as its own entry (`qkv[offset=...,shape=...]`). Uses
+that read the same values the same way, such as `F.linear(h, weight)` and
+`h @ weight.T`, share one entry and GPTQ calibrates it with both. A matrix
+read other than by a matrix product, such as an embedding table gathered by
+token, is stored as it is read, grouped along its rows, so that read is a
+use too, without calibration data. Values read only in other ways, such as
+the experts of a bank an expert operation reads whole, are grouped along the
+parameter's last dimension, reported as `name[remaining]` when the rest of
+the parameter is quantized for its uses. When two uses read the same values
+grouped along different axes, as `F.linear(x, weight)` and `x @ weight` do,
+or an embedding gathered by token and the first rows of it read by
+`h @ embedding[:16]`, only one layout can be stored in integers: the larger
+use's, or the first one's. A parameter, or part of one, that the export
+never reads, such as a submodule `forward` doesn't call or the rows of
+`weight[:256]` past 256, isn't stored, so it is neither quantized nor
+reported.
+
+A weight the model copies before using it, such as
+`F.linear(x, weight.t().contiguous())` or `x @ weight.clone()`, is the
+parameter read in another layout: the parameter is quantized once, for its
+direct uses and its copies' together, GPTQ calibrates it with all of them,
+and each copy holds the same quantized values. The report has one entry
+for it, and a table read directly and through a copy, such as an embedding
+gathered by token and used as the head through `weight.t().contiguous()`,
+is stored once.
+
+A weight computed from parameters before any input arrives, such as a
+`weight_norm` or `spectral_norm` weight (`torch.nn.utils.parametrizations` or
+the older `torch.nn.utils.spectral_norm`), `F.linear(x, w * g)`, a LoRA sum
+`w + b @ a`, `w.clamp(...)`, a masked `w * mask`, a scaled tied embedding or
+an average of a weight and a buffer, is quantized as computed: grouped as
+the matrix product reads it and calibrated by GPTQ like a parameter, while
+the parameters it is computed from stay unrounded. What it is computed
+with may be a buffer, a tensor held as a plain attribute, or one built in
+`forward` from constants alone, such as `torch.tril(torch.ones(n, m))`.
+The model then computes
+with the quantized weight in place of the computation, both in the sprite
+and in every PyTorch comparison cattorch makes (`verify` with an
+`ExportProgram`, the length check of `dynamic=`). The report names a
+parametrized or `spectral_norm` weight by its attribute (`fc.weight`), and
+any other one `weight computed from <parameters>`, and lists the
+parameters in `sources`. A weight computed outside the forward of any of the
+model's modules, as in an `ExportProgram` entry point method, or within an
+operation that also reads an input, is stored as computed, in float16, with
+a warning and a `method="float16"` entry. The older
+`torch.nn.utils.weight_norm` usually can't be exported, because PyTorch
+can't copy a module that uses it; use
+`torch.nn.utils.parametrizations.weight_norm`.
+
+The report says what storage stores. Storage keeps a list in integers only
+when one of the integer encodings quantization uses reproduces it exactly, so
+a quantized value read in another layout is kept in float16. Each stored list is traced
+back to the parameter values it holds: an entry whose values are all stored
+in float16 is reported with `method` `"float16"` and the reason, and
+values also or only stored in float16 elsewhere get a `name[float16]` entry.
+Storage keeps one list for lists that hold the same values, as a weight and
+a `view` of it do, and stores it in the fewest bits any of their shapes
+allows, whichever use comes first; `verify` reads that list for each of
+them.
+`result.warnings` names the parameter each time. A weight split into
+several lists is stored at one precision, however short its last list. The
+entry points of an `ExportProgram` each store the lists they read, and the
+report describes them together: a weight one entry point reads as a linear
+weight and another on the right of a matrix product has an integer entry
+and a `name[float16]` entry, whichever entry point comes first. A matrix
+read only at positions fixed before any input arrives, such as a learned
+position table read with `torch.arange` (GPT-2's `wpe`), is stored as the
+rows read, in float16, and reported with the number of values stored.
+
 Matrices with fewer than `min_quantized_values=16384` values stay float16,
 because the integer decoder costs more than it saves on small tensors. Set
-`min_quantized_values=1` to quantize every eligible matrix. Biases,
-normalization parameters, and buffers such as RoPE tables and masks use
-float16. Values that can't safely be stored lossily stay float32.
+`min_quantized_values=1` to quantize every eligible matrix. A matrix is a
+parameter read as one by the uses above, or one with at least two
+dimensions larger than one (for an expert bank, per expert). The minimum
+applies to the whole parameter (or computed weight), however it is read: a
+weight above it is quantized and stored in integers even where the export
+reads it in smaller slices, such as `F.linear(x, w[:32])`, or splits it
+into several lists. Vectors stay
+float16: biases, normalization parameters, `nn.MultiheadAttention`'s
+`(1, 1, E)` `bias_k` and `bias_v`, and `(N, 1)` gains such as
+`weight_norm`'s. Buffers such as RoPE tables and masks use float16 too.
+Values that can't safely be stored lossily stay float32.
 
 Inspect `result.warnings` and `result.quantization.tensors`, then verify
 model-level output or generation quality.
+
+## Per-weight settings
+
+`QuantizationConfig.overrides` gives some weights other settings. Each key
+is a module path or a parameter name, as `model.named_parameters()` spells
+it, or a computed attribute such as a parametrized `fc.weight`; the value is
+bits (4, 6 or 8), `None` to keep the weights float16, or a
+`QuantizationOverride` with `bits`, `method` and `group_size`:
+
+```python
+from cattorch import QuantizationConfig, QuantizationOverride
+
+QuantizationConfig(
+    bits=4,
+    method="gptq",
+    overrides={
+        "transformer.h.11.mlp": 8,         # the last MLP in int8
+        "transformer.h.0": QuantizationOverride(bits=6, group_size=32),
+        "transformer.h.11.mlp.c_proj": None,  # float16
+    },
+)
+```
+
+A key selects the parameters under it, and the longest matching key wins.
+A key that selects no parameter is an error. Keys name your model's
+parameters, as you passed it: a layer fast mode factorizes into low-rank
+factors (`a` into `a.0` and `a.1`) gives its overrides to the factors, so
+`"a.weight"` selects both, and the report names the key as you wrote it.
+A BatchNorm folded into the convolution or linear layer before it has no
+weights of its own any more; a key naming it is an error that names that
+layer. A weight read under several
+names, such as GPT-2's token embedding `transformer.wte.weight` and its tied
+output head `lm_head.weight`, takes the highest precision its names select
+(float16 above 8 bits above 6 and 4), so `{"lm_head": 8}` keeps the shared
+table in int8. A weight computed from parameters takes the highest precision
+of the overrides that select its parameters or its attribute name.
+`method="gptq"` needs a GPTQ config; `method="symmetric"` within one skips
+calibration for those weights. Each `TensorQuantizationReport` names the
+`override` it used. One sprite can hold several integer formats: each is
+decoded by its own bank, and the int4 Huffman decoder is added only when
+some weight uses int4.
+
+## The output head of a language model
+
+In a generation export (`GenerationProgram`, `RecurrentGenerationProgram`),
+the output head is stored in int8 when `bits` is 4 or 6. The output head is
+the weight of the last matrix product that computes the logits: cattorch
+follows the model's computation while it observes it, and takes the
+weights of the matrix products that no other matrix product follows on the
+way to the logits. A bias, a scale or a softcap after the head doesn't
+change which weight it is, and a sum of two products, such as a head and a
+low-rank adapter on it, makes both weights part of the head. That is
+`lm_head` in Llama or Qwen2, `head` in RWKV, a hand-written model's final
+`nn.Linear`, and GPT-2's or Mamba's token embedding, which is tied to the
+head, so the shared table is int8. An untied input embedding stays at
+`bits`. A model whose logits no matrix product computes, such as a bigram
+table looked up by token, has no output head.
+
+The head turns a few hundred hidden values into tens of thousands of
+logits, and int4 rounding errors in it shift every logit at once. On the
+trained 124M-parameter GPT-2, measured on 510 next-token predictions of
+held-out text (float perplexity 40.0):
+
+| `QuantizationConfig` | Head in `bits` | Head in int8 (default) | Matrix payload |
+|---|---:|---:|---|
+| `bits=4` | perplexity 1,220 | 45.9 | 57.7 MB → 79.4 MB |
+| `bits=4, method="gptq"` | 70.0 | 42.1 | 57.7 MB → 79.4 MB |
+| `bits=6` | 58.3 | 41.4 | 96.5 MB → 106.2 MB |
+| `bits=6, method="gptq"` | 41.1 | 40.3 | 96.5 MB → 106.2 MB |
+| `bits=8` | 41.1 | 41.1 | 127.4 MB |
+
+The full int4 export grows from 89 MB to 109 MB of sprite JSON. Quantizing
+only GPT-2's embedding side to int4, with the rest in float, leaves the
+perplexity at 39.9, which is why an untied input embedding keeps `bits`.
+A small trained two-layer transformer with a tied 4,096-token table shows
+the same (perplexity 166 in float, 291 in int4, 169 with the int8 head); a
+small LSTM language model loses less (134, 139, 137).
+
+The cost is the head's share of the weights. In a model whose vocabulary
+table is most of its weights, an int4 export with the int8 head is nearly
+as large as an int8 one: a two-layer Mamba-2 with the full 50,288-token
+tied table takes 34 MB of sprite JSON in int4, 60 MB with the int8 head,
+and 65 MB in int8. Set `head_bits=4` where size matters more.
+
+`QuantizationConfig.head_bits` sets it: `"auto"` (the default) means int8
+for `bits=4` and `bits=6` and `bits` otherwise; `4`, `6` or `8` store the
+head in that many bits, and `None` keeps it float16. The head uses the
+config's `method` and `group_size`. An override that selects the head
+under any of its names takes precedence over `head_bits`, raising or
+lowering it, so for GPT-2 `overrides={"lm_head": 4}` stores the shared
+table in int4. The precedence is: an override for the weight, then
+`head_bits`, then `bits`.
+
+```python
+QuantizationConfig(bits=4)                  # int4, the output head int8
+QuantizationConfig(bits=4, head_bits=4)     # int4 everywhere
+QuantizationConfig(bits=4, overrides={"lm_head": 6})  # the head int6
+```
+
+The head's `TensorQuantizationReport` has `override="head_bits"` when
+`head_bits` chose its settings. Other exports, of tensor inputs or an
+`ExportProgram`, have no output head: they accept the default `"auto"` and
+raise `ValueError` for any other `head_bits`. Name the last layer in
+`overrides` to keep it in int8 there. `verify` reproduces the head of a
+generation export from the same `QuantizationConfig`.
 
 ## GPTQ calibration
 
@@ -81,7 +301,7 @@ result = transpile(
     example,
     "model_gptq_q4",
     quantization=QuantizationConfig(bits=4, method="gptq"),
-    calibration_inputs=calibration_batches,
+    calibration=calibration_batches,
 )
 
 for tensor in result.quantization.tensors:
@@ -89,21 +309,33 @@ for tensor in result.quantization.tensors:
         print(tensor.name, tensor.fallback_reason)
 ```
 
-Choose the calibration argument to match the export interface:
+`calibration` takes items in the form the export is called with:
 
-| Export interface | Calibration argument | Items |
-|---|---|---|
-| Tensor example inputs | `calibration_inputs` | Tensors or tuples matching the eager model's inputs |
-| `ExportProgram` | `calibration_calls` | Ordered `ProgramCall` values exercising the model's methods and state |
-| `GenerationProgram` | `calibration_sequences` | Full token sequences accepted by the generation method |
+| Export interface | `calibration` items |
+|---|---|
+| Tensor example inputs | Tensors or tuples matching the eager model's inputs |
+| `ExportProgram` | Ordered `ProgramCall` values exercising the model's methods and state |
+| `GenerationProgram`, `RecurrentGenerationProgram` | Full `[1, length]` token sequences accepted by the generation method |
 
 Calibration data is read once, so a generator works. For cached generation,
-keep the export example at one token (`[1, 1]`) but calibrate with realistic
-full sequences. The model method must accept those sequence lengths.
+calibrate with realistic full sequences of up to `max_context` tokens.
+Each item is checked as it is read: a token sequence must be `[1, length]`
+with `length` up to `max_context` and token IDs the model has, and tensor
+items must have as many tensors as the example inputs, with as many
+dimensions and the same kind of values. An item that fails a check, or
+that the model fails on, raises a `ValueError` naming it, such as
+`calibration[3]`.
 
 A matrix that saw too little calibration data, such as an expert the router
-never picked, falls back to symmetric quantization. Small matrices stay
-float16. The quantization report shows which method each tensor used.
+never picked, falls back to symmetric quantization, and so does one with
+more than 8,192 inputs, whose GPTQ statistics would take over 512 MiB. Small
+matrices stay float16. The quantization report shows which method each
+tensor used.
+
+GPTQ applies its error feedback within a block of `block_size` columns
+column by column, and to the columns after the block as one matrix product
+(the lazy batch update of the GPTQ paper), which makes wide matrices several
+times faster to calibrate.
 
 The [`QuantizationConfig` reference](api-reference.md#quantizationconfig)
 lists the GPTQ settings. GPTQ reduces per-layer error, but that doesn't always
@@ -121,24 +353,41 @@ which one causes a drop in accuracy.
 
 ## Preserve processor costumes
 
-Compressed weights are stored in the generated sprite's costume names. Don't
-rename, reorder, remove, or add costumes on that sprite, or the weights will
-load incorrectly. Put any visible costumes on a different sprite.
+Weights are stored in lists. Compressed weights are text, in a 92-character
+alphabet (base92), and the sprite has a costume named after each of those
+characters. To decode a character, the sprite switches to its costume and
+reads the costume number: the costumes are the decoder's lookup table, and
+hold no weights. Don't rename, reorder, remove, or add costumes on that
+sprite, or the weights will load incorrectly. Put any visible costumes on a
+different sprite. A sprite stored with `compression=False` has one costume.
 
 ## List sharding
 
-Scratch limits each list to 200,000 items. cattorch splits larger tensors
-across several lists, called shards:
+Scratch limits each list to 200,000 items, so cattorch splits a larger
+tensor across several lists, called shards. A global list, such as an input,
+an output, a state or `NAME logits`, is split like this:
 
 - The first shard keeps the original name.
-- Later shards are named `<name> shard 2`, `<name> shard 3`, and so on.
+- Later shards are named `<name> shard 2`, `<name> shard 3`, and so on,
+  such as `NAME output shard 2`; they are global too.
+- The sprite's own variables `cattorch <base> shard count` and
+  `cattorch <base> logical length` hold the number of shards and the total
+  number of items, where `<base>` is the list's name without NAME, such as
+  `cattorch output shard count`.
 - The generated blocks read and write every shard.
-- For each split public list, the variables `cattorch <name> shard count` and
-  `cattorch <name> logical length` hold the number of shards and total items.
 
-If your own scripts copy a sharded input or output, copy every shard in order,
-not only the first. `result.sharded_lists` names the lists that were split.
-`verify` handles shards for you.
+The result's `sharded_lists` names the public lists that were split. If your
+own scripts fill a sharded input, fill every shard in order, each but the
+last up to 200,000 items: a block refuses an input laid out otherwise (see
+[long lists](scratch-interface.md#long-lists)). Copy a sharded output the
+same way, every shard in order; `verify` handles shards for you. Weights are split too, into
+internal lists that `sharded_lists` leaves out: a compressed weight into
+smaller pieces, since each piece's decoded bytes must also fit in one list.
+
+A token embedding tied to the output head, as in GPT-2 and Mamba, is stored
+once even when it spans several lists: the embedding reads the head's shards.
+When another operation or a custom kernel needs the table in a different
+layout from the head's, it is stored twice and `result.warnings` says so.
 
 ## Project size
 
@@ -157,13 +406,11 @@ To reduce size, try lower-precision storage and
 ## Save after running
 
 After a run, the sprite holds both the compressed weights and the decoded
-copies. Model and `ExportProgram` sprites have a `cattorch prepare for save`
+copies. Model, program and generation sprites have a `cattorch prepare for save`
 block that clears the decoded weights and working data. Call it before saving;
-the next model call initializes the sprite again.
-
-`GenerationProgram` sprites don't have this block. Their `cattorch reset`
-clears the cache and outputs but leaves the decoded weights loaded, so a
-project saved after generating will be larger.
+the next call initializes the sprite again. A generation sprite's
+`cattorch prepare for save` also resets it, as `cattorch reset` does, since its
+cache is too large to save: prefill again afterwards.
 
 Related: [verification](verification-and-benchmarking.md) and
 [result types](api-reference.md#result-types).

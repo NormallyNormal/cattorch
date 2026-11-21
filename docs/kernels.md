@@ -25,24 +25,92 @@ Where things live:
 
 | Module | Responsibility |
 |---|---|
-| `cattorch.frontend` | Turns FX and `torch.export` traces into one graph format. |
+| `cattorch.frontend` | Traces the model with FX and normalizes the graph. |
+| `cattorch.decompositions` | Rewrites operations without a kernel into ones that have one. |
 | `cattorch.graph` | Constant folding, aliases, validation, and recognizing fusable patterns. |
 | `cattorch.operator_registry` | Operation validation, exact/fast kernel selection, quantization hooks, and internal module adapters. |
-| `cattorch.transpiler` | Turns graph nodes into instruction programs. |
-| `cattorch.sprite` | Adds init, storage, sharding, and generation blocks around the compiled program. |
-| `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. |
-| `cattorch.util.instruction.dispatch`, `cattorch.util.instruction.optimized` | Compatibility re-exports only. Add no new code here. |
+| `cattorch.transpiler` | `transpile` itself, and the two stages of one graph's export: `_compile_sprite` turns graph nodes into instruction programs (`_Compiler`), stores the weights and shards the lists; `_finalize_sprite` adds a standalone sprite's input checks and guards, marks internal names, gives the sprite its global interface and writes the file. |
+| `cattorch.program_export` | Exports an `ExportProgram`: one compiled graph per entry point, joined into one sprite with its state lists. |
+| `cattorch.autoregressive` | Derives a `GenerationProgram`'s one-token step and caches from the model, and checks it against the model. |
+| `cattorch.recurrent_generation` | Exports a `RecurrentGenerationProgram` around the model's step. |
+| `cattorch.sprite` | Wraps a plain export's compiled program in its init and forward procedures, adds input checks and prepare for save, and sizes the lists for sharding. |
+| `cattorch.procedures` | Adds DSL programs to a sprite as custom blocks, and finds and edits them. |
+| `cattorch.guards` | Keeps stopped and overlapping calls of a sprite's blocks from reporting ok wrongly; its docstring compares what each kind of export does. |
+| `cattorch.static_storage` | Chooses each static tensor's storage precision, shares identical tensors, and installs the compressed payloads and their decoder. |
+| `cattorch.generation_blocks` | Adds the reset, prefill and decode blocks, top-k selection and cache bookkeeping around a generation sprite's one-token step. |
+| `cattorch.layer_sharing` | Replaces a transformer's identical repeated layers with one custom block called once per layer. |
+| `cattorch.util.instruction.optimized_*` | Kernels, split by domain: `linear`, `elementwise`, `normalization`, `tensor`, `convolution`, and `moe`. `generic` holds kernels for operations without a specialized one, and `row_loop` runs a one-row kernel once per row of a variable-length input. |
+| `cattorch.util.scratch` | The DSL (`dsl`), the Python emulator (`emulator`), list sharding (`sharding`), the global interface every finished sprite gets (`globals`: broadcasts that run its blocks, and global lists and variables named after the export), and writing the `.sprite3` archive (`finalize_scratch`, `archive`). |
 
 A change to an operation should come with:
 
 1. Tests against PyTorch covering shapes, edge cases, and broadcasting.
 2. Emulator tests of the generated blocks.
-3. A benchmark project whose timer starts after `cattorch init`.
+3. A benchmark project whose timer starts after `NAME init`.
 4. Results from real Scratch, with enough iterations to be well above the
    timer's resolution.
 
 Fast kernels also need tests that measure how far the approximation drifts, and
 that the exact kernel is used when the approximation is turned off.
+
+## Context kernels
+
+New kernels are written against the public, experimental interface described
+in [custom kernels and operations](custom-kernels.md): a `Kernel` with an
+`emit(ctx)` function returning `cattorch.scratch` statements. Rotary
+embedding, `topk`, runtime gather and scatter, and generation's cached
+attention (`cattorch/builtin_kernels.py`) are written this way, and register
+in `_build_default_registry`. New built-in operations are declared with
+`cattorch.custom_ops.op`, as `cattorch/ops.py` does. Notes that only matter
+inside cattorch:
+
+- Lists are declared in request order, after the inputs, and the output is
+  placed when `ctx.output` is first read. That order shows up in the sprite,
+  so keep it stable when porting an existing kernel.
+- `temp_list` and `static_list` names start with `_` and are never merged
+  across instructions; `temp_list` records its capacity so it is sharded past
+  200,000 items.
+- `Kernel(fast_flag="activations")` ties an approximate kernel to a
+  `FastConfig` flag.
+- `ctx.options` holds facts the compiler decides after the operation is
+  known, such as the row stride and base variable of banked generation caches,
+  or the variable that lets the final layer skip its attention during hidden
+  prefill. It is empty in
+  validators. An option that differs between repeated layers prevents layer
+  sharing, so pass one only when it is identical for them.
+- A tensor input that the compiler binds to a persistent named list, such as a
+  generation K/V cache, is read through `TensorInfo.list` like any other input.
+  The kernel appends to or reads from it; the generation blocks clear and
+  shard it. The `cattorch.cached_attention` and
+  `cattorch.sequence_row` kernels in `cattorch/builtin_kernels.py` are written
+  this way, and read the current position from the `cattorch cache length`
+  variable.
+- `register_kernel` merges into the operation's existing rule, keeping its
+  quantization observer and the other (exact or fast) kernel. Register on a
+  cloned registry, never on `default_registry()`; `transpile(kernels=...)`
+  does this per export.
+
+## Operator conformance
+
+`tests/opinfo_conformance.py` runs PyTorch's OpInfo samples through
+`transpile` and `verify`: up to four per operator, and up to four more whose
+other arguments differ from those. Each sample's tensors are Scratch inputs,
+so a sample that only passes with constant indices is reported separately.
+A full run uses every core by default (`--workers N` limits it):
+
+```bash
+python tests/opinfo_conformance.py --check   # every recorded case still passes
+python tests/opinfo_conformance.py --write   # record new passes, regenerate the page
+python tests/opinfo_conformance.py sign round   # try a few operators
+```
+
+`--write` updates `tests/opinfo_passing.json` and
+[`docs/operator-coverage.md`](operator-coverage.md). The test suite runs the
+first recorded sample of each operator, and CI runs `--check`, so a case that
+passes once has to keep passing. Record new passes with `--write` in the same
+change that adds them. The list is tied to one PyTorch minor version, because
+OpInfo's samples change between releases; with another version both checks
+skip and ask for a refresh.
 
 ## Performance evidence
 

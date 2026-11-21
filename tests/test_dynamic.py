@@ -1,0 +1,513 @@
+"""Bounded variable-length inputs: ``transpile(..., dynamic=...)``."""
+
+from __future__ import annotations
+
+from cattorch import interface
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from cattorch import BoundedDimension, UnsupportedModelError, entrypoint, transpile, verify
+from cattorch import ProgramCall
+from sprite_helpers import SpriteEmulator, load_sprite
+
+
+class Lambda(nn.Module):
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+
+    def forward(self, value):
+        return self.function(value)
+
+
+def _check(tmp_path, model, example, dynamic, lengths, axis=0):
+    model = model.eval()
+    result = transpile(model, example, tmp_path / "dynamic", dynamic=dynamic)
+    for length in lengths:
+        shape = list(example.shape)
+        shape[axis] = length
+        value = (
+            torch.randn(shape) if example.is_floating_point()
+            else torch.randint(0, 10, shape)
+        )
+        assert verify(model, value, result).passed, length
+    return result
+
+
+def test_a_variable_batch_has_a_bounded_interface(tmp_path):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.GELU(), nn.LayerNorm(8), nn.Linear(8, 3))
+    result = _check(tmp_path, model, torch.randn(5, 4), {0: (1, 16)}, (1, 3, 16))
+    assert result.inputs[0].shape == (BoundedDimension("input", 1, 16), 4)
+    assert result.output.shape == (BoundedDimension("input", 1, 16), 3)
+    assert result.output.max_numel == 48
+
+
+def _written(value, write):
+    result = value * 1.0
+    write(result)
+    return result
+
+
+ROW_BY_ROW = {
+    "sum": lambda x: x.sum(-1),
+    "topk": lambda x: x.topk(2, -1).values,
+    "pad": lambda x: F.pad(x, (1, 2)),
+    "flip": lambda x: x.flip(-1),
+    "slice": lambda x: x[:, 1:4],
+    "cumsum": lambda x: x.cumsum(-1),
+    "cat": lambda x: torch.cat([x, x * 2], -1),
+    "cat of three": lambda x: torch.cat([x, x * 2, x + 1], -1),
+    "cat of four, unequal": lambda x: torch.cat([x[:, :2], x * 2, x + 1, x[:, 3:]], 1),
+    "column write": lambda x: _written(x, lambda y: y.__setitem__((slice(None), 1), x[:, 2])),
+    "columns write": lambda x: _written(
+        x, lambda y: y.__setitem__((Ellipsis, slice(1, 3)), x[..., 3:5] * 2),
+    ),
+    "group norm": lambda x: F.group_norm(x.unsqueeze(-1), 2),
+    "rms norm": lambda x: F.rms_norm(x, (6,)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROW_BY_ROW))
+def test_operations_without_runtime_length_kernels_run_row_by_row(tmp_path, name):
+    torch.manual_seed(1)
+    _check(tmp_path, Lambda(ROW_BY_ROW[name]), torch.randn(3, 6), {0: (1, 8)}, (2, 8))
+
+
+def test_a_token_dimension_after_a_size_one_batch(tmp_path):
+    torch.manual_seed(2)
+    model = nn.Sequential(nn.Embedding(10, 8), nn.Linear(8, 10), nn.LogSoftmax(-1))
+    result = _check(
+        tmp_path, model, torch.tensor([[1, 2, 3]]), {0: {1: (1, 12)}}, (1, 5, 12), axis=1,
+    )
+    assert result.inputs[0].shape == (1, BoundedDimension("input", 1, 12))
+
+
+class _AfterStart(nn.Module):
+    """Looks up a start token and the ids, shifted or not: an index along the
+    variable-length dimension, after a fixed item."""
+
+    def __init__(self, shift):
+        super().__init__()
+        self.shift = shift
+        self.emb = nn.Embedding(10, 4)
+
+    def forward(self, ids):
+        return self.emb(torch.cat([torch.tensor([0]), ids]) + self.shift).mean(0)
+
+
+@pytest.mark.parametrize("shift", [0, 1])
+def test_an_index_along_the_variable_length_dimension_is_checked(tmp_path, shift):
+    # The ids themselves are checked before the call; ids + 1 as the
+    # block runs, along the whole variable-length list.
+    torch.manual_seed(2)
+    model = _AfterStart(shift).eval()
+    result = transpile(model, torch.tensor([1, 5, 7]), tmp_path / "ids", dynamic={0: (1, 12)})
+    for length in (1, 4, 12):
+        assert verify(model, torch.randint(-shift, 10 - shift, (length,)), result).passed, length
+    emulator = SpriteEmulator(load_sprite(result.path))
+    highest, lowest = 9 - shift, -shift
+    for ids, valid in (
+        ([3, highest], True), ([3, highest + 1], False), ([8, 0, 2, lowest, 4], True),
+        ([1, 2, 3, lowest - 1], False),
+    ):
+        emulator.lists["input"] = ids
+        emulator.run_procedure(interface.FORWARD)
+        status = emulator.variables[interface.STATUS_VARIABLE]
+        if valid:
+            assert status == interface.OK, ids
+            torch.testing.assert_close(
+                torch.tensor([float(item) for item in emulator.lists["output"]]),
+                model(torch.tensor(ids)).detach(),
+            )
+        else:
+            with pytest.raises(IndexError):
+                model(torch.tensor(ids))
+            assert status == interface.invalid_item(emulator.public("input")), ids
+
+
+def test_a_model_that_reorders_its_batch_runs_once_per_item(tmp_path):
+    torch.manual_seed(3)
+    layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+    result = _check(tmp_path, layer, torch.randn(2, 4, 8), {0: (1, 5)}, (1, 4))
+    assert any("once per item" in warning for warning in result.warnings)
+
+
+def test_a_model_using_the_length_itself_is_rejected(tmp_path):
+    class Positions(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tokens = nn.Embedding(10, 4)
+            self.positions = nn.Embedding(16, 4)
+
+        def forward(self, tokens):
+            return self.tokens(tokens) + self.positions(torch.arange(tokens.shape[1]))
+
+    with pytest.raises(
+        UnsupportedModelError,
+        match="export gives different numbers from the model.*One possible cause is "
+        "that the model uses the length itself",
+    ):
+        transpile(Positions().eval(), torch.tensor([[1, 2, 3]]), tmp_path / "p", dynamic={0: {1: (1, 16)}})
+
+
+def _first_row_written(value):
+    written = value * 1.0
+    written[:, 0, :] = 5.0
+    return written
+
+
+@pytest.mark.parametrize("function", [
+    _first_row_written,
+    lambda value: torch.cat([value[:, :1] * 3, value[:, 1:]], 1),
+])
+def test_a_slice_empty_in_the_one_item_trace_is_named_as_the_cause(tmp_path, function):
+    with pytest.raises(UnsupportedModelError, match="holds nothing with one item") as caught:
+        transpile(
+            Lambda(function).eval(), torch.randn(1, 3, 4), tmp_path / "rest",
+            dynamic={0: {1: (1, 6)}},
+        )
+    assert "uses the length itself" not in str(caught.value)
+
+
+def test_the_length_check_compares_with_the_stored_weights(tmp_path):
+    # Quantization changes the weights, so the sprite and the model differ
+    # by more at some lengths than at one row; the check compares with a
+    # model holding the quantized weights, so only a real difference trips it.
+    from cattorch import QuantizationConfig
+
+    quantization = QuantizationConfig(bits=4, min_quantized_values=1, group_size=4)
+    torch.manual_seed(4)
+    model = nn.Sequential(nn.Linear(4, 5), nn.ReLU()).eval()
+    transpile(model, torch.randn(3, 4), tmp_path / "m", dynamic={0: (1, 8)}, quantization=quantization)
+
+    class Positions(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4)
+            self.positions = nn.Parameter(torch.randn(16, 4))
+
+        def forward(self, x):
+            return self.linear(x) + self.positions[:x.shape[0]]
+
+    with pytest.raises(UnsupportedModelError, match="uses the length itself"):
+        transpile(
+            Positions().eval(), torch.randn(3, 4), tmp_path / "p", dynamic={0: (1, 8)},
+            quantization=quantization,
+        )
+
+
+@pytest.mark.parametrize("mode", ["sum", "max"])
+def test_an_embedding_bag_with_padding_along_variable_indices(tmp_path, mode):
+    # Traced with one index, the padding mask [1] is viewed as [1, 1, 1];
+    # the trace at two indices tells which of those dimensions grows.
+    torch.manual_seed(0)
+    model = nn.EmbeddingBag(10, 4, mode=mode, padding_idx=0).eval()
+    result = transpile(
+        model, torch.tensor([[1, 2, 3]]), tmp_path / "bag", dynamic={0: {1: (1, 8)}},
+    )
+    for indices in ([[1, 0, 0, 5, 9]], [[0]], [[4, 2, 0, 1, 1, 7, 8, 0]]):
+        assert verify(model, torch.tensor(indices), result).passed
+
+
+def test_a_model_with_two_runtime_dimensions_is_rejected(tmp_path):
+    with pytest.raises(UnsupportedModelError, match="two runtime dimensions"):
+        transpile(
+            Lambda(lambda x: x @ x.T).eval(), torch.randn(3, 4), tmp_path / "m",
+            dynamic={0: (1, 8)},
+        )
+
+
+@pytest.mark.parametrize(("dynamic", "error"), [
+    ({3: (1, 4)}, ValueError),
+    ({0: (0, 4)}, ValueError),
+    ({0: (5, 4)}, ValueError),
+    ({0: {2: (1, 4)}}, ValueError),
+    ({"missing": (1, 4)}, ValueError),
+    ([(1, 4)], TypeError),
+])
+def test_dynamic_arguments_are_validated(tmp_path, dynamic, error):
+    with pytest.raises(error):
+        transpile(nn.Linear(4, 2).eval(), torch.randn(2, 4), tmp_path / "v", dynamic=dynamic)
+
+
+def test_a_keyword_input_can_be_dynamic(tmp_path):
+    class Gated(nn.Module):
+        def forward(self, value, *, gate):
+            return value * torch.sigmoid(gate)
+
+    model = Gated().eval()
+    result = transpile(
+        model, (torch.randn(1, 3),), tmp_path / "k",
+        example_kwargs={"gate": torch.randn(2, 3)}, dynamic={"gate": (1, 6)},
+    )
+    assert result.inputs[1].shape[0] == BoundedDimension("input_1", 1, 6)
+    report = verify(model, (torch.randn(1, 3),), result, example_kwargs={"gate": torch.randn(5, 3)})
+    assert report.passed
+
+
+def test_entry_points_take_dynamic_inputs(tmp_path):
+    class Scorer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(3, 2)
+            self.register_buffer("calls", torch.zeros(1))
+
+        @entrypoint(example_inputs=lambda: (torch.ones(4, 3),), dynamic={"rows": (1, 10)})
+        def score(self, rows):
+            self.calls += 1
+            return torch.softmax(self.linear(rows), -1) * self.calls
+
+    torch.manual_seed(4)
+    model = Scorer().eval()
+    result = transpile(model, None, tmp_path / "scorer")
+    assert result.entrypoints[0].inputs[0].shape == (BoundedDimension("rows", 1, 10), 3)
+    calls = (ProgramCall("score", (torch.randn(2, 3),)), ProgramCall("score", (torch.randn(9, 3),)))
+    assert verify(model, None, result, calls=calls).passed
+
+
+def test_an_entry_point_that_cant_follow_the_length_runs_per_item(tmp_path):
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            return self.layer(sequences)
+
+    torch.manual_seed(0)
+    model = Encoder().eval()
+    result = transpile(model, None, tmp_path / "encoder")
+    assert any("runs once per item" in warning for warning in result.warnings)
+    assert result.entrypoints[0].outputs[0].shape == (BoundedDimension("sequences", 1, 6), 4, 8)
+    calls = tuple(ProgramCall("encode", (torch.randn(length, 4, 8),)) for length in (1, 5, 2))
+    assert verify(model, None, result, calls=calls).passed
+
+
+def test_a_per_item_output_list_holding_a_longer_intermediate_is_sharded(
+    tmp_path, small_list_limit,
+):
+    # Each item's 640-value product is computed in its output's list.
+    small_list_limit(300)
+
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+            self.weight = nn.Parameter(torch.randn(1, 1, 20))
+            self.bias = nn.Parameter(torch.randn(32))
+
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            return (self.layer(sequences).reshape(-1, 32, 1) * self.weight).sum(-1) + self.bias
+
+    torch.manual_seed(0)
+    model = Encoder().eval()
+    result = transpile(model, None, tmp_path / "encoder")
+    assert any("runs once per item" in warning for warning in result.warnings)
+    calls = tuple(ProgramCall("encode", (torch.randn(length, 4, 8),)) for length in (1, 5))
+    assert verify(model, None, result, calls=calls).passed
+
+
+def test_an_entry_point_that_updates_state_doesnt_run_per_item(tmp_path):
+    class Encoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+            self.register_buffer("calls", torch.zeros(1))
+
+        @entrypoint(example_inputs=lambda: (torch.randn(3, 4, 8),), dynamic={"sequences": (1, 6)})
+        def encode(self, sequences):
+            self.calls += 1
+            return self.layer(sequences) * self.calls
+
+    with pytest.raises(UnsupportedModelError):
+        transpile(Encoder().eval(), None, tmp_path / "encoder")
+
+
+def test_an_entry_point_using_the_length_itself_is_rejected(tmp_path):
+    class Positions(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.table = nn.Parameter(torch.randn(10, 3))
+
+        @entrypoint(example_inputs=lambda: (torch.randn(4, 3),), dynamic={"rows": (1, 8)})
+        def add(self, rows):
+            return rows + self.table[torch.arange(rows.shape[0])]
+
+    with pytest.raises(UnsupportedModelError, match="entry point 'add' .*input 'rows'"):
+        transpile(Positions().eval(), None, tmp_path / "positions")
+
+
+def test_dynamic_is_rejected_for_programs(tmp_path):
+    class Tally(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.zeros(3))
+
+        @entrypoint(example_inputs=lambda: (torch.ones(3),))
+        def add(self, value):
+            self.total += value
+            return self.total.sum()
+
+    with pytest.raises(ValueError, match="@entrypoint"):
+        transpile(Tally().eval(), None, tmp_path / "tally", dynamic={0: (1, 4)})
+
+
+def test_row_loop_capture_sees_only_its_own_thread():
+    import threading
+
+    from cattorch.util.instruction.row_loop import captured_programs
+    from cattorch.util.scratch.dsl import Program, set_var
+
+    started, finish = threading.Event(), threading.Event()
+
+    def other():
+        started.wait()
+        Program("other", variables=("v",), body=(set_var("v", 1),)).compile()
+        finish.set()
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    with captured_programs() as programs:
+        mine = Program("mine", variables=("v",), body=(set_var("v", 2),))
+        started.set()
+        finish.wait()
+        mine.compile()
+    thread.join()
+    assert programs == [mine]
+
+
+class _FeatureTokens(nn.Module):
+    """Each feature becomes a token: ``(items, features) -> (items, features, width)``."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(3, 4))
+        self.bias = nn.Parameter(torch.randn(3, 4))
+
+    def forward(self, x):
+        return x.unsqueeze(-1) * self.weight + self.bias
+
+
+def test_broadcast_that_adds_a_dimension_follows_the_length(tmp_path):
+    torch.manual_seed(0)
+    _check(tmp_path, _FeatureTokens().eval(), torch.randn(2, 3), {0: (1, 8)}, (1, 4, 8))
+
+
+class _BatchedWeight(nn.Module):
+    def __init__(self, shape, function=torch.matmul):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(shape))
+        self.function = function
+
+    def forward(self, x):
+        return self.function(x, self.weight)
+
+
+@pytest.mark.parametrize(("shape", "output"), [
+    ((3, 4, 5), (3, "n", 5)),
+    # Trailing size-1 batch dimensions are added after the rows are placed.
+    ((2, 3, 1, 4, 5), (2, 3, 1, "n", 5)),
+])
+def test_rows_times_a_batched_weight_keep_their_items(tmp_path, shape, output):
+    torch.manual_seed(0)
+    result = _check(tmp_path, _BatchedWeight(shape).eval(), torch.randn(2, 4), {0: (1, 6)}, (1, 6))
+    bounded = BoundedDimension("input", 1, 6)
+    assert result.output.shape == tuple(bounded if size == "n" else size for size in output)
+    assert not result.warnings
+
+
+@pytest.mark.parametrize("after", [
+    lambda y, bias, scale: torch.relu(y + bias) * scale,
+    lambda y, bias, scale: (bias - y).softmax(0),
+    lambda y, bias, scale: y.sum(-1) + y.amax(0, keepdim=True).sum(),
+])
+def test_operations_after_rows_times_a_batched_weight(tmp_path, after):
+    # The items are the middle dimension of [3, n, 5], not one contiguous
+    # block each, so these run as runtime kernels rather than once per item.
+    class Heads(_BatchedWeight):
+        def __init__(self):
+            super().__init__((3, 4, 5))
+            self.bias = nn.Parameter(torch.randn(3, 1, 5))
+            self.scale = nn.Parameter(torch.randn(3, 1, 1))
+
+        def forward(self, x):
+            return after(x @ self.weight, self.bias, self.scale)
+
+    torch.manual_seed(0)
+    result = _check(tmp_path, Heads(), torch.randn(2, 4), {0: (1, 6)}, (1, 2, 6))
+    assert not result.warnings
+
+
+def test_a_variable_batch_against_a_batched_weight_runs_once_per_item(tmp_path):
+    # The batched kernel can't follow the length of [n, 1, 3, 4].
+    torch.manual_seed(0)
+    result = _check(
+        tmp_path, _BatchedWeight((3, 4, 5)).eval(), torch.randn(2, 1, 3, 4), {0: (1, 6)}, (1, 6),
+    )
+    assert any("once per item" in warning for warning in result.warnings)
+
+
+def test_rows_inside_a_batch_against_a_batched_weight_are_rejected(tmp_path):
+    model = _BatchedWeight((3, 4, 5), lambda x, weight: x.transpose(0, 1) @ weight).eval()
+    with pytest.raises(UnsupportedModelError, match="batched right side"):
+        transpile(model, torch.randn(2, 3, 4), tmp_path / "m", dynamic={0: (1, 6)})
+
+
+def test_length_check_reaches_the_maximum(tmp_path):
+    # Correct up to 20 items, wrong past them.
+    model = Lambda(lambda x: x.sum(0) / min(x.shape[0], 20)).eval()
+    with pytest.raises(UnsupportedModelError, match="with 64 items"):
+        transpile(model, torch.randn(4, 2), tmp_path / "capped", dynamic={0: (1, 64)})
+
+
+@pytest.mark.parametrize("by_item", [False, True])
+def test_a_wrong_input_length_is_reported(tmp_path, by_item):
+
+
+    if by_item:  # attention that reorders its batch runs once per item
+        model = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True)
+        example, width = torch.randn(2, 3, 8), 24
+    else:
+        model, example, width = nn.Linear(3, 2), torch.randn(4, 3), 3
+    result = transpile(model.eval(), example, tmp_path / "bounded", dynamic={0: (1, 4)})
+    sprite = load_sprite(result.path)
+    for count, status in (
+        (0, interface.too_few_items("bounded input")),
+        (5 * width, interface.too_many_items("bounded input")),
+        (width + 1, interface.wrong_number_of_items("bounded input")), (2 * width, interface.OK),
+    ):
+        emulator = SpriteEmulator(sprite)
+        emulator.lists["input"] = [0.5] * count
+        emulator.run_procedure("cattorch forward")
+        assert emulator.variables["cattorch status"] == status, count
+        # A forward that fails writes no output.
+        assert bool(emulator.lists["output"]) == (status == interface.OK)
+        assert emulator.broadcasts[-1] == interface.completion("bounded forward")
+
+
+def test_each_item_can_give_several_output_rows(tmp_path):
+    model = Lambda(lambda x: x.reshape(-1, 2)).eval()
+    result = _check(tmp_path, model, torch.randn(3, 4), {0: (1, 9)}, (1, 4, 9))
+    assert result.outputs[0].shape[0] == BoundedDimension("input", 2, 18)
+
+
+def test_running_once_per_item_is_built_before_finalizing(tmp_path):
+    from cattorch import CodegenConfig
+    from cattorch.util.scratch.archive import read_json
+
+    # Attention that reorders its batch runs once per item.
+    layer = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True).eval()
+    result = transpile(
+        layer, torch.randn(2, 3, 8), tmp_path / "items", dynamic={0: (1, 4)},
+        codegen=CodegenConfig(compact_internal_names=True),
+    )
+    sprite = read_json(result.path)
+    names = [entry[0] for section in ("variables", "lists") for entry in sprite[section].values()]
+    # The per-item wrapper's own names are compacted with the rest.
+    assert not any(name.startswith("_cattorch unit") for name in names)
+    assert verify(layer, torch.randn(3, 3, 8), result).passed

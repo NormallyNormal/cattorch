@@ -18,7 +18,7 @@ def main():
     path = build_benchmark_suite(
         cases,
         OUTPUT,
-        iterations=100,
+        repeats=100,
     )
     print(f"Exact/fast suite written: {path}")
 

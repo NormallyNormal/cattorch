@@ -12,13 +12,19 @@ connecting it to the rest of a project.
 - [Getting started](getting-started.md): export and integrate a small model.
 - [Supported models and operations](supported-models.md): which models and
   PyTorch operations can be exported.
+- [Operator coverage](operator-coverage.md): how PyTorch's own operator samples
+  fare, generated from a test run.
 - [Optimization modes](optimization.md): exact or faster approximate kernels.
 - [Storage and quantization](storage.md): float16, integer quantization, GPTQ,
   and Scratch's size limits.
 - [KV-cached generation](generation.md): export a language model and generate
   text one token at a time.
+- [Recurrent generation](recurrent-generation.md): generate with GRU and LSTM
+  language models, Mamba, Mamba-2, and RWKV.
 - [Tokenizers](tokenizers.md): export character, BPE, or SentencePiece
   tokenizers.
+- [Projects and the command line](projects-and-cli.md): build a runnable
+  Scratch project around exported sprites, and export from the terminal.
 - [Verification and benchmarking](verification-and-benchmarking.md): check
   output against PyTorch and measure speed in Scratch.
 - [Troubleshooting](troubleshooting.md): fix export failures and report
@@ -28,11 +34,20 @@ connecting it to the rest of a project.
 
 - [API reference](api-reference.md): functions, configuration classes, result
   types, benchmark builders, and exceptions.
+- [Scratch interface](scratch-interface.md): the blocks, lists, variables, and
+  broadcasts of exported sprites, versioned for 1.x.
 - [Code generation and JSON size](code-generation.md): trade sprite size for
   speed.
-- [Experimental programs and sparse MoE](programs-and-moe.md): multiple
-  methods, persistent state, and mixture-of-experts models.
+- [Programs and sparse MoE](programs-and-moe.md): multiple methods,
+  persistent state, and mixture-of-experts models.
+- [Markers](markers.md): declare entry points, state, MoE routing, and
+  export-only methods with decorators on your own classes.
+- [Custom kernels and operations](custom-kernels.md): write Scratch kernels
+  and declare new operations (experimental).
+- [Stability](stability.md): what cattorch 1.x keeps compatible, and what's
+  experimental.
 - [Glossary](glossary.md): cattorch and Scratch terms used in these guides.
+- [Migrating to 1.0](migrating-to-1.0.md): update 0.5 code and Scratch projects for 1.0.
 
 ## Contribute
 

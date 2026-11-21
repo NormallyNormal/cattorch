@@ -15,7 +15,7 @@ OUTPUT = Path(__file__).parent / "artifacts" / "full_suite.sb3"
 def main():
     torch.manual_seed(123)
     cases = [*build_kernel_cases(), *build_model_cases()]
-    path = build_benchmark_suite(cases, OUTPUT, iterations=100)
+    path = build_benchmark_suite(cases, OUTPUT, repeats=100)
     print(f"Full suite written: {path}")
 
 

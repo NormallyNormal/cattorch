@@ -91,6 +91,8 @@ def fold_eval_batch_norms(
             for left, right in eligible
         ):
             continue
+        if isinstance(layer, torch.nn.Linear) and layer.out_features != batch_norm.num_features:
+            continue  # the BatchNorm normalizes another axis
         # A different method may consume a layer's parameters directly.
         if any(
             target.startswith((f"{producer_path}.", f"{batch_norm_path}."))
@@ -111,10 +113,70 @@ def fold_eval_batch_norms(
         if isinstance(layer, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
             folded = fuse_conv_bn_eval(layer, batch_norm)
         else:
-            folded = fuse_linear_bn_eval(layer, batch_norm)
+            folded = _LinearThenBatchNorm(
+                fuse_linear_bn_eval(copy.deepcopy(layer), batch_norm), layer, batch_norm,
+            )
         _set_submodule(transformed, layer_path, folded)
         _set_submodule(transformed, batch_norm_path, torch.nn.Identity())
+    # Quantization overrides name the model's own parameters; a folded
+    # BatchNorm's are part of its layer's now.
+    transformed._cattorch_replaced_modules = {
+        **getattr(transformed, "_cattorch_replaced_modules", {}),
+        **{batch_norm_path: ("folded", layer_path) for layer_path, batch_norm_path in pairs},
+    }
     return transformed
 
 
+class _LinearThenBatchNorm(torch.nn.Module):
+    """A Linear folded with the BatchNorm1d after it, for 2-D inputs only.
+
+    BatchNorm1d normalizes dimension 1. For a ``(batch, features)`` output
+    that is the Linear's features, but for ``(batch, tokens, features)`` it
+    is the tokens, which a fold can't express. The rank is known when the
+    model is traced, so only one branch is exported.
+    """
+
+    def __init__(self, folded, linear, batch_norm):
+        super().__init__()
+        self.folded, self.linear, self.batch_norm = folded, linear, batch_norm
+
+    def forward(self, value):
+        if value.dim() == 2:
+            return self.folded(value)
+        return self.batch_norm(self.linear(value))
+
+
 __all__ = ["fold_eval_batch_norms"]
+
+
+def mode_dependent_modules(model: torch.nn.Module) -> list[str]:
+    """Paths of the modules in training mode whose output depends on it.
+
+    These are dropout and batch norm, a recurrent layer or attention with
+    dropout, an instance norm tracking running statistics, and any module
+    whose ``forward`` reads ``self.training``. Other modules give the same
+    output in either mode, so exporting them in evaluation mode changes
+    nothing.
+    """
+    nn = torch.nn
+    found = []
+    for path, module in model.named_modules():
+        if not module.training:
+            continue
+        dependent = (
+            isinstance(module, (nn.modules.dropout._DropoutNd, nn.modules.batchnorm._BatchNorm))
+            or (
+                isinstance(module, nn.modules.instancenorm._InstanceNorm)
+                and module.track_running_stats
+            )
+            or (
+                isinstance(module, (nn.RNNBase, nn.MultiheadAttention))
+                and getattr(module, "dropout", 0)
+            )
+        )
+        if not dependent:
+            code = getattr(getattr(type(module), "forward", None), "__code__", None)
+            dependent = code is not None and "training" in code.co_names
+        if dependent:
+            found.append(path or type(module).__name__)
+    return found

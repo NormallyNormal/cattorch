@@ -16,24 +16,29 @@ import hashlib
 import json
 import logging
 import math
+import re
 import shutil
 import tempfile
 import uuid
-import warnings
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from cattorch import interface
 from cattorch.codegen import CodegenConfig
+from cattorch.errors import warn
 from cattorch.storage import BASE92_ALPHABET
 from cattorch.templates.template import TEMPLATE_DIR
+from cattorch.util.scratch.dataflow import check_list_dataflow
+from cattorch.util.scratch.globals import globalize
 from cattorch.util.scratch.ids import compact_sprite_ids
+from cattorch.util.scratch.sharding import SCRATCH_LIST_LIMIT
 
 log = logging.getLogger(__name__)
 
 SCRATCH_ONLINE_JSON_LIMIT = 5_000_000
 SCRATCH_ONLINE_JSON_WARN_SIZE = 4_000_000
-SCRATCH_MAX_LIST_LENGTH = 200_000
 
 SPRITE_ASSET_DIR = TEMPLATE_DIR / "sprite"
 
@@ -96,62 +101,12 @@ def _make_asset_id(sprite_name: str) -> str:
     return hashlib.md5(sprite_name.encode()).hexdigest()
 
 
-_PUBLIC_DATA_NAMES = {
-    "input", "output", "token_ids", "cattorch tokens", "cattorch logits",
-    "cattorch status", "cattorch cache length", "cattorch max context",
-    "cattorch top k values", "cattorch top k ids",
-    "cattorch storage compression", "cattorch storage precision",
-    "cattorch storage scale precision",
-}
-_PUBLIC_PROCEDURES = {
-    "cattorch init", "cattorch forward", "cattorch prepare for save",
-    "cattorch reset", "cattorch reset cache", "cattorch prefill", "cattorch decode",
-    "cattorch tokenize", "cattorch detokenize",
-}
-
-
-def _compact_internal_display_names(
-    sprite: dict,
-    *,
-    public_data_names: frozenset[str] = frozenset(),
-    public_procedures: frozenset[str] = frozenset(),
-) -> None:
-    """Shorten private UI names while preserving documented interfaces."""
-    data_names: dict[str, str] = {}
-    counters = {"variables": 0, "lists": 0}
-    prefixes = {"variables": "v", "lists": "l"}
+def _rename_display_names(sprite: dict, data_names: dict[str, str], procedures: dict[str, str]) -> None:
+    """Rename variables and lists (by ID) and procedures (by proccode) everywhere."""
     for section in ("variables", "lists"):
         for identifier, entry in sprite.get(section, {}).items():
-            old_name = entry[0]
-            # Physical shards belong to the same public tensor interface.
-            public_base = old_name.split(" shard ", 1)[0]
-            if (
-                public_base in _PUBLIC_DATA_NAMES
-                or public_base in public_data_names
-                or public_base.startswith(("input_", "output_"))
-            ):
-                continue
-            new_name = f"{prefixes[section]}{counters[section]}"
-            counters[section] += 1
-            entry[0] = new_name
-            data_names[identifier] = new_name
-
-    procedure_names: dict[str, str] = {}
-    procedure_counter = 0
-    for block in sprite.get("blocks", {}).values():
-        mutation = block.get("mutation")
-        if not isinstance(mutation, dict):
-            continue
-        proccode = mutation.get("proccode")
-        if (
-            isinstance(proccode, str)
-            and proccode not in _PUBLIC_PROCEDURES
-            and proccode not in public_procedures
-            and proccode not in procedure_names
-        ):
-            procedure_names[proccode] = f"p{procedure_counter}"
-            procedure_counter += 1
-
+            if identifier in data_names:
+                entry[0] = data_names[identifier]
     stack = [sprite.get("blocks", {})]
     while stack:
         value = stack.pop()
@@ -159,8 +114,8 @@ def _compact_internal_display_names(
             mutation = value.get("mutation")
             if isinstance(mutation, dict):
                 proccode = mutation.get("proccode")
-                if proccode in procedure_names:
-                    mutation["proccode"] = procedure_names[proccode]
+                if proccode in procedures:
+                    mutation["proccode"] = procedures[proccode]
             stack.extend(value.values())
         elif isinstance(value, list):
             # Scratch field/reference arrays redundantly carry a display name
@@ -174,6 +129,99 @@ def _compact_internal_display_names(
                 ):
                     value[index - 1] = data_names[identifier]
             stack.extend(value)
+
+
+def _procedure_codes(sprite: dict) -> set[str]:
+    return {
+        mutation["proccode"]
+        for block in sprite.get("blocks", {}).values()
+        if isinstance((mutation := block.get("mutation")), dict)
+        and isinstance(mutation.get("proccode"), str)
+    }
+
+
+def _mark_internal_names(
+    sprite: dict, *, public_data_names: frozenset[str], public_procedures: frozenset[str],
+) -> None:
+    """Prefix every internal name with ``_`` and record the interface version.
+
+    A name is public by ``cattorch.interface.is_public_data`` (or, for a
+    block, ``is_public_procedure``); every other list, variable and block is
+    internal, and gets the ``_`` prefix so that nothing internal looks public
+    in Scratch.
+    """
+    data_names = {
+        identifier: interface.internal_name(entry[0])
+        for section in ("variables", "lists")
+        for identifier, entry in sprite.get(section, {}).items()
+        if not entry[0].startswith(interface.INTERNAL_PREFIX)
+        and not interface.is_public_data(
+            entry[0], public_data_names, is_list=section == "lists",
+        )
+    }
+    procedures = {
+        proccode: interface.internal_name(proccode)
+        for proccode in _procedure_codes(sprite)
+        if not proccode.startswith(interface.INTERNAL_PREFIX)
+        and not interface.is_public_procedure(proccode, public_procedures)
+    }
+    _check_distinct_names(sprite, data_names)
+    _rename_display_names(sprite, data_names, procedures)
+    variables = sprite.setdefault("variables", {})
+    # What a sprite holds before any block has run.
+    for entry in variables.values():
+        if entry[0] == interface.STATUS_VARIABLE:
+            entry[1] = interface.INITIAL_STATUS
+        elif entry[0] == interface.INITIALIZED_VARIABLE:
+            entry[1] = 0
+    for entry in variables.values():
+        if entry[0] == interface.VERSION_VARIABLE:
+            entry[1] = interface.INTERFACE_VERSION
+            break
+    else:
+        variables["cattorch_interface_version"] = [
+            interface.VERSION_VARIABLE, interface.INTERFACE_VERSION,
+        ]
+
+
+def _check_distinct_names(sprite: dict, renames: dict[str, str]) -> None:
+    """Fail if renaming would give two lists, or two variables, the same name."""
+    for section in ("variables", "lists"):
+        names = [
+            renames.get(identifier, entry[0])
+            for identifier, entry in sprite.get(section, {}).items()
+        ]
+        renamed = {renames[identifier] for identifier in sprite.get(section, {}) if identifier in renames}
+        clashes = {name for name in renamed if names.count(name) > 1}
+        if clashes:
+            raise ValueError(f"internal {section} would share a name: {sorted(clashes)}")
+
+
+def _compact_internal_display_names(
+    sprite: dict,
+    *,
+    public_data_names: frozenset[str] = frozenset(),
+    public_procedures: frozenset[str] = frozenset(),
+) -> None:
+    """Shorten internal names (to ``_v0``, ``_l0``, ``_p0``) and keep public ones."""
+    data_names: dict[str, str] = {}
+    counters = {"variables": 0, "lists": 0}
+    prefixes = {"variables": "_v", "lists": "_l"}
+    for section in ("variables", "lists"):
+        for identifier, entry in sprite.get(section, {}).items():
+            if interface.is_public_data(entry[0], public_data_names, is_list=section == "lists"):
+                continue
+            data_names[identifier] = f"{prefixes[section]}{counters[section]}"
+            counters[section] += 1
+    procedure_names = {
+        # Keep each argument's slot, which calls and the editor read.
+        proccode: f"_p{position}" + "".join(f" {slot}" for slot in re.findall(r"%[snb]", proccode))
+        for position, proccode in enumerate(sorted(
+            proccode for proccode in _procedure_codes(sprite)
+            if not interface.is_public_procedure(proccode, public_procedures)
+        ))
+    }
+    _rename_display_names(sprite, data_names, procedure_names)
 
 
 def _trim_safe_schema_defaults(sprite: dict) -> None:
@@ -194,6 +242,7 @@ def finalize_sprite(
     codegen: CodegenConfig | None = None,
     public_data_names: frozenset[str] = frozenset(),
     public_procedures: frozenset[str] = frozenset(),
+    costume_names: Sequence[str] | None = None,
 ) -> FinalizedSprite:
     """
     Finalize a sprite dict and write it as a .sprite3 zip file.
@@ -206,6 +255,11 @@ def finalize_sprite(
         Path for the output .sprite3 file, e.g. "my_model.sprite3".
     sprite_name : str
         Name for the sprite inside Scratch. Also used to derive the asset ID.
+    costume_names : sequence of str, optional
+        The costumes' names, all sharing the one SVG. Scratch's ``switch
+        costume to`` matches names exactly, so a sprite can name costumes after
+        characters to tell ``A`` from ``a``. Defaults to the Base92 codec
+        alphabet when the sprite switches costumes, else one costume.
 
     Returns
     -------
@@ -216,15 +270,25 @@ def finalize_sprite(
     codegen = codegen or CodegenConfig()
     if not isinstance(codegen, CodegenConfig):
         raise TypeError("codegen must be a CodegenConfig")
+    # Before any renaming, while public lists still have their own names.
+    check_list_dataflow(data, public_data_names, export=sprite_name)
     sprite = copy.deepcopy(data)
     _ensure_costume_menu_shadows(sprite)
     sprite = compact_sprite_ids(sprite, namespace=codegen.id_namespace)
+    _mark_internal_names(
+        sprite, public_data_names=public_data_names, public_procedures=public_procedures,
+    )
     if codegen.compact_internal_names:
         _compact_internal_display_names(
             sprite,
             public_data_names=public_data_names,
             public_procedures=public_procedures,
         )
+    # Last, so that compaction keeps the global names.
+    globalize(
+        sprite, sprite_name, public_data_names=public_data_names,
+        public_procedures=public_procedures,
+    )
     if codegen.compact_schema:
         _trim_safe_schema_defaults(sprite)
 
@@ -253,7 +317,8 @@ def finalize_sprite(
         block.get("opcode") == "looks_switchcostumeto"
         for block in sprite.get("blocks", {}).values()
     )
-    costume_names = BASE92_ALPHABET if uses_costume_codec else ("cat",)
+    if costume_names is None:
+        costume_names = BASE92_ALPHABET if uses_costume_codec else ("cat",)
 
     # Codec costumes share one physical SVG, adding only their JSON metadata.
     sprite.update({
@@ -275,10 +340,10 @@ def finalize_sprite(
     # Check list sizes before writing
     for sid, entry in sprite.get("lists", {}).items():
         name, contents = entry[0], entry[1]
-        if len(contents) > SCRATCH_MAX_LIST_LENGTH:
+        if len(contents) > SCRATCH_LIST_LIMIT:
             raise ValueError(
                 f"list \"{name}\" has {len(contents):,} items, "
-                f"which exceeds Scratch's limit of {SCRATCH_MAX_LIST_LENGTH:,}"
+                f"which exceeds Scratch's limit of {SCRATCH_LIST_LIMIT:,}"
             )
 
     # Write into a temp dir then zip
@@ -323,7 +388,7 @@ def finalize_sprite(
     file_size = output_path.stat().st_size
 
     for message in warning_messages:
-        warnings.warn(message, stacklevel=2)
+        warn(message)
     log.info("Written: %s (asset_id: %s)", output_path, asset_id)
     return FinalizedSprite(
         path=output_path,
