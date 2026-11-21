@@ -1,4 +1,4 @@
-# 1.0.0 - 2026-11-17
+# 1.0.0 - 2026-11-21
 
 cattorch 1.0 freezes the public Python API, the `cattorch` command line and
 the Scratch interface for 1.x; see [stability](docs/stability.md). Upgrading
